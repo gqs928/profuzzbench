@@ -67,6 +67,7 @@ RUN apt-get install -y psmisc
 
 RUN apt-get -y install \
     libpcre3-dev \
+    libpcre2-dev \
     pkg-config \
     libdb-dev \
     libgdbm-dev
