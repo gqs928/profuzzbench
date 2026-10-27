@@ -83,7 +83,7 @@ RUN cd ${WORKDIR} && \
     tar -zxvf bftpd-6.7.tar.gz -C ${WORKDIR}/bftpd-gcov --strip-components=1 && \
     cd ${WORKDIR}/bftpd-gcov && \
     patch -p1 < ${WORKDIR}/gcov.patch && \
-    make CFLAGS="-g -O0 -fprofile-arcs -ftest-coverage" LDFLAGS="--coverage" $MAKE_OPT
+    make clean all CFLAGS='-g -O0 -fprofile-arcs -ftest-coverage -DHAVE_CONFIG_H -Wall -I. -DVERSION=\"6.7\" -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -DPREFIX=\"/usr\"' LDFLAGS="--coverage" $MAKE_OPT
 
 
 COPY --chown=ubuntu:ubuntu basic.conf ${WORKDIR}/
