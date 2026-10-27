@@ -79,7 +79,7 @@ RUN cd $WORKDIR && \
 # Set up LightFTP for fuzzing
 RUN cd ${WORKDIR}/LightFTP/src/Release && \
     cp ${WORKDIR}/LightFTP/data/fftp.conf ./ && \
-    sed -i 's|^port=.*|port=2200|; s|/home/user|/home/ubuntu|g' fftp.conf && \
+    sed -i 's|^port=.*|port=2200|; s|/home/user|/home/ubuntu|g; s|^Keyfile=.*|Keyfile=/home/ubuntu/certificate/my.key|' fftp.conf && \
     cp ${AFLNET}/tutorials/lightftp/ftpclean.sh ./ && \
     cp -r ${AFLNET}/tutorials/lightftp/certificate /home/ubuntu && \
     mkdir -p /home/ubuntu/ftpshare
@@ -96,7 +96,7 @@ RUN cd $WORKDIR && \
 # Set up LightFTP for fuzzing
 RUN cd ${WORKDIR}/LightFTP-gcov/src/Release && \
     cp ${WORKDIR}/LightFTP-gcov/data/fftp.conf ./ && \
-    sed -i 's|^port=.*|port=2200|; s|/home/user|/home/ubuntu|g' fftp.conf && \
+    sed -i 's|^port=.*|port=2200|; s|/home/user|/home/ubuntu|g; s|^Keyfile=.*|Keyfile=/home/ubuntu/certificate/my.key|' fftp.conf && \
     cp ${AFLNET}/tutorials/lightftp/ftpclean.sh ./
 
 
