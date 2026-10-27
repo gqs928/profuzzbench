@@ -38,16 +38,20 @@ WORKDIR /home/ubuntu
 # Import environment variable to pass as parameter to make (e.g., to make parallel builds with -j)
 ARG MAKE_OPT
 
+COPY --chown=ubuntu:ubuntu trace-pc-llvm14.patch /home/ubuntu/trace-pc-llvm14.patch
+
 # Set up fuzzers
 RUN git clone https://github.com/profuzzbench/aflnet.git && \
     cd aflnet && \
+    patch -p1 < /home/ubuntu/trace-pc-llvm14.patch && \
     make clean all $MAKE_OPT && \
-    cd llvm_mode && make $MAKE_OPT
+    cd llvm_mode && AFL_TRACE_PC=1 make clean all $MAKE_OPT
 
 RUN git clone https://github.com/profuzzbench/aflnwe.git && \
     cd aflnwe && \
+    patch -p1 < /home/ubuntu/trace-pc-llvm14.patch && \
     make clean all $MAKE_OPT && \
-    cd llvm_mode && make $MAKE_OPT
+    cd llvm_mode && AFL_TRACE_PC=1 make clean all $MAKE_OPT
 
 # Set up environment variables for AFLNet
 ENV WORKDIR="/home/ubuntu/experiments"
@@ -69,7 +73,7 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 
 # Download and compile Live555 for fuzzing
 RUN cd $WORKDIR && \
-    wget -q https://www.live555.com/liveMedia/public/live.2026.10.24.tar.gz -O live.2026.10.24.tar.gz && \
+    wget -q https://download.live555.com/live.2026.10.24.tar.gz -O live.2026.10.24.tar.gz && \
     echo "5d6244604b364251d0c0b0fc87a849488958802245b1473eaaf55eaaef5a838b  live.2026.10.24.tar.gz" | sha256sum -c - && \
     tar -xzf live.2026.10.24.tar.gz && mv live live555 && \
     cd live555 && \
