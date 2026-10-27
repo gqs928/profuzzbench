@@ -18,7 +18,7 @@ instrumentation, or server lifecycle to that source revision.
 | LightFTP | upstream master snapshot (2026-10-19; after 2.3.1) | `a7af93ab0bbf9df6aba3e987c0d4180a5bef5253` | [GitHub](https://github.com/hfiref0x/LightFTP) |
 | ProFTPD | 1.3.9e | `fc3f908a0d07fa3b17fbe1e3054b7520806bc75a` | [GitHub](https://github.com/proftpd/proftpd) |
 | Pure-FTPd | 1.0.54 | `3fe02789c4f0e5756f3f612e32edee9aa5d49455` | [GitHub](https://github.com/jedisct1/pure-ftpd) |
-| Live555 | 2026-10-24 | SHA-256 `5d6244604b364251d0c0b0fc87a849488958802245b1473eaaf55eaaef5a838b` | [Official release archive](https://www.live555.com/liveMedia/public/live.2026.10.24.tar.gz) |
+| Live555 | 2026-10-24 | SHA-256 `5d6244604b364251d0c0b0fc87a849488958802245b1473eaaf55eaaef5a838b` | [Official release archive](https://download.live555.com/live.2026.10.24.tar.gz) |
 | Kamailio | 6.1.5 | `aab4e3d6d157bdf09bd7a6512cfec70a4f2b5477` | [GitHub](https://github.com/kamailio/kamailio) |
 | Exim | 4.100.1 | `fb7ccaa78db25a5816a3c4413d2e6caa44aaf822` | [Official Git](https://code.exim.org/exim/exim) |
 | OpenSSH | 10.6p1 | `a8c72b842423f0774f542d3c2197247c3dd28d74` | [GitHub portable](https://github.com/openssh/openssh-portable) |
@@ -29,14 +29,28 @@ instrumentation, or server lifecycle to that source revision.
 
 - DCMTK now uses its `OFString` configuration path API; AFL/StateAFL compiler
   selection is passed to the build-directory CMake invocation.
+- forked-daapd now installs its `libprotobuf-c` development and compiler packages,
+  required by the current bundled librespot-c configure step; obsolete parser
+  generation targets were removed because the current Automake build handles them.
 - dnsmasq gets a deterministic SURF PRNG state, and all variants build from the
   checksum-verified official release archive.
 - TinyDTLS now uses its upstream Autotools build and registers SIGUSR1 for coverage
   shutdown.
-- BFTPD and Live555 downloads are checksum-verified. Live555's coverage image
-  applies both the deterministic RTSP adaptation and the coverage shutdown hook.
+- BFTPD and Live555 downloads are checksum-verified. Live555's AFLNet, AFlnwe,
+  and StateAFL builds use LLVM's trace-pc-guard instrumentation and remove a
+  legacy LLVM command-line option no longer accepted by Ubuntu 22.04's LLVM 14.
+  StateAFL's statically linked tracer uses non-PIE linking; the coverage image
+  also applies the deterministic RTSP adaptation and shutdown hook.
 - LightFTP now builds from `src/Release`; the updated runtime reads its port from
   `fftp.conf`, so the target config pins it to 2200. Its TLS config points to the
   `my.key` file included in ProFuzzBench's certificate bundle.
 - Exim's random-seed and message-ID patches were reduced to current source sites;
-  the default test config is patched before install.
+  the default test config is patched before install, and PCRE2 development files
+  are installed for the current configure script; Local/Makefile explicitly
+  selects the OpenSSL TLS backend.
+- OpenSSH now links against the OpenSSL 4.1.0 `lib64` installation path, matching
+  the headers and runtime libraries used by its pinned dependency.
+- OpenSSL 4.1.0 builds all generated headers before compiling its app target;
+  the public headers are generated from `.h.in` templates in this release. The
+  deterministic random helper is copied into the upstream `fuzz/` tree before
+  applying the ProFuzzBench adaptation in both the AFL and StateAFL images.
