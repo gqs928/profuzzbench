@@ -70,7 +70,7 @@ RUN apt-get -y update && \
     libavcodec-dev libavformat-dev libavfilter-dev libswscale-dev libavutil-dev \
     libasound2-dev libmxml-dev libgcrypt20-dev libavahi-client-dev zlib1g-dev \
     libevent-dev libplist-dev libsodium-dev libjson-c-dev libwebsockets-dev \
-    libcurl4-openssl-dev avahi-daemon
+    libcurl4-openssl-dev avahi-daemon libprotobuf-c-dev protobuf-c-compiler
 USER ubuntu
 
 COPY --chown=ubuntu:ubuntu forked-daapd.patch ${WORKDIR}/forked-daapd.patch
@@ -88,7 +88,6 @@ RUN cd $WORKDIR && \
     patch -p1 < $WORKDIR/forked-daapd.patch && \
     autoreconf -i && \
     CC=$AFLNET/afl-clang-fast CFLAGS="-DSQLITE_CORE" ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var  --disable-mpd --disable-itunes --disable-lastfm --disable-spotify --disable-verification  --disable-shared --enable-static && \
-    AFL_USE_ASAN=1 make -C src/ SMARTPL2SQL.c SMARTPL.c DAAP2SQL.c DAAPLexer.c RSPLexer.c RSP2SQL.c && \
     AFL_USE_ASAN=1 make clean all $MAKE_OPT
 
 # Download and compile forked-daapd for code coverage analysis
@@ -100,7 +99,6 @@ RUN cd $WORKDIR && \
     patch -p1 < $WORKDIR/forked-daapd-gcov.patch && \
     autoreconf -i && \
     CFLAGS="-DSQLITE_CORE -fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var  --disable-mpd --disable-itunes --disable-lastfm --disable-spotify --disable-verification  --disable-shared --enable-static && \
-    make -C src/ SMARTPL2SQL.c SMARTPL.c DAAP2SQL.c DAAPLexer.c RSPLexer.c RSP2SQL.c && \
     make clean all $MAKE_OPT
 
 
