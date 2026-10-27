@@ -11,6 +11,9 @@ RUN apt-get -y update && \
     graphviz-dev \
     git \
     autoconf \
+    automake \
+    libtool \
+    pkg-config \
     libgnutls28-dev \
     libssl-dev \
     llvm \
@@ -68,24 +71,22 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 
 # Download and compile TinyDTLS for fuzzing
 RUN cd $WORKDIR && \
-    git clone https://github.com/assist-project/tinydtls-fuzz.git tinydtls && \
+    git clone https://github.com/eclipse-tinydtls/tinydtls.git tinydtls && \
     cd tinydtls && \
-    git checkout 06995d4 && \
-    cd tests && \
-    CC=afl-clang-fast make clean && \
-    AFL_USE_ASAN=1 CC=afl-clang-fast make ../libtinydtls.a $MAKE_OPT && \
-    AFL_USE_ASAN=1 CC=afl-clang-fast make $MAKE_OPT
+    git checkout 5b05dd673b036ce7e10df8feaa1a827d578f907a && \
+    ./autogen.sh && \
+    AFL_USE_ASAN=1 CC=afl-clang-fast CFLAGS="-g -O1" ./configure --disable-shared && \
+    AFL_USE_ASAN=1 make $MAKE_OPT
 
 # Download and compile TinyDTLS for coverage analysis
 RUN cd $WORKDIR && \
-    git clone https://github.com/assist-project/tinydtls-fuzz.git tinydtls-gcov && \
+    git clone https://github.com/eclipse-tinydtls/tinydtls.git tinydtls-gcov && \
     cd tinydtls-gcov && \
-    git checkout 06995d4 && \
+    git checkout 5b05dd673b036ce7e10df8feaa1a827d578f907a && \
     patch -p1 < $WORKDIR/gcov.patch && \
-    cd tests && \
-    cov=1 make clean && \
-    cov=1 make ../libtinydtls.a $MAKE_OPT && \
-    cov=1 make $MAKE_OPT
+    ./autogen.sh && \
+    CFLAGS="-g -O0 -fprofile-arcs -ftest-coverage" LDFLAGS="--coverage" ./configure --disable-shared && \
+    make $MAKE_OPT
 
 COPY --chown=ubuntu:ubuntu in-dtls ${WORKDIR}/in-dtls
 COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script

@@ -75,20 +75,20 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 RUN cd ${WORKDIR} && \
     git clone https://github.com/jedisct1/pure-ftpd.git && \
     cd pure-ftpd && \
-    git checkout c21b45f && \
+    git checkout 3fe02789c4f0e5756f3f612e32edee9aa5d49455 && \
     patch -p1 < ${WORKDIR}/fuzzing.patch && \
     ./autogen.sh && \
-    CC="afl-clang-fast" CXX="afl-clang-fast++" CFLAGS="-fsanitize=address -g -O0" CXXFLAGS="-fsanitize=address -g -O0" LDFLAGS="-fsanitize=address" ./configure --without-privsep -without-capabilities && \
+    CC="afl-clang-fast" CXX="afl-clang-fast++" CFLAGS="-fsanitize=address -g -O0" CXXFLAGS="-fsanitize=address -g -O0" LDFLAGS="-fsanitize=address" ./configure --without-privsep --without-capabilities && \
     make $MAKE_OPT
 
 # Set up PureFTPD for coverage analysis
 RUN cd ${WORKDIR} && \
     git clone https://github.com/jedisct1/pure-ftpd.git pure-ftpd-gcov && \
     cd pure-ftpd-gcov && \
-    git checkout c21b45f && \
+    git checkout 3fe02789c4f0e5756f3f612e32edee9aa5d49455 && \
     patch -p1 < ${WORKDIR}/gcov.patch && \
     ./autogen.sh && \
-    CFLAGS="-fprofile-arcs -ftest-coverage" CPPFLAGS="-fprofile-arcs -ftest-coverage" CXXFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" ./configure --without-privsep -without-capabilities && \
+    CFLAGS="-fprofile-arcs -ftest-coverage" CPPFLAGS="-fprofile-arcs -ftest-coverage" CXXFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" ./configure --without-privsep --without-capabilities && \
     make $MAKE_OPT
 
 COPY --chown=ubuntu:ubuntu in-ftp ${WORKDIR}/in-ftp

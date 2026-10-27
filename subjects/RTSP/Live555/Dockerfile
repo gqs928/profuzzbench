@@ -1,4 +1,4 @@
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
 # Install common dependencies
 ENV DEBIAN_FRONTEND=noninteractive
@@ -19,7 +19,7 @@ RUN apt-get -y update && \
     net-tools \
     vim \
     gdb \
-    netcat \
+    netcat-openbsd \
     strace \
     wget
 
@@ -69,12 +69,13 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 
 # Download and compile Live555 for fuzzing
 RUN cd $WORKDIR && \
-    git clone https://github.com/rgaufman/live555.git && \
+    wget -q https://www.live555.com/liveMedia/public/live.2026.10.24.tar.gz -O live.2026.10.24.tar.gz && \
+    echo "5d6244604b364251d0c0b0fc87a849488958802245b1473eaaf55eaaef5a838b  live.2026.10.24.tar.gz" | sha256sum -c - && \
+    tar -xzf live.2026.10.24.tar.gz && mv live live555 && \
     cd live555 && \
-    git checkout ceeb4f4 && \
     patch -p1 < $WORKDIR/fuzzing.patch && \
     ./genMakefiles linux && \
-    AFL_USE_ASAN=1 make clean all $MAKE_OPT || make all
+    AFL_USE_ASAN=1 CC=afl-clang-fast CXX=afl-clang-fast++ make clean all $MAKE_OPT
 
 # Set up Live555 for fuzzing
 RUN cd ${WORKDIR}/live555/testProgs && \
@@ -82,12 +83,12 @@ RUN cd ${WORKDIR}/live555/testProgs && \
 
 # Download and compile Live555 for coverage analysis
 RUN cd $WORKDIR && \
-    git clone https://github.com/rgaufman/live555.git live555-cov && \
+    mkdir live555-cov && tar -xzf live.2026.10.24.tar.gz --strip-components=1 -C live555-cov && \
     cd live555-cov && \
-    git checkout ceeb4f4 && \
+    patch -p1 < $WORKDIR/fuzzing.patch && \
     patch -p1 < $WORKDIR/gcov.patch && \
     ./genMakefiles linux && \
-    make CFLAGS="-fprofile-arcs -ftest-coverage" CPPFLAGS="-fprofile-arcs -ftest-coverage" CXXFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" clean all
+    make CFLAGS="-g -O0 -fprofile-arcs -ftest-coverage" CPPFLAGS="-fprofile-arcs -ftest-coverage" CXXFLAGS="-g -O0 -fprofile-arcs -ftest-coverage" LDFLAGS="--coverage" clean all $MAKE_OPT
 
 # Set up Live555 for coverage analysis
 RUN cd ${WORKDIR}/live555-cov/testProgs && \

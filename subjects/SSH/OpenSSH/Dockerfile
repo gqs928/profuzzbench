@@ -72,12 +72,11 @@ COPY --chown=ubuntu:ubuntu rand.inc ${WORKDIR}/rand.inc
 env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_after_return=1:detect_container_overflow=0:poison_array_cookie=0:malloc_fill_byte=0:max_malloc_fill_size=16777216'
 
 
-# Download and compile OpenSSL 1.0.2
-# (for compatibility with older OpenSSH used in this benchmark)
+# Download and compile current OpenSSL for OpenSSH
 RUN cd ${WORKDIR} && \
     git clone https://github.com/openssl/openssl openssl && \
     cd openssl && \
-    git checkout 12ad22d && \
+    git checkout 2f4e3a5fec05394068cfa7379890ab552483a8a6 && \
     ./Configure linux-x86_64-clang shared --prefix=$WORKDIR/openssl-install && \
     make $MAKE_OPT && \
     make install
@@ -86,9 +85,9 @@ ENV LD_LIBRARY_PATH="${WORKDIR}/openssl-install/lib"
 
 # Download and compile OpenSSH for fuzzing
 RUN cd ${WORKDIR} && \
-    git clone https://github.com/vegard/openssh-portable.git openssh && \
+    git clone https://github.com/openssh/openssh-portable.git openssh && \
     cd openssh && \
-    git checkout 7cfea58 && \
+    git checkout a8c72b842423f0774f542d3c2197247c3dd28d74 && \
     cp ${WORKDIR}/rand.inc . && \
     patch -p1 < ${WORKDIR}/rand.patch && \
     autoreconf && \
@@ -106,9 +105,9 @@ RUN cd ${WORKDIR} && \
 
 # Download and compile OpenSSH for coverage analysis
 RUN cd ${WORKDIR} && \
-    git clone https://github.com/vegard/openssh-portable.git openssh-gcov && \
+    git clone https://github.com/openssh/openssh-portable.git openssh-gcov && \
     cd openssh-gcov && \
-    git checkout 7cfea58 && \
+    git checkout a8c72b842423f0774f542d3c2197247c3dd28d74 && \
     cp ${WORKDIR}/rand.inc . && \
     patch -p1 < ${WORKDIR}/rand.patch && \
     autoreconf && \

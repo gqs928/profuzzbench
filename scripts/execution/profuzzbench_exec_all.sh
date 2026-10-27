@@ -48,7 +48,7 @@ do
 
             if [[ $FUZZER == "stateafl" ]] || [[ $FUZZER == "all" ]]
             then
-                profuzzbench_exec_common.sh lightftp-stateafl $NUM_CONTAINERS results-lightftp stateafl out-lightftp-stateafl "-P FTP -D 10000 -q 3 -s 3 -E -K -m none -u /home/ubuntu/experiments/LightFTP/Source/Release/fftp -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
+                profuzzbench_exec_common.sh lightftp-stateafl $NUM_CONTAINERS results-lightftp stateafl out-lightftp-stateafl "-P FTP -D 10000 -q 3 -s 3 -E -K -m none -u /home/ubuntu/experiments/LightFTP/src/Release/fftp -t ${TEST_TIMEOUT}" $TIMEOUT $SKIPCOUNT
             fi
 
             if [[ $FUZZER == "aflnwe" ]] || [[ $FUZZER == "all" ]]

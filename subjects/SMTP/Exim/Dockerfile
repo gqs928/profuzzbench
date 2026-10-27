@@ -81,30 +81,30 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 
 # Download, compile and install Exim for fuzzing
 RUN cd ${WORKDIR} && \
-    git clone https://github.com/Exim/exim && \
+    git clone https://code.exim.org/exim/exim.git && \
     cd exim && \
-    git checkout 38903fb && \
+    git checkout fb7ccaa78db25a5816a3c4413d2e6caa44aaf822 && \
     patch -p1 < ${WORKDIR}/exim-rand.patch && \
     patch -p1 < ${WORKDIR}/exim-log-bug.patch && \
-    cd src; mkdir Local; cp src/EDITME Local/Makefile && \
-    cd Local; patch -p1 < ${WORKDIR}/exim.patch; cd .. && \
+    patch -p1 < ${WORKDIR}/exim.configure.patch && \
+    cd src && mkdir -p Local && cp src/EDITME Local/Makefile && \
+    cd Local && patch -p1 < ${WORKDIR}/exim.patch && cd .. && \
     AFL_USE_ASAN=1 make CC=afl-clang-fast clean all install $MAKE_OPT
 
 # Download and compile Exim for coverage analysis
 RUN cd ${WORKDIR} && \
-    git clone https://github.com/Exim/exim exim-gcov && \
+    git clone https://code.exim.org/exim/exim.git exim-gcov && \
     cd exim-gcov && \
-    git checkout 38903fb && \
+    git checkout fb7ccaa78db25a5816a3c4413d2e6caa44aaf822 && \
     patch -p1 < ${WORKDIR}/exim-rand.patch && \
     patch -p1 < ${WORKDIR}/exim-log-bug.patch && \
-    cd src; mkdir Local; cp src/EDITME Local/Makefile && \
-    cd Local; patch -p1 < ${WORKDIR}/exim.patch; cd .. && \
+    patch -p1 < ${WORKDIR}/exim.configure.patch && \
+    cd src && mkdir -p Local && cp src/EDITME Local/Makefile && \
+    cd Local && patch -p1 < ${WORKDIR}/exim.patch && cd .. && \
     make CFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" LFLAGS+="-lgcov --coverage" clean all $MAKE_OPT
 
 # Configure exim
-RUN cd /usr/exim && \
-    patch -p1 < ${WORKDIR}/exim.configure.patch && \
-    chmod 1777 /var/mail
+RUN chmod 1777 /var/mail
 
 ENV PATH="/usr/exim/bin:${PATH}"
 

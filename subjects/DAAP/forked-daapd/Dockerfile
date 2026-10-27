@@ -84,7 +84,7 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 RUN cd $WORKDIR && \
     git clone https://github.com/ejurgensen/forked-daapd.git && \
     cd forked-daapd && \
-    git checkout 2ca10d9 && \
+    git checkout d6fb3edf5831de38134ebd92fcf09a730ddd37aa && \
     patch -p1 < $WORKDIR/forked-daapd.patch && \
     autoreconf -i && \
     CC=$AFLNET/afl-clang-fast CFLAGS="-DSQLITE_CORE" ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var  --disable-mpd --disable-itunes --disable-lastfm --disable-spotify --disable-verification  --disable-shared --enable-static && \
@@ -95,7 +95,7 @@ RUN cd $WORKDIR && \
 RUN cd $WORKDIR && \
     git clone https://github.com/ejurgensen/forked-daapd.git forked-daapd-gcov && \
     cd forked-daapd-gcov && \
-    git checkout 2ca10d9 && \
+    git checkout d6fb3edf5831de38134ebd92fcf09a730ddd37aa && \
     patch -p1 < $WORKDIR/forked-daapd.patch && \
     patch -p1 < $WORKDIR/forked-daapd-gcov.patch && \
     autoreconf -i && \

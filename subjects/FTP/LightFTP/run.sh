@@ -24,32 +24,32 @@ if $(strstr $FUZZER "afl"); then
 
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
-  cd $WORKDIR/${TARGET_DIR}/Source/Release
-  echo "$WORKDIR/${TARGET_DIR}/Source/Release"
+  cd $WORKDIR/${TARGET_DIR}/src/Release
+  echo "$WORKDIR/${TARGET_DIR}/src/Release"
   timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/${FUZZER}/afl-fuzz -d -i ${INPUTS} -x ${WORKDIR}/ftp.dict -o $OUTDIR -N tcp://127.0.0.1/2200 $OPTIONS -c ${WORKDIR}/ftpclean ./fftp fftp.conf 2200
 
   STATUS=$?
 
   #Step-2. Collect code coverage over time
   #Move to gcov folder
-  cd $WORKDIR/LightFTP-gcov/Source/Release
+  cd $WORKDIR/LightFTP-gcov/src/Release
 
   #The last argument passed to cov_script should be 0 if the fuzzer is afl/nwe and it should be 1 if the fuzzer is based on aflnet
   #0: the test case is a concatenated message sequence -- there is no message boundary
   #1: the test case is a structured file keeping several request messages
   if [ $FUZZER = "aflnwe" ]; then
-    cov_script ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/ 2200 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_over_time.csv 0
+    cov_script ${WORKDIR}/${TARGET_DIR}/src/Release/${OUTDIR}/ 2200 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/src/Release/${OUTDIR}/cov_over_time.csv 0
   else
-    cov_script ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/ 2200 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_over_time.csv 1
+    cov_script ${WORKDIR}/${TARGET_DIR}/src/Release/${OUTDIR}/ 2200 ${SKIPCOUNT} ${WORKDIR}/${TARGET_DIR}/src/Release/${OUTDIR}/cov_over_time.csv 1
   fi
 
   gcovr -r .. --html --html-details -o index.html
-  mkdir ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_html/
-  cp *.html ${WORKDIR}/${TARGET_DIR}/Source/Release/${OUTDIR}/cov_html/
+  mkdir ${WORKDIR}/${TARGET_DIR}/src/Release/${OUTDIR}/cov_html/
+  cp *.html ${WORKDIR}/${TARGET_DIR}/src/Release/${OUTDIR}/cov_html/
 
   #Step-3. Save the result to the ${WORKDIR} folder
   #Tar all results to a file
-  cd ${WORKDIR}/${TARGET_DIR}/Source/Release
+  cd ${WORKDIR}/${TARGET_DIR}/src/Release
   tar -zcvf ${WORKDIR}/${OUTDIR}.tar.gz ${OUTDIR}
 
   exit $STATUS

@@ -71,19 +71,19 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 
 # Download and compile Dnsmasq for fuzzing
 RUN cd $WORKDIR && \
-    git clone git://thekelleys.org.uk/dnsmasq.git && \
+    wget -q https://thekelleys.org.uk/dnsmasq/dnsmasq-2.93.tar.gz -O dnsmasq-2.93.tar.gz && \
+    echo "cc967771abdafeb43d10db18932d6b59fd4bed2c69c22acf8cb96aff6920d55f  dnsmasq-2.93.tar.gz" | sha256sum -c - && \
+    mkdir dnsmasq && tar -xzf dnsmasq-2.93.tar.gz --strip-components=1 -C dnsmasq && \
     cd dnsmasq && \
-    git checkout v2.73rc6 && \
     patch -p1 < ${WORKDIR}/dnsmasq.patch && \
-    AFL_USE_ASAN=1 CC=afl-clang-fast make $MAKE_OPT
+    AFL_USE_ASAN=1 make CC=afl-clang-fast CFLAGS="-g -O1" $MAKE_OPT
 
 # Download and compile Dnsmasq for coverage analysis
 RUN cd $WORKDIR && \
-    git clone git://thekelleys.org.uk/dnsmasq.git dnsmasq-gcov && \
+    mkdir dnsmasq-gcov && tar -xzf dnsmasq-2.93.tar.gz --strip-components=1 -C dnsmasq-gcov && \
     cd dnsmasq-gcov && \
-    git checkout v2.73rc6 && \
     patch -p1 < ${WORKDIR}/dnsmasq.patch && \
-    make CFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" $MAKE_OPT
+    make CC=gcc CFLAGS="-g -O0 -fprofile-arcs -ftest-coverage" LDFLAGS="--coverage" $MAKE_OPT
 
 
 COPY --chown=ubuntu:ubuntu in-dns ${WORKDIR}/in-dns

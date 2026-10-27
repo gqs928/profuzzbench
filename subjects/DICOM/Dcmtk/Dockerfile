@@ -74,10 +74,10 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 RUN cd $WORKDIR && \
     git clone https://github.com/DCMTK/dcmtk && \
     cd dcmtk && \
-    git checkout 7f8564c && \
+    git checkout 108acdae424d6999b2e398243938d8c563315ecf && \
     patch -p1 < $WORKDIR/fuzzing.patch && \
     mkdir build && cd build && \
-    cmake .. && \
+    cmake .. -DCMAKE_C_COMPILER=afl-clang-fast -DCMAKE_CXX_COMPILER=afl-clang-fast++ && \
     AFL_USE_ASAN=1 make dcmqrscp $MAKE_OPT
 
 
@@ -85,10 +85,10 @@ RUN cd $WORKDIR && \
 RUN cd $WORKDIR && \
     git clone https://github.com/DCMTK/dcmtk dcmtk-gcov && \
     cd dcmtk-gcov && \
-    git checkout 7f8564c && \
+    git checkout 108acdae424d6999b2e398243938d8c563315ecf && \
     patch -p1 < $WORKDIR/normal.patch && \
     mkdir build && cd build && \
-    cmake -G"Unix Makefiles" .. -DCMAKE_C_FLAGS="-g -fprofile-arcs -ftest-coverage" -DCMAKE_CXX_FLAGS="-g -fprofile-arcs -ftest-coverage" && \
+    cmake -G"Unix Makefiles" .. -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_FLAGS="-g -fprofile-arcs -ftest-coverage" -DCMAKE_CXX_FLAGS="-g -fprofile-arcs -ftest-coverage" -DCMAKE_EXE_LINKER_FLAGS="--coverage" && \
     make dcmqrscp $MAKE_OPT
 
 

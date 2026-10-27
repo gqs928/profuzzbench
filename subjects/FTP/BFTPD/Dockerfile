@@ -69,8 +69,9 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 
 # Set up Bftpd for fuzzing
 RUN cd ${WORKDIR} && \
-    wget https://sourceforge.net/projects/bftpd/files/bftpd/bftpd-5.7/bftpd-5.7.tar.gz && \
-    tar -zxvf bftpd-5.7.tar.gz && \
+    wget -q https://sourceforge.net/projects/bftpd/files/bftpd/bftpd-6.7/bftpd-6.7.tar.gz/download -O bftpd-6.7.tar.gz && \
+    echo "40317957c3667fded7541ff4b0f44328573827ef0315519a44ca1b627f5eafb2  bftpd-6.7.tar.gz" | sha256sum -c - && \
+    tar -zxvf bftpd-6.7.tar.gz && \
     cd bftpd && \
     patch -p1 < ${WORKDIR}/fuzzing.patch && \
     AFL_USE_ASAN=1 CC=afl-clang-fast make clean all $MAKE_OPT
@@ -79,10 +80,10 @@ RUN cd ${WORKDIR} && \
 # Set up Bftpd for coverage analysis
 RUN cd ${WORKDIR} && \
     mkdir ${WORKDIR}/bftpd-gcov && \
-    tar -zxvf bftpd-5.7.tar.gz -C ${WORKDIR}/bftpd-gcov --strip-components=1 && \
+    tar -zxvf bftpd-6.7.tar.gz -C ${WORKDIR}/bftpd-gcov --strip-components=1 && \
     cd ${WORKDIR}/bftpd-gcov && \
     patch -p1 < ${WORKDIR}/gcov.patch && \
-    make $MAKE_OPT
+    make CFLAGS="-g -O0 -fprofile-arcs -ftest-coverage" LDFLAGS="--coverage" $MAKE_OPT
 
 
 COPY --chown=ubuntu:ubuntu basic.conf ${WORKDIR}/

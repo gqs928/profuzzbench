@@ -71,30 +71,32 @@ env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_a
 RUN cd $WORKDIR && \
     git clone https://github.com/hfiref0x/LightFTP.git && \
     cd LightFTP && \
-    git checkout 5980ea1 && \
+    git checkout a7af93ab0bbf9df6aba3e987c0d4180a5bef5253 && \
     patch -p1 < ${WORKDIR}/fuzzing.patch && \
-    cd Source/Release && \
+    cd src/Release && \
     AFL_USE_ASAN=1 CC=afl-clang-fast make clean all $MAKE_OPT
 
 # Set up LightFTP for fuzzing
-RUN cd ${WORKDIR}/LightFTP/Source/Release && \
-    cp ${AFLNET}/tutorials/lightftp/fftp.conf ./ && \
+RUN cd ${WORKDIR}/LightFTP/src/Release && \
+    cp ${WORKDIR}/LightFTP/data/fftp.conf ./ && \
+    sed -i 's|^port=.*|port=2200|; s|/home/user|/home/ubuntu|g' fftp.conf && \
     cp ${AFLNET}/tutorials/lightftp/ftpclean.sh ./ && \
     cp -r ${AFLNET}/tutorials/lightftp/certificate /home/ubuntu && \
-    mkdir /home/ubuntu/ftpshare
+    mkdir -p /home/ubuntu/ftpshare
 
 # Download and compile LightFTP for coverage analysis
 RUN cd $WORKDIR && \
     git clone https://github.com/hfiref0x/LightFTP.git LightFTP-gcov && \
     cd LightFTP-gcov && \
-    git checkout 5980ea1 && \
+    git checkout a7af93ab0bbf9df6aba3e987c0d4180a5bef5253 && \
     patch -p1 < ${WORKDIR}/gcov.patch && \
-    cd Source/Release && \
+    cd src/Release && \
     make CFLAGS="-fprofile-arcs -ftest-coverage" CPPFLAGS="-fprofile-arcs -ftest-coverage" CXXFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" clean all $MAKE_OPT
 
 # Set up LightFTP for fuzzing
-RUN cd ${WORKDIR}/LightFTP-gcov/Source/Release && \
-    cp ${AFLNET}/tutorials/lightftp/fftp.conf ./ && \
+RUN cd ${WORKDIR}/LightFTP-gcov/src/Release && \
+    cp ${WORKDIR}/LightFTP-gcov/data/fftp.conf ./ && \
+    sed -i 's|^port=.*|port=2200|; s|/home/user|/home/ubuntu|g' fftp.conf && \
     cp ${AFLNET}/tutorials/lightftp/ftpclean.sh ./
 
 
