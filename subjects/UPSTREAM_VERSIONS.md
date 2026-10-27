@@ -36,6 +36,7 @@ instrumentation, or server lifecycle to that source revision.
 - BFTPD and Live555 downloads are checksum-verified. Live555's coverage image
   applies both the deterministic RTSP adaptation and the coverage shutdown hook.
 - LightFTP now builds from `src/Release`; the updated runtime reads its port from
-  `fftp.conf`, so the target config pins it to 2200.
+  `fftp.conf`, so the target config pins it to 2200. Its TLS config points to the
+  `my.key` file included in ProFuzzBench's certificate bundle.
 - Exim's random-seed and message-ID patches were reduced to current source sites;
   the default test config is patched before install.
