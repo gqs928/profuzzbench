@@ -81,7 +81,7 @@ RUN cd ${WORKDIR} && \
     make $MAKE_OPT && \
     make install
 
-ENV LD_LIBRARY_PATH="${WORKDIR}/openssl-install/lib"
+ENV LD_LIBRARY_PATH="${WORKDIR}/openssl-install/lib64"
 
 # Download and compile OpenSSH for fuzzing
 RUN cd ${WORKDIR} && \
@@ -96,7 +96,7 @@ RUN cd ${WORKDIR} && \
     CFLAGS="-g -O3 -I$WORKDIR/openssl-install/include" \
     --prefix=$PWD/install \
     --with-openssl=$WORKDIR/openssl-install \
-    --with-ldflags="-L$WORKDIR/openssl-install/lib" \
+    --with-ldflags="-L$WORKDIR/openssl-install/lib64" \
     --with-privsep-path=$PWD/var-empty \
     --with-sandbox=no \
     --with-privsep-user=ubuntu && \
@@ -116,7 +116,7 @@ RUN cd ${WORKDIR} && \
     CFLAGS="-g -O3 -fprofile-arcs -ftest-coverage -I$WORKDIR/openssl-install/include" \
     LDFLAGS="-fprofile-arcs -ftest-coverage" \
     --with-openssl=$WORKDIR/openssl-install \
-    --with-ldflags="-L$WORKDIR/openssl-install/lib" \
+    --with-ldflags="-L$WORKDIR/openssl-install/lib64" \
     --prefix=$PWD/install \
     --with-privsep-path=$PWD/var-empty \
     --with-sandbox=no \
@@ -128,4 +128,3 @@ COPY --chown=ubuntu:ubuntu in-ssh ${WORKDIR}/in-ssh
 COPY --chown=ubuntu:ubuntu ssh.dict ${WORKDIR}/ssh.dict
 COPY --chown=ubuntu:ubuntu cov_script.sh ${WORKDIR}/cov_script
 COPY --chown=ubuntu:ubuntu run.sh ${WORKDIR}/run
-
