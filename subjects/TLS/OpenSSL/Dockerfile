@@ -64,31 +64,38 @@ RUN mkdir $WORKDIR
 COPY --chown=ubuntu:ubuntu key.pem ${WORKDIR}/key.pem
 COPY --chown=ubuntu:ubuntu cert.pem ${WORKDIR}/cert.pem
 COPY --chown=ubuntu:ubuntu rand.patch ${WORKDIR}/rand.patch
+COPY --chown=ubuntu:ubuntu rand.inc ${WORKDIR}/rand.inc
 
 # Set up environment variables for ASAN
 env ASAN_OPTIONS='abort_on_error=1:symbolize=0:detect_leaks=0:detect_stack_use_after_return=1:detect_container_overflow=0:poison_array_cookie=0:malloc_fill_byte=0:max_malloc_fill_size=16777216'
 
 # Download and compile OpenSSL for fuzzing
 RUN cd ${WORKDIR} && \
-    git clone https://github.com/openssl/openssl.git && \
+    git init openssl && \
     cd openssl && \
+    git remote add origin https://github.com/openssl/openssl.git && \
+    git fetch --depth 1 origin 2f4e3a5fec05394068cfa7379890ab552483a8a6 && \
+    git checkout FETCH_HEAD && \
     cp ${WORKDIR}/*.pem ./ && \
-    git checkout 2f4e3a5fec05394068cfa7379890ab552483a8a6 && \
+    cp ${WORKDIR}/rand.inc fuzz/rand.inc && \
     patch -p1 < ${WORKDIR}/rand.patch && \
     CC=afl-clang-fast ./config no-shared --with-rand-seed=none && \
-    CC=afl-clang-fast make include/openssl/configuration.h include/openssl/opensslv.h include/crypto/bn_conf.h include/crypto/dso_conf.h && \
+    CC=afl-clang-fast make build_all_generated && \
     AFL_USE_ASAN=1 CC=afl-clang-fast make apps/openssl $MAKE_OPT
 
 
 # Download and compile OpenSSL for coverage analysis
 RUN cd ${WORKDIR} && \
-    git clone https://github.com/openssl/openssl.git openssl-gcov && \
+    git init openssl-gcov && \
     cd openssl-gcov && \
+    git remote add origin https://github.com/openssl/openssl.git && \
+    git fetch --depth 1 origin 2f4e3a5fec05394068cfa7379890ab552483a8a6 && \
+    git checkout FETCH_HEAD && \
     cp ${WORKDIR}/*.pem ./ && \
-    git checkout 2f4e3a5fec05394068cfa7379890ab552483a8a6 && \
+    cp ${WORKDIR}/rand.inc fuzz/rand.inc && \
     patch -p1 < ${WORKDIR}/rand.patch && \
     CFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" ./config no-shared --with-rand-seed=none && \
-    CFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" make include/openssl/configuration.h include/openssl/opensslv.h include/crypto/bn_conf.h include/crypto/dso_conf.h && \
+    CFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" make build_all_generated && \
     CFLAGS="-fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs -ftest-coverage" make apps/openssl $MAKE_OPT
 
 COPY --chown=ubuntu:ubuntu in-tls ${WORKDIR}/in-tls
