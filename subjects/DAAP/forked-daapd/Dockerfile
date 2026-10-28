@@ -116,6 +116,9 @@ RUN update-rc.d avahi-daemon defaults
 RUN mkdir /usr/share/forked-daapd/ && \
     cp -R $WORKDIR/forked-daapd/htdocs /usr/share/forked-daapd/htdocs
 
+RUN mkdir -p /usr/share/owntone && \
+    ln -s /usr/share/forked-daapd/htdocs /usr/share/owntone/htdocs
+
 RUN ln -s $WORKDIR/MP3 /tmp/MP3
 
 #The script needs to launch dbus and avahi-daemon using sudo

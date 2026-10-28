@@ -40,10 +40,12 @@ WORKDIR /home/ubuntu
 
 # Import environment variable to pass as parameter to make (e.g., to make parallel builds with -j)
 ARG MAKE_OPT
+COPY --chown=ubuntu:ubuntu aflnet-state0.patch /home/ubuntu/aflnet-state0.patch
 
 # Set up fuzzers
 RUN git clone https://github.com/profuzzbench/aflnet.git && \
     cd aflnet && \
+    patch -p1 < /home/ubuntu/aflnet-state0.patch && \
     make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
 

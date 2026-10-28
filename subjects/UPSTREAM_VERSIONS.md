@@ -49,7 +49,8 @@ instrumentation, or server lifecycle to that source revision.
   are installed for the current configure script; Local/Makefile explicitly
   selects the OpenSSL TLS backend.
 - OpenSSH now links against the OpenSSL 4.1.0 `lib64` installation path, matching
-  the headers and runtime libraries used by its pinned dependency.
+  the headers and runtime libraries used by its pinned dependency. The runtime
+  script uses the absolute `sshd` path required by the current upstream release.
 - OpenSSL 4.1.0 builds all generated headers before compiling its app target;
   the public headers are generated from `.h.in` templates in this release. The
   deterministic random helper is copied into the upstream `fuzz/` tree before

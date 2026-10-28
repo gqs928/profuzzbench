@@ -21,6 +21,7 @@ if $(strstr $FUZZER "afl"); then
 
   TARGET_DIR=${TARGET_DIR:-"openssh"}
   INPUTS=${INPUTS:-${WORKDIR}"/in-ssh"}
+  SSHD_BINARY=${SSHD_BINARY:-${WORKDIR}/${TARGET_DIR}/sshd}
 
   #Step-1. Do Fuzzing
   #Move to fuzzing folder
@@ -28,11 +29,11 @@ if $(strstr $FUZZER "afl"); then
 
   # Run sshd and ssh once before fuzzing
   rm -rf ~/.ssh
-  ./sshd -d -e -p 22 -r -f sshd_config &
+  "$SSHD_BINARY" -d -e -p 22 -r -f sshd_config &
   sleep 5
   sshpass -p "ubuntu" ssh -oStrictHostKeyChecking=no ubuntu@127.0.0.1 -p 22 "exit"
 
-  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/${FUZZER}/afl-fuzz -d -i ${INPUTS} -x ${WORKDIR}/ssh.dict -o $OUTDIR -N tcp://127.0.0.1/22 $OPTIONS ./sshd -d -e -p 22 -r -f sshd_config
+  timeout -k 0 --preserve-status $TIMEOUT /home/ubuntu/${FUZZER}/afl-fuzz -d -i ${INPUTS} -x ${WORKDIR}/ssh.dict -o $OUTDIR -N tcp://127.0.0.1/22 $OPTIONS "$SSHD_BINARY" -d -e -p 22 -r -f sshd_config
 
   STATUS=$?
 
