@@ -260,7 +260,7 @@ SH
   hangs=$(awk -F: '$1 ~ /^[[:space:]]*unique_hangs[[:space:]]*$/ {gsub(/[[:space:]]/, "", $2); print $2}' "$target_dir/fuzzer_stats" 2>/dev/null || true)
   if [[ -z $execs || -z $crashes || -z $hangs ]]; then
     local plain_log execs_display
-    plain_log="$target_dir/container-plain.log"
+    plain_log=$(mktemp "$target_dir/container-plain.XXXXXX")
     sed -E 's/\x1B\[[0-9;?]*[[:alpha:]]//g' "$target_dir/container.log" | tr '\r' '\n' > "$plain_log"
     if [[ -z $execs ]]; then
       execs_display=$(grep -oE 'total execs[[:space:]]*:[[:space:]]*[0-9]+([.][0-9]+)?[kKmM]?' "$plain_log" | tail -1 | sed -E 's/.*:[[:space:]]*//' || true)
@@ -274,6 +274,10 @@ SH
     if [[ -z $hangs ]]; then
       hangs=$(grep -oE 'uniq hangs[[:space:]]*:[[:space:]]*[0-9]+' "$plain_log" | tail -1 | grep -oE '[0-9]+$' || true)
     fi
+    rm -f "$plain_log"
+  fi
+  if [[ -z $paths ]]; then
+    paths=$(grep -c 'replayable-queue/id:' "$target_dir/container.log" 2>/dev/null || true)
   fi
   elapsed=${elapsed:-0}; execs=${execs:-0}; paths=${paths:-0}; crashes=${crashes:-0}; hangs=${hangs:-0}
   passed=no
