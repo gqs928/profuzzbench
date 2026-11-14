@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUT="$1"
+test -s "$OUT/preflight/rtmp-smoke.json"
+test -s "$OUT/campaign/aflnet-out/fuzzer_stats"
+test -s "$OUT/campaign/aflnet-out/ipsm.dot"
+test -s "$OUT/campaign/fuzzer-summary.txt"
+test -s "$OUT/campaign/proxy-stats.json"
+test -s "$OUT/campaign/server-stop-status.txt"
+test -s "$OUT/campaign/go-coverage-summary.txt"
+test -s "$OUT/post-smoke/rtmp-smoke.json"
+test -s "$OUT/post-smoke/server-stop-status.txt"
+test -s "$OUT/go-coverage-summary.txt"
+grep -q '"has_connect_result": true' "$OUT/preflight/rtmp-smoke.json"
+[[ "$(<"$OUT/campaign/wrapper-exit-code.txt")" == 124 ]]
+grep -qx 'graceful=yes' "$OUT/campaign/server-stop-status.txt"
+grep -qx 'process_exit_code=0' "$OUT/campaign/server-stop-status.txt"
+grep -qx 'graceful=yes' "$OUT/post-smoke/server-stop-status.txt"
+grep -qx 'process_exit_code=0' "$OUT/post-smoke/server-stop-status.txt"
+test -n "$(find "$OUT/campaign/go-coverdata" -type f -name 'covcounters.*' -print -quit)"
+test -n "$(find "$OUT/post-smoke/go-coverdata" -type f -name 'covcounters.*' -print -quit)"
+awk -F: '/^execs_done[[:space:]]*:/ { if ($2+0 > 0) ok=1 } END { exit !ok }' "$OUT/campaign/aflnet-out/fuzzer_stats"
+awk -F: '/^paths_total[[:space:]]*:/ { if ($2+0 > 1) ok=1 } END { exit !ok }' "$OUT/campaign/aflnet-out/fuzzer_stats"
+grep -q -- ' -> ' "$OUT/campaign/aflnet-out/ipsm.dot"
+awk '/^total:/ { x=$NF; sub(/%$/, "", x); if (x+0 > 0) ok=1 } END { exit !ok }' "$OUT/campaign/go-coverage-summary.txt"
+echo "PASS: RTMP handshake bridge, response states, AFLNet preflight, graceful service shutdown, and Go native coverage."

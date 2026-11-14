@@ -1,0 +1,7 @@
+# FRRouting 10.7.1 — BGP-4 baseline
+
+Completed bounded profile for FRRouting 10.7.1, the stable release verified on 2026-11-12. The target uses the official pinned `quay.io/frrouting/frr:10.7.1` linux/amd64 image; `bgpd --version` is checked at runtime. BGP-4 runs over TCP/179 inside an isolated container. The scope covers OPEN, KEEPALIVE, UPDATE, NOTIFICATION and ROUTE-REFRESH messages for one IPv4-unicast peer; advanced address families and routing topologies are out of scope.
+
+The Alpine target runs as a standalone foreground daemon with Zebra and kernel route installation disabled; a dynamic loopback peer range supplies an isolated inbound BGP session. AFLNet's snapshot has no BGP parser, so `aflnet-bgp.patch` registers a parser that splits the 16-byte marker, 2-byte length and message type, and classifies replies. The parser unit covers multi-message framing, notification subcodes and truncated lengths. A 30-minute response-state campaign completed for 1,798 seconds with 2,010 executions, six queued paths, 100% stability and no AFLNet crash/hang reports. Fourteen raw/KL-framed queue samples replayed in fresh bgpd processes; three post-campaign OPEN/KEEPALIVE/UPDATE smoke passes succeeded and the listener closed after shutdown. The target is not coverage-instrumented: the 0% AFLNet helper bitmap is not FRR source coverage.
+
+Upstream: [FRRouting releases](https://github.com/FRRouting/frr/releases), [BGP-4 protocol documentation](https://docs.frrouting.org/en/stable-10.7/bgp.html).
