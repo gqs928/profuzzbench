@@ -1,0 +1,1 @@
+The standalone ZIP includes the exact source archive and version lock, build/runtime toolchain evidence, upstream fuzz target and source corpus provenance, build logs, preflight/formal logs, native metrics and generated corpus, final-image smoke, plus acceptance and checksum evidence. It excludes Docker build cache and the central aggregated experience library.

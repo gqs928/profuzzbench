@@ -1,0 +1,164 @@
+--- aflnet.h
++++ aflnet.h
+@@ -68,6 +68,7 @@
+ unsigned int* extract_response_codes_dtls12(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_sip(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_http(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
++unsigned int* extract_response_codes_http2(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ extern unsigned int* (*extract_response_codes)(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ 
+ region_t* extract_requests_smtp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+@@ -80,6 +81,7 @@
+ region_t* extract_requests_dtls12(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_sip(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_http(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
++region_t* extract_requests_http2(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ extern region_t* (*extract_requests)(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ 
+ // Network communication functions
+--- aflnet.c
++++ aflnet.c
+@@ -722,6 +722,86 @@
+   return regions;
+ }
+ 
++/* HTTP/2 messages are frames, not CRLF-delimited text lines. Preserve the
++ * preface and a valid initial SETTINGS frame as one region, then split later
++ * complete frames by their 24-bit length field. Keep malformed tails intact. */
++static void append_http2_region(region_t **regions_ref, unsigned int *count_ref,
++                                unsigned int *capacity_ref, unsigned int start,
++                                unsigned int end)
++{
++  region_t *region;
++  if (*count_ref == *capacity_ref) {
++    *capacity_ref = *capacity_ref ? *capacity_ref * 2 : 8;
++    *regions_ref = (region_t *)ck_realloc(*regions_ref, *capacity_ref * sizeof(region_t));
++  }
++  region = &(*regions_ref)[(*count_ref)++];
++  region->start_byte = start;
++  region->end_byte = end;
++  region->modifiable = 1;
++  region->state_sequence = NULL;
++  region->state_count = 0;
++}
++
++region_t* extract_requests_http2(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
++{
++  static const unsigned char preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
++  const unsigned int preface_len = sizeof(preface) - 1;
++  unsigned int offset = 0;
++  unsigned int region_count = 0;
++  unsigned int region_capacity = 0;
++  region_t *regions = NULL;
++
++  if (buf_size == 0) {
++    *region_count_ref = 0;
++    return NULL;
++  }
++
++  if (buf_size >= preface_len && memcmp(buf, preface, preface_len) == 0) {
++    offset = preface_len;
++    if (buf_size - offset >= 9) {
++      unsigned int frame_len = ((unsigned int)buf[offset] << 16) |
++                               ((unsigned int)buf[offset + 1] << 8) |
++                               (unsigned int)buf[offset + 2];
++      unsigned int stream_id = ((unsigned int)(buf[offset + 5] & 0x7f) << 24) |
++                               ((unsigned int)buf[offset + 6] << 16) |
++                               ((unsigned int)buf[offset + 7] << 8) |
++                               (unsigned int)buf[offset + 8];
++      if (buf[offset + 3] == 4 && buf[offset + 4] == 0 && stream_id == 0 &&
++          frame_len % 6 == 0 && frame_len <= buf_size - offset - 9) {
++        offset += frame_len + 9;
++        append_http2_region(&regions, &region_count, &region_capacity, 0, offset - 1);
++      } else {
++        append_http2_region(&regions, &region_count, &region_capacity, 0, preface_len - 1);
++      }
++    } else {
++      append_http2_region(&regions, &region_count, &region_capacity, 0, preface_len - 1);
++    }
++  }
++
++  while (offset < buf_size) {
++    unsigned int remaining = buf_size - offset;
++    unsigned int frame_len;
++    unsigned int frame_size;
++
++    if (remaining < 9) break;
++    frame_len = ((unsigned int)buf[offset] << 16) |
++                ((unsigned int)buf[offset + 1] << 8) |
++                (unsigned int)buf[offset + 2];
++    if (frame_len > remaining - 9) break;
++    frame_size = frame_len + 9;
++
++    append_http2_region(&regions, &region_count, &region_capacity, offset, offset + frame_size - 1);
++    offset += frame_size;
++  }
++
++  if (offset < buf_size) {
++    append_http2_region(&regions, &region_count, &region_capacity, offset, buf_size - 1);
++  }
++
++  *region_count_ref = region_count;
++  return regions;
++}
++
+ unsigned int* extract_response_codes_smtp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+ {
+   char *mem;
+@@ -1357,6 +1437,35 @@
+   *state_count_ref = state_count;
+   return state_sequence;
+ }
++
++/* Track HTTP/2 response frame type and flags as stable protocol states. The
++ * first word remains the initial state, matching the other AFLNet parsers. */
++unsigned int* extract_response_codes_http2(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
++{
++  unsigned int offset = 0;
++  unsigned int state_count = 1;
++  unsigned int max_states = buf_size / 9 + 1;
++  unsigned int *state_sequence = (unsigned int *)ck_alloc(max_states * sizeof(unsigned int));
++  state_sequence[0] = 0;
++
++  while (buf_size - offset >= 9) {
++    unsigned int frame_len = ((unsigned int)buf[offset] << 16) |
++                             ((unsigned int)buf[offset + 1] << 8) |
++                             (unsigned int)buf[offset + 2];
++    unsigned int frame_size = frame_len + 9;
++    unsigned int frame_type = buf[offset + 3];
++    unsigned int frame_flags = buf[offset + 4];
++    unsigned int state;
++
++    if (frame_len > buf_size - offset - 9) break;
++    state = 0x48000000u | (frame_type << 16) | frame_flags;
++    state_sequence[state_count++] = state;
++    offset += frame_size;
++  }
++
++  *state_count_ref = state_count;
++  return state_sequence;
++}
+ 
+ // kl_messages manipulating functions
+ 
+--- afl-fuzz.c
++++ afl-fuzz.c
+@@ -8075,7 +8075,7 @@
+        "Settings for network protocol fuzzing (AFLNet):\n\n"
+ 
+        "  -N netinfo    - server information (e.g., tcp://127.0.0.1/8554)\n"
+-       "  -P protocol   - application protocol to be tested (e.g., RTSP, FTP, DTLS12, DNS, SMTP, SSH, TLS)\n"
++       "  -P protocol   - application protocol to be tested (e.g., HTTP2, RTSP, FTP, DTLS12, DNS, SMTP, SSH, TLS)\n"
+        "  -D usec       - waiting time (in micro seconds) for the server to initialize\n"
+        "  -W msec       - waiting time (in miliseconds) for receiving the first response to each input sent\n"
+        "  -w usec       - waiting time (in micro seconds) for receiving follow-up responses\n"
+@@ -8995,6 +8995,9 @@
+         } else if (!strcmp(optarg, "HTTP")) {
+           extract_requests = &extract_requests_http;
+           extract_response_codes = &extract_response_codes_http;
++        } else if (!strcmp(optarg, "HTTP2")) {
++          extract_requests = &extract_requests_http2;
++          extract_response_codes = &extract_response_codes_http2;
+         } else {
+           FATAL("%s protocol is not supported yet!", optarg);
+         }

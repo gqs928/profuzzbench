@@ -1,0 +1,3 @@
+# Package manifest
+
+The standalone Apache HTTP/2 ZIP contains the pinned Apache and AFLNet source archives, source verification metadata, HTTP/2 parser and AFLNet lifecycle patches, build/run/replay scripts, seed files and hashes, formal campaign output, per-sample replay records, the dedicated replay of all AFLNet hang classifications, acceptance report, and image cleanup evidence. AFL's standard forkserver starts a fresh AFL-instrumented single-process Apache target for each testcase. AFLNet counted three inputs without a valid HTTP/2 preface as hangs; replay showed HTTP/1.1 400 responses, zero HTTP/2 response frames, a live Apache process, and clean controlled shutdown. The ZIP does not include the central experience library.

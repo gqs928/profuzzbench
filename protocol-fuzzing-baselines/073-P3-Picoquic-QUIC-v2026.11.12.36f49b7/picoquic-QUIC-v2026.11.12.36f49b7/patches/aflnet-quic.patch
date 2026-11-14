@@ -1,0 +1,196 @@
+--- a/aflnet.h
++++ b/aflnet.h
+@@ -62,7 +62,8 @@
+ unsigned int* extract_response_codes_ssh(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_tls(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_dicom(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+-unsigned int* extract_response_codes_dns(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
++unsigned int* extract_response_codes_dns(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
++unsigned int* extract_response_codes_quic(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_rtsp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_dtls12(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+@@ -74,7 +75,8 @@
+ region_t* extract_requests_ssh(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_tls(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_dicom(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+-region_t* extract_requests_dns(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
++region_t* extract_requests_dns(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
++region_t* extract_requests_quic(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_ftp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_rtsp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_dtls12(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+--- a/aflnet.c
++++ b/aflnet.c
+@@ -365,7 +365,141 @@
+   return regions;
+ }
+ 
+-region_t* extract_requests_dns(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
++/* QUIC runs over UDP: one AFLNet request region must remain one UDP datagram.
++ * The packet bytes are intentionally not split into regions because packet
++ * coalescing and datagram boundaries are semantically significant. */
++region_t* extract_requests_quic(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
++{
++  region_t *regions;
++
++  if (buf_size == 0) {
++    *region_count_ref = 0;
++    return NULL;
++  }
++
++  regions = (region_t *)ck_alloc(sizeof(region_t));
++  regions[0].start_byte = 0;
++  regions[0].end_byte = buf_size - 1;
++  regions[0].state_sequence = NULL;
++  regions[0].state_count = 0;
++  *region_count_ref = 1;
++  return regions;
++}
++
++/* Read one QUIC variable-length integer without advancing past the datagram. */
++static int quic_read_varint(const unsigned char *buf, size_t size, size_t *offset,
++                            unsigned long long *value)
++{
++  size_t width;
++  unsigned long long result;
++
++  if (*offset >= size) return 0;
++  width = (size_t)1 << (buf[*offset] >> 6);
++  if (width > size - *offset) return 0;
++
++  result = buf[*offset] & 0x3f;
++  for (size_t i = 1; i < width; i++) result = (result << 8) | buf[*offset + i];
++  *offset += width;
++  *value = result;
++  return 1;
++}
++
++/* Determine a packet boundary for a coalesced long-header datagram. Short
++ * headers, Retry, and Version Negotiation consume the rest of the datagram. */
++static int quic_packet_end(const unsigned char *buf, size_t size, size_t start,
++                           size_t *end, unsigned int *packet_type,
++                           unsigned int *version)
++{
++  size_t offset;
++  unsigned int dcid_len, scid_len, type;
++  unsigned long long field_len;
++  unsigned int v;
++
++  if (start >= size) return 0;
++  if (!(buf[start] & 0x80)) {
++    *packet_type = 4; /* short header */
++    *version = 0;
++    *end = size;
++    return 1;
++  }
++  if (size - start < 7) return 0;
++
++  v = ((unsigned int)buf[start + 1] << 24) |
++      ((unsigned int)buf[start + 2] << 16) |
++      ((unsigned int)buf[start + 3] << 8) |
++      (unsigned int)buf[start + 4];
++  offset = start + 5;
++  dcid_len = buf[offset++];
++  if (dcid_len > size - offset) return 0;
++  offset += dcid_len;
++  if (offset >= size) return 0;
++  scid_len = buf[offset++];
++  if (scid_len > size - offset) return 0;
++  offset += scid_len;
++  type = (buf[start] >> 4) & 0x03;
++
++  if (v == 0) {
++    *packet_type = 5; /* Version Negotiation */
++    *version = v;
++    *end = size;
++    return 1;
++  }
++
++  /* QUIC v1 and v2 assign different long-header type values. */
++  if ((v == 0x00000001 && type == 3) ||
++      (v == 0x6b3343cf && type == 0)) {
++    *packet_type = 3; /* Retry */
++    *version = v;
++    *end = size;
++    return 1;
++  }
++
++  if ((v == 0x00000001 && type == 0) ||
++      (v == 0x6b3343cf && type == 1)) {
++    if (!quic_read_varint(buf, size, &offset, &field_len) ||
++        field_len > size - offset) return 0;
++    offset += (size_t)field_len;
++  }
++
++  if (!quic_read_varint(buf, size, &offset, &field_len) ||
++      field_len > size - offset) return 0;
++
++  *packet_type = type;
++  *version = v;
++  *end = offset + (size_t)field_len;
++  return 1;
++}
++
++unsigned int* extract_response_codes_quic(unsigned char* buf, unsigned int buf_size,
++                                           unsigned int* state_count_ref)
++{
++  unsigned int *states = NULL;
++  unsigned int count = 1;
++  size_t offset = 0, end = 0;
++  unsigned int packet_type = 0, version = 0;
++
++  states = (unsigned int *)ck_alloc(sizeof(unsigned int));
++  states[0] = 0; /* AFLNet's initial protocol state */
++
++  while (offset < buf_size) {
++    unsigned int state;
++    if (!quic_packet_end(buf, buf_size, offset, &end, &packet_type, &version) || end <= offset) {
++      state = 0x5155ffff; /* malformed or truncated response header */
++      end = buf_size;
++    } else {
++      state = 0x51500000 | ((packet_type & 0x0f) << 16) | (version & 0xffff);
++    }
++    count++;
++    states = (unsigned int *)ck_realloc(states, count * sizeof(unsigned int));
++    states[count - 1] = state;
++    offset = end;
++  }
++
++  *state_count_ref = count;
++  return states;
++}
++
++region_t* extract_requests_dns(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+ {
+   char *mem;
+   unsigned int mem_count = 0;
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -8974,9 +8974,12 @@
+         } else if (!strcmp(optarg, "DTLS12")) {
+           extract_requests = &extract_requests_dtls12;
+           extract_response_codes = &extract_response_codes_dtls12;
+-        } else if (!strcmp(optarg, "DNS")) {
+-          extract_requests = &extract_requests_dns;
+-          extract_response_codes = &extract_response_codes_dns;
++        } else if (!strcmp(optarg, "DNS")) {
++          extract_requests = &extract_requests_dns;
++          extract_response_codes = &extract_response_codes_dns;
++        } else if (!strcmp(optarg, "QUIC")) {
++          extract_requests = &extract_requests_quic;
++          extract_response_codes = &extract_response_codes_quic;
+         } else if (!strcmp(optarg, "DICOM")) {
+           extract_requests = &extract_requests_dicom;
+           extract_response_codes = &extract_response_codes_dicom;
+--- a/config.h
++++ b/config.h
+@@ -151,7 +151,7 @@
+ 
+ /* Maximum size of input file, in bytes (keep under 100MB): */
+ 
+-#define MAX_FILE            (1 * 1024 * 1024)
++#define MAX_FILE            65507 /* Maximum IPv4 UDP payload for QUIC datagrams. */
+ 
+ /* The same, for the test case minimizer: */
+ 
