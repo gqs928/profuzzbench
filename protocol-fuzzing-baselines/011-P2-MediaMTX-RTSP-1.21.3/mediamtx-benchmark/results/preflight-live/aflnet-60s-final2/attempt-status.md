@@ -1,0 +1,3 @@
+# Failed diagnostic attempt: black-box target process without `-K`
+
+This run is not an accepted preflight. The persistent MediaMTX service started and wrote Go coverage metadata, but AFLNet `-n` with a naturally exiting `/bin/true` child remained CPU-bound after the 60-second stop signal; `/bin/true` was left as a zombie and no campaign statistics or response graph were finalized. The partial service and fuzzer evidence is retained. The next attempt uses an AFL-instrumented lifecycle helper whose forkserver reaps each SIGTERM-stopped helper child; helper bitmap/counters are explicitly separate from MediaMTX Go coverage.

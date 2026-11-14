@@ -1,0 +1,144 @@
+'use strict'
+
+const assert = require('node:assert/strict')
+const { describe, it, beforeEach } = require('node:test')
+
+const { makeConnection, makePlugin } = require('haraka-test-fixtures')
+
+const _set_up = () => {
+    this.plugin = makePlugin('xclient', { register: false })
+    this.connection = makeConnection()
+    this.connection.capabilities = []
+}
+
+describe('xclient', () => {
+    beforeEach(_set_up)
+
+    describe('hook_capabilities', () => {
+        const cases = [
+            { desc: 'adds XCLIENT for loopback IPv4 (127.0.0.1)', ip: '127.0.0.1', expected: true },
+            { desc: 'adds XCLIENT for loopback IPv6 (::1)', ip: '::1', expected: true },
+            { desc: 'does not add XCLIENT for non-loopback IP', ip: '10.0.0.1', expected: false },
+        ]
+
+        for (const { desc, ip, expected } of cases) {
+            it(desc, async () => {
+                this.connection.remote.ip = ip
+                await new Promise((resolve) => this.plugin.hook_capabilities(resolve, this.connection))
+                const hasXclient = this.connection.capabilities.some((c) => c.startsWith('XCLIENT'))
+                assert.equal(hasXclient, expected)
+            })
+        }
+    })
+
+    describe('hook_unrecognized_command', () => {
+        const callHook = (params) =>
+            new Promise((resolve) => {
+                this.plugin.hook_unrecognized_command((code) => resolve(code), this.connection, params)
+            })
+
+        const cases = [
+            {
+                desc: 'ignores non-XCLIENT commands',
+                params: ['EHLO', 'example.com'],
+                check: (code) => assert.equal(code, undefined),
+            },
+            {
+                desc: 'denies XCLIENT when transaction is in progress',
+                setup: () => {
+                    this.connection = makeConnection({ withTxn: true })
+                    this.connection.capabilities = []
+                },
+                params: ['XCLIENT', 'ADDR=127.0.0.1'],
+                check: (code) => assert.equal(code, DENY),
+            },
+            {
+                desc: 'denies XCLIENT from disallowed IP',
+                setup: () => {
+                    this.connection.remote.ip = '10.0.0.1'
+                },
+                params: ['XCLIENT', 'ADDR=127.0.0.2'],
+                check: (code) => assert.equal(code, DENY),
+            },
+            {
+                desc: 'denies XCLIENT with no valid IP address',
+                setup: () => {
+                    this.connection.remote.ip = '127.0.0.1'
+                },
+                params: ['XCLIENT', 'NAME=example.com'],
+                check: (code) => assert.equal(code, DENY),
+            },
+            {
+                desc: 'accepts XCLIENT with valid IPv4 ADDR from allowed host',
+                setup: () => {
+                    this.connection.remote.ip = '127.0.0.1'
+                },
+                params: ['XCLIENT', 'ADDR=1.2.3.4'],
+                check: (code) => assert.ok(code === NEXT_HOOK || code === undefined),
+            },
+            {
+                desc: 'accepts XCLIENT with valid IPv6 ADDR from allowed host',
+                setup: () => {
+                    this.connection.remote.ip = '127.0.0.1'
+                },
+                params: ['XCLIENT', 'ADDR=IPV6:2001:db8::1'],
+                check: (code) => assert.ok(code === NEXT_HOOK || code === undefined),
+            },
+            {
+                desc: 'accepts XCLIENT with ADDR and NAME, skipping rdns lookup',
+                setup: () => {
+                    this.connection.remote.ip = '127.0.0.1'
+                },
+                params: ['XCLIENT', 'ADDR=1.2.3.4 NAME=example.com'],
+                check: (code) => assert.equal(code, NEXT_HOOK),
+            },
+        ]
+
+        for (const { desc, setup, params, check } of cases) {
+            it(desc, async () => {
+                if (setup) setup()
+                const code = await callHook(params)
+                check(code)
+            })
+        }
+    })
+
+    describe('control characters in forwarded attributes', () => {
+        // XCLIENT forwards the *client's* attributes, so these are attacker
+        // controlled even though only trusted relays may send the command.
+        const applyXclient = (args) =>
+            new Promise((resolve) => {
+                this.connection.remote.ip = '127.0.0.1'
+                this.plugin.hook_unrecognized_command(() => resolve(), this.connection, ['XCLIENT', args])
+            })
+
+        it('strips them from NAME before it becomes remote.host', async () => {
+            await applyXclient('ADDR=1.2.3.4 NAME=evil\rinjected')
+            assert.equal(this.connection.remote.host, 'evilinjected')
+        })
+
+        it('strips them from HELO before it becomes hello.host', async () => {
+            await applyXclient('ADDR=1.2.3.4 NAME=example.com HELO=evil\rinjected')
+            assert.equal(this.connection.hello.host, 'evilinjected')
+        })
+
+        it('strips them from LOGIN before it becomes remote.login', async () => {
+            await applyXclient('ADDR=1.2.3.4 NAME=example.com LOGIN=evil\rinjected')
+            assert.equal(this.connection.remote.login, 'evilinjected')
+        })
+    })
+
+    describe('DESTPORT type', () => {
+        it('stores local.port as an integer (587/465 auth check)', async () => {
+            this.connection.remote.ip = '127.0.0.1'
+            await new Promise((resolve) => {
+                this.plugin.hook_unrecognized_command(() => resolve(), this.connection, [
+                    'XCLIENT',
+                    'ADDR=1.2.3.4 DESTPORT=587',
+                ])
+            })
+            assert.strictEqual(this.connection.local.port, 587)
+            assert.equal(typeof this.connection.local.port, 'number')
+        })
+    })
+})

@@ -1,0 +1,284 @@
+'use strict'
+/* global server */
+
+const fs = require('node:fs')
+const path = require('node:path')
+
+exports.register = function () {
+    this.outbound = require('../outbound')
+    this.queue_dir = require('../outbound/queue').queue_dir
+}
+
+exports.hook_capabilities = (next, connection) => {
+    if (connection.remote.is_local) {
+        connection.capabilities.push('STATUS')
+    }
+
+    next()
+}
+
+exports.hook_unrecognized_command = function (next, connection, params) {
+    if (params[0] !== 'STATUS') return next()
+    if (!connection.remote.is_local) return next(DENY, 'STATUS not allowed remotely')
+
+    this.run(params[1], (err, result) => {
+        if (err) return next(DENY, err.message)
+
+        connection.respond(211, result ? JSON.stringify(result) : 'null', () => next(OK))
+    })
+}
+
+const is_queue_file = (file) => !!file && file !== '.' && file !== '..' && path.basename(file) === file
+
+exports.run = function (cmd, cb) {
+    // validate here: cluster IPC drops errors, so a worker-side rejection would reply success
+    const [noun, verb, file] = cmd.split(' ')
+    if (noun === 'QUEUE' && verb === 'DISCARD' && !is_queue_file(file)) {
+        return cb(new Error('invalid queue file'))
+    }
+
+    if (server.cluster && !/^QUEUE LIST/.test(cmd)) {
+        this.call_master(cmd, cb)
+    } else {
+        this.command_action(cmd, cb)
+    }
+}
+
+exports.command_action = function (cmd, cb) {
+    const params = cmd.split(' ')
+
+    switch (params.shift()) {
+        case 'POOL':
+            return this.pool_action(params, cb)
+        case 'QUEUE':
+            return this.queue_action(params, cb)
+        default:
+            cb('unknown STATUS command')
+    }
+}
+
+exports.pool_action = function (params, cb) {
+    switch (params.shift()) {
+        case 'LIST':
+            return this.pool_list(cb)
+        default:
+            cb('unknown POOL command')
+    }
+}
+
+exports.queue_action = function (params, cb) {
+    switch (params.shift()) {
+        case 'LIST':
+            return this.queue_list(cb)
+        case 'STATS':
+            return this.queue_stats(cb)
+        case 'INSPECT':
+            return this.queue_inspect(cb)
+        case 'DISCARD':
+            return this.queue_discard(params.shift(), cb)
+        case 'PUSH':
+            return this.queue_push(params.shift(), cb)
+        default:
+            cb('unknown QUEUE command')
+    }
+}
+
+exports.pool_list = (cb) => {
+    const result = {}
+
+    if (server.notes.pool) {
+        for (const name of Object.keys(server.notes.pool)) {
+            const instance = server.notes.pool[name]
+
+            result[name] = {
+                inUse: instance.inUseObjectsCount(),
+                size: instance.getPoolSize(),
+            }
+        }
+    }
+
+    cb(null, result)
+}
+
+exports.queue_list = async function (cb) {
+    try {
+        const qlist = await this.outbound.list_queue()
+        const result = []
+
+        for (const todo of qlist) {
+            result.push({
+                file: todo.file,
+                uuid: todo.uuid,
+                queue_time: todo.queue_time,
+                domain: todo.domain,
+                from: todo.mail_from.toString(),
+                to: todo.rcpt_to.map((r) => r.toString()),
+            })
+        }
+
+        cb(null, result)
+    } catch (err) {
+        cb(err)
+    }
+}
+
+exports.queue_stats = function (cb) {
+    cb(null, this.outbound.get_stats())
+}
+
+exports.queue_inspect = function (cb) {
+    const delivery_queue_items = this.outbound.delivery_queue.tasks
+    const fail_queue_items = this.outbound.temp_fail_queue.queue
+
+    cb(null, {
+        delivery_queue: delivery_queue_items.map((hmail) => ({
+            id: hmail.file,
+        })),
+        temp_fail_queue: fail_queue_items.map((tqtimer) => ({
+            id: tqtimer.id,
+            fire_time: tqtimer.fire_time,
+        })),
+    })
+}
+
+exports.queue_discard = function (file, cb) {
+    if (!is_queue_file(file)) return cb(new Error('invalid queue file'))
+
+    try {
+        this.outbound.temp_fail_queue.discard(file)
+    } catch {
+        // ignore not found error
+    }
+
+    fs.unlink(path.join(this.queue_dir || '', file), () => {
+        cb(null, 'OK')
+    })
+}
+
+exports.queue_push = function (file, cb) {
+    const { queue } = this.outbound.temp_fail_queue
+
+    for (let i = 0; i < queue.length; i++) {
+        if (queue[i].id !== file) continue
+
+        const item = queue.splice(i, 1)[0]
+        item.cb()
+
+        break
+    }
+
+    cb(null, 'OK')
+}
+
+// cluster IPC
+
+exports.hook_init_master = function (next) {
+    const plugin = this
+
+    if (!server.cluster) return next()
+
+    function message_handler(sender, msg) {
+        if (msg.event !== 'status.request') return
+
+        plugin.call_workers(msg, (response) => {
+            const valid = response.filter((el) => el != null)
+            msg.result = plugin.merge_worker_responses(msg.params, valid)
+            msg.event = 'status.result'
+            sender.send(msg)
+        })
+    }
+
+    server.cluster.on('message', message_handler)
+    next()
+}
+
+exports.hook_init_child = function (next) {
+    const self = this
+
+    function message_handler(msg) {
+        if (msg.event !== 'status.request') return
+
+        self.command_action(msg.params, (err, result) => {
+            msg.event = 'status.response'
+            msg.result = result
+            process.send(msg)
+        })
+    }
+
+    process.on('message', message_handler)
+    next()
+}
+
+exports.call_master = (cmd, cb) => {
+    function message_handler(msg) {
+        if (msg.event !== 'status.result') return
+
+        process.removeListener('message', message_handler)
+        cb(null, msg.result)
+    }
+
+    process.on('message', message_handler)
+    process.send({ event: 'status.request', params: cmd })
+}
+
+exports.call_workers = function (cmd, cb) {
+    Promise.allSettled(Object.values(server.cluster.workers).map((w) => this.call_worker(w, cmd))).then((r) => {
+        cb(r.filter((s) => s.status === 'fulfilled').map((s) => s.value))
+    })
+}
+
+// Merge per-worker responses into a single result matching non-cluster output shape.
+exports.merge_worker_responses = (params, results) => {
+    const cmd = params.trim().split(/\s+/).slice(0, 2).join(' ').toUpperCase()
+
+    switch (cmd) {
+        case 'POOL LIST': {
+            return Object.assign({}, ...results)
+        }
+        case 'QUEUE INSPECT': {
+            const merged = { delivery_queue: [], temp_fail_queue: [] }
+            for (const r of results) {
+                if (!r) continue
+                if (Array.isArray(r.delivery_queue)) merged.delivery_queue.push(...r.delivery_queue)
+                if (Array.isArray(r.temp_fail_queue)) merged.temp_fail_queue.push(...r.temp_fail_queue)
+            }
+            return merged
+        }
+        case 'QUEUE STATS': {
+            const totals = [0, 0, 0]
+            for (const r of results) {
+                if (!r) continue
+                const parts = String(r).split('/')
+                for (let i = 0; i < 3; i++) totals[i] += parseInt(parts[i] ?? 0, 10)
+            }
+            return totals.join('/')
+        }
+        default:
+            return results
+    }
+}
+
+// sends command to worker and then wait for response or timeout
+exports.call_worker = (worker, cmd) => {
+    return new Promise((resolve) => {
+        let timeout
+
+        function message_handler(sender, msg) {
+            if (sender.id !== worker.id) return
+            if (msg.event !== 'status.response') return
+
+            clearTimeout(timeout)
+            server.cluster.removeListener('message', message_handler)
+
+            resolve(msg.result)
+        }
+
+        timeout = setTimeout(() => {
+            server.cluster.removeListener('message', message_handler)
+            resolve()
+        }, 1000)
+
+        server.cluster.on('message', message_handler)
+        worker.send(cmd)
+    })
+}

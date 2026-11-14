@@ -1,0 +1,219 @@
+/* IMAP request framing and stable response-state feedback for AFLNet. */
+#include <ctype.h>
+#include <limits.h>
+#include <stddef.h>
+#include <string.h>
+
+#include "alloc-inl.h"
+#include "aflnet.h"
+
+static void imap_add_region(region_t **regions, unsigned int *count,
+                            unsigned int start, unsigned int end)
+{
+  *regions = (region_t *)ck_realloc(*regions, (*count + 1U) * sizeof(region_t));
+  (*regions)[*count].start_byte = (int)start;
+  (*regions)[*count].end_byte = (int)end;
+  (*regions)[*count].modifiable = 1;
+  (*regions)[*count].state_sequence = NULL;
+  (*regions)[*count].state_count = 0;
+  (*count)++;
+}
+
+/* Return the literal length when a line ends in {N} or {N+}. */
+static int imap_literal_length(const unsigned char *buf, unsigned int start,
+                              unsigned int end, unsigned int *length)
+{
+  unsigned int digit_end, open, value = 0;
+  int saw_digit = 0;
+
+  while (end > start && (buf[end - 1U] == '\r' || buf[end - 1U] == ' ' ||
+                         buf[end - 1U] == '\t'))
+    --end;
+  if (end <= start || buf[end - 1U] != '}') return 0;
+  digit_end = end - 1U;
+  if (digit_end > start && buf[digit_end - 1U] == '+') --digit_end;
+  open = digit_end;
+  while (open > start && isdigit((unsigned char)buf[open - 1U])) {
+    unsigned int digit = (unsigned int)(buf[open - 1U] - '0');
+    if (value > (UINT_MAX - digit) / 10U) return 0;
+    value = value * 10U + digit;
+    --open;
+    saw_digit = 1;
+  }
+  if (!saw_digit || open <= start || buf[open - 1U] != '{') return 0;
+  *length = value;
+  return 1;
+}
+
+/* Skip declared literal octets before looking for an IMAP command boundary.
+   Truncated commands and malformed tails remain visible to AFLNet. */
+region_t *extract_requests_imap(unsigned char *buf, unsigned int buf_size,
+                                unsigned int *region_count_ref)
+{
+  region_t *regions = NULL;
+  unsigned int count = 0, start = 0, pos;
+
+  if (!region_count_ref) return NULL;
+  if (!buf || !buf_size) {
+    *region_count_ref = 0;
+    return NULL;
+  }
+  if (buf_size > (unsigned int)INT_MAX) {
+    imap_add_region(&regions, &count, 0U, (unsigned int)INT_MAX - 1U);
+    *region_count_ref = count;
+    return regions;
+  }
+
+  while (start < buf_size) {
+    int completed = 0;
+    pos = start;
+    while (pos < buf_size) {
+      unsigned int line_end = pos, literal_size = 0;
+      while (line_end < buf_size && buf[line_end] != '\n') ++line_end;
+      if (line_end == buf_size) break;
+      if (imap_literal_length(buf, pos, line_end, &literal_size)) {
+        unsigned int payload = line_end + 1U;
+        if (literal_size > buf_size - payload) {
+          pos = buf_size;
+          break;
+        }
+        pos = payload + literal_size;
+        continue;
+      }
+      imap_add_region(&regions, &count, start, line_end);
+      start = line_end + 1U;
+      completed = 1;
+      break;
+    }
+    if (!completed) {
+      if (start < buf_size) imap_add_region(&regions, &count, start, buf_size - 1U);
+      break;
+    }
+  }
+  *region_count_ref = count;
+  return regions;
+}
+
+static void imap_add_state(unsigned int **states, unsigned int *count,
+                           unsigned int state)
+{
+  *states = (unsigned int *)ck_realloc(*states,
+                                       (*count + 1U) * sizeof(unsigned int));
+  (*states)[(*count)++] = state;
+}
+
+static int imap_token_equal(const unsigned char *buf, unsigned int start,
+                            unsigned int end, const char *token)
+{
+  unsigned int length = (unsigned int)strlen(token);
+  if (end - start != length) return 0;
+  for (unsigned int i = 0; i < length; ++i)
+    if ((unsigned char)toupper(buf[start + i]) != (unsigned char)token[i])
+      return 0;
+  return 1;
+}
+
+static unsigned int imap_response_state(const unsigned char *buf,
+                                        unsigned int start,
+                                        unsigned int end)
+{
+  unsigned int first_start, first_end, second_start, second_end;
+  if (start >= end) return 0U;
+  if (buf[start] == '+') return 16U;
+
+  if (buf[start] == '*') {
+    first_start = start + 1U;
+    while (first_start < end &&
+           (buf[first_start] == ' ' || buf[first_start] == '\t'))
+      ++first_start;
+    first_end = first_start;
+    while (first_end < end && buf[first_end] != ' ' && buf[first_end] != '\t')
+      ++first_end;
+    second_start = first_end;
+    while (second_start < end &&
+           (buf[second_start] == ' ' || buf[second_start] == '\t'))
+      ++second_start;
+    second_end = second_start;
+    while (second_end < end && buf[second_end] != ' ' && buf[second_end] != '\t')
+      ++second_end;
+
+    if (first_start == first_end) return 0U;
+    if (isdigit((unsigned char)buf[first_start])) {
+      first_start = second_start;
+      first_end = second_end;
+    }
+    if (imap_token_equal(buf, first_start, first_end, "OK")) return 1U;
+    if (imap_token_equal(buf, first_start, first_end, "NO")) return 2U;
+    if (imap_token_equal(buf, first_start, first_end, "BAD")) return 3U;
+    if (imap_token_equal(buf, first_start, first_end, "CAPABILITY")) return 4U;
+    if (imap_token_equal(buf, first_start, first_end, "LIST") ||
+        imap_token_equal(buf, first_start, first_end, "LSUB")) return 5U;
+    if (imap_token_equal(buf, first_start, first_end, "STATUS")) return 6U;
+    if (imap_token_equal(buf, first_start, first_end, "SEARCH")) return 7U;
+    if (imap_token_equal(buf, first_start, first_end, "FLAGS")) return 8U;
+    if (imap_token_equal(buf, first_start, first_end, "EXISTS")) return 9U;
+    if (imap_token_equal(buf, first_start, first_end, "RECENT")) return 10U;
+    if (imap_token_equal(buf, first_start, first_end, "FETCH")) return 11U;
+    if (imap_token_equal(buf, first_start, first_end, "VANISHED")) return 12U;
+    if (imap_token_equal(buf, first_start, first_end, "NAMESPACE")) return 13U;
+    if (imap_token_equal(buf, first_start, first_end, "ID")) return 14U;
+    if (imap_token_equal(buf, first_start, first_end, "ENABLED")) return 15U;
+    if (imap_token_equal(buf, first_start, first_end, "EXPUNGE")) return 17U;
+    return 0U;
+  }
+
+  first_start = start;
+  while (first_start < end && buf[first_start] != ' ' && buf[first_start] != '\t')
+    ++first_start;
+  second_start = first_start;
+  while (second_start < end &&
+         (buf[second_start] == ' ' || buf[second_start] == '\t'))
+    ++second_start;
+  second_end = second_start;
+  while (second_end < end && buf[second_end] != ' ' && buf[second_end] != '\t')
+    ++second_end;
+  if (imap_token_equal(buf, second_start, second_end, "OK")) return 20U;
+  if (imap_token_equal(buf, second_start, second_end, "NO")) return 21U;
+  if (imap_token_equal(buf, second_start, second_end, "BAD")) return 22U;
+  return 0U;
+}
+
+/* Stable response classes are recorded; declared literal bodies are skipped
+   so user-controlled message text cannot invent protocol-state feedback. */
+unsigned int *extract_response_codes_imap(unsigned char *buf,
+                                          unsigned int buf_size,
+                                          unsigned int *state_count_ref)
+{
+  unsigned int *states = NULL;
+  unsigned int count = 0, offset = 0;
+
+  if (!state_count_ref) return NULL;
+  imap_add_state(&states, &count, 0U);
+  if (!buf || !buf_size) {
+    *state_count_ref = count;
+    return states;
+  }
+
+  while (offset < buf_size) {
+    unsigned int end = offset, literal_size = 0, state_end, state;
+    while (end < buf_size && buf[end] != '\n') ++end;
+    if (end == buf_size) break;
+    state_end = end;
+    if (state_end > offset && buf[state_end - 1U] == '\r') --state_end;
+    state = imap_response_state(buf, offset, state_end);
+    if (state) imap_add_state(&states, &count, state);
+
+    if (imap_literal_length(buf, offset, end, &literal_size)) {
+      unsigned int payload = end + 1U;
+      if (literal_size > buf_size - payload) {
+        offset = buf_size;
+        break;
+      }
+      offset = payload + literal_size;
+    } else {
+      offset = end + 1U;
+    }
+  }
+  *state_count_ref = count;
+  return states;
+}
