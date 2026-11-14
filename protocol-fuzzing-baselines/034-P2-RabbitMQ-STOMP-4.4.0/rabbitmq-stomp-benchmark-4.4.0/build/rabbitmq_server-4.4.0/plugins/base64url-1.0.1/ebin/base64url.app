@@ -1,0 +1,10 @@
+{application,base64url,
+             [{description,"URL safe base64-compatible codec"},
+              {vsn,"1.0.1"},
+              {id, "24d5157"},
+              {registered,[]},
+              {applications,[kernel,stdlib]},
+              {env,[]},
+              {licenses,["MIT"]},
+              {links,[{"Github","https://github.com/dvv/base64url"}]},
+              {modules, ['base64url']}]}.

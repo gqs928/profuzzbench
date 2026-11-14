@@ -1,0 +1,7 @@
+# Apache Qpid Broker-J AMQP benchmark
+
+This profile benchmarks Qpid Broker-J 10.1.1 over AMQP 1.0/TCP on loopback port 5672. It uses a binary frame-boundary parser and maps AMQP 1.0 performative descriptors (including SASL performatives) to stable AFLNet states. The broker runs as a persistent service while each testcase is replayed on a fresh connection. This is a black-box protocol-state profile, not Java source coverage.
+
+The default formal campaign runs for 1,800 seconds after the first mutation testcase. Build with `docker build -t profuzzbench-qpid-brokerj:10.1.1 .`. Run the protocol handshake check using `docker exec <container> python3 /opt/benchmark/protocol_smoke.py`; run AFLNet against an empty host results directory mounted at `/results` with `bash /opt/benchmark/fuzz.sh /results/amqp-30m 1800`.
+
+The official binary's generated initial configuration provides the `guest` PLAIN user with password `guest` (recorded in `config/qpid-initial-config.json`); the seeds use SASL PLAIN `guest/guest`. Qpid disables PLAIN on non-TLS ports by default, so this isolated `--network none` benchmark sets `secureOnlyMechanisms` to `[]` as described in the [official Broker-J security guide](https://qpid.apache.org/releases/qpid-broker-j-10.1.1/book/Java-Broker-Security.html). Do not expose this configuration on a network: PLAIN sends credentials without encryption. The source lock pins the official binary release checksum; `Dockerfile` constrains its Java heap and direct-memory use for the benchmark container.

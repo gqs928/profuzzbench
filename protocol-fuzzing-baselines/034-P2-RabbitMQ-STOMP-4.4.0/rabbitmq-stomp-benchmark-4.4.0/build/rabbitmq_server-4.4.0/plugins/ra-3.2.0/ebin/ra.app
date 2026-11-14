@@ -1,0 +1,11 @@
+{application,ra,
+             [{description,"Raft library"},
+              {vsn,"3.2.0"},
+              {licenses,["Apache-2.0","MPL-2.0"]},
+              {links,[{"github","https://github.com/rabbitmq/ra"}]},
+              {modules, ['eqwalizer_specs','ra','ra_app','ra_aux','ra_bench','ra_counters','ra_dbg','ra_directory','ra_env','ra_ets_queue','ra_file','ra_flru','ra_kv','ra_kv_harness','ra_leaderboard','ra_li','ra_lib','ra_log','ra_log_ets','ra_log_meta','ra_log_pre_init','ra_log_read_plan','ra_log_segment','ra_log_segment_writer','ra_log_segments','ra_log_snapshot','ra_log_snapshot_state','ra_log_sup','ra_log_sync','ra_log_wal','ra_log_wal_sup','ra_lol','ra_machine','ra_machine_ets','ra_machine_simple','ra_metrics_ets','ra_monitors','ra_mt','ra_range','ra_seq','ra_server','ra_server_proc','ra_server_sup','ra_server_sup_sup','ra_snapshot','ra_sup','ra_system','ra_system_recover','ra_system_sup','ra_systems_sup','ra_worker']},
+              {registered,[ra_sup]},
+              {applications,[kernel,stdlib,sasl,crypto,aten,gen_batch_server,
+                             seshat]},
+              {mod,{ra_app,[]}},
+              {env,[]}]}.

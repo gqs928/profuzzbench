@@ -1,0 +1,9 @@
+# 389 Directory Server LDAP benchmark
+
+Target version: 389 Directory Server 3.3.1, the current upstream stable release checked on 2026-11-09. The official source archive is included and SHA-512 locked. The official `quay.io/389ds/dirsrv:latest` image was inspected and found to contain 2.4.6, so it is not used. The benchmark image is based on the immutable Fedora 45 base digest in `source-lock.json` and installs the exact Fedora stable package `389-ds-base-3.3.1-3.fc45`; the Docker build verifies both RPM NEVRA and `ns-slapd -v`.
+
+The target image installs the official Fedora 45 stable Directory Server package and the BER-aware AFLNet adapter binary. `container-start.sh` creates a fresh instance with `dscreate` from the included `instance.inf`; the directory server listens on container TCP 3389, and the host publishes only 127.0.0.1:1389. `fuzz.sh` and AFLNet run inside the same target container and connect to 127.0.0.1:3389. A statically linked ELF readiness probe is used as AFLNet's process target because the server is managed as a persistent background service; smoke and queue replay run from the host against 127.0.0.1:1389.
+
+Build the adapter with `./build-aflnet.sh`, then build `profuzzbench-389ds-ldap:3.3.1` with `docker build -t profuzzbench-389ds-ldap:3.3.1 .`. Start with `./start-server.sh`, run `python3 protocol_smoke.py`, then `docker exec -d 389ds-ldap-331 bash /opt/benchmark/fuzz.sh /results/ldap-30m 1800`. Afterward replay the queue with `python3 replay_queue.py results/ldap-30m`. Once the package ZIP and checksums are verified, `./stop-server-and-remove-image.sh` removes this profile's exact container and image.
+
+The corpus uses anonymous Bind and a RootDSE SearchRequest. No UnbindRequest is used because Unbind has no LDAP response. BER truncation is kept in fixtures, outside the live seed corpus. Per-protocol experience belongs in the shared experience library, not this package.

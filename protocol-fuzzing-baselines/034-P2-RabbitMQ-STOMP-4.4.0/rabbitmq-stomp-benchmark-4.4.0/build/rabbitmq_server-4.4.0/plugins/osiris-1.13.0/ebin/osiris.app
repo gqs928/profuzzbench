@@ -1,0 +1,11 @@
+{application,osiris,
+             [{description,"Foundation of the log-based streaming subsystem for RabbitMQ"},
+              {vsn,"1.13.0"},
+              {licenses,["Apache-2.0","MPL-2.0"]},
+              {links,[{"github","https://github.com/rabbitmq/osiris"}]},
+              {modules, ['osiris','osiris_app','osiris_bench','osiris_bloom','osiris_counters','osiris_ets','osiris_log','osiris_log_shared','osiris_member','osiris_replica','osiris_replica_reader','osiris_replica_reader_sup','osiris_retention','osiris_server_sup','osiris_sup','osiris_tracking','osiris_util','osiris_writer']},
+              {registered,[ra_sup]},
+              {applications,[kernel,stdlib,sasl,crypto,gen_batch_server,
+                             seshat]},
+              {mod,{osiris_app,[]}},
+              {env,[{data_dir,"/tmp/osiris"}]}]}.

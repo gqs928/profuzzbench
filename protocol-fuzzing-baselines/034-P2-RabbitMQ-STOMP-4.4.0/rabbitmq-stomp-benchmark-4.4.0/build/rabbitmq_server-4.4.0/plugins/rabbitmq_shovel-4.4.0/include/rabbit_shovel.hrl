@@ -1,0 +1,38 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%%
+
+-define(SHOVEL_APP, rabbitmq_shovel).
+
+-type shovel_definition() :: proplists:proplist() | map().
+
+-record(endpoint,
+        {uris,
+         resource_declaration
+        }).
+
+-record(shovel,
+        {sources,
+         destinations,
+         prefetch_count,
+         ack_mode,
+         publish_fields,
+         publish_properties,
+         queue,
+         reconnect_delay,
+         delete_after = never
+        }).
+
+-define(SHOVEL_USER, <<"rmq-shovel">>).
+-define(SHOVEL_COMPONENT, <<"shovel">>).
+-define(DEFAULT_PREFETCH, 1000).
+-define(DEFAULT_ACK_MODE, on_confirm).
+-define(DEFAULT_RECONNECT_DELAY, 5).
+
+-define(SOFT_DELETE_AFTER_DURATION_FLOOR, 60).
+-define(HARD_DELETE_AFTER_DURATION_FLOOR, 15).
+
+-define(SHOVEL_GUIDE_URL, <<"https://rabbitmq.com/docs/shovel">>).
