@@ -1,0 +1,307 @@
+#ifndef SQL_API_H
+#define SQL_API_H
+
+#include "guid.h"
+#include "var-expand-split.h"
+
+struct timespec;
+struct var_expand_program;
+
+/* This SQL API is designed to work asynchronously. The underlying drivers
+   however may not. */
+
+enum sql_db_flags {
+	/* Set if queries are not executed asynchronously */
+	SQL_DB_FLAG_BLOCKING		= 0x01,
+	/* Set if database wants to use connection pooling */
+	SQL_DB_FLAG_POOLED		= 0x02,
+	/* Prepared statements are supported by the database. If they aren't,
+	   the functions can still be used, but they're just internally
+	   converted into regular statements. */
+	SQL_DB_FLAG_PREP_STATEMENTS	= 0x04,
+	/* Database supports INSERT .. ON DUPLICATE KEY syntax. */
+	SQL_DB_FLAG_ON_DUPLICATE_KEY	= 0x08,
+	/* Database supports INSERT .. ON CONFLICT DO UPDATE syntax. */
+	SQL_DB_FLAG_ON_CONFLICT_DO	= 0x10,
+};
+
+enum sql_field_type {
+	SQL_TYPE_STR,
+	SQL_TYPE_UINT,
+	SQL_TYPE_ULLONG,
+	SQL_TYPE_BOOL,
+	SQL_TYPE_UUID,
+};
+
+struct sql_field_def {
+	enum sql_field_type type;
+	const char *name;
+	size_t offset;
+};
+
+enum sql_result_error_type {
+	SQL_RESULT_ERROR_TYPE_UNKNOWN = 0,
+	/* It's unknown whether write succeeded or not. This could be due to
+	   a timeout or a disconnection from server. */
+	SQL_RESULT_ERROR_TYPE_WRITE_UNCERTAIN
+};
+
+enum sql_result_next {
+	/* Row was returned */
+	SQL_RESULT_NEXT_OK = 1,
+	/* There are no more rows */
+	SQL_RESULT_NEXT_LAST = 0,
+	/* Error occurred - see sql_result_get_error*() */
+	SQL_RESULT_NEXT_ERROR = -1,
+	/* There are more results - call sql_result_more() */
+	SQL_RESULT_NEXT_MORE = -99
+};
+
+#define SQL_DEF_STRUCT(name, struct_name, type, c_type) \
+	{ (type) + COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE( \
+		((struct struct_name *)0)->name, c_type), \
+	  #name, offsetof(struct struct_name, name) }
+
+#define SQL_DEF_STRUCT_STR(name, struct_name) \
+	SQL_DEF_STRUCT(name, struct_name, SQL_TYPE_STR, const char *)
+#define SQL_DEF_STRUCT_UINT(name, struct_name) \
+	SQL_DEF_STRUCT(name, struct_name, SQL_TYPE_UINT, unsigned int)
+#define SQL_DEF_STRUCT_ULLONG(name, struct_name) \
+	SQL_DEF_STRUCT(name, struct_name, SQL_TYPE_ULLONG, unsigned long long)
+#define SQL_DEF_STRUCT_BOOL(name, struct_name) \
+	SQL_DEF_STRUCT(name, struct_name, SQL_TYPE_BOOL, bool)
+
+struct sql_db;
+struct sql_result;
+
+struct sql_commit_result {
+	const char *error;
+	enum sql_result_error_type error_type;
+};
+
+struct sql_settings {
+	pool_t pool;
+	const char *sql_driver;
+};
+
+extern const struct setting_parser_info sql_setting_parser_info;
+
+/* Called when query finished, note that result will be automatically
+ * unreferenced after callback finishes. */
+typedef void sql_query_callback_t(struct sql_result *result, void *context);
+/* Called when commit finished, note that result will be freed after
+ * callback finishes. */
+typedef void sql_commit_callback_t(const struct sql_commit_result *result, void *context);
+
+void sql_drivers_init(void);
+void sql_drivers_deinit(void);
+
+void sql_driver_register(const struct sql_db *driver);
+void sql_driver_unregister(const struct sql_db *driver);
+
+/* Initialize the sql db by pulling settings automatically using the event.
+   The event parameter is used as the parent event. Returns 1 if ok, 0 if
+   sql_driver setting is empty (error_r is also set), -1 if settings lookup or
+   driver initialization failed. */
+int sql_init_auto(struct event *event, struct sql_db **db_r,
+		  const char **error_r);
+
+void sql_ref(struct sql_db *db);
+void sql_unref(struct sql_db **db);
+
+/* Returns SQL database state flags. */
+enum sql_db_flags sql_get_flags(struct sql_db *db);
+
+/* Explicitly connect to the database. It's not required to call this function
+   though. Returns -1 if we're not connected, 0 if we started connecting or
+   1 if we are fully connected now. */
+int sql_connect(struct sql_db *db);
+/* Explicitly disconnect from database and abort pending auth requests. */
+void sql_disconnect(struct sql_db *db);
+
+/* Escape the given string if needed and return it. */
+int sql_escape_string(struct sql_db *db, const char *string,
+		      const char **output_r, const char **error_r);
+/* Escape the given data as a string. */
+const char *sql_escape_blob(struct sql_db *db,
+			    const unsigned char *data, size_t size);
+
+/* Execute SQL query without waiting for results. */
+void sql_exec(struct sql_db *db, const char *query);
+/* Execute SQL query and return result in callback. If fields list is given,
+   the returned fields are validated to be of correct type, and you can use
+   sql_result_next_row_get().  The callback is never called immediately. */
+void sql_query(struct sql_db *db, const char *query,
+	       sql_query_callback_t *callback, void *context);
+#define sql_query(db, query, callback, context) \
+	sql_query(db, query - \
+		CALLBACK_TYPECHECK(callback, void (*)( \
+			struct sql_result *, typeof(context))), \
+		(sql_query_callback_t *)callback, context)
+/* Execute blocking SQL query and return result. */
+struct sql_result *sql_query_s(struct sql_db *db, const char *query);
+
+struct sql_prepared_statement *
+sql_prepared_statement_init(struct sql_db *db, const char *query_template);
+void sql_prepared_statement_unref(struct sql_prepared_statement **prep_stmt);
+
+/* Return TRUE with *count_r set to the number of bind placeholders
+   sql_statement_init() would find in query_template - see
+   sql_template_scan() in sql-api-private.h for what counts as one and
+   for what makes a template unscannable. Returns FALSE with *error_r
+   set if it is unscannable. */
+bool sql_template_placeholder_count(const char *query_template,
+				    unsigned int *count_r,
+				    const char **error_r);
+
+/* Build a query template from program's literal text, turning each
+   variable part into a bind placeholder, and initialize a statement
+   from it. A variable written as '%{var}' - the sole content of a
+   single-quoted literal - has its surrounding quotes stripped so the
+   placeholder ends up unquoted, the same as a bare %{var} would; this
+   looks only at the characters touching the variable, not at SQL quote
+   state, so it can strip wrongly for e.g. an admin's own 'x'%{var} -
+   see the placeholder count check below for what catches that.
+
+   The resulting template's placeholder count is checked against the
+   number of variable substitutions before the statement is created,
+   since a mismatch would otherwise reach an i_panic() in
+   sql_statement_init() on the first lookup that uses this query.
+   Returns NULL with *error_r set if the counts do not match or the
+   template is unscannable (see sql_template_placeholder_count()).
+
+   parts_r is initialized and receives one entry per variable
+   substitution, in bind-index order, for the caller to expand and
+   bind. */
+struct sql_statement *
+sql_statement_init_from_var_expand_program(
+	struct sql_db *db, const struct var_expand_program *program,
+	ARRAY_TYPE(const_expansion_program) *parts_r, const char **error_r);
+
+struct sql_statement *
+sql_statement_init(struct sql_db *db, const char *query_template);
+struct sql_statement *
+sql_statement_init_prepared(struct sql_prepared_statement *prep_stmt);
+void sql_statement_abort(struct sql_statement **stmt);
+void sql_statement_set_timestamp(struct sql_statement *stmt,
+				 const struct timespec *ts);
+void sql_statement_set_no_log_expanded_values(struct sql_statement *stmt,
+					      bool no_expand);
+/* Hide this one column's bind parameter value in the logged query. This
+   also clears the statement's blanket no_log_expanded_values flag, so
+   every other field is then shown expanded, even if no_expand was never
+   explicitly turned off. */
+void sql_statement_set_no_log_expanded_value_field(struct sql_statement *stmt,
+						   unsigned int column_idx);
+const char *sql_statement_get_log_query(struct sql_statement *stmt);
+void sql_statement_bind_str(struct sql_statement *stmt,
+			    unsigned int column_idx, const char *value);
+void sql_statement_bind_binary(struct sql_statement *stmt,
+			       unsigned int column_idx, const void *value,
+			       size_t value_size);
+void sql_statement_bind_int64(struct sql_statement *stmt,
+			      unsigned int column_idx, int64_t value);
+void sql_statement_bind_double(struct sql_statement *stmt,
+			       unsigned int column_idx, double value);
+void sql_statement_bind_uuid(struct sql_statement *stmt,
+			     unsigned int column_idx, const guid_128_t uuid);
+void sql_statement_query(struct sql_statement **stmt,
+			 sql_query_callback_t *callback, void *context);
+#define sql_statement_query(stmt, callback, context) \
+	sql_statement_query(stmt, \
+		(sql_query_callback_t *)callback, TRUE ? context : \
+		CALLBACK_TYPECHECK(callback, void (*)( \
+			struct sql_result *, typeof(context))))
+struct sql_result *sql_statement_query_s(struct sql_statement **stmt);
+
+void sql_result_setup_fetch(struct sql_result *result,
+			    const struct sql_field_def *fields,
+			    void *dest, size_t dest_size);
+
+/* Go to next row. See enum sql_result_next. */
+int sql_result_next_row(struct sql_result *result);
+
+/* If sql_result_next_row() returned SQL_RESULT_NEXT_MORE, this can be called
+   to continue returning more results. The result is freed with this call, so
+   it must not be accessed anymore until the callback is finished. */
+void sql_result_more(struct sql_result **result,
+		     sql_query_callback_t *callback, void *context);
+#define sql_result_more(result, callback, context) \
+	sql_result_more(result - \
+		CALLBACK_TYPECHECK(callback, void (*)( \
+			struct sql_result *, typeof(context))), \
+		(sql_query_callback_t *)callback, context)
+/* Synchronous version of sql_result_more(). The result will be replaced with
+   the new result. */
+void sql_result_more_s(struct sql_result **result);
+
+void sql_result_ref(struct sql_result *result);
+/* Needs to be called only with sql_query_s() or when result has been
+   explicitly referenced. */
+void sql_result_unref(struct sql_result *result);
+
+/* Return number of fields in result. */
+unsigned int sql_result_get_fields_count(struct sql_result *result);
+/* Return name of the given field index. */
+const char *sql_result_get_field_name(struct sql_result *result,
+				      unsigned int idx);
+/* Return field index for given name, or -1 if not found. */
+int sql_result_find_field(struct sql_result *result, const char *field_name);
+
+/* Returns value of given field as string. Note that it can be NULL. */
+const char *sql_result_get_field_value(struct sql_result *result,
+				       unsigned int idx);
+/* Returns a binary value. Note that a NULL is returned as NULL with size=0,
+   while empty string returns non-NULL with size=0. */
+const unsigned char *
+sql_result_get_field_value_binary(struct sql_result *result,
+				  unsigned int idx, size_t *size_r);
+/* Find the field and return its value. NULL return value can mean that either
+   the field didn't exist or that its value is NULL. */
+const char *sql_result_find_field_value(struct sql_result *result,
+					const char *field_name);
+/* Return all values of current row. Note that this array is not
+   NULL-terminated - you must use sql_result_get_fields_count() to find out
+   the array's length. It's also possible that some of the values inside the
+   array are NULL. */
+const char *const *sql_result_get_values(struct sql_result *result);
+
+/* Return last error message in result. */
+const char *sql_result_get_error(struct sql_result *result);
+enum sql_result_error_type sql_result_get_error_type(struct sql_result *result);
+
+/* Begin a new transaction. Currently you're limited to only one open
+   transaction at a time. */
+struct sql_transaction_context *sql_transaction_begin(struct sql_db *db);
+/* Don't require transaction to be atomic. Currently this is implemented only
+   with Cassandra to use UNLOGGED BATCH operations. */
+void sql_transaction_set_non_atomic(struct sql_transaction_context *ctx);
+/* Commit transaction. The callback is never called immediately. */
+void sql_transaction_commit(struct sql_transaction_context **ctx,
+			    sql_commit_callback_t *callback, void *context);
+#define sql_transaction_commit(ctx, callback, context) \
+	  sql_transaction_commit(ctx - \
+		CALLBACK_TYPECHECK(callback, void (*)( \
+			const struct sql_commit_result *, typeof(context))), \
+		(sql_commit_callback_t *)callback, context)
+/* Synchronous commit. Returns 0 if ok, -1 if error. */
+int sql_transaction_commit_s(struct sql_transaction_context **ctx,
+			     const char **error_r);
+void sql_transaction_rollback(struct sql_transaction_context **ctx);
+
+/* Execute query in given transaction. */
+void sql_update(struct sql_transaction_context *ctx, const char *query);
+void sql_update_stmt(struct sql_transaction_context *ctx,
+		     struct sql_statement **stmt);
+/* Save the number of rows updated by this query. The value is set before
+   commit callback is called. */
+void sql_update_get_rows(struct sql_transaction_context *ctx, const char *query,
+			 unsigned int *affected_rows);
+void sql_update_stmt_get_rows(struct sql_transaction_context *ctx,
+			      struct sql_statement **stmt,
+			      unsigned int *affected_rows);
+
+/* Wait for SQL query results. */
+void sql_wait(struct sql_db *db);
+
+#endif

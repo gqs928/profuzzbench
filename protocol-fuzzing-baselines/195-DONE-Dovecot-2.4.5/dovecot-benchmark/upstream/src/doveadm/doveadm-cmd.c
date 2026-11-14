@@ -1,0 +1,192 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "array.h"
+#include "istream.h"
+#include "str.h"
+#include "net.h"
+#include "doveadm.h"
+#include "doveadm-cmd.h"
+
+#include <stdio.h>
+#include <unistd.h>
+#include <getopt.h>
+
+static struct doveadm_cmd_ver2 *doveadm_commands_ver2[] = {
+	&doveadm_cmd_mailbox_mutf7,
+	&doveadm_cmd_service_stop_ver2,
+	&doveadm_cmd_service_status_ver2,
+	&doveadm_cmd_sis_find,
+	&doveadm_cmd_process_status_ver2,
+	&doveadm_cmd_stop_ver2,
+	&doveadm_cmd_reload_ver2,
+	&doveadm_cmd_stats_dump_ver2,
+	&doveadm_cmd_stats_add_ver2,
+	&doveadm_cmd_stats_remove_ver2,
+	&doveadm_cmd_stats_reopen_ver2,
+	&doveadm_cmd_penalty_ver2,
+	&doveadm_cmd_kick_ver2,
+	&doveadm_cmd_proxy_kick_ver2,
+	&doveadm_cmd_who_ver2,
+	&doveadm_cmd_proxy_list_ver2,
+	&doveadm_cmd_indexer_add,
+	&doveadm_cmd_indexer_remove,
+	&doveadm_cmd_indexer_list,
+};
+
+ARRAY_TYPE(doveadm_cmd_ver2) doveadm_cmds_ver2;
+
+void doveadm_cmd_register_ver2(struct doveadm_cmd_ver2 *cmd)
+{
+	if (cmd->cmd == NULL) {
+		if (cmd->mail_cmd != NULL)
+			cmd->cmd = doveadm_cmd_ver2_to_mail_cmd_wrapper;
+		else i_unreached();
+	}
+	array_push_back(&doveadm_cmds_ver2, cmd);
+}
+
+const struct doveadm_cmd_ver2 *doveadm_cmd_find_ver2(const char *cmd_name)
+{
+	const struct doveadm_cmd_ver2 *cmd;
+
+	array_foreach(&doveadm_cmds_ver2, cmd) {
+		if (strcmp(cmd_name, cmd->name) == 0)
+			return cmd;
+	}
+	return NULL;
+}
+
+const struct doveadm_cmd_ver2 *
+doveadm_cmdline_find_with_args(const char *cmd_name, int *argc,
+			       const char *const *argv[])
+{
+	int i, k;
+	const struct doveadm_cmd_ver2 *cmd;
+	const char *cptr;
+
+	for (i = 0; i < *argc; i++) {
+		if (strcmp((*argv)[i], cmd_name) == 0)
+			break;
+	}
+
+	i_assert(i != *argc);
+
+	array_foreach(&doveadm_cmds_ver2, cmd) {
+		cptr = cmd->name;
+		/* cannot reuse i here because this needs be
+		   done more than once */
+		for (k = 0; *cptr != '\0' && i + k < *argc; k++) {
+			size_t alen = strlen((*argv)[i + k]);
+			/* make sure we don't overstep */
+			if (strlen(cptr) < alen)
+				break;
+			/* did not match */
+			if (strncmp(cptr, (*argv)[i+k], alen) != 0)
+				break;
+			/* do not accept abbreviations */
+			if (cptr[alen] != ' ' && cptr[alen] != '\0')
+				break;
+			cptr += alen;
+			if (*cptr != '\0')
+				cptr++; /* consume space */
+		}
+		/* name was fully consumed */
+		if (*cptr == '\0') {
+			if (k > 1) {
+				*argc -= k-1;
+				*argv += k-1;
+			}
+			return cmd;
+		}
+	}
+
+	return NULL;
+}
+
+void doveadm_cmds_init(void)
+{
+	unsigned int i;
+
+	i_array_init(&doveadm_cmds_ver2, 2);
+
+	for (i = 0; i < N_ELEMENTS(doveadm_commands_ver2); i++)
+		doveadm_cmd_register_ver2(doveadm_commands_ver2[i]);
+
+	doveadm_register_instance_commands();
+	doveadm_register_log_commands();
+	doveadm_register_dict_commands();
+	doveadm_register_fs_commands();
+}
+
+void doveadm_cmds_deinit(void)
+{
+	array_free(&doveadm_cmds_ver2);
+}
+
+static void
+doveadm_cmdline_check_for_help_request(int argc, const char *const argv[],
+				       struct doveadm_cmd_context *cctx) {
+	for (int i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "--") == 0)
+			break;
+
+		if (strcmp(argv[i], "--help") == 0) {
+			cctx->help_requested = DOVEADM_CMD_VER2_HELP_ARGUMENT;
+			break;
+		}
+
+		if (strcmp(argv[i], "help") == 0) {
+			cctx->help_requested = DOVEADM_CMD_VER2_HELP_COMMAND;
+			break;
+		}
+	}
+}
+
+bool doveadm_cmdline_try_run(const char *cmd_name,
+			     int argc, const char *const argv[],
+			     struct doveadm_cmd_context *cctx)
+{
+	const struct doveadm_cmd_ver2 *cmd;
+
+	doveadm_cmdline_check_for_help_request(argc, argv, cctx);
+	cmd = doveadm_cmdline_find_with_args(cmd_name, &argc, &argv);
+	if (cmd == NULL)
+		return FALSE;
+
+	cctx->cmd = cmd;
+	if (cctx->help_requested == DOVEADM_CMD_VER2_HELP_ARGUMENT)
+		return FALSE;
+	if (doveadm_cmdline_run(argc, argv, cctx) < 0)
+		doveadm_exit_code = EX_USAGE;
+	doveadm_cmd_context_finished(cctx);
+	return TRUE;
+}
+
+void doveadm_cmd_context_finished(struct doveadm_cmd_context *cctx)
+{
+	const char *cmd_name = cctx->cmd == NULL ? NULL : cctx->cmd->name;
+
+	struct event *event =
+		event_create_passthrough(cctx->event)->
+		set_name("doveadm_command_finished")->
+		add_str("command", cmd_name)->
+		add_int("exit_code", doveadm_exit_code)->
+		add_int_nonzero("local_port", cctx->local_port)->
+		add_int_nonzero("remote_port", cctx->remote_port)->
+		event();
+
+	/* Added explicitly rather than relying on inheritance: on the http
+	   path the parent chain has no local_ip at all (lib-http never
+	   resolves its own listening address), so this is the only place
+	   it can come from. The family != 0 guard keeps event_add_ip() from
+	   ever taking its "clear the inherited field" branch, which is what
+	   would otherwise make an unconditional add unsafe here (e.g. on
+	   the CLI path, where cctx has neither address). */
+	if (cctx->local_ip.family != 0)
+		event_add_ip(event, "local_ip", &cctx->local_ip);
+	if (cctx->remote_ip.family != 0)
+		event_add_ip(event, "remote_ip", &cctx->remote_ip);
+
+	e_debug(event, "Command finished.");
+}

@@ -1,0 +1,519 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConsumerMembershipManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">ConsumerMembershipManager.java</span></div><h1>ConsumerMembershipManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.consumer.CloseOptions;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
+import org.apache.kafka.clients.consumer.internals.events.ApplyAssignmentEvent;
+import org.apache.kafka.clients.consumer.internals.events.BackgroundEventHandler;
+import org.apache.kafka.clients.consumer.internals.events.CompletableBackgroundEvent;
+import org.apache.kafka.clients.consumer.internals.events.ConsumerRebalanceListenerCallbackCompletedEvent;
+import org.apache.kafka.clients.consumer.internals.events.ErrorEvent;
+import org.apache.kafka.clients.consumer.internals.events.PartitionsAssignedEvent;
+import org.apache.kafka.clients.consumer.internals.events.PartitionsRemovedEvent;
+import org.apache.kafka.clients.consumer.internals.metrics.ConsumerRebalanceMetricsManager;
+import org.apache.kafka.clients.consumer.internals.metrics.RebalanceMetricsManager;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.ConsumerGroupHeartbeatResponseData;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.requests.ConsumerGroupHeartbeatRequest;
+import org.apache.kafka.common.requests.ConsumerGroupHeartbeatResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
+
+import static org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation.DEFAULT;
+import static org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation.LEAVE_GROUP;
+import static org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP;
+import static org.apache.kafka.clients.consumer.internals.ConsumerRebalanceListenerMethodName.ON_PARTITIONS_LOST;
+import static org.apache.kafka.clients.consumer.internals.ConsumerRebalanceListenerMethodName.ON_PARTITIONS_REVOKED;
+
+/**
+ * Group manager for a single consumer that has a group id defined in the config
+ * {@link ConsumerConfig#GROUP_ID_CONFIG}, to use the Kafka-based offset management capability,
+ * and the consumer group protocol to get automatically assigned partitions when calling the
+ * subscribe API.
+ *
+ * &lt;p/&gt;
+ *
+ * While the subscribe API hasn't been called (or if the consumer called unsubscribe), this manager
+ * will only be responsible for keeping the member in the {@link MemberState#UNSUBSCRIBED} state,
+ * where it can commit offsets to the group identified by the {@link #groupId()}, without joining
+ * the group.
+ *
+ * &lt;p/&gt;
+ *
+ * If the consumer subscribe API is called, this manager will use the {@link #groupId()} to join the
+ * consumer group, and based on the consumer group protocol heartbeats, will handle the full
+ * lifecycle of the member as it joins the group, reconciles assignments, handles fencing and
+ * fatal errors, and leaves the group.
+ *
+ * &lt;p/&gt;
+ *
+ * Reconciliation process:&lt;p/&gt;
+ * The member accepts all assignments received from the broker, resolves topic names from
+ * metadata, reconciles the resolved assignments, and keeps the unresolved to be reconciled when
+ * discovered with a metadata update. Reconciliations of resolved assignments are executed
+ * sequentially and acknowledged to the server as they complete. The reconciliation process
+ * involves multiple async operations, so the member will continue to heartbeat while these
+ * operations complete, to make sure that the member stays in the group while reconciling.
+ *
+ * &lt;p/&gt;
+ *
+ * Reconciliation steps:
+ * &lt;ol&gt;
+ *     &lt;li&gt;Resolve topic names for all topic IDs received in the target assignment. Topic names
+ *     found in metadata are then ready to be reconciled. Topic IDs not found are kept as
+ *     unresolved, and the member request metadata updates until it resolves them (or the broker
+ *     removes it from the target assignment.&lt;/li&gt;
+ *     &lt;li&gt;Commit offsets if auto-commit is enabled.&lt;/li&gt;
+ *     &lt;li&gt;Invoke the user-defined onPartitionsRevoked listener.&lt;/li&gt;
+ *     &lt;li&gt;Invoke the user-defined onPartitionsAssigned listener.&lt;/li&gt;
+ *     &lt;li&gt;When the above steps complete, the member acknowledges the reconciled assignment,
+ *     which is the subset of the target that was resolved from metadata and actually reconciled.
+ *     The ack is performed by sending a heartbeat request back to the broker, including the
+ *     reconciled assignment.&lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ * Note that user-defined callbacks are triggered from this manager that runs in the
+ * BackgroundThread, but executed in the Application Thread, where a failure will be returned to
+ * the user if the callbacks fail. This manager is only concerned about the callbacks completion to
+ * know that it can proceed with the reconciliation.
+ */
+public class ConsumerMembershipManager extends AbstractMembershipManager&lt;ConsumerGroupHeartbeatResponse&gt; {
+
+    /**
+     * Group instance ID to be used by the member, provided when creating the current membership manager.
+     */
+    protected final Optional&lt;String&gt; groupInstanceId;
+
+    private final Optional&lt;String&gt; rackId;
+
+    /**
+     * Rebalance timeout. To be used as time limit for the commit request issued
+     * when a new assignment is received, that is retried until it succeeds, fails with a
+     * non-retriable error, it the time limit expires.
+     */
+    private final int rebalanceTimeoutMs;
+
+    /**
+     * Name of the server-side assignor this member has configured to use. It will be sent
+     * out to the server on the {@link ConsumerGroupHeartbeatRequest}. If not defined, the server
+     * will select the assignor implementation to use.
+     */
+    private final Optional&lt;String&gt; serverAssignor;
+
+    /**
+     * Manager to perform commit requests needed before rebalance (if auto-commit is enabled)
+     */
+    private final CommitRequestManager commitRequestManager;
+
+    /**
+     * Serves as the conduit by which we can report events to the application thread. This is needed as we send
+     * {@link PartitionsAssignedEvent}, {@link PartitionsRemovedEvent} and, if needed,
+     * {@link ErrorEvent errors} to the application thread.
+     */
+    private final BackgroundEventHandler backgroundEventHandler;
+
+    public ConsumerMembershipManager(String groupId,
+                                     Optional&lt;String&gt; groupInstanceId,
+                                     Optional&lt;String&gt; rackId,
+                                     int rebalanceTimeoutMs,
+                                     Optional&lt;String&gt; serverAssignor,
+                                     SubscriptionState subscriptions,
+                                     CommitRequestManager commitRequestManager,
+                                     ConsumerMetadata metadata,
+                                     LogContext logContext,
+                                     BackgroundEventHandler backgroundEventHandler,
+                                     Time time,
+                                     Metrics metrics,
+                                     boolean autoCommitEnabled) {
+<span class="nc" id="L155">        this(groupId,</span>
+            groupInstanceId,
+            rackId,
+            rebalanceTimeoutMs,
+            serverAssignor,
+            subscriptions,
+            commitRequestManager,
+            metadata,
+            logContext,
+            backgroundEventHandler,
+            time,
+            new ConsumerRebalanceMetricsManager(metrics, subscriptions),
+            autoCommitEnabled);
+<span class="nc" id="L168">    }</span>
+
+    // Visible for testing
+    ConsumerMembershipManager(String groupId,
+                              Optional&lt;String&gt; groupInstanceId,
+                              Optional&lt;String&gt; rackId,
+                              int rebalanceTimeoutMs,
+                              Optional&lt;String&gt; serverAssignor,
+                              SubscriptionState subscriptions,
+                              CommitRequestManager commitRequestManager,
+                              ConsumerMetadata metadata,
+                              LogContext logContext,
+                              BackgroundEventHandler backgroundEventHandler,
+                              Time time,
+                              RebalanceMetricsManager metricsManager,
+                              boolean autoCommitEnabled) {
+<span class="nc" id="L184">        super(groupId,</span>
+            subscriptions,
+            metadata,
+<span class="nc" id="L187">            logContext.logger(ConsumerMembershipManager.class),</span>
+            time,
+            metricsManager,
+            autoCommitEnabled);
+<span class="nc" id="L191">        this.groupInstanceId = groupInstanceId;</span>
+<span class="nc" id="L192">        this.rackId = rackId;</span>
+<span class="nc" id="L193">        this.rebalanceTimeoutMs = rebalanceTimeoutMs;</span>
+<span class="nc" id="L194">        this.serverAssignor = serverAssignor;</span>
+<span class="nc" id="L195">        this.commitRequestManager = commitRequestManager;</span>
+<span class="nc" id="L196">        this.backgroundEventHandler = backgroundEventHandler;</span>
+<span class="nc" id="L197">    }</span>
+
+    /**
+     * @return Instance ID used by the member when joining the group. If non-empty, it will indicate that
+     * this is a static member.
+     */
+    public Optional&lt;String&gt; groupInstanceId() {
+<span class="nc" id="L204">        return groupInstanceId;</span>
+    }
+
+    public Optional&lt;String&gt; rackId() {
+<span class="nc" id="L208">        return rackId;</span>
+    }
+
+    @Override
+    protected short errorCode(ConsumerGroupHeartbeatResponse response) {
+<span class="nc" id="L213">        return response.data().errorCode();</span>
+    }
+
+    @Override
+    protected int memberEpoch(ConsumerGroupHeartbeatResponse response) {
+<span class="nc" id="L218">        return response.data().memberEpoch();</span>
+    }
+
+    @Override
+    protected Optional&lt;Map&lt;Uuid, SortedSet&lt;Integer&gt;&gt;&gt; extractAssignment(ConsumerGroupHeartbeatResponse response) {
+<span class="nc" id="L223">        ConsumerGroupHeartbeatResponseData.Assignment assignment = response.data().assignment();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (assignment == null) {</span>
+<span class="nc" id="L225">            return Optional.empty();</span>
+        }
+<span class="nc" id="L227">        Map&lt;Uuid, SortedSet&lt;Integer&gt;&gt; newAssignment = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L228">        assignment.topicPartitions().forEach(topicPartition -&gt;</span>
+<span class="nc" id="L229">            newAssignment.put(topicPartition.topicId(), new TreeSet&lt;&gt;(topicPartition.partitions())));</span>
+<span class="nc" id="L230">        return Optional.of(newAssignment);</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    protected CompletableFuture&lt;Void&gt; signalReconciliationStarted() {
+        // Issue a commit request that will be retried until it succeeds, fails with a
+        // non-retriable error, or the time limit expires. Retry on stale member epoch error, in a
+        // best effort to commit the offsets in the case where the epoch might have changed while
+        // the current reconciliation is in process. Note this is using the rebalance timeout as
+        // it is the limit enforced by the broker to complete the reconciliation process.
+<span class="nc" id="L243">        return commitRequestManager.maybeAutoCommitSyncBeforeRebalance(getDeadlineMsForTimeout(rebalanceTimeoutMs));</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    protected void signalReconciliationCompleting() {
+        // Reschedule the auto commit starting from now that the member has a new assignment.
+<span class="nc" id="L252">        commitRequestManager.resetAutoCommitTimer();</span>
+<span class="nc" id="L253">    }</span>
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    protected CompletableFuture&lt;Void&gt; signalMemberLeavingGroup() {
+<span class="nc" id="L260">        return invokeOnPartitionsRevokedOrLostToReleaseAssignment();</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    protected CompletableFuture&lt;Void&gt; signalPartitionsLost(Set&lt;TopicPartition&gt; partitionsLost) {
+        // Mark partitions as pending revocation to stop fetching from the partitions (no new
+        // fetches sent out, and no in-flight fetches responses processed).
+<span class="nc" id="L270">        markPendingRevocationToPauseFetching(partitionsLost);</span>
+<span class="nc" id="L271">        return invokeOnPartitionsLostCallback(partitionsLost);</span>
+    }
+
+    /**
+     * Release member assignment by calling the user defined callbacks for onPartitionsRevoked or
+     * onPartitionsLost.
+     * &lt;ul&gt;
+     *     &lt;li&gt;If the member is part of the group (epoch &gt; 0), this will invoke onPartitionsRevoked.
+     *     This will be the case when releasing assignment because the member is intentionally
+     *     leaving the group (after a call to unsubscribe)&lt;/li&gt;
+     *
+     *     &lt;li&gt;If the member is not part of the group (epoch &lt;=0), this will invoke onPartitionsLost.
+     *     This will be the case when releasing assignment after being fenced .&lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * @return Future that will complete when the callback execution completes.
+     */
+    private CompletableFuture&lt;Void&gt; invokeOnPartitionsRevokedOrLostToReleaseAssignment() {
+<span class="nc" id="L289">        SortedSet&lt;TopicPartition&gt; droppedPartitions = new TreeSet&lt;&gt;(TOPIC_PARTITION_COMPARATOR);</span>
+<span class="nc" id="L290">        droppedPartitions.addAll(subscriptions.assignedPartitions());</span>
+
+<span class="nc" id="L292">        log.info(&quot;Member {} is triggering callbacks to release assignment {} and leave group&quot;,</span>
+                memberId, droppedPartitions);
+
+        CompletableFuture&lt;Void&gt; callbackResult;
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if (droppedPartitions.isEmpty()) {</span>
+            // No assignment to release.
+<span class="nc" id="L298">            callbackResult = CompletableFuture.completedFuture(null);</span>
+        } else {
+            // Release assignment.
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if (memberEpoch &gt; 0) {</span>
+                // Member is part of the group. Invoke onPartitionsRevoked.
+<span class="nc" id="L303">                callbackResult = revokePartitions(droppedPartitions);</span>
+            } else {
+                // Member is not part of the group anymore. Invoke onPartitionsLost.
+<span class="nc" id="L306">                callbackResult = invokeOnPartitionsLostCallback(droppedPartitions);</span>
+            }
+        }
+<span class="nc" id="L309">        return callbackResult;</span>
+    }
+
+    /**
+     * @return Server-side assignor implementation configured for the member, that will be sent
+     * out to the server to be used. If empty, then the server will select the assignor.
+     */
+    public Optional&lt;String&gt; serverAssignor() {
+<span class="nc" id="L317">        return this.serverAssignor;</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; invokeOnPartitionsRevokedCallback(Set&lt;TopicPartition&gt; partitionsRevoked) {
+        // This should not trigger the callback if partitionsRevoked is empty, to keep the
+        // current behaviour.
+<span class="nc" id="L323">        Optional&lt;ConsumerRebalanceListener&gt; listener = subscriptions.rebalanceListener();</span>
+<span class="nc bnc" id="L324" title="All 4 branches missed.">        if (!partitionsRevoked.isEmpty() &amp;&amp; listener.isPresent()) {</span>
+<span class="nc" id="L325">            return enqueueConsumerRebalanceListenerCallback(ON_PARTITIONS_REVOKED, partitionsRevoked);</span>
+        } else {
+<span class="nc" id="L327">            return CompletableFuture.completedFuture(null);</span>
+        }
+    }
+
+    private CompletableFuture&lt;Void&gt; invokeOnPartitionsLostCallback(Set&lt;TopicPartition&gt; partitionsLost) {
+        // This should not trigger the callback if partitionsLost is empty, to keep the current
+        // behaviour.
+<span class="nc" id="L334">        Optional&lt;ConsumerRebalanceListener&gt; listener = subscriptions.rebalanceListener();</span>
+<span class="nc bnc" id="L335" title="All 4 branches missed.">        if (!partitionsLost.isEmpty() &amp;&amp; listener.isPresent()) {</span>
+<span class="nc" id="L336">            return enqueueConsumerRebalanceListenerCallback(ON_PARTITIONS_LOST, partitionsLost);</span>
+        } else {
+<span class="nc" id="L338">            return CompletableFuture.completedFuture(null);</span>
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    protected CompletableFuture&lt;Void&gt; signalPartitionsAssigned(TopicIdPartitionSet assignedPartitions,
+                                                               SortedSet&lt;TopicPartition&gt; addedPartitions) {
+        // Send an event to notify the app thread that the assignment changed with new partitions.
+        // The app thread is expected to trigger the assignment update (within a call to poll),
+        // and to run the onPartitionsAssigned callback if needed.
+<span class="nc" id="L351">        return enqueuePartitionsAssignedEvent(assignedPartitions.topicPartitions(), addedPartitions);</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void signalPartitionsBeingRevoked(Set&lt;TopicPartition&gt; partitionsToRevoke) {
+<span class="nc" id="L359">        logPausedPartitionsBeingRevoked(partitionsToRevoke);</span>
+<span class="nc" id="L360">    }</span>
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public CompletableFuture&lt;Void&gt; signalPartitionsRevoked(Set&lt;TopicPartition&gt; partitionsRevoked) {
+<span class="nc" id="L367">        return invokeOnPartitionsRevokedCallback(partitionsRevoked);</span>
+    }
+
+    /**
+     * Log partitions being revoked that were already paused, since the pause flag will be
+     * effectively lost.
+     */
+    private void logPausedPartitionsBeingRevoked(Set&lt;TopicPartition&gt; partitionsToRevoke) {
+<span class="nc" id="L375">        Set&lt;TopicPartition&gt; revokePausedPartitions = subscriptions.pausedPartitions();</span>
+<span class="nc" id="L376">        revokePausedPartitions.retainAll(partitionsToRevoke);</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        if (!revokePausedPartitions.isEmpty()) {</span>
+<span class="nc" id="L378">            log.info(&quot;The pause flag in partitions {} will be removed due to revocation.&quot;, revokePausedPartitions);</span>
+        }
+<span class="nc" id="L380">    }</span>
+
+    @Override
+    public boolean isLeavingGroup() {
+<span class="nc" id="L384">        CloseOptions.GroupMembershipOperation leaveGroupOperation = leaveGroupOperation();</span>
+<span class="nc bnc" id="L385" title="All 4 branches missed.">        if (REMAIN_IN_GROUP == leaveGroupOperation &amp;&amp; groupInstanceId.isEmpty()) {</span>
+<span class="nc" id="L386">            return false;</span>
+        }
+
+<span class="nc" id="L389">        MemberState state = state();</span>
+<span class="nc bnc" id="L390" title="All 4 branches missed.">        boolean isLeavingState = state == MemberState.PREPARE_LEAVING || state == MemberState.LEAVING;</span>
+
+        // Default operation: both static and dynamic consumers will send a leave heartbeat
+<span class="nc bnc" id="L393" title="All 4 branches missed.">        boolean hasLeaveOperation = DEFAULT == leaveGroupOperation ||</span>
+            // Leave operation: both static and dynamic consumers will send a leave heartbeat
+            LEAVE_GROUP == leaveGroupOperation ||
+            // Remain in group: static consumers will send a leave heartbeat with -2 epoch to reflect that a member using the given
+            // instance id decided to leave the group and would be back within the session timeout.
+<span class="nc bnc" id="L398" title="All 2 branches missed.">            groupInstanceId().isPresent();</span>
+
+<span class="nc bnc" id="L400" title="All 4 branches missed.">        return isLeavingState &amp;&amp; hasLeaveOperation;</span>
+    }
+
+    /**
+     * Enqueue a {@link PartitionsRemovedEvent} to trigger the execution of either
+     * {@link ConsumerRebalanceListener#onPartitionsRevoked} or {@link ConsumerRebalanceListener#onPartitionsLost}
+     * on the application thread.
+     *
+     * &lt;p/&gt;
+     *
+     * Because the reconciliation process (run in the background thread) will be blocked by the application thread
+     * until it completes this, we need to provide a {@link CompletableFuture} by which to remember where we left off.
+     *
+     * @param methodName Callback method that needs to be executed (ON_PARTITIONS_REVOKED or ON_PARTITIONS_LOST)
+     * @param partitions Partitions to supply to the callback method
+     * @return Future that will be chained within the rest of the reconciliation logic
+     */
+    private CompletableFuture&lt;Void&gt; enqueueConsumerRebalanceListenerCallback(ConsumerRebalanceListenerMethodName methodName,
+                                                                             Set&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L419">        SortedSet&lt;TopicPartition&gt; sortedPartitions = new TreeSet&lt;&gt;(TOPIC_PARTITION_COMPARATOR);</span>
+<span class="nc" id="L420">        sortedPartitions.addAll(partitions);</span>
+
+<span class="nc" id="L422">        CompletableBackgroundEvent&lt;Void&gt; event = new PartitionsRemovedEvent(methodName, sortedPartitions);</span>
+<span class="nc" id="L423">        backgroundEventHandler.add(event);</span>
+<span class="nc" id="L424">        log.debug(&quot;The event to trigger the {} method execution was enqueued successfully&quot;, methodName.fullyQualifiedMethodName());</span>
+<span class="nc" id="L425">        return event.future();</span>
+    }
+
+    /**
+     * Enqueue a {@link PartitionsAssignedEvent} to the application thread.
+     * This event handles the assignment update and optional onPartitionsAssigned callback.
+     *
+     * @param fullAssignment The full assignment to apply
+     * @param addedPartitions The newly added partitions (passed to the callback)
+     * @return Future that will be chained within the rest of the reconciliation logic
+     */
+    private CompletableFuture&lt;Void&gt; enqueuePartitionsAssignedEvent(Set&lt;TopicPartition&gt; fullAssignment,
+                                                                   SortedSet&lt;TopicPartition&gt; addedPartitions) {
+<span class="nc" id="L438">        CompletableBackgroundEvent&lt;Void&gt; event = new PartitionsAssignedEvent(fullAssignment, addedPartitions);</span>
+<span class="nc" id="L439">        backgroundEventHandler.add(event);</span>
+<span class="nc" id="L440">        log.debug(&quot;The event to update the new assignment and trigger onPartitionsAssigned callback if needed &quot; +</span>
+                &quot;has been enqueued successfully to be sent to the app thread.&quot;);
+<span class="nc" id="L442">        return event.future();</span>
+    }
+
+    /**
+     * Signals that a {@link ConsumerRebalanceListener} callback has completed. This is invoked when the
+     * application thread has completed the callback and has submitted a
+     * {@link ConsumerRebalanceListenerCallbackCompletedEvent} to the network I/O thread. At this point, we
+     * notify the state machine that it's complete so that it can move to the next appropriate step of the
+     * rebalance process.
+     *
+     * @param event Event with details about the callback that was executed
+     */
+    public void consumerRebalanceListenerCallbackCompleted(ConsumerRebalanceListenerCallbackCompletedEvent event) {
+<span class="nc" id="L455">        ConsumerRebalanceListenerMethodName methodName = event.methodName();</span>
+<span class="nc" id="L456">        Optional&lt;KafkaException&gt; error = event.error();</span>
+<span class="nc" id="L457">        CompletableFuture&lt;Void&gt; future = event.future();</span>
+
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        if (error.isPresent()) {</span>
+<span class="nc" id="L460">            Exception e = error.get();</span>
+<span class="nc" id="L461">            log.warn(</span>
+                    &quot;The {} method completed with an error ({}); signaling to continue to the next phase of rebalance&quot;,
+<span class="nc" id="L463">                    methodName.fullyQualifiedMethodName(),</span>
+<span class="nc" id="L464">                    e.getMessage()</span>
+            );
+
+<span class="nc" id="L467">            future.completeExceptionally(e);</span>
+<span class="nc" id="L468">        } else {</span>
+<span class="nc" id="L469">            log.debug(</span>
+                    &quot;The {} method completed successfully; signaling to continue to the next phase of rebalance&quot;,
+<span class="nc" id="L471">                    methodName.fullyQualifiedMethodName()</span>
+            );
+
+<span class="nc" id="L474">            future.complete(null);</span>
+        }
+<span class="nc" id="L476">    }</span>
+
+    /**
+     * Apply the assignment update to the subscription state. This is called from the background
+     * thread when processing an {@link ApplyAssignmentEvent} that was triggered by the application
+     * thread during poll. This ensures that the assignment update happens on the background thread
+     * but is coordinated by the application thread, so consumer.assignment() only changes within
+     * a call to consumer.poll().
+     *
+     * @param assignedPartitions The full assignment to apply
+     * @param addedPartitions The newly added partitions
+     */
+    public void applyAssignment(Set&lt;TopicPartition&gt; assignedPartitions, SortedSet&lt;TopicPartition&gt; addedPartitions) {
+<span class="nc" id="L489">        subscriptions.assignFromSubscribedAwaitingCallback(assignedPartitions, addedPartitions);</span>
+<span class="nc" id="L490">        notifyAssignmentChange(assignedPartitions);</span>
+<span class="nc" id="L491">    }</span>
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public int joinGroupEpoch() {
+<span class="nc" id="L498">        return ConsumerGroupHeartbeatRequest.JOIN_GROUP_MEMBER_EPOCH;</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public int leaveGroupEpoch() {
+<span class="nc" id="L506">        boolean isStaticMember = groupInstanceId.isPresent();</span>
+        // The mechanism to make static members permanently leave the group is to
+        // send an HB to leave with the -1 epoch (used by dynamic members).
+        // This will make the group coordinator fence this member, effectively removing it from the group.
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        if (LEAVE_GROUP == leaveGroupOperation) {</span>
+<span class="nc" id="L511">            return ConsumerGroupHeartbeatRequest.LEAVE_GROUP_MEMBER_EPOCH;</span>
+        }
+
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        return isStaticMember ?</span>
+<span class="nc" id="L515">            ConsumerGroupHeartbeatRequest.LEAVE_GROUP_STATIC_MEMBER_EPOCH :</span>
+<span class="nc" id="L516">            ConsumerGroupHeartbeatRequest.LEAVE_GROUP_MEMBER_EPOCH;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

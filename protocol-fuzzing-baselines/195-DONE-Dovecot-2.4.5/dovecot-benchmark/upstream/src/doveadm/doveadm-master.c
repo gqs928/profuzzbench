@@ -1,0 +1,344 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "str.h"
+#include "strescape.h"
+#include "connection.h"
+#include "istream.h"
+#include "ostream.h"
+#include "master-service.h"
+#include "sleep.h"
+#include "doveadm.h"
+#include "doveadm-print.h"
+
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+
+#define MASTER_PID_FILE_NAME "master.pid"
+
+static bool pid_file_read(const char *path, pid_t *pid_r, struct event *event)
+{
+	char buf[32];
+	int fd;
+	ssize_t ret;
+	bool found;
+
+	fd = open(path, O_RDONLY);
+	if (fd == -1) {
+		if (errno == ENOENT)
+			return FALSE;
+		i_fatal("open(%s) failed: %m", path);
+	}
+
+	ret = read(fd, buf, sizeof(buf)-1);
+	if (ret <= 0) {
+		if (ret == 0)
+			e_error(event, "Empty PID file in %s", path);
+		else
+			i_fatal("read(%s) failed: %m", path);
+		found = FALSE;
+	} else {
+		if (buf[ret-1] == '\n')
+			ret--;
+		buf[ret] = '\0';
+		if (str_to_pid(buf, pid_r) < 0)
+			found = FALSE;
+		else {
+			found = !(*pid_r == getpid() ||
+				  (kill(*pid_r, 0) < 0 && errno == ESRCH));
+		}
+	}
+	i_close_fd(&fd);
+	return found;
+}
+
+void doveadm_master_send_signal(int signo, struct event *event)
+{
+	const char *pidfile_path;
+	unsigned int i;
+	pid_t pid;
+
+	pidfile_path = t_strconcat(doveadm_settings->base_dir,
+				   "/"MASTER_PID_FILE_NAME, NULL);
+
+	if (!pid_file_read(pidfile_path, &pid, event))
+		i_fatal("Dovecot is not running (read from %s)", pidfile_path);
+
+	if (kill(pid, signo) < 0)
+		i_fatal("kill(%s, %d) failed: %m", dec2str(pid), signo);
+
+	if (signo == SIGTERM) {
+		/* wait for a while for the process to die */
+		unsigned int sleep_msecs = 1;
+		for (i = 0; i < 30; i++) {
+			i_sleep_msecs(sleep_msecs);
+			if (kill(pid, 0) < 0) {
+				if (errno != ESRCH)
+					e_error(event, "kill() failed: %m");
+				break;
+			}
+			if (sleep_msecs < 256)
+				sleep_msecs *= 2;
+		}
+	}
+}
+
+static void cmd_stop(struct doveadm_cmd_context *cctx)
+{
+	doveadm_master_send_signal(SIGTERM, cctx->event);
+}
+
+int master_service_send_cmd(const char *cmd, struct istream **input_r,
+			    const char **error_r)
+{
+	const char *path =
+		t_strconcat(doveadm_settings->base_dir, "/master", NULL);
+	const struct connection_settings set = {
+		.service_name_out = "master-client",
+		.service_name_in = "master-server",
+		.major_version = 1,
+		.minor_version = 0,
+	};
+	struct istream *input;
+	struct ostream *output;
+
+	if (doveadm_blocking_connect(path, &set, &input, &output, error_r) < 0)
+		return -1;
+	o_stream_nsend_str(output, t_strconcat(cmd, "\n", NULL));
+	if (o_stream_flush(output) < 0) {
+		*error_r = t_strdup(o_stream_get_error(output));
+		i_stream_unref(&input);
+	}
+	o_stream_unref(&output);
+	*input_r = input;
+	return input == NULL ? -1 : 0;
+}
+
+static struct istream *master_service_send_cmd_or_fatal(const char *cmd)
+{
+	struct istream *input;
+	const char *error;
+
+	if (master_service_send_cmd(cmd, &input, &error) < 0)
+		i_fatal("%s", error);
+	return input;
+}
+
+static struct istream *
+master_service_send_cmd_with_args(const char *cmd, const char *const *args)
+{
+	string_t *str = t_str_new(128);
+
+	str_append(str, cmd);
+	if (args != NULL) {
+		for (unsigned int i = 0; args[i] != NULL; i++) {
+			str_append_c(str, '\t');
+			str_append_tabescaped(str, args[i]);
+		}
+	}
+	return master_service_send_cmd_or_fatal(str_c(str));
+}
+
+/* error_exit_code is used when the master replies with an error. */
+static void master_service_send_cmd_reply(struct doveadm_cmd_context *cctx,
+					  struct istream *input,
+					  int error_exit_code)
+{
+	const char *line;
+
+	alarm(5);
+	if ((line = i_stream_read_next_line(input)) == NULL) {
+		e_error(cctx->event, "read(%s) failed: %s", i_stream_get_name(input),
+			i_stream_get_error(input));
+		doveadm_exit_code = EX_TEMPFAIL;
+	} else if (line[0] == '-') {
+		doveadm_exit_code = error_exit_code;
+		e_error(cctx->event, "%s", line+1);
+	} else if (line[0] != '+') {
+		e_error(cctx->event, "Unexpected input from %s: %s",
+			i_stream_get_name(input), line);
+		doveadm_exit_code = EX_TEMPFAIL;
+	}
+	alarm(0);
+	i_stream_destroy(&input);
+}
+
+static void cmd_reload(struct doveadm_cmd_context *cctx)
+{
+	const char *kick_timeout;
+
+	if (!doveadm_cmd_param_str(cctx, "kick-timeout", &kick_timeout)) {
+		/* Sending a signal also works with older masters. */
+		doveadm_master_send_signal(SIGHUP, cctx->event);
+		return;
+	}
+	const char *const args[] = { kick_timeout, NULL };
+
+	master_service_send_cmd_reply(cctx,
+		master_service_send_cmd_with_args("RELOAD", args),
+		EX_TEMPFAIL);
+}
+
+static void cmd_service_stop(struct doveadm_cmd_context *cctx)
+{
+	const char *const *services;
+
+	if (!doveadm_cmd_param_array(cctx, "service", &services))
+		i_fatal("service parameter missing");
+
+	master_service_send_cmd_reply(cctx,
+		master_service_send_cmd_with_args("STOP", services),
+		DOVEADM_EX_NOTFOUND);
+}
+
+static void cmd_service_status(struct doveadm_cmd_context *cctx)
+{
+	static const char *const all_args[] = { "all-generations", NULL };
+	const char *line, *const *services;
+	const char *const *args = NULL;
+	unsigned int fields_count;
+	bool all_generations;
+
+	if (!doveadm_cmd_param_array(cctx, "service", &services))
+		services = NULL;
+	if (!doveadm_cmd_param_bool(cctx, "all-generations", &all_generations))
+		all_generations = FALSE;
+	if (all_generations)
+		args = all_args;
+
+	struct istream *input =
+		master_service_send_cmd_with_args("SERVICE-STATUS", args);
+
+	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
+	doveadm_print_header_simple("name");
+	doveadm_print_header_simple("process_count");
+	doveadm_print_header_simple("process_avail");
+	doveadm_print_header_simple("process_limit");
+	doveadm_print_header_simple("client_limit");
+	doveadm_print_header_simple("throttle_secs");
+	doveadm_print_header_simple("exit_failure_last");
+	doveadm_print_header_simple("exit_failures_in_sec");
+	doveadm_print_header_simple("last_drop_warning");
+	doveadm_print_header_simple("listen_pending");
+	doveadm_print_header_simple("listening");
+	doveadm_print_header_simple("doveadm_stop");
+	doveadm_print_header_simple("process_total");
+	doveadm_print_header_simple("generation");
+	doveadm_print_header_simple("kill_time");
+	fields_count = doveadm_print_get_headers_count();
+
+	alarm(5);
+	while ((line = i_stream_read_next_line(input)) != NULL) {
+		if (line[0] == '\0')
+			break;
+		T_BEGIN {
+			const char *const *args = t_strsplit_tabescaped(line);
+			if (args[0] != NULL &&
+			    (services == NULL ||
+			     str_array_find(services, args[0]))) {
+				unsigned int i;
+				for (i = 0; i < fields_count && args[i] != NULL; i++)
+					doveadm_print(args[i]);
+				doveadm_print_empty(fields_count - i);
+			}
+		} T_END;
+	}
+	if (line == NULL) {
+		e_error(cctx->event, "read(%s) failed: %s", i_stream_get_name(input),
+			i_stream_get_error(input));
+		doveadm_exit_code = EX_TEMPFAIL;
+	}
+	alarm(0);
+	i_stream_destroy(&input);
+}
+
+static void cmd_process_status(struct doveadm_cmd_context *cctx)
+{
+	const char *line, *const *services;
+	unsigned int fields_count;
+
+	if (!doveadm_cmd_param_array(cctx, "service", &services))
+		services = NULL;
+
+	struct istream *input =
+		master_service_send_cmd_with_args("PROCESS-STATUS", services);
+
+	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
+	doveadm_print_header_simple("name");
+	doveadm_print_header_simple("pid");
+	doveadm_print_header_simple("available_count");
+	doveadm_print_header_simple("total_count");
+	doveadm_print_header_simple("idle_start");
+	doveadm_print_header_simple("last_status_update");
+	doveadm_print_header_simple("last_kill_sent");
+	doveadm_print_header_simple("generation");
+	doveadm_print_header_simple("kill_time");
+	fields_count = doveadm_print_get_headers_count();
+
+	alarm(5);
+	while ((line = i_stream_read_next_line(input)) != NULL) {
+		if (line[0] == '\0')
+			break;
+		T_BEGIN {
+			const char *const *args = t_strsplit_tabescaped(line);
+			unsigned int i;
+
+			for (i = 0; i < fields_count && args[i] != NULL; i++)
+				doveadm_print(args[i]);
+			doveadm_print_empty(fields_count - i);
+		} T_END;
+	}
+	if (line == NULL) {
+		e_error(cctx->event, "read(%s) failed: %s", i_stream_get_name(input),
+			i_stream_get_error(input));
+		doveadm_exit_code = EX_TEMPFAIL;
+	}
+	alarm(0);
+	i_stream_destroy(&input);
+}
+
+struct doveadm_cmd_ver2 doveadm_cmd_stop_ver2 = {
+	.cmd = cmd_stop,
+	.name = "stop",
+	.usage = "",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAMS_END
+};
+
+struct doveadm_cmd_ver2 doveadm_cmd_reload_ver2 = {
+        .cmd = cmd_reload,
+        .name = "reload",
+        .usage = "[--kick-timeout <time>]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAM('\0', "kick-timeout", CMD_PARAM_STR, 0)
+DOVEADM_CMD_PARAMS_END
+};
+
+struct doveadm_cmd_ver2 doveadm_cmd_service_stop_ver2 = {
+	.cmd = cmd_service_stop,
+	.name = "service stop",
+	.usage = "<service> [<service> [...]]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAM('\0', "service", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+};
+
+struct doveadm_cmd_ver2 doveadm_cmd_service_status_ver2 = {
+	.cmd = cmd_service_status,
+	.name = "service status",
+	.usage = "[-a] [<service> [...]]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAM('a', "all-generations", CMD_PARAM_BOOL, 0)
+DOVEADM_CMD_PARAM('\0', "service", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+};
+
+struct doveadm_cmd_ver2 doveadm_cmd_process_status_ver2 = {
+	.cmd = cmd_process_status,
+	.name = "process status",
+	.usage = "[<service> [...]]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAM('\0', "service", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+};

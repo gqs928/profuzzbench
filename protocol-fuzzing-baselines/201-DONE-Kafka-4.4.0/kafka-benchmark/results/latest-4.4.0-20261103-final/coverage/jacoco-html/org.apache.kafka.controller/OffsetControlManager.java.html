@@ -1,0 +1,422 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OffsetControlManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.controller</a> &gt; <span class="el_source">OffsetControlManager.java</span></div><h1>OffsetControlManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.controller;
+
+import org.apache.kafka.common.metadata.AbortTransactionRecord;
+import org.apache.kafka.common.metadata.BeginTransactionRecord;
+import org.apache.kafka.common.metadata.EndTransactionRecord;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.controller.metrics.QuorumControllerMetrics;
+import org.apache.kafka.raft.Batch;
+import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.common.OffsetAndEpoch;
+import org.apache.kafka.snapshot.Snapshots;
+import org.apache.kafka.timeline.SnapshotRegistry;
+
+import org.slf4j.Logger;
+
+import java.util.Optional;
+
+
+/**
+ * Manages read and write offsets, and in-memory snapshots.
+ * &lt;p&gt;
+ * Also manages the following metrics:
+ *      kafka.controller:type=KafkaController,name=ActiveControllerCount
+ *      kafka.controller:type=KafkaController,name=LastAppliedRecordLagMs
+ *      kafka.controller:type=KafkaController,name=LastAppliedRecordOffset
+ *      kafka.controller:type=KafkaController,name=LastAppliedRecordTimestamp
+ *      kafka.controller:type=KafkaController,name=LastCommittedRecordOffset
+ */
+class OffsetControlManager {
+<span class="nc" id="L48">    static class Builder {</span>
+<span class="nc" id="L49">        private LogContext logContext = null;</span>
+<span class="nc" id="L50">        private SnapshotRegistry snapshotRegistry = null;</span>
+<span class="nc" id="L51">        private QuorumControllerMetrics metrics = null;</span>
+<span class="nc" id="L52">        private Time time = Time.SYSTEM;</span>
+
+        Builder setLogContext(LogContext logContext) {
+<span class="nc" id="L55">            this.logContext = logContext;</span>
+<span class="nc" id="L56">            return this;</span>
+        }
+
+        Builder setSnapshotRegistry(SnapshotRegistry snapshotRegistry) {
+<span class="nc" id="L60">            this.snapshotRegistry = snapshotRegistry;</span>
+<span class="nc" id="L61">            return this;</span>
+        }
+
+        Builder setMetrics(QuorumControllerMetrics metrics) {
+<span class="nc" id="L65">            this.metrics = metrics;</span>
+<span class="nc" id="L66">            return this;</span>
+        }
+
+        Builder setTime(Time time) {
+<span class="nc" id="L70">            this.time = time;</span>
+<span class="nc" id="L71">            return this;</span>
+        }
+
+        OffsetControlManager build() {
+<span class="nc bnc" id="L75" title="All 2 branches missed.">            if (logContext == null) logContext = new LogContext();</span>
+<span class="nc bnc" id="L76" title="All 2 branches missed.">            if (snapshotRegistry == null) snapshotRegistry = new SnapshotRegistry(logContext);</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">            if (metrics == null) {</span>
+<span class="nc" id="L78">                metrics = new QuorumControllerMetrics(Optional.empty(), time, 0);</span>
+            }
+<span class="nc" id="L80">            return new OffsetControlManager(logContext,</span>
+                    snapshotRegistry,
+                    metrics,
+                    time);
+        }
+    }
+
+    /**
+     * The slf4j logger.
+     */
+    private final Logger log;
+
+    /**
+     * The snapshot registry.
+     */
+    private final SnapshotRegistry snapshotRegistry;
+
+    /**
+     * The quorum controller metrics.
+     */
+    private final QuorumControllerMetrics metrics;
+
+    /**
+     * The clock.
+     */
+    private final Time time;
+
+    /**
+     * The ID of the snapshot that we're currently replaying, or null if there is none.
+     */
+    private OffsetAndEpoch currentSnapshotId;
+
+    /**
+     * The name of the snapshot that we're currently replaying, or null if there is none.
+     */
+    private String currentSnapshotName;
+
+    /**
+     * The latest committed offset.
+     */
+    private long lastCommittedOffset;
+
+    /**
+     * The latest committed epoch.
+     */
+    private int lastCommittedEpoch;
+
+    /**
+     * The latest offset that it is safe to read from.
+     */
+    private long lastStableOffset;
+
+    /**
+     * The offset of the transaction we're in, or -1 if we are not in one.
+     */
+    private long transactionStartOffset;
+
+    /**
+     * The next offset we should write to, or -1 if the controller is not active. Exclusive offset.
+     */
+    private long nextWriteOffset;
+
+    private OffsetControlManager(
+        LogContext logContext,
+        SnapshotRegistry snapshotRegistry,
+        QuorumControllerMetrics metrics,
+        Time time
+<span class="nc" id="L147">    ) {</span>
+<span class="nc" id="L148">        this.log = logContext.logger(OffsetControlManager.class);</span>
+<span class="nc" id="L149">        this.snapshotRegistry = snapshotRegistry;</span>
+<span class="nc" id="L150">        this.metrics = metrics;</span>
+<span class="nc" id="L151">        this.time = time;</span>
+<span class="nc" id="L152">        this.currentSnapshotId = null;</span>
+<span class="nc" id="L153">        this.currentSnapshotName = null;</span>
+<span class="nc" id="L154">        this.lastCommittedOffset = -1L;</span>
+<span class="nc" id="L155">        this.lastCommittedEpoch = -1;</span>
+<span class="nc" id="L156">        this.lastStableOffset = -1L;</span>
+<span class="nc" id="L157">        this.transactionStartOffset = -1L;</span>
+<span class="nc" id="L158">        this.nextWriteOffset = -1L;</span>
+<span class="nc" id="L159">        snapshotRegistry.idempotentCreateSnapshot(-1L);</span>
+<span class="nc" id="L160">        metrics.setActive(false);</span>
+<span class="nc" id="L161">        metrics.setLastCommittedRecordOffset(-1L);</span>
+<span class="nc" id="L162">        metrics.setLastAppliedRecordOffset(-1L);</span>
+<span class="nc" id="L163">        metrics.setLastAppliedRecordTimestamp(-1L);</span>
+<span class="nc" id="L164">    }</span>
+
+    /**
+     *  @return The SnapshotRegistry used by this offset control manager.
+     */
+    SnapshotRegistry snapshotRegistry() {
+<span class="nc" id="L170">        return snapshotRegistry;</span>
+    }
+
+    /**
+     * @return QuorumControllerMetrics managed by this offset control manager.
+     */
+    QuorumControllerMetrics metrics() {
+<span class="nc" id="L177">        return metrics;</span>
+    }
+
+    /**
+     * @return the ID of the current snapshot.
+     */
+    OffsetAndEpoch currentSnapshotId() {
+<span class="nc" id="L184">        return currentSnapshotId;</span>
+    }
+
+    /**
+     * @return the name of the current snapshot.
+     */
+    String currentSnapshotName() {
+<span class="nc" id="L191">        return currentSnapshotName;</span>
+    }
+
+    /**
+     * @return the last committed offset.
+     */
+    long lastCommittedOffset() {
+<span class="nc" id="L198">        return lastCommittedOffset;</span>
+    }
+
+    /**
+     * @return the last committed epoch.
+     */
+    int lastCommittedEpoch() {
+<span class="nc" id="L205">        return lastCommittedEpoch;</span>
+    }
+
+    /**
+     * @return the latest offset that it is safe to read from.
+     */
+    long lastStableOffset() {
+<span class="nc" id="L212">        return lastStableOffset;</span>
+    }
+
+    /**
+     * @return the transaction start offset, or -1 if there is no transaction.
+     */
+    long transactionStartOffset() {
+<span class="nc" id="L219">        return transactionStartOffset;</span>
+    }
+
+    /**
+     * @return the next offset that the active controller should write to.
+     */
+    long nextWriteOffset() {
+<span class="nc" id="L226">        return nextWriteOffset;</span>
+    }
+
+    /**
+     * @return true only if the manager is active.
+     */
+    boolean active() {
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        return nextWriteOffset != -1L;</span>
+    }
+
+    /**
+     * Called when the QuorumController becomes active.
+     *
+     * @param newNextWriteOffset The new next write offset to use. Must be non-negative.
+     */
+    void activate(long newNextWriteOffset) {
+<span class="nc bnc" id="L242" title="All 2 branches missed.">        if (active()) {</span>
+<span class="nc" id="L243">            throw new RuntimeException(&quot;Can't activate already active OffsetControlManager.&quot;);</span>
+        }
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if (newNextWriteOffset &lt; 0) {</span>
+<span class="nc" id="L246">            throw new RuntimeException(&quot;Invalid negative newNextWriteOffset &quot; +</span>
+                    newNextWriteOffset + &quot;.&quot;);
+        }
+        // Before switching to active, create an in-memory snapshot at the last committed
+        // offset. This is required because the active controller assumes that there is always
+        // an in-memory snapshot at the last committed offset.
+<span class="nc" id="L252">        snapshotRegistry.idempotentCreateSnapshot(lastStableOffset);</span>
+<span class="nc" id="L253">        this.nextWriteOffset = newNextWriteOffset;</span>
+<span class="nc" id="L254">        metrics.setActive(true);</span>
+<span class="nc" id="L255">    }</span>
+
+    /**
+     * Called when the QuorumController becomes inactive.
+     */
+    void deactivate() {
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        if (!active()) {</span>
+<span class="nc" id="L262">            throw new RuntimeException(&quot;Can't deactivate inactive OffsetControlManager.&quot;);</span>
+        }
+<span class="nc" id="L264">        metrics.setActive(false);</span>
+<span class="nc" id="L265">        metrics.setLastAppliedRecordOffset(lastStableOffset);</span>
+<span class="nc" id="L266">        this.nextWriteOffset = -1L;</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        if (!snapshotRegistry.hasSnapshot(lastStableOffset)) {</span>
+<span class="nc" id="L268">            throw new RuntimeException(&quot;Unable to reset to last stable offset &quot; + lastStableOffset +</span>
+                    &quot;. No in-memory snapshot found for this offset.&quot;);
+        }
+<span class="nc" id="L271">        snapshotRegistry.revertToSnapshot(lastStableOffset);</span>
+<span class="nc" id="L272">    }</span>
+
+    /**
+     * Handle the callback from the Raft layer indicating that a batch was committed.
+     *
+     * @param batch The batch that has been committed.
+     */
+    void handleCommitBatch(Batch&lt;ApiMessageAndVersion&gt; batch) {
+<span class="nc" id="L280">        this.lastCommittedOffset = batch.lastOffset();</span>
+<span class="nc" id="L281">        this.lastCommittedEpoch = batch.epoch();</span>
+<span class="nc" id="L282">        maybeAdvanceLastStableOffset();</span>
+<span class="nc" id="L283">        handleCommitBatchMetrics(batch);</span>
+<span class="nc" id="L284">    }</span>
+
+    void handleCommitBatchMetrics(Batch&lt;ApiMessageAndVersion&gt; batch) {
+<span class="nc" id="L287">        metrics.setLastCommittedRecordOffset(batch.lastOffset());</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        if (!active()) {</span>
+            // On standby controllers, the last applied record offset is equals to the last
+            // committed offset.
+<span class="nc" id="L291">            metrics.setLastAppliedRecordOffset(batch.lastOffset());</span>
+<span class="nc" id="L292">            metrics.setLastAppliedRecordTimestamp(batch.appendTimestamp());</span>
+        }
+<span class="nc" id="L294">    }</span>
+
+    /**
+     * Called by the active controller after it has invoked scheduleAtomicAppend to schedule some
+     * records to be written.
+     *
+     * @param lastOffset The offset of the last record that was written.
+     */
+    void handleScheduleAppend(long lastOffset) {
+<span class="nc" id="L303">        this.nextWriteOffset = lastOffset + 1;</span>
+
+<span class="nc" id="L305">        snapshotRegistry.idempotentCreateSnapshot(lastOffset);</span>
+
+<span class="nc" id="L307">        metrics.setLastAppliedRecordOffset(lastOffset);</span>
+
+        // This is not truly the append timestamp. The KRaft client doesn't expose the append
+        // time when scheduling a write. This is good enough because this is called right after
+        // the records were given to the KRAft client for appending and the default append linger
+        // for KRaft is 25ms.
+<span class="nc" id="L313">        metrics.setLastAppliedRecordTimestamp(time.milliseconds());</span>
+<span class="nc" id="L314">    }</span>
+
+    /**
+     * Advance the last stable offset if needed.
+     */
+    void maybeAdvanceLastStableOffset() {
+        long newLastStableOffset;
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        if (transactionStartOffset == -1L) {</span>
+<span class="nc" id="L322">            newLastStableOffset = lastCommittedOffset;</span>
+        } else {
+<span class="nc" id="L324">            newLastStableOffset = Math.min(transactionStartOffset - 1, lastCommittedOffset);</span>
+        }
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        if (lastStableOffset &lt; newLastStableOffset) {</span>
+<span class="nc" id="L327">            lastStableOffset = newLastStableOffset;</span>
+<span class="nc" id="L328">            snapshotRegistry.deleteSnapshotsUpTo(lastStableOffset);</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">            if (!active()) {</span>
+<span class="nc" id="L330">                snapshotRegistry.idempotentCreateSnapshot(lastStableOffset);</span>
+            }
+        }
+<span class="nc" id="L333">    }</span>
+
+    /**
+     * Called before we load a Raft snapshot.
+     *
+     * @param snapshotId The Raft snapshot offset and epoch.
+     */
+    void beginLoadSnapshot(OffsetAndEpoch snapshotId) {
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        if (currentSnapshotId != null) {</span>
+<span class="nc" id="L342">            throw new RuntimeException(&quot;Can't begin reading snapshot for &quot; + snapshotId +</span>
+                    &quot;, because we are already reading &quot; + currentSnapshotId);
+        }
+<span class="nc" id="L345">        this.currentSnapshotId = snapshotId;</span>
+<span class="nc" id="L346">        this.currentSnapshotName = Snapshots.filenameFromSnapshotId(snapshotId);</span>
+<span class="nc" id="L347">        log.info(&quot;Starting to load snapshot {}. Previous lastCommittedOffset was {}. Previous &quot; +</span>
+<span class="nc" id="L348">                &quot;transactionStartOffset was {}.&quot;, currentSnapshotName, lastCommittedOffset,</span>
+<span class="nc" id="L349">                transactionStartOffset);</span>
+<span class="nc" id="L350">        this.snapshotRegistry.reset();</span>
+<span class="nc" id="L351">        this.lastCommittedOffset = -1L;</span>
+<span class="nc" id="L352">        this.lastCommittedEpoch = -1;</span>
+<span class="nc" id="L353">        this.lastStableOffset = -1L;</span>
+<span class="nc" id="L354">        this.transactionStartOffset = -1L;</span>
+<span class="nc" id="L355">        this.nextWriteOffset = -1L;</span>
+<span class="nc" id="L356">    }</span>
+
+    /**
+     * Called after we have finished loading a Raft snapshot.
+     *
+     * @param timestamp The timestamp of the snapshot.
+     */
+    void endLoadSnapshot(long timestamp) {
+<span class="nc bnc" id="L364" title="All 2 branches missed.">        if (currentSnapshotId == null) {</span>
+<span class="nc" id="L365">            throw new RuntimeException(&quot;Can't end loading snapshot, because there is no &quot; +</span>
+                    &quot;current snapshot.&quot;);
+        }
+<span class="nc" id="L368">        log.info(&quot;Successfully loaded snapshot {}.&quot;, currentSnapshotName);</span>
+<span class="nc" id="L369">        this.snapshotRegistry.idempotentCreateSnapshot(currentSnapshotId.offset());</span>
+<span class="nc" id="L370">        this.lastCommittedOffset = currentSnapshotId.offset();</span>
+<span class="nc" id="L371">        this.lastCommittedEpoch = currentSnapshotId.epoch();</span>
+<span class="nc" id="L372">        this.lastStableOffset = currentSnapshotId.offset();</span>
+<span class="nc" id="L373">        this.transactionStartOffset = -1L;</span>
+<span class="nc" id="L374">        this.nextWriteOffset = -1L;</span>
+<span class="nc" id="L375">        metrics.setLastCommittedRecordOffset(currentSnapshotId.offset());</span>
+<span class="nc" id="L376">        metrics.setLastAppliedRecordOffset(currentSnapshotId.offset());</span>
+<span class="nc" id="L377">        metrics.setLastAppliedRecordTimestamp(timestamp);</span>
+<span class="nc" id="L378">        this.currentSnapshotId = null;</span>
+<span class="nc" id="L379">        this.currentSnapshotName = null;</span>
+<span class="nc" id="L380">    }</span>
+
+    public void replay(BeginTransactionRecord message, long offset) {
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        if (currentSnapshotId != null) {</span>
+<span class="nc" id="L384">            throw new RuntimeException(&quot;BeginTransactionRecord cannot appear within a snapshot.&quot;);</span>
+        }
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        if (transactionStartOffset != -1L) {</span>
+<span class="nc" id="L387">            throw new RuntimeException(&quot;Can't replay a BeginTransactionRecord at &quot; + offset +</span>
+                &quot; because the transaction at &quot; + transactionStartOffset + &quot; was never closed.&quot;);
+        }
+<span class="nc" id="L390">        snapshotRegistry.idempotentCreateSnapshot(offset - 1);</span>
+<span class="nc" id="L391">        transactionStartOffset = offset;</span>
+<span class="nc" id="L392">        log.info(&quot;Replayed {} at offset {}.&quot;, message, offset);</span>
+<span class="nc" id="L393">    }</span>
+
+    public void replay(EndTransactionRecord message, long offset) {
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        if (currentSnapshotId != null) {</span>
+<span class="nc" id="L397">            throw new RuntimeException(&quot;EndTransactionRecord cannot appear within a snapshot.&quot;);</span>
+        }
+<span class="nc bnc" id="L399" title="All 2 branches missed.">        if (transactionStartOffset == -1L) {</span>
+<span class="nc" id="L400">            throw new RuntimeException(&quot;Can't replay an EndTransactionRecord at &quot; + offset +</span>
+                    &quot; because there is no open transaction.&quot;);
+        }
+<span class="nc" id="L403">        transactionStartOffset = -1L;</span>
+<span class="nc" id="L404">        log.info(&quot;Replayed {} at offset {}.&quot;, message, offset);</span>
+<span class="nc" id="L405">    }</span>
+
+    public void replay(AbortTransactionRecord message, long offset) {
+<span class="nc bnc" id="L408" title="All 2 branches missed.">        if (currentSnapshotId != null) {</span>
+<span class="nc" id="L409">            throw new RuntimeException(&quot;AbortTransactionRecord cannot appear within a snapshot.&quot;);</span>
+        }
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        if (transactionStartOffset == -1L) {</span>
+<span class="nc" id="L412">            throw new RuntimeException(&quot;Can't replay an AbortTransactionRecord at &quot; + offset +</span>
+                    &quot; because there is no open transaction.&quot;);
+        }
+<span class="nc" id="L415">        long preTransactionOffset = transactionStartOffset - 1;</span>
+<span class="nc" id="L416">        snapshotRegistry.revertToSnapshot(preTransactionOffset);</span>
+<span class="nc" id="L417">        transactionStartOffset = -1L;</span>
+<span class="nc" id="L418">        log.info(&quot;Replayed {} at offset {}. Reverted to offset {}.&quot;,</span>
+<span class="nc" id="L419">                message, offset, preTransactionOffset);</span>
+<span class="nc" id="L420">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

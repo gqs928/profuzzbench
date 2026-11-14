@@ -1,0 +1,793 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamsResetter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.tools</a> &gt; <span class="el_source">StreamsResetter.java</span></div><h1>StreamsResetter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.tools;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.DeleteTopicsResult;
+import org.apache.kafka.clients.admin.DescribeConsumerGroupsOptions;
+import org.apache.kafka.clients.admin.DescribeConsumerGroupsResult;
+import org.apache.kafka.clients.admin.MemberDescription;
+import org.apache.kafka.clients.admin.RemoveMembersFromConsumerGroupOptions;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.GroupProtocol;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.annotation.InterfaceStability;
+import org.apache.kafka.common.errors.GroupIdNotFoundException;
+import org.apache.kafka.common.errors.UnknownMemberIdException;
+import org.apache.kafka.common.requests.ListOffsetsResponse;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.Exit;
+import org.apache.kafka.server.util.CommandDefaultOptions;
+import org.apache.kafka.server.util.CommandLineUtils;
+
+import java.io.IOException;
+import java.text.ParseException;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import joptsimple.OptionException;
+import joptsimple.OptionSpec;
+import joptsimple.OptionSpecBuilder;
+
+import static org.apache.kafka.clients.consumer.ConsumerConfig.GROUP_PROTOCOL_CONFIG;
+
+
+/**
+ * {@link StreamsResetter} resets the processing state of a Kafka Streams application so that, for example,
+ * you can reprocess its input from scratch.
+ * &lt;p&gt;
+ * &lt;strong&gt;This class is not part of public API. For backward compatibility,
+ * use the provided script in &quot;bin/&quot; instead of calling this class directly from your code.&lt;/strong&gt;
+ * &lt;p&gt;
+ * Resetting the processing state of an application includes the following actions:
+ * &lt;ol&gt;
+ * &lt;li&gt;setting the application's consumer offsets for input and internal topics to zero&lt;/li&gt;
+ * &lt;li&gt;skip over all intermediate user topics (i.e., &quot;seekToEnd&quot; for consumers of intermediate topics)&lt;/li&gt;
+ * &lt;li&gt;deleting any topics created internally by Kafka Streams for this application&lt;/li&gt;
+ * &lt;/ol&gt;
+ * &lt;p&gt;
+ * Do only use this tool if &lt;strong&gt;no&lt;/strong&gt; application instance is running.
+ * Otherwise, the application will get into an invalid state and crash or produce wrong results.
+ * &lt;p&gt;
+ * If you run multiple application instances, running this tool once is sufficient.
+ * However, you need to call {@code KafkaStreams#cleanUp()} before re-starting any instance
+ * (to clean local state store directory).
+ * Otherwise, your application is in an invalid state.
+ * &lt;p&gt;
+ * User output topics will not be deleted or modified by this tool.
+ * If downstream applications consume intermediate or output topics,
+ * it is the user's responsibility to adjust those applications manually if required.
+ */
+@InterfaceStability.Unstable
+<span class="nc" id="L95">public class StreamsResetter {</span>
+    private static final int EXIT_CODE_SUCCESS = 0;
+    private static final int EXIT_CODE_ERROR = 1;
+
+    private static final String USAGE = &quot;This tool helps to quickly reset an application in order to reprocess &quot;
+            + &quot;its data from scratch.\n&quot;
+            + &quot;* This tool resets offsets of input topics to the earliest available offset (by default), or to a specific defined position&quot;
+            + &quot;* This tool deletes the internal topics that were created by Kafka Streams (topics starting with &quot;
+            + &quot;\&quot;&lt;application.id&gt;-\&quot;).\n&quot;
+            + &quot;The tool finds these internal topics automatically. If the topics flagged automatically for deletion by &quot;
+            + &quot;the dry-run are unsuitable, you can specify a subset with the \&quot;--internal-topics\&quot; option.\n&quot;
+            + &quot;* This tool will not delete output topics (if you want to delete them, you need to do it yourself &quot;
+            + &quot;with the bin/kafka-topics.sh command).\n&quot;
+            + &quot;* This tool will not clean up the local state on the stream application instances (the persisted &quot;
+            + &quot;stores used to cache aggregation results).\n&quot;
+            + &quot;You need to call KafkaStreams#cleanUp() in your application or manually delete them from the &quot;
+            + &quot;directory specified by \&quot;state.dir\&quot; configuration (${java.io.tmpdir}/kafka-streams/&lt;application.id&gt; by default).\n&quot;
+            + &quot;* When long session timeout has been configured, active members could take longer to get expired on the &quot;
+            + &quot;broker thus blocking the reset job to complete. Use the \&quot;--force\&quot; option could remove those left-over &quot;
+            + &quot;members immediately. Make sure to stop all stream applications when this option is specified &quot;
+            + &quot;to avoid unexpected disruptions.\n\n&quot;
+            + &quot;*** Important! You will get wrong output if you don't clean up the local stores after running the &quot;
+            + &quot;reset tool!\n\n&quot;
+            + &quot;*** Warning! This tool makes irreversible changes to your application. It is strongly recommended that &quot;
+            + &quot;you run this once with \&quot;--dry-run\&quot; to preview your changes before making them.\n\n&quot;;
+
+    private static final int MAX_REMOVE_MEMBERS_FROM_CONSUMER_GROUP_RETRIES = 3;
+
+<span class="nc" id="L123">    private final List&lt;String&gt; allTopics = new LinkedList&lt;&gt;();</span>
+
+    public static void main(final String[] args) {
+<span class="nc" id="L126">        Exit.exit(new StreamsResetter().execute(args));</span>
+<span class="nc" id="L127">    }</span>
+
+    public int execute(final String[] args) {
+<span class="nc" id="L130">        return execute(args, new Properties());</span>
+    }
+
+    public int execute(final String[] args, final Properties config) {
+        try {
+<span class="nc" id="L135">            StreamsResetterOptions options = new StreamsResetterOptions(args);</span>
+
+<span class="nc" id="L137">            String groupId = options.applicationId();</span>
+
+            String commandConfigFile;
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            if (options.hasConfig()) {</span>
+<span class="nc" id="L141">                System.out.println(&quot;Option --config-file has been deprecated and will be removed in a future version. Use --command-config instead.&quot;);</span>
+<span class="nc" id="L142">                commandConfigFile = options.config();</span>
+            } else {
+<span class="nc" id="L144">                commandConfigFile = options.commandConfig();</span>
+            }
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            Properties properties = (commandConfigFile != null) ? Utils.loadProps(commandConfigFile) : new Properties();</span>
+
+<span class="nc" id="L148">            String bootstrapServerValue = &quot;localhost:9092&quot;;</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">            if (options.hasBootstrapServer()) {</span>
+<span class="nc" id="L150">                bootstrapServerValue = options.bootstrapServer();</span>
+            }
+
+<span class="nc" id="L153">            properties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServerValue);</span>
+
+<span class="nc" id="L155">            try (Admin adminClient = Admin.create(properties)) {</span>
+<span class="nc" id="L156">                maybeDeleteActiveConsumers(groupId, adminClient, options.hasForce());</span>
+
+<span class="nc" id="L158">                allTopics.clear();</span>
+<span class="nc" id="L159">                allTopics.addAll(adminClient.listTopics().names().get(60, TimeUnit.SECONDS));</span>
+
+<span class="nc bnc" id="L161" title="All 2 branches missed.">                if (options.hasDryRun()) {</span>
+<span class="nc" id="L162">                    System.out.println(&quot;----Dry run displays the actions which will be performed when running Streams Reset Tool----&quot;);</span>
+                }
+
+<span class="nc" id="L165">                final HashMap&lt;Object, Object&gt; consumerConfig = new HashMap&lt;&gt;(config);</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                if (consumerConfig.containsKey(GROUP_PROTOCOL_CONFIG) &amp;&amp;</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">                    !consumerConfig.get(GROUP_PROTOCOL_CONFIG).toString().equalsIgnoreCase(GroupProtocol.CLASSIC.name())</span>
+                ) {
+<span class="nc" id="L169">                    System.out.println(&quot;WARNING: provided group protocol will be ignored. Using supported &quot; + GroupProtocol.CLASSIC.name() + &quot; protocol instead&quot;);</span>
+                }
+<span class="nc" id="L171">                consumerConfig.put(GROUP_PROTOCOL_CONFIG, GroupProtocol.CLASSIC.name());</span>
+<span class="nc" id="L172">                consumerConfig.putAll(properties);</span>
+<span class="nc" id="L173">                int exitCode = maybeResetInputAndSeekToEndIntermediateTopicOffsets(consumerConfig, options);</span>
+<span class="nc" id="L174">                exitCode |= maybeDeleteInternalTopics(adminClient, options);</span>
+<span class="nc" id="L175">                return exitCode;</span>
+            }
+<span class="nc" id="L177">        } catch (Throwable e) {</span>
+<span class="nc" id="L178">            System.err.println(&quot;ERROR: &quot; + e);</span>
+<span class="nc" id="L179">            e.printStackTrace(System.err);</span>
+<span class="nc" id="L180">            return EXIT_CODE_ERROR;</span>
+        }
+    }
+
+    // visible for testing
+    void maybeDeleteActiveConsumers(final String groupId,
+                                    final Admin adminClient,
+                                    final boolean force)
+        throws ExecutionException, InterruptedException {
+<span class="nc" id="L189">        int retries = 0;</span>
+        while (true) {
+<span class="nc" id="L191">            final DescribeConsumerGroupsResult describeResult = adminClient.describeConsumerGroups(</span>
+<span class="nc" id="L192">                    Set.of(groupId),</span>
+<span class="nc" id="L193">                    new DescribeConsumerGroupsOptions().timeoutMs(10 * 1000));</span>
+            try {
+<span class="nc" id="L195">                final List&lt;MemberDescription&gt; members =</span>
+<span class="nc" id="L196">                        new ArrayList&lt;&gt;(describeResult.describedGroups().get(groupId).get().members());</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">                if (!members.isEmpty()) {</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">                    if (force) {</span>
+<span class="nc" id="L199">                        System.out.println(&quot;Force deleting all active members in the group: &quot; + groupId);</span>
+<span class="nc" id="L200">                        adminClient.removeMembersFromConsumerGroup(groupId, new RemoveMembersFromConsumerGroupOptions()).all().get();</span>
+                    } else {
+<span class="nc" id="L202">                        throw new IllegalStateException(&quot;Consumer group '&quot; + groupId + &quot;' is still active &quot;</span>
+                                + &quot;and has following members: &quot; + members + &quot;. &quot;
+                                + &quot;Make sure to stop all running application instances before running the reset tool.&quot;
+                                + &quot; You can use option '--force' to remove active members from the group.&quot;);
+                    }
+                }
+<span class="nc" id="L208">                break;</span>
+<span class="nc" id="L209">            } catch (ExecutionException ee) {</span>
+                // If the group ID is not found, this is not an error case
+<span class="nc bnc" id="L211" title="All 2 branches missed.">                if (ee.getCause() instanceof GroupIdNotFoundException) {</span>
+<span class="nc" id="L212">                    break;</span>
+                }
+                // if a member is unknown, it may mean that it left the group itself. Retrying to confirm.
+<span class="nc bnc" id="L215" title="All 4 branches missed.">                if (ee.getCause() instanceof KafkaException ke &amp;&amp; ke.getCause() instanceof UnknownMemberIdException) {</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">                    if (retries++ &lt; MAX_REMOVE_MEMBERS_FROM_CONSUMER_GROUP_RETRIES) {</span>
+<span class="nc" id="L217">                        continue;</span>
+                    }
+                }
+<span class="nc" id="L220">                throw ee;</span>
+            }
+        }
+<span class="nc" id="L223">    }</span>
+
+    private int maybeResetInputAndSeekToEndIntermediateTopicOffsets(final Map&lt;Object, Object&gt; consumerConfig,
+                                                                    final StreamsResetterOptions options)
+        throws IOException, ParseException {
+<span class="nc" id="L228">        final List&lt;String&gt; inputTopics = options.inputTopicsOption();</span>
+<span class="nc" id="L229">        final List&lt;String&gt; intermediateTopics = options.intermediateTopicsOption();</span>
+<span class="nc" id="L230">        int topicNotFound = EXIT_CODE_SUCCESS;</span>
+
+<span class="nc" id="L232">        final List&lt;String&gt; notFoundInputTopics = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L233">        final List&lt;String&gt; notFoundIntermediateTopics = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L235" title="All 4 branches missed.">        if (inputTopics.isEmpty() &amp;&amp; intermediateTopics.isEmpty()) {</span>
+<span class="nc" id="L236">            System.out.println(&quot;No input or intermediate topics specified. Skipping seek.&quot;);</span>
+<span class="nc" id="L237">            return EXIT_CODE_SUCCESS;</span>
+        }
+
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        if (!inputTopics.isEmpty()) {</span>
+<span class="nc" id="L241">            System.out.println(&quot;Reset-offsets for input topics &quot; + inputTopics);</span>
+        }
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        if (!intermediateTopics.isEmpty()) {</span>
+<span class="nc" id="L244">            System.out.println(&quot;Seek-to-end for intermediate topics &quot; + intermediateTopics);</span>
+        }
+
+<span class="nc" id="L247">        final Set&lt;String&gt; topicsToSubscribe = new HashSet&lt;&gt;(inputTopics.size() + intermediateTopics.size());</span>
+
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        for (final String topic : inputTopics) {</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">            if (!allTopics.contains(topic)) {</span>
+<span class="nc" id="L251">                notFoundInputTopics.add(topic);</span>
+            } else {
+<span class="nc" id="L253">                topicsToSubscribe.add(topic);</span>
+            }
+<span class="nc" id="L255">        }</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        for (final String topic : intermediateTopics) {</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">            if (!allTopics.contains(topic)) {</span>
+<span class="nc" id="L258">                notFoundIntermediateTopics.add(topic);</span>
+            } else {
+<span class="nc" id="L260">                topicsToSubscribe.add(topic);</span>
+            }
+<span class="nc" id="L262">        }</span>
+
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        if (!notFoundInputTopics.isEmpty()) {</span>
+<span class="nc" id="L265">            System.out.println(&quot;Following input topics are not found, skipping them&quot;);</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            for (final String topic : notFoundInputTopics) {</span>
+<span class="nc" id="L267">                System.out.println(&quot;Topic: &quot; + topic);</span>
+<span class="nc" id="L268">            }</span>
+<span class="nc" id="L269">            topicNotFound = EXIT_CODE_ERROR;</span>
+        }
+
+<span class="nc bnc" id="L272" title="All 2 branches missed.">        if (!notFoundIntermediateTopics.isEmpty()) {</span>
+<span class="nc" id="L273">            System.out.println(&quot;Following intermediate topics are not found, skipping them&quot;);</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            for (final String topic : notFoundIntermediateTopics) {</span>
+<span class="nc" id="L275">                System.out.println(&quot;Topic:&quot; + topic);</span>
+<span class="nc" id="L276">            }</span>
+<span class="nc" id="L277">            topicNotFound = EXIT_CODE_ERROR;</span>
+        }
+
+        // Return early if there are no topics to reset (the consumer will raise an error if we
+        // try to poll with an empty subscription)
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        if (topicsToSubscribe.isEmpty()) {</span>
+<span class="nc" id="L283">            return topicNotFound;</span>
+        }
+
+<span class="nc" id="L286">        final Properties config = new Properties();</span>
+<span class="nc" id="L287">        config.putAll(consumerConfig);</span>
+<span class="nc" id="L288">        config.setProperty(ConsumerConfig.GROUP_ID_CONFIG, options.applicationId());</span>
+<span class="nc" id="L289">        config.setProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, &quot;false&quot;);</span>
+
+<span class="nc" id="L291">        try (final KafkaConsumer&lt;byte[], byte[]&gt; client =</span>
+                 new KafkaConsumer&lt;&gt;(config, new ByteArrayDeserializer(), new ByteArrayDeserializer())) {
+
+<span class="nc" id="L294">            final Collection&lt;TopicPartition&gt; partitions = topicsToSubscribe.stream().map(client::partitionsFor)</span>
+<span class="nc" id="L295">                    .flatMap(Collection::stream)</span>
+<span class="nc" id="L296">                    .map(info -&gt; new TopicPartition(info.topic(), info.partition()))</span>
+<span class="nc" id="L297">                    .collect(Collectors.toList());</span>
+<span class="nc" id="L298">            client.assign(partitions);</span>
+
+<span class="nc" id="L300">            final Set&lt;TopicPartition&gt; inputTopicPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L301">            final Set&lt;TopicPartition&gt; intermediateTopicPartitions = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            for (final TopicPartition p : partitions) {</span>
+<span class="nc" id="L304">                final String topic = p.topic();</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                if (options.isInputTopic(topic)) {</span>
+<span class="nc" id="L306">                    inputTopicPartitions.add(p);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                } else if (options.isIntermediateTopic(topic)) {</span>
+<span class="nc" id="L308">                    intermediateTopicPartitions.add(p);</span>
+                } else {
+<span class="nc" id="L310">                    System.err.println(&quot;Skipping invalid partition: &quot; + p);</span>
+                }
+<span class="nc" id="L312">            }</span>
+
+<span class="nc" id="L314">            maybeReset(client, inputTopicPartitions, options);</span>
+
+<span class="nc" id="L316">            maybeSeekToEnd(options.applicationId(), client, intermediateTopicPartitions);</span>
+
+<span class="nc bnc" id="L318" title="All 2 branches missed.">            if (!options.hasDryRun()) {</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                for (final TopicPartition p : partitions) {</span>
+<span class="nc" id="L320">                    client.position(p);</span>
+<span class="nc" id="L321">                }</span>
+<span class="nc" id="L322">                client.commitSync();</span>
+            }
+<span class="nc" id="L324">        } catch (final IOException | ParseException e) {</span>
+<span class="nc" id="L325">            System.err.println(&quot;ERROR: Resetting offsets failed.&quot;);</span>
+<span class="nc" id="L326">            throw e;</span>
+<span class="nc" id="L327">        }</span>
+<span class="nc" id="L328">        System.out.println(&quot;Done.&quot;);</span>
+<span class="nc" id="L329">        return topicNotFound;</span>
+    }
+
+    // visible for testing
+    public void maybeSeekToEnd(final String groupId,
+                               final Consumer&lt;byte[], byte[]&gt; client,
+                               final Set&lt;TopicPartition&gt; intermediateTopicPartitions) {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        if (!intermediateTopicPartitions.isEmpty()) {</span>
+<span class="nc" id="L337">            System.out.println(&quot;Following intermediate topics offsets will be reset to end (for consumer group &quot; + groupId + &quot;)&quot;);</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">            for (final TopicPartition topicPartition : intermediateTopicPartitions) {</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                if (allTopics.contains(topicPartition.topic())) {</span>
+<span class="nc" id="L340">                    System.out.println(&quot;Topic: &quot; + topicPartition.topic());</span>
+                }
+<span class="nc" id="L342">            }</span>
+<span class="nc" id="L343">            client.seekToEnd(intermediateTopicPartitions);</span>
+        }
+<span class="nc" id="L345">    }</span>
+
+    private void maybeReset(final Consumer&lt;byte[], byte[]&gt; client,
+                            final Set&lt;TopicPartition&gt; inputTopicPartitions,
+                            final StreamsResetterOptions options)
+        throws IOException, ParseException {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (!inputTopicPartitions.isEmpty()) {</span>
+<span class="nc" id="L352">            System.out.println(&quot;Following input topics offsets will be reset to (for consumer group &quot; + options.applicationId() + &quot;)&quot;);</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">            if (options.hasToOffset()) {</span>
+<span class="nc" id="L354">                resetOffsetsTo(client, inputTopicPartitions, options.toOffset());</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">            } else if (options.hasToEarliest()) {</span>
+<span class="nc" id="L356">                client.seekToBeginning(inputTopicPartitions);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            } else if (options.hasToLatest()) {</span>
+<span class="nc" id="L358">                client.seekToEnd(inputTopicPartitions);</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">            } else if (options.hasShiftBy()) {</span>
+<span class="nc" id="L360">                shiftOffsetsBy(client, inputTopicPartitions, options.shiftBy());</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            } else if (options.hasToDatetime()) {</span>
+<span class="nc" id="L362">                final String ts = options.toDatetime();</span>
+<span class="nc" id="L363">                final long timestamp = Utils.getDateTime(ts);</span>
+<span class="nc" id="L364">                resetToDatetime(client, inputTopicPartitions, timestamp);</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">            } else if (options.hasByDuration()) {</span>
+<span class="nc" id="L366">                final String duration = options.byDuration();</span>
+<span class="nc" id="L367">                resetByDuration(client, inputTopicPartitions, Duration.parse(duration));</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            } else if (options.hasFromFile()) {</span>
+<span class="nc" id="L369">                final String resetPlanPath = options.fromFile();</span>
+<span class="nc" id="L370">                final Map&lt;TopicPartition, Long&gt; topicPartitionsAndOffset =</span>
+<span class="nc" id="L371">                    getTopicPartitionOffsetFromResetPlan(resetPlanPath);</span>
+<span class="nc" id="L372">                resetOffsetsFromResetPlan(client, inputTopicPartitions, topicPartitionsAndOffset);</span>
+<span class="nc" id="L373">            } else {</span>
+<span class="nc" id="L374">                client.seekToBeginning(inputTopicPartitions);</span>
+            }
+
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            for (final TopicPartition p : inputTopicPartitions) {</span>
+<span class="nc" id="L378">                System.out.println(&quot;Topic: &quot; + p.topic() + &quot; Partition: &quot; + p.partition() + &quot; Offset: &quot; + client.position(p));</span>
+<span class="nc" id="L379">            }</span>
+        }
+<span class="nc" id="L381">    }</span>
+
+    // visible for testing
+    public void resetOffsetsFromResetPlan(final Consumer&lt;byte[], byte[]&gt; client,
+                                          final Set&lt;TopicPartition&gt; inputTopicPartitions,
+                                          final Map&lt;TopicPartition, Long&gt; topicPartitionsAndOffset) {
+<span class="nc" id="L387">        final Map&lt;TopicPartition, Long&gt; endOffsets = client.endOffsets(inputTopicPartitions);</span>
+<span class="nc" id="L388">        final Map&lt;TopicPartition, Long&gt; beginningOffsets = client.beginningOffsets(inputTopicPartitions);</span>
+
+<span class="nc" id="L390">        final Map&lt;TopicPartition, Long&gt; validatedTopicPartitionsAndOffset =</span>
+<span class="nc" id="L391">            checkOffsetRange(topicPartitionsAndOffset, beginningOffsets, endOffsets);</span>
+
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        for (final TopicPartition topicPartition : inputTopicPartitions) {</span>
+<span class="nc" id="L394">            client.seek(topicPartition, validatedTopicPartitionsAndOffset.get(topicPartition));</span>
+<span class="nc" id="L395">        }</span>
+<span class="nc" id="L396">    }</span>
+
+    private Map&lt;TopicPartition, Long&gt; getTopicPartitionOffsetFromResetPlan(final String resetPlanPath)
+        throws IOException, ParseException {
+<span class="nc" id="L400">        final String resetPlanCsv = Utils.readFileAsString(resetPlanPath);</span>
+<span class="nc" id="L401">        return parseResetPlan(resetPlanCsv);</span>
+    }
+
+    private void resetByDuration(final Consumer&lt;byte[], byte[]&gt; client,
+                                 final Set&lt;TopicPartition&gt; inputTopicPartitions,
+                                 final Duration duration) {
+<span class="nc" id="L407">        resetToDatetime(client, inputTopicPartitions, Instant.now().minus(duration).toEpochMilli());</span>
+<span class="nc" id="L408">    }</span>
+
+    // visible for testing
+    public void resetToDatetime(final Consumer&lt;byte[], byte[]&gt; client,
+                                final Set&lt;TopicPartition&gt; inputTopicPartitions,
+                                final Long timestamp) {
+<span class="nc" id="L414">        final Map&lt;TopicPartition, Long&gt; topicPartitionsAndTimes = new HashMap&lt;&gt;(inputTopicPartitions.size());</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">        for (final TopicPartition topicPartition : inputTopicPartitions) {</span>
+<span class="nc" id="L416">            topicPartitionsAndTimes.put(topicPartition, timestamp);</span>
+<span class="nc" id="L417">        }</span>
+
+<span class="nc" id="L419">        final Map&lt;TopicPartition, OffsetAndTimestamp&gt; topicPartitionsAndOffset = client.offsetsForTimes(topicPartitionsAndTimes);</span>
+
+<span class="nc bnc" id="L421" title="All 2 branches missed.">        for (final TopicPartition topicPartition : inputTopicPartitions) {</span>
+<span class="nc" id="L422">            final Optional&lt;Long&gt; partitionOffset = Optional.ofNullable(topicPartitionsAndOffset.get(topicPartition))</span>
+<span class="nc" id="L423">                    .map(OffsetAndTimestamp::offset)</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">                    .filter(offset -&gt; offset != ListOffsetsResponse.UNKNOWN_OFFSET);</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">            if (partitionOffset.isPresent()) {</span>
+<span class="nc" id="L426">                client.seek(topicPartition, partitionOffset.get());</span>
+            } else {
+<span class="nc" id="L428">                client.seekToEnd(List.of(topicPartition));</span>
+<span class="nc" id="L429">                System.out.println(&quot;Partition &quot; + topicPartition.partition() + &quot; from topic &quot; + topicPartition.topic() +</span>
+                        &quot; is empty, without a committed record. Falling back to latest known offset.&quot;);
+            }
+<span class="nc" id="L432">        }</span>
+<span class="nc" id="L433">    }</span>
+
+    // visible for testing
+    public void shiftOffsetsBy(final Consumer&lt;byte[], byte[]&gt; client,
+                               final Set&lt;TopicPartition&gt; inputTopicPartitions,
+                               final long shiftBy) {
+<span class="nc" id="L439">        final Map&lt;TopicPartition, Long&gt; endOffsets = client.endOffsets(inputTopicPartitions);</span>
+<span class="nc" id="L440">        final Map&lt;TopicPartition, Long&gt; beginningOffsets = client.beginningOffsets(inputTopicPartitions);</span>
+
+<span class="nc" id="L442">        final Map&lt;TopicPartition, Long&gt; topicPartitionsAndOffset = new HashMap&lt;&gt;(inputTopicPartitions.size());</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        for (final TopicPartition topicPartition : inputTopicPartitions) {</span>
+<span class="nc" id="L444">            final long position = client.position(topicPartition);</span>
+<span class="nc" id="L445">            final long offset = position + shiftBy;</span>
+<span class="nc" id="L446">            topicPartitionsAndOffset.put(topicPartition, offset);</span>
+<span class="nc" id="L447">        }</span>
+
+<span class="nc" id="L449">        final Map&lt;TopicPartition, Long&gt; validatedTopicPartitionsAndOffset =</span>
+<span class="nc" id="L450">            checkOffsetRange(topicPartitionsAndOffset, beginningOffsets, endOffsets);</span>
+
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        for (final TopicPartition topicPartition : inputTopicPartitions) {</span>
+<span class="nc" id="L453">            client.seek(topicPartition, validatedTopicPartitionsAndOffset.get(topicPartition));</span>
+<span class="nc" id="L454">        }</span>
+<span class="nc" id="L455">    }</span>
+
+    // visible for testing
+    public void resetOffsetsTo(final Consumer&lt;byte[], byte[]&gt; client,
+                               final Set&lt;TopicPartition&gt; inputTopicPartitions,
+                               final Long offset) {
+<span class="nc" id="L461">        final Map&lt;TopicPartition, Long&gt; endOffsets = client.endOffsets(inputTopicPartitions);</span>
+<span class="nc" id="L462">        final Map&lt;TopicPartition, Long&gt; beginningOffsets = client.beginningOffsets(inputTopicPartitions);</span>
+
+<span class="nc" id="L464">        final Map&lt;TopicPartition, Long&gt; topicPartitionsAndOffset = new HashMap&lt;&gt;(inputTopicPartitions.size());</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">        for (final TopicPartition topicPartition : inputTopicPartitions) {</span>
+<span class="nc" id="L466">            topicPartitionsAndOffset.put(topicPartition, offset);</span>
+<span class="nc" id="L467">        }</span>
+
+<span class="nc" id="L469">        final Map&lt;TopicPartition, Long&gt; validatedTopicPartitionsAndOffset =</span>
+<span class="nc" id="L470">            checkOffsetRange(topicPartitionsAndOffset, beginningOffsets, endOffsets);</span>
+
+<span class="nc bnc" id="L472" title="All 2 branches missed.">        for (final TopicPartition topicPartition : inputTopicPartitions) {</span>
+<span class="nc" id="L473">            client.seek(topicPartition, validatedTopicPartitionsAndOffset.get(topicPartition));</span>
+<span class="nc" id="L474">        }</span>
+<span class="nc" id="L475">    }</span>
+
+    private Map&lt;TopicPartition, Long&gt; parseResetPlan(final String resetPlanCsv) throws ParseException {
+<span class="nc" id="L478">        final Map&lt;TopicPartition, Long&gt; topicPartitionAndOffset = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L479" title="All 4 branches missed.">        if (resetPlanCsv == null || resetPlanCsv.isEmpty()) {</span>
+<span class="nc" id="L480">            throw new ParseException(&quot;Error parsing reset plan CSV file. It is empty,&quot;, 0);</span>
+        }
+
+<span class="nc" id="L483">        final String[] resetPlanCsvParts = resetPlanCsv.split(&quot;\n&quot;);</span>
+
+<span class="nc bnc" id="L485" title="All 2 branches missed.">        for (final String line : resetPlanCsvParts) {</span>
+<span class="nc" id="L486">            final String[] lineParts = line.split(&quot;,&quot;);</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">            if (lineParts.length != 3) {</span>
+<span class="nc" id="L488">                throw new ParseException(&quot;Reset plan CSV file is not following the format `TOPIC,PARTITION,OFFSET`.&quot;, 0);</span>
+            }
+<span class="nc" id="L490">            final String topic = lineParts[0];</span>
+<span class="nc" id="L491">            final int partition = Integer.parseInt(lineParts[1]);</span>
+<span class="nc" id="L492">            final long offset = Long.parseLong(lineParts[2]);</span>
+<span class="nc" id="L493">            final TopicPartition topicPartition = new TopicPartition(topic, partition);</span>
+<span class="nc" id="L494">            topicPartitionAndOffset.put(topicPartition, offset);</span>
+        }
+
+<span class="nc" id="L497">        return topicPartitionAndOffset;</span>
+    }
+
+    private Map&lt;TopicPartition, Long&gt; checkOffsetRange(final Map&lt;TopicPartition, Long&gt; inputTopicPartitionsAndOffset,
+                                                       final Map&lt;TopicPartition, Long&gt; beginningOffsets,
+                                                       final Map&lt;TopicPartition, Long&gt; endOffsets) {
+<span class="nc" id="L503">        final Map&lt;TopicPartition, Long&gt; validatedTopicPartitionsOffsets = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">        for (final Map.Entry&lt;TopicPartition, Long&gt; topicPartitionAndOffset : inputTopicPartitionsAndOffset.entrySet()) {</span>
+<span class="nc" id="L505">            final long endOffset = endOffsets.get(topicPartitionAndOffset.getKey());</span>
+<span class="nc" id="L506">            final long offset = topicPartitionAndOffset.getValue();</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">            if (offset &lt; endOffset) {</span>
+<span class="nc" id="L508">                final long beginningOffset = beginningOffsets.get(topicPartitionAndOffset.getKey());</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">                if (offset &gt; beginningOffset) {</span>
+<span class="nc" id="L510">                    validatedTopicPartitionsOffsets.put(topicPartitionAndOffset.getKey(), offset);</span>
+                } else {
+<span class="nc" id="L512">                    System.out.println(&quot;New offset (&quot; + offset + &quot;) is lower than earliest offset. Value will be set to &quot; + beginningOffset);</span>
+<span class="nc" id="L513">                    validatedTopicPartitionsOffsets.put(topicPartitionAndOffset.getKey(), beginningOffset);</span>
+                }
+<span class="nc" id="L515">            } else {</span>
+<span class="nc" id="L516">                System.out.println(&quot;New offset (&quot; + offset + &quot;) is higher than latest offset. Value will be set to &quot; + endOffset);</span>
+<span class="nc" id="L517">                validatedTopicPartitionsOffsets.put(topicPartitionAndOffset.getKey(), endOffset);</span>
+            }
+<span class="nc" id="L519">        }</span>
+<span class="nc" id="L520">        return validatedTopicPartitionsOffsets;</span>
+    }
+
+    private int maybeDeleteInternalTopics(final Admin adminClient, final StreamsResetterOptions options) {
+<span class="nc" id="L524">        final List&lt;String&gt; inferredInternalTopics = allTopics.stream()</span>
+<span class="nc" id="L525">                .filter(options::isInferredInternalTopic)</span>
+<span class="nc" id="L526">                .collect(Collectors.toList());</span>
+<span class="nc" id="L527">        final List&lt;String&gt; specifiedInternalTopics = options.internalTopics();</span>
+        final List&lt;String&gt; topicsToDelete;
+
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        if (!specifiedInternalTopics.isEmpty()) {</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">            if (!new HashSet&lt;&gt;(inferredInternalTopics).containsAll(specifiedInternalTopics)) {</span>
+<span class="nc" id="L532">                throw new IllegalArgumentException(&quot;Invalid topic specified in the &quot;</span>
+                        + &quot;--internal-topics option. &quot;
+                        + &quot;Ensure that the topics specified are all internal topics. &quot;
+                        + &quot;Do a dry run without the --internal-topics option to see the &quot;
+                        + &quot;list of all internal topics that can be deleted.&quot;);
+            }
+
+<span class="nc" id="L539">            topicsToDelete = specifiedInternalTopics;</span>
+<span class="nc" id="L540">            System.out.println(&quot;Deleting specified internal topics &quot; + topicsToDelete);</span>
+        } else {
+<span class="nc" id="L542">            topicsToDelete = inferredInternalTopics;</span>
+<span class="nc" id="L543">            System.out.println(&quot;Deleting inferred internal topics &quot; + topicsToDelete);</span>
+        }
+
+<span class="nc bnc" id="L546" title="All 2 branches missed.">        if (!options.hasDryRun()) {</span>
+<span class="nc" id="L547">            doDelete(topicsToDelete, adminClient);</span>
+        }
+
+<span class="nc" id="L550">        System.out.println(&quot;Done.&quot;);</span>
+<span class="nc" id="L551">        return EXIT_CODE_SUCCESS;</span>
+    }
+
+    // visible for testing
+    public void doDelete(final List&lt;String&gt; topicsToDelete, final Admin adminClient) {
+<span class="nc" id="L556">        boolean hasDeleteErrors = false;</span>
+<span class="nc" id="L557">        final DeleteTopicsResult deleteTopicsResult = adminClient.deleteTopics(topicsToDelete);</span>
+<span class="nc" id="L558">        final Map&lt;String, KafkaFuture&lt;Void&gt;&gt; results = deleteTopicsResult.topicNameValues();</span>
+
+<span class="nc bnc" id="L560" title="All 2 branches missed.">        for (final Map.Entry&lt;String, KafkaFuture&lt;Void&gt;&gt; entry : results.entrySet()) {</span>
+            try {
+<span class="nc" id="L562">                entry.getValue().get(30, TimeUnit.SECONDS);</span>
+<span class="nc" id="L563">            } catch (final Exception e) {</span>
+<span class="nc" id="L564">                System.err.println(&quot;ERROR: deleting topic &quot; + entry.getKey());</span>
+<span class="nc" id="L565">                e.printStackTrace(System.err);</span>
+<span class="nc" id="L566">                hasDeleteErrors = true;</span>
+<span class="nc" id="L567">            }</span>
+<span class="nc" id="L568">        }</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        if (hasDeleteErrors) {</span>
+<span class="nc" id="L570">            throw new RuntimeException(&quot;Encountered an error deleting one or more topics&quot;);</span>
+        }
+<span class="nc" id="L572">    }</span>
+
+    // visible for testing
+    public static boolean matchesInternalTopicFormat(final String topicName) {
+<span class="nc bnc" id="L576" title="All 4 branches missed.">        return topicName.endsWith(&quot;-changelog&quot;) || topicName.endsWith(&quot;-repartition&quot;)</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">               || topicName.endsWith(&quot;-subscription-registration-topic&quot;)</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">               || topicName.endsWith(&quot;-subscription-response-topic&quot;)</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">               || topicName.matches(&quot;.+-KTABLE-FK-JOIN-SUBSCRIPTION-REGISTRATION-\\d+-topic&quot;)</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">               || topicName.matches(&quot;.+-KTABLE-FK-JOIN-SUBSCRIPTION-RESPONSE-\\d+-topic&quot;);</span>
+    }
+
+    private static class StreamsResetterOptions extends CommandDefaultOptions {
+        private final OptionSpec&lt;String&gt; bootstrapServerOption;
+        private final OptionSpec&lt;String&gt; applicationIdOption;
+        private final OptionSpec&lt;String&gt; inputTopicsOption;
+        private final OptionSpec&lt;String&gt; intermediateTopicsOption;
+        private final OptionSpec&lt;String&gt; internalTopicsOption;
+        private final OptionSpec&lt;Long&gt; toOffsetOption;
+        private final OptionSpec&lt;String&gt; toDatetimeOption;
+        private final OptionSpec&lt;String&gt; byDurationOption;
+        private final OptionSpecBuilder toEarliestOption;
+        private final OptionSpecBuilder toLatestOption;
+        private final OptionSpec&lt;String&gt; fromFileOption;
+        private final OptionSpec&lt;Long&gt; shiftByOption;
+        private final OptionSpecBuilder dryRunOption;
+        @Deprecated(since = &quot;4.2&quot;, forRemoval = true)
+        private final OptionSpec&lt;String&gt; configOption;
+        private final OptionSpec&lt;String&gt; commandConfigOption;
+        private final OptionSpecBuilder forceOption;
+
+        public StreamsResetterOptions(String[] args) {
+<span class="nc" id="L603">            super(args);</span>
+<span class="nc" id="L604">            applicationIdOption = parser.accepts(&quot;application-id&quot;, &quot;REQUIRED: The Kafka Streams application ID (application.id).&quot;)</span>
+<span class="nc" id="L605">                .withRequiredArg()</span>
+<span class="nc" id="L606">                .ofType(String.class)</span>
+<span class="nc" id="L607">                .describedAs(&quot;id&quot;)</span>
+<span class="nc" id="L608">                .required();</span>
+<span class="nc" id="L609">            bootstrapServerOption = parser.accepts(&quot;bootstrap-server&quot;, &quot;The server(s) to connect to. The broker list string in the form HOST1:PORT1,HOST2:PORT2. (default: localhost:9092)&quot;)</span>
+<span class="nc" id="L610">                .withRequiredArg()</span>
+<span class="nc" id="L611">                .ofType(String.class)</span>
+<span class="nc" id="L612">                .describedAs(&quot;server to connect to&quot;);</span>
+<span class="nc" id="L613">            inputTopicsOption = parser.accepts(&quot;input-topics&quot;, &quot;Comma-separated list of user input topics. For these topics, the tool by default will reset the offset to the earliest available offset. &quot;</span>
+                    + &quot;Reset to other offset position by appending other reset offset option, ex: --input-topics foo --shift-by 5&quot;)
+<span class="nc" id="L615">                .withRequiredArg()</span>
+<span class="nc" id="L616">                .ofType(String.class)</span>
+<span class="nc" id="L617">                .withValuesSeparatedBy(',')</span>
+<span class="nc" id="L618">                .describedAs(&quot;list&quot;);</span>
+<span class="nc" id="L619">            intermediateTopicsOption = parser.accepts(&quot;intermediate-topics&quot;, &quot;[deprecated] Comma-separated list of intermediate user topics (topics that are input and output topics). &quot;</span>
+                    + &quot;For these topics, the tool will skip to the end.&quot;)
+<span class="nc" id="L621">                .withRequiredArg()</span>
+<span class="nc" id="L622">                .ofType(String.class)</span>
+<span class="nc" id="L623">                .withValuesSeparatedBy(',')</span>
+<span class="nc" id="L624">                .describedAs(&quot;list&quot;);</span>
+<span class="nc" id="L625">            internalTopicsOption = parser.accepts(&quot;internal-topics&quot;, &quot;Comma-separated list of &quot;</span>
+                    + &quot;internal topics to delete. Must be a subset of the internal topics marked for deletion by the &quot;
+                    + &quot;default behaviour (do a dry-run without this option to view these topics).&quot;)
+<span class="nc" id="L628">                .withRequiredArg()</span>
+<span class="nc" id="L629">                .ofType(String.class)</span>
+<span class="nc" id="L630">                .withValuesSeparatedBy(',')</span>
+<span class="nc" id="L631">                .describedAs(&quot;list&quot;);</span>
+<span class="nc" id="L632">            toOffsetOption = parser.accepts(&quot;to-offset&quot;, &quot;Reset offsets to a specific offset.&quot;)</span>
+<span class="nc" id="L633">                .withRequiredArg()</span>
+<span class="nc" id="L634">                .ofType(Long.class);</span>
+<span class="nc" id="L635">            toDatetimeOption = parser.accepts(&quot;to-datetime&quot;, &quot;Reset offsets to offset from datetime. Format: 'YYYY-MM-DDThh:mm:ss.sss'&quot;)</span>
+<span class="nc" id="L636">                .withRequiredArg()</span>
+<span class="nc" id="L637">                .ofType(String.class);</span>
+<span class="nc" id="L638">            byDurationOption = parser.accepts(&quot;by-duration&quot;, &quot;Reset offsets to offset by duration from current timestamp. Format: 'PnDTnHnMnS'&quot;)</span>
+<span class="nc" id="L639">                .withRequiredArg()</span>
+<span class="nc" id="L640">                .ofType(String.class);</span>
+<span class="nc" id="L641">            toEarliestOption = parser.accepts(&quot;to-earliest&quot;, &quot;Reset offsets to earliest offset.&quot;);</span>
+<span class="nc" id="L642">            toLatestOption = parser.accepts(&quot;to-latest&quot;, &quot;Reset offsets to latest offset.&quot;);</span>
+<span class="nc" id="L643">            fromFileOption = parser.accepts(&quot;from-file&quot;, &quot;Reset offsets to values defined in CSV file.&quot;)</span>
+<span class="nc" id="L644">                .withRequiredArg()</span>
+<span class="nc" id="L645">                .ofType(String.class);</span>
+<span class="nc" id="L646">            shiftByOption = parser.accepts(&quot;shift-by&quot;, &quot;Reset offsets shifting current offset by 'n', where 'n' can be positive or negative&quot;)</span>
+<span class="nc" id="L647">                .withRequiredArg()</span>
+<span class="nc" id="L648">                .describedAs(&quot;number-of-offsets&quot;)</span>
+<span class="nc" id="L649">                .ofType(Long.class);</span>
+<span class="nc" id="L650">            configOption = parser.accepts(&quot;config-file&quot;, &quot;(DEPRECATED) Property file containing configs to be passed to admin clients and embedded consumer. &quot;</span>
+                    + &quot;This option will be removed in a future version. Use --command-config instead.&quot;)
+<span class="nc" id="L652">                .withRequiredArg()</span>
+<span class="nc" id="L653">                .ofType(String.class)</span>
+<span class="nc" id="L654">                .describedAs(&quot;file name&quot;);</span>
+<span class="nc" id="L655">            commandConfigOption = parser.accepts(&quot;command-config&quot;, &quot;Config properties file to be passed to admin clients and embedded consumer.&quot;)</span>
+<span class="nc" id="L656">                .withRequiredArg()</span>
+<span class="nc" id="L657">                .ofType(String.class)</span>
+<span class="nc" id="L658">                .describedAs(&quot;file name&quot;);</span>
+<span class="nc" id="L659">            forceOption = parser.accepts(&quot;force&quot;, &quot;Force the removal of members of the consumer group (intended to remove stopped members if a long session timeout was used). &quot; +</span>
+                &quot;Make sure to shut down all stream applications when this option is specified to avoid unexpected rebalances.&quot;);
+
+<span class="nc" id="L662">            dryRunOption = parser.accepts(&quot;dry-run&quot;, &quot;Display the actions that would be performed without executing the reset commands.&quot;);</span>
+
+            try {
+<span class="nc" id="L665">                options = parser.parse(args);</span>
+<span class="nc" id="L666">                CommandLineUtils.maybePrintHelpOrVersion(this, USAGE);</span>
+<span class="nc" id="L667">                CommandLineUtils.checkInvalidArgs(parser, options, toOffsetOption, toDatetimeOption, byDurationOption, toEarliestOption, toLatestOption, fromFileOption, shiftByOption);</span>
+<span class="nc" id="L668">                CommandLineUtils.checkInvalidArgs(parser, options, toDatetimeOption, toOffsetOption, byDurationOption, toEarliestOption, toLatestOption, fromFileOption, shiftByOption);</span>
+<span class="nc" id="L669">                CommandLineUtils.checkInvalidArgs(parser, options, byDurationOption, toOffsetOption, toDatetimeOption, toEarliestOption, toLatestOption, fromFileOption, shiftByOption);</span>
+<span class="nc" id="L670">                CommandLineUtils.checkInvalidArgs(parser, options, toEarliestOption, toOffsetOption, toDatetimeOption, byDurationOption, toLatestOption, fromFileOption, shiftByOption);</span>
+<span class="nc" id="L671">                CommandLineUtils.checkInvalidArgs(parser, options, toLatestOption, toOffsetOption, toDatetimeOption, byDurationOption, toEarliestOption, fromFileOption, shiftByOption);</span>
+<span class="nc" id="L672">                CommandLineUtils.checkInvalidArgs(parser, options, fromFileOption, toOffsetOption, toDatetimeOption, byDurationOption, toEarliestOption, toLatestOption, shiftByOption);</span>
+<span class="nc" id="L673">                CommandLineUtils.checkInvalidArgs(parser, options, shiftByOption, toOffsetOption, toDatetimeOption, byDurationOption, toEarliestOption, toLatestOption, fromFileOption);</span>
+<span class="nc" id="L674">                CommandLineUtils.checkInvalidArgs(parser, options, configOption, commandConfigOption);</span>
+<span class="nc" id="L675">            } catch (final OptionException e) {</span>
+<span class="nc" id="L676">                CommandLineUtils.printUsageAndExit(parser, e.getMessage());</span>
+<span class="nc" id="L677">            }</span>
+<span class="nc" id="L678">        }</span>
+
+        public boolean hasDryRun() {
+<span class="nc" id="L681">            return options.has(dryRunOption);</span>
+        }
+
+        public String applicationId() {
+<span class="nc" id="L685">            return options.valueOf(applicationIdOption);</span>
+        }
+
+        public boolean hasConfig() {
+<span class="nc" id="L689">            return options.has(configOption);</span>
+        }
+
+        public String config() {
+<span class="nc" id="L693">            return options.valueOf(configOption);</span>
+        }
+
+        public String commandConfig() {
+<span class="nc" id="L697">            return options.valueOf(commandConfigOption);</span>
+        }
+
+        public boolean hasBootstrapServer() {
+<span class="nc" id="L701">            return options.has(bootstrapServerOption);</span>
+        }
+
+        public String bootstrapServer() {
+<span class="nc" id="L705">            return options.valueOf(bootstrapServerOption);</span>
+        }
+
+        public boolean hasForce() {
+<span class="nc" id="L709">            return options.has(forceOption);</span>
+        }
+
+        public List&lt;String&gt; inputTopicsOption() {
+<span class="nc" id="L713">            return options.valuesOf(inputTopicsOption);</span>
+        }
+
+        public List&lt;String&gt; intermediateTopicsOption() {
+<span class="nc bnc" id="L717" title="All 2 branches missed.">            if (options.has(intermediateTopicsOption)) {</span>
+<span class="nc" id="L718">                System.out.println(&quot;WARN: `--intermediate-topics` is deprecated and will be removed in a future release&quot;);</span>
+            }
+<span class="nc" id="L720">            return options.valuesOf(intermediateTopicsOption);</span>
+        }
+
+        public boolean hasToOffset() {
+<span class="nc" id="L724">            return options.has(toOffsetOption);</span>
+        }
+
+        public long toOffset() {
+<span class="nc" id="L728">            return options.valueOf(toOffsetOption);</span>
+        }
+
+        public boolean hasToEarliest() {
+<span class="nc" id="L732">            return options.has(toEarliestOption);</span>
+        }
+
+        public boolean hasToLatest() {
+<span class="nc" id="L736">            return options.has(toLatestOption);</span>
+        }
+
+        public boolean hasShiftBy() {
+<span class="nc" id="L740">            return options.has(shiftByOption);</span>
+        }
+
+        public long shiftBy() {
+<span class="nc" id="L744">            return options.valueOf(shiftByOption);</span>
+        }
+
+        public boolean hasToDatetime() {
+<span class="nc" id="L748">            return options.has(toDatetimeOption);</span>
+        }
+
+        public String toDatetime() {
+<span class="nc" id="L752">            return options.valueOf(toDatetimeOption);</span>
+        }
+
+        public boolean hasByDuration() {
+<span class="nc" id="L756">            return options.has(byDurationOption);</span>
+        }
+
+        public String byDuration() {
+<span class="nc" id="L760">            return options.valueOf(byDurationOption);</span>
+        }
+
+        public boolean hasFromFile() {
+<span class="nc" id="L764">            return options.has(fromFileOption);</span>
+        }
+
+        public String fromFile() {
+<span class="nc" id="L768">            return options.valueOf(fromFileOption);</span>
+        }
+
+        public boolean isInputTopic(String topic) {
+<span class="nc" id="L772">            return options.valuesOf(inputTopicsOption).contains(topic);</span>
+        }
+
+        public boolean isIntermediateTopic(String topic) {
+<span class="nc" id="L776">            return options.valuesOf(intermediateTopicsOption).contains(topic);</span>
+        }
+
+        private boolean isInferredInternalTopic(final String topicName) {
+            // Specified input/intermediate topics might be named like internal topics (by chance).
+            // Even is this is not expected in general, we need to exclude those topics here
+            // and don't consider them as internal topics even if they follow the same naming schema.
+            // Cf. https://issues.apache.org/jira/browse/KAFKA-7930
+<span class="nc bnc" id="L784" title="All 6 branches missed.">            return !isInputTopic(topicName) &amp;&amp; !isIntermediateTopic(topicName) &amp;&amp; topicName.startsWith(options.valueOf(applicationIdOption) + &quot;-&quot;)</span>
+<span class="nc bnc" id="L785" title="All 2 branches missed.">                &amp;&amp; matchesInternalTopicFormat(topicName);</span>
+        }
+
+        public List&lt;String&gt; internalTopics() {
+<span class="nc" id="L789">            return options.valuesOf(internalTopicsOption);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

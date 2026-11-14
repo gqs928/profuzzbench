@@ -1,0 +1,934 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>QuorumState.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.raft</a> &gt; <span class="el_source">QuorumState.java</span></div><h1>QuorumState.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.raft;
+
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.feature.SupportedVersionRange;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.raft.internals.BatchAccumulator;
+import org.apache.kafka.raft.internals.KRaftControlRecordStateMachine;
+import org.apache.kafka.raft.internals.KafkaRaftMetrics;
+import org.apache.kafka.server.common.OffsetAndEpoch;
+
+import org.slf4j.Logger;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Random;
+
+/**
+ * This class is responsible for managing the current state of this node and ensuring
+ * only valid state transitions. Below we define the possible state transitions and
+ * how they are triggered:
+ *
+ * Resigned transitions to:
+ *    Unattached:  After learning of a new election with a higher epoch, or expiration of the election timeout
+ *    Follower:    After discovering a leader with a larger epoch
+ *
+ * Unattached transitions to:
+ *    Unattached:  After learning of a new election with a higher epoch or after giving a binding vote
+ *    Prospective: After expiration of the election timeout
+ *    Follower:    After discovering a leader with an equal or larger epoch
+ *
+ * Prospective transitions to:
+ *    Unattached:  After learning of an election with a higher epoch, or node did not have last
+ *                 known leader and loses/times out election
+ *    Candidate:   After receiving a majority of PreVotes granted
+ *    Follower:    After discovering a leader with a larger epoch, or node had a last known leader
+ *                 and loses/times out election
+ *
+ * Candidate transitions to:
+ *    Unattached:  After learning of a new election with a higher epoch
+ *    Prospective: After expiration of the election timeout or loss of election
+ *    Leader:      After receiving a majority of votes
+ *
+ * Leader transitions to:
+ *    Unattached:  After learning of a new election with a higher epoch
+ *    Resigned:    When shutting down gracefully
+ *    Follower:    After discovering a leader with a larger epoch
+ *
+ * Follower transitions to:
+ *    Unattached:  After learning of a new election with a higher epoch
+ *    Prospective: After expiration of the fetch timeout
+ *    Follower:    After discovering a leader with a larger epoch
+ *
+ * Observers follow a simpler state machine. The Prospective/Candidate/Leader/Resigned
+ * states are not possible for observers, so the only transitions that are possible
+ * are between Unattached and Follower.
+ *
+ * Unattached transitions to:
+ *    Unattached: After learning of a new election with a higher epoch
+ *    Follower:   After discovering a leader with an equal or larger epoch
+ *
+ * Follower transitions to:
+ *    Unattached: After learning of a new election with a higher epoch
+ *    Follower:   After discovering a leader with a larger epoch
+ *
+ */
+public class QuorumState {
+    private final OptionalInt localId;
+    private final Uuid localDirectoryId;
+    private final Time time;
+    private final Logger log;
+    private final QuorumStateStore store;
+    private final KRaftControlRecordStateMachine partitionState;
+    private final Endpoints localListeners;
+    private final SupportedVersionRange localSupportedKRaftVersion;
+    private final Random random;
+    private final int electionTimeoutMs;
+    private final int fetchTimeoutMs;
+    private final LogContext logContext;
+    private final KafkaRaftMetrics kafkaRaftMetrics;
+
+    private volatile EpochState state;
+
+    public QuorumState(
+        OptionalInt localId,
+        Uuid localDirectoryId,
+        KRaftControlRecordStateMachine partitionState,
+        Endpoints localListeners,
+        SupportedVersionRange localSupportedKRaftVersion,
+        int electionTimeoutMs,
+        int fetchTimeoutMs,
+        QuorumStateStore store,
+        Time time,
+        LogContext logContext,
+        Random random,
+        KafkaRaftMetrics kafkaRaftMetrics
+<span class="nc" id="L114">    ) {</span>
+<span class="nc" id="L115">        this.localId = localId;</span>
+<span class="nc" id="L116">        this.localDirectoryId = localDirectoryId;</span>
+<span class="nc" id="L117">        this.partitionState = partitionState;</span>
+<span class="nc" id="L118">        this.localListeners = localListeners;</span>
+<span class="nc" id="L119">        this.localSupportedKRaftVersion = localSupportedKRaftVersion;</span>
+<span class="nc" id="L120">        this.electionTimeoutMs = electionTimeoutMs;</span>
+<span class="nc" id="L121">        this.fetchTimeoutMs = fetchTimeoutMs;</span>
+<span class="nc" id="L122">        this.store = store;</span>
+<span class="nc" id="L123">        this.time = time;</span>
+<span class="nc" id="L124">        this.log = logContext.logger(QuorumState.class);</span>
+<span class="nc" id="L125">        this.random = random;</span>
+<span class="nc" id="L126">        this.logContext = logContext;</span>
+<span class="nc" id="L127">        this.kafkaRaftMetrics = kafkaRaftMetrics;</span>
+<span class="nc" id="L128">    }</span>
+
+    private ElectionState readElectionState() {
+        ElectionState election;
+<span class="nc" id="L132">        election = store</span>
+<span class="nc" id="L133">            .readElectionState()</span>
+<span class="nc" id="L134">            .orElseGet(</span>
+<span class="nc" id="L135">                () -&gt; ElectionState.withUnknownLeader(0, partitionState.lastVoterSet().voterIds())</span>
+            );
+
+<span class="nc" id="L138">        return election;</span>
+    }
+
+    public void initialize(OffsetAndEpoch logEndOffsetAndEpoch) throws IllegalStateException {
+        // We initialize in whatever state we were in on shutdown. If we were a leader
+        // or candidate, probably an election was held, but we will find out about it
+        // when we send Vote or BeginEpoch requests.
+<span class="nc" id="L145">        ElectionState election = readElectionState();</span>
+
+        final EpochState initialState;
+<span class="nc bnc" id="L148" title="All 4 branches missed.">        if (election.hasVoted() &amp;&amp; localId.isEmpty()) {</span>
+<span class="nc" id="L149">            throw new IllegalStateException(</span>
+<span class="nc" id="L150">                String.format(</span>
+                    &quot;Initialized quorum state (%s) with a voted candidate but without a local id&quot;,
+                    election
+                )
+            );
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        } else if (election.epoch() &lt; logEndOffsetAndEpoch.epoch()) {</span>
+<span class="nc" id="L156">            log.warn(</span>
+                &quot;Epoch from quorum store file ({}) is {}, which is smaller than last written &quot; +
+                &quot;epoch {} in the log&quot;,
+<span class="nc" id="L159">                store.path(),</span>
+<span class="nc" id="L160">                election.epoch(),</span>
+<span class="nc" id="L161">                logEndOffsetAndEpoch.epoch()</span>
+            );
+<span class="nc" id="L163">            initialState = new UnattachedState(</span>
+                time,
+<span class="nc" id="L165">                logEndOffsetAndEpoch.epoch(),</span>
+<span class="nc" id="L166">                OptionalInt.empty(),</span>
+<span class="nc" id="L167">                Optional.empty(),</span>
+<span class="nc" id="L168">                partitionState.lastVoterSet().voterIds(),</span>
+<span class="nc" id="L169">                Optional.empty(),</span>
+<span class="nc" id="L170">                randomElectionTimeoutMs(),</span>
+                logContext
+            );
+<span class="nc bnc" id="L173" title="All 4 branches missed.">        } else if (localId.isPresent() &amp;&amp; election.isLeader(localId.getAsInt())) {</span>
+            // If we were previously a leader, then we will start out as resigned
+            // in the same epoch. This serves two purposes:
+            // 1. It ensures that we cannot vote for another leader in the same epoch.
+            // 2. It protects the invariant that each record is uniquely identified by
+            //    offset and epoch, which might otherwise be violated if unflushed data
+            //    is lost after restarting.
+<span class="nc" id="L180">            initialState = new ResignedState(</span>
+                time,
+<span class="nc" id="L182">                localId.getAsInt(),</span>
+<span class="nc" id="L183">                election.epoch(),</span>
+<span class="nc" id="L184">                partitionState.lastVoterSet().voterIds(),</span>
+<span class="nc" id="L185">                randomElectionTimeoutMs(),</span>
+<span class="nc" id="L186">                List.of(),</span>
+                localListeners,
+                logContext
+            );
+<span class="nc" id="L190">        } else if (</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            localId.isPresent() &amp;&amp;</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">            election.isVotedCandidate(ReplicaKey.of(localId.getAsInt(), localDirectoryId))</span>
+        ) {
+<span class="nc" id="L194">            initialState = new CandidateState(</span>
+                time,
+<span class="nc" id="L196">                localId.getAsInt(),</span>
+                localDirectoryId,
+<span class="nc" id="L198">                election.epoch(),</span>
+<span class="nc" id="L199">                partitionState.lastVoterSet(),</span>
+<span class="nc" id="L200">                Optional.empty(),</span>
+<span class="nc" id="L201">                randomElectionTimeoutMs(),</span>
+                logContext
+            );
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        } else if (election.hasLeader()) {</span>
+<span class="nc" id="L205">            VoterSet voters = partitionState.lastVoterSet();</span>
+<span class="nc" id="L206">            Endpoints leaderEndpoints = voters.listeners(election.leaderId());</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            if (leaderEndpoints.isEmpty()) {</span>
+                // Since the leader's endpoints are not known, it cannot send Fetch or
+                // FetchSnapshot requests to the leader.
+                //
+                // Transition to unattached instead and discover the leader's endpoint through
+                // Fetch requests to the bootstrap servers or from a BeginQuorumEpoch request from
+                // the leader.
+<span class="nc" id="L214">                log.info(</span>
+                    &quot;The leader in election state {} is not a member of the latest voter set {}; &quot; +
+                    &quot;transitioning to unattached instead of follower because the leader's &quot; +
+                    &quot;endpoints are not known&quot;,
+                    election,
+                    voters
+                );
+
+<span class="nc" id="L222">                initialState = new UnattachedState(</span>
+                    time,
+<span class="nc" id="L224">                    election.epoch(),</span>
+<span class="nc" id="L225">                    OptionalInt.of(election.leaderId()),</span>
+<span class="nc" id="L226">                    election.optionalVotedKey(),</span>
+<span class="nc" id="L227">                    partitionState.lastVoterSet().voterIds(),</span>
+<span class="nc" id="L228">                    Optional.empty(),</span>
+<span class="nc" id="L229">                    randomElectionTimeoutMs(),</span>
+                    logContext
+                );
+            } else {
+<span class="nc" id="L233">                initialState = new FollowerState(</span>
+                    time,
+<span class="nc" id="L235">                    election.epoch(),</span>
+<span class="nc" id="L236">                    election.leaderId(),</span>
+                    leaderEndpoints,
+<span class="nc" id="L238">                    election.optionalVotedKey(),</span>
+<span class="nc" id="L239">                    voters.voterIds(),</span>
+<span class="nc" id="L240">                    Optional.empty(),</span>
+                    fetchTimeoutMs,
+                    logContext
+                );
+            }
+<span class="nc" id="L245">        } else {</span>
+<span class="nc" id="L246">            initialState = new UnattachedState(</span>
+                time,
+<span class="nc" id="L248">                election.epoch(),</span>
+<span class="nc" id="L249">                OptionalInt.empty(),</span>
+<span class="nc" id="L250">                election.optionalVotedKey(),</span>
+<span class="nc" id="L251">                partitionState.lastVoterSet().voterIds(),</span>
+<span class="nc" id="L252">                Optional.empty(),</span>
+<span class="nc" id="L253">                randomElectionTimeoutMs(),</span>
+                logContext
+            );
+        }
+
+<span class="nc" id="L258">        durableTransitionTo(initialState);</span>
+<span class="nc" id="L259">    }</span>
+
+    public boolean isOnlyVoter() {
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        return localId.isPresent() &amp;&amp;</span>
+            partitionState
+<span class="nc" id="L264">                .lastVoterSet()</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">                .isOnlyVoter(ReplicaKey.of(localId.getAsInt(), localDirectoryId));</span>
+    }
+
+    public int localIdOrSentinel() {
+<span class="nc" id="L269">        return localId.orElse(-1);</span>
+    }
+
+    public int localIdOrThrow() {
+<span class="nc" id="L273">        return localId.orElseThrow(() -&gt; new IllegalStateException(&quot;Required local id is not present&quot;));</span>
+    }
+
+    public OptionalInt localId() {
+<span class="nc" id="L277">        return localId;</span>
+    }
+
+    public Uuid localDirectoryId() {
+<span class="nc" id="L281">        return localDirectoryId;</span>
+    }
+
+    public ReplicaKey localReplicaKeyOrThrow() {
+<span class="nc" id="L285">        return ReplicaKey.of(localIdOrThrow(), localDirectoryId());</span>
+    }
+
+    public VoterSet.VoterNode localVoterNodeOrThrow() {
+<span class="nc" id="L289">        return VoterSet.VoterNode.of(</span>
+<span class="nc" id="L290">            localReplicaKeyOrThrow(),</span>
+            localListeners,
+            localSupportedKRaftVersion
+        );
+    }
+
+    public int epoch() {
+<span class="nc" id="L297">        return state.epoch();</span>
+    }
+
+    public int leaderIdOrSentinel() {
+<span class="nc" id="L301">        return state.election().leaderIdOrSentinel();</span>
+    }
+
+    public Optional&lt;LogOffsetMetadata&gt; highWatermark() {
+<span class="nc" id="L305">        return state.highWatermark();</span>
+    }
+
+    public OptionalInt leaderId() {
+<span class="nc" id="L309">        ElectionState election = state.election();</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        if (election.hasLeader())</span>
+<span class="nc" id="L311">            return OptionalInt.of(state.election().leaderId());</span>
+        else
+<span class="nc" id="L313">            return OptionalInt.empty();</span>
+    }
+
+    public Optional&lt;ReplicaKey&gt; votedKey() {
+<span class="nc" id="L317">        return state.election().optionalVotedKey();</span>
+    }
+
+    public boolean hasLeader() {
+<span class="nc" id="L321">        return leaderId().isPresent();</span>
+    }
+
+    public boolean hasRemoteLeader() {
+<span class="nc bnc" id="L325" title="All 4 branches missed.">        return hasLeader() &amp;&amp; leaderIdOrSentinel() != localIdOrSentinel();</span>
+    }
+
+    public Endpoints leaderEndpoints() {
+<span class="nc" id="L329">        return state.leaderEndpoints();</span>
+    }
+
+    public boolean isVoter() {
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        if (localId.isEmpty()) {</span>
+<span class="nc" id="L334">            return false;</span>
+        }
+
+<span class="nc" id="L337">        return partitionState</span>
+<span class="nc" id="L338">            .lastVoterSet()</span>
+<span class="nc" id="L339">            .isVoter(ReplicaKey.of(localId.getAsInt(), localDirectoryId));</span>
+    }
+
+    public boolean isVoter(ReplicaKey nodeKey) {
+<span class="nc" id="L343">        return partitionState.lastVoterSet().isVoter(nodeKey);</span>
+    }
+
+    public boolean isObserver() {
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        return !isVoter();</span>
+    }
+
+    public void transitionToResigned(List&lt;ReplicaKey&gt; preferredSuccessors) {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (!isLeader()) {</span>
+<span class="nc" id="L352">            throw new IllegalStateException(&quot;Invalid transition to Resigned state from &quot; + state);</span>
+        }
+
+        // The Resigned state is a soft state which does not need to be persisted.
+        // A leader will always be re-initialized in this state.
+<span class="nc" id="L357">        int epoch = state.epoch();</span>
+<span class="nc" id="L358">        memoryTransitionTo(</span>
+            new ResignedState(
+                time,
+<span class="nc" id="L361">                localIdOrThrow(),</span>
+                epoch,
+<span class="nc" id="L363">                partitionState.lastVoterSet().voterIds(),</span>
+<span class="nc" id="L364">                randomElectionTimeoutMs(),</span>
+                preferredSuccessors,
+                localListeners,
+                logContext
+            )
+        );
+<span class="nc" id="L370">    }</span>
+
+    /**
+     * Transition to the &quot;unattached&quot; state. This means one of the following
+     * 1. the replica has found an epoch greater than the current epoch.
+     * 2. the replica has transitioned from Prospective with the same epoch.
+     * 3. the replica has transitioned from Resigned with current epoch + 1.
+     * Note, if the replica is transitioning from unattached to add voted state and there is no epoch change,
+     * it takes the route of unattachedAddVotedState instead.
+     */
+    public void transitionToUnattached(int epoch, OptionalInt leaderId) {
+<span class="nc" id="L381">        int currentEpoch = state.epoch();</span>
+<span class="nc bnc" id="L382" title="All 6 branches missed.">        if (epoch &lt; currentEpoch || (epoch == currentEpoch &amp;&amp; !isProspective())) {</span>
+<span class="nc" id="L383">            throw new IllegalStateException(</span>
+<span class="nc" id="L384">                String.format(</span>
+                    &quot;Cannot transition to Unattached with epoch %d from current state %s&quot;,
+<span class="nc" id="L386">                    epoch,</span>
+                    state
+                )
+            );
+        }
+
+        final long electionTimeoutMs;
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (isObserver()) {</span>
+<span class="nc" id="L394">            electionTimeoutMs = Long.MAX_VALUE;</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        } else if (isCandidate()) {</span>
+<span class="nc" id="L396">            electionTimeoutMs = candidateStateOrThrow().remainingElectionTimeMs(time.milliseconds());</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        } else if (isUnattached()) {</span>
+<span class="nc" id="L398">            electionTimeoutMs = unattachedStateOrThrow().remainingElectionTimeMs(time.milliseconds());</span>
+<span class="nc bnc" id="L399" title="All 4 branches missed.">        } else if (isProspective() &amp;&amp; !prospectiveStateOrThrow().epochElection().isVoteRejected()) {</span>
+<span class="nc" id="L400">            electionTimeoutMs = prospectiveStateOrThrow().remainingElectionTimeMs(time.milliseconds());</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        } else if (isResigned()) {</span>
+<span class="nc" id="L402">            electionTimeoutMs = resignedStateOrThrow().remainingElectionTimeMs(time.milliseconds());</span>
+        } else {
+<span class="nc" id="L404">            electionTimeoutMs = randomElectionTimeoutMs();</span>
+        }
+
+        // If the local replica is transitioning to Unattached in the same epoch (i.e. from Prospective), it
+        // should retain its voted key if it exists, so that it will not vote again in the same epoch.
+<span class="nc bnc" id="L409" title="All 2 branches missed.">        Optional&lt;ReplicaKey&gt; votedKey = epoch == currentEpoch ? votedKey() : Optional.empty();</span>
+<span class="nc" id="L410">        durableTransitionTo(new UnattachedState(</span>
+            time,
+            epoch,
+            leaderId,
+            votedKey,
+<span class="nc" id="L415">            partitionState.lastVoterSet().voterIds(),</span>
+<span class="nc" id="L416">            state.highWatermark(),</span>
+            electionTimeoutMs,
+            logContext
+        ));
+<span class="nc" id="L420">    }</span>
+
+    /**
+     * Grant a vote to a candidate as Unattached. The replica will transition to Unattached with votedKey
+     * state in the same epoch and remain there until either the election timeout expires or it discovers the leader.
+     * Note, if the replica discovers a higher epoch or is transitioning from Prospective, it takes
+     * the route of transitionToUnattached instead.
+     */
+    public void unattachedAddVotedState(
+        int epoch,
+        ReplicaKey candidateKey
+    ) {
+<span class="nc" id="L432">        int currentEpoch = state.epoch();</span>
+<span class="nc bnc" id="L433" title="All 4 branches missed.">        if (localId.isPresent() &amp;&amp; candidateKey.id() == localId.getAsInt()) {</span>
+<span class="nc" id="L434">            throw new IllegalStateException(</span>
+<span class="nc" id="L435">                String.format(</span>
+                    &quot;Cannot add voted key (%s) to current state (%s) in epoch %d since it matches the local &quot; +
+                    &quot;broker.id&quot;,
+                    candidateKey,
+                    state,
+<span class="nc" id="L440">                    epoch</span>
+                )
+            );
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        } else if (localId.isEmpty()) {</span>
+<span class="nc" id="L444">            throw new IllegalStateException(&quot;Cannot add voted state without a replica id&quot;);</span>
+<span class="nc bnc" id="L445" title="All 4 branches missed.">        } else if (epoch != currentEpoch || !isUnattachedNotVoted()) {</span>
+<span class="nc" id="L446">            throw new IllegalStateException(</span>
+<span class="nc" id="L447">                String.format(</span>
+                    &quot;Cannot add voted key (%s) to current state (%s) in epoch %d&quot;,
+                    candidateKey,
+                    state,
+<span class="nc" id="L451">                    epoch</span>
+                )
+            );
+        }
+
+        // Note that we reset the election timeout after voting for a candidate because we
+        // know that the candidate has at least as good of a chance of getting elected as us
+<span class="nc" id="L458">        durableTransitionTo(</span>
+            new UnattachedState(
+                time,
+                epoch,
+<span class="nc" id="L462">                state.election().optionalLeaderId(),</span>
+<span class="nc" id="L463">                Optional.of(candidateKey),</span>
+<span class="nc" id="L464">                partitionState.lastVoterSet().voterIds(),</span>
+<span class="nc" id="L465">                state.highWatermark(),</span>
+<span class="nc" id="L466">                randomElectionTimeoutMs(),</span>
+                logContext
+            )
+        );
+<span class="nc" id="L470">    }</span>
+
+    /**
+     * Grant a vote to a candidate as Prospective. The replica will transition to Prospective with votedKey
+     * state in the same epoch. Note, if the replica is transitioning to Prospective due to a fetch/election timeout
+     * or loss of election as candidate, it takes the route of transitionToProspective instead.
+     */
+    public void prospectiveAddVotedState(
+        int epoch,
+        ReplicaKey candidateKey
+    ) {
+        // Verify the current state is prospective, this method should only be used to add voted state to
+        // prospective state. Transitions from other states to prospective use transitionToProspective instead.
+<span class="nc" id="L483">        prospectiveStateOrThrow();</span>
+<span class="nc" id="L484">        int currentEpoch = state.epoch();</span>
+<span class="nc bnc" id="L485" title="All 4 branches missed.">        if (localId.isPresent() &amp;&amp; candidateKey.id() == localId.getAsInt()) {</span>
+<span class="nc" id="L486">            throw new IllegalStateException(</span>
+<span class="nc" id="L487">                String.format(</span>
+                    &quot;Cannot add voted key (%s) to current state (%s) in epoch %d since it matches the local &quot; +
+                    &quot;broker.id&quot;,
+                    candidateKey,
+                    state,
+<span class="nc" id="L492">                    epoch</span>
+                )
+            );
+<span class="nc bnc" id="L495" title="All 2 branches missed.">        } else if (localId.isEmpty()) {</span>
+<span class="nc" id="L496">            throw new IllegalStateException(&quot;Cannot add voted state without a replica id&quot;);</span>
+<span class="nc bnc" id="L497" title="All 4 branches missed.">        } else if (epoch != currentEpoch || !isProspectiveNotVoted()) {</span>
+<span class="nc" id="L498">            throw new IllegalStateException(</span>
+<span class="nc" id="L499">                String.format(</span>
+                    &quot;Cannot add voted key (%s) to current state (%s) in epoch %d&quot;,
+                    candidateKey,
+                    state,
+<span class="nc" id="L503">                    epoch</span>
+                )
+            );
+        }
+
+        // Note that we reset the election timeout after voting for a candidate because we
+        // know that the candidate has at least as good of a chance of getting elected as us
+<span class="nc" id="L510">        durableTransitionTo(</span>
+            new ProspectiveState(
+                time,
+<span class="nc" id="L513">                localIdOrThrow(),</span>
+                epoch,
+<span class="nc" id="L515">                state.election().optionalLeaderId(),</span>
+<span class="nc" id="L516">                state.leaderEndpoints(),</span>
+<span class="nc" id="L517">                Optional.of(candidateKey),</span>
+<span class="nc" id="L518">                partitionState.lastVoterSet(),</span>
+<span class="nc" id="L519">                state.highWatermark(),</span>
+<span class="nc" id="L520">                randomElectionTimeoutMs(),</span>
+                logContext
+            )
+        );
+<span class="nc" id="L524">    }</span>
+
+    /**
+     * Become a follower of an elected leader so that we can begin fetching.
+     */
+    public void transitionToFollower(int epoch, int leaderId, Endpoints endpoints) {
+<span class="nc" id="L530">        int currentEpoch = state.epoch();</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">        if (endpoints.isEmpty()) {</span>
+<span class="nc" id="L532">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L533">                String.format(</span>
+                    &quot;Cannot transition to Follower with leader %s and epoch %s without a leader endpoint&quot;,
+<span class="nc" id="L535">                    leaderId,</span>
+<span class="nc" id="L536">                    epoch</span>
+                )
+            );
+<span class="nc bnc" id="L539" title="All 4 branches missed.">        } else if (localId.isPresent() &amp;&amp; leaderId == localId.getAsInt()) {</span>
+<span class="nc" id="L540">            throw new IllegalStateException(</span>
+<span class="nc" id="L541">                String.format(</span>
+                    &quot;Cannot transition to Follower with leader %s and epoch %s since it matches the local node.id %s&quot;,
+<span class="nc" id="L543">                    leaderId,</span>
+<span class="nc" id="L544">                    epoch,</span>
+                    localId
+                )
+            );
+<span class="nc bnc" id="L548" title="All 2 branches missed.">        } else if (epoch &lt; currentEpoch) {</span>
+<span class="nc" id="L549">            throw new IllegalStateException(</span>
+<span class="nc" id="L550">                String.format(</span>
+                    &quot;Cannot transition to Follower with leader %s and epoch %s since the current epoch %s is larger&quot;,
+<span class="nc" id="L552">                    leaderId,</span>
+<span class="nc" id="L553">                    epoch,</span>
+<span class="nc" id="L554">                    currentEpoch</span>
+                )
+            );
+<span class="nc bnc" id="L557" title="All 2 branches missed.">        } else if (epoch == currentEpoch) {</span>
+<span class="nc bnc" id="L558" title="All 4 branches missed.">            if (isFollower() &amp;&amp; state.leaderEndpoints().size() &gt;= endpoints.size()) {</span>
+<span class="nc" id="L559">                throw new IllegalStateException(</span>
+<span class="nc" id="L560">                    String.format(</span>
+                        &quot;Cannot transition to Follower with leader %s, epoch %s and endpoints %s from state %s&quot;,
+<span class="nc" id="L562">                        leaderId,</span>
+<span class="nc" id="L563">                        epoch,</span>
+                        endpoints,
+                        state
+                    )
+                );
+<span class="nc bnc" id="L568" title="All 2 branches missed.">            } else if (isLeader()) {</span>
+<span class="nc" id="L569">                throw new IllegalStateException(</span>
+<span class="nc" id="L570">                    String.format(</span>
+                        &quot;Cannot transition to Follower with leader %s and epoch %s from state %s&quot;,
+<span class="nc" id="L572">                        leaderId,</span>
+<span class="nc" id="L573">                        epoch,</span>
+                        state
+                    )
+                );
+            }
+        }
+
+        // State transitions within the same epoch should preserve voted key if it exists. This prevents
+        // replicas from voting multiple times in the same epoch, which could violate the Raft invariant of
+        // at most one leader elected in an epoch.
+<span class="nc bnc" id="L583" title="All 2 branches missed.">        Optional&lt;ReplicaKey&gt; votedKey = epoch == currentEpoch ? votedKey() : Optional.empty();</span>
+
+<span class="nc" id="L585">        durableTransitionTo(</span>
+            new FollowerState(
+                time,
+                epoch,
+                leaderId,
+                endpoints,
+                votedKey,
+<span class="nc" id="L592">                partitionState.lastVoterSet().voterIds(),</span>
+<span class="nc" id="L593">                state.highWatermark(),</span>
+                fetchTimeoutMs,
+                logContext
+            )
+        );
+<span class="nc" id="L598">    }</span>
+
+    /**
+     * Transition to the &quot;prospective&quot; state. This means the replica experienced a fetch/election timeout or
+     * loss of election as candidate. Note, if the replica is transitioning from prospective to add voted state
+     * and there is no epoch change, it takes the route of prospectiveAddVotedState instead.
+     */
+    public void transitionToProspective() {
+<span class="nc bnc" id="L606" title="All 2 branches missed.">        if (isObserver()) {</span>
+<span class="nc" id="L607">            throw new IllegalStateException(</span>
+<span class="nc" id="L608">                String.format(</span>
+                    &quot;Cannot transition to Prospective since the local id (%s) and directory id (%s) &quot; +
+                    &quot;is not one of the voters %s&quot;,
+                    localId,
+                    localDirectoryId,
+<span class="nc" id="L613">                    partitionState.lastVoterSet()</span>
+                )
+            );
+<span class="nc bnc" id="L616" title="All 4 branches missed.">        } else if (isLeader() || isProspective()) {</span>
+<span class="nc" id="L617">            throw new IllegalStateException(&quot;Cannot transition to Prospective since the local broker.id=&quot; + localId +</span>
+                &quot; is state &quot; + state);
+        }
+
+        // Durable transition is not necessary since there is no change to the persisted electionState
+<span class="nc" id="L622">        memoryTransitionTo(</span>
+            new ProspectiveState(
+                time,
+<span class="nc" id="L625">                localIdOrThrow(),</span>
+<span class="nc" id="L626">                epoch(),</span>
+<span class="nc" id="L627">                leaderId(),</span>
+<span class="nc" id="L628">                state.leaderEndpoints(),</span>
+<span class="nc" id="L629">                votedKey(),</span>
+<span class="nc" id="L630">                partitionState.lastVoterSet(),</span>
+<span class="nc" id="L631">                state.highWatermark(),</span>
+<span class="nc" id="L632">                randomElectionTimeoutMs(),</span>
+                logContext
+            )
+        );
+<span class="nc" id="L636">    }</span>
+
+    public void transitionToCandidate() {
+<span class="nc" id="L639">        checkValidTransitionToCandidate();</span>
+
+<span class="nc" id="L641">        int newEpoch = epoch() + 1;</span>
+<span class="nc" id="L642">        int electionTimeoutMs = randomElectionTimeoutMs();</span>
+
+<span class="nc" id="L644">        durableTransitionTo(new CandidateState(</span>
+            time,
+<span class="nc" id="L646">            localIdOrThrow(),</span>
+            localDirectoryId,
+            newEpoch,
+<span class="nc" id="L649">            partitionState.lastVoterSet(),</span>
+<span class="nc" id="L650">            state.highWatermark(),</span>
+            electionTimeoutMs,
+            logContext
+        ));
+<span class="nc" id="L654">    }</span>
+
+    private void checkValidTransitionToCandidate() {
+<span class="nc bnc" id="L657" title="All 2 branches missed.">        if (isObserver()) {</span>
+<span class="nc" id="L658">            throw new IllegalStateException(</span>
+<span class="nc" id="L659">                String.format(</span>
+                    &quot;Cannot transition to Candidate since the local id (%s) and directory id (%s) &quot; +
+                    &quot;is not one of the voters %s&quot;,
+                    localId,
+                    localDirectoryId,
+<span class="nc" id="L664">                    partitionState.lastVoterSet()</span>
+                )
+            );
+        }
+        // Only Prospective is allowed to transition to Candidate
+<span class="nc bnc" id="L669" title="All 2 branches missed.">        if (!isProspective()) {</span>
+<span class="nc" id="L670">            throw new IllegalStateException(</span>
+<span class="nc" id="L671">                String.format(</span>
+                    &quot;Cannot transition to Candidate since the local broker.id=%s is state %s&quot;,
+                    localId,
+                    state
+                )
+            );
+        }
+<span class="nc" id="L678">    }</span>
+
+    public &lt;T&gt; LeaderState&lt;T&gt; transitionToLeader(long epochStartOffset, BatchAccumulator&lt;T&gt; accumulator) {
+<span class="nc bnc" id="L681" title="All 2 branches missed.">        if (isObserver()) {</span>
+<span class="nc" id="L682">            throw new IllegalStateException(</span>
+<span class="nc" id="L683">                String.format(</span>
+                    &quot;Cannot transition to Leader since the local id (%s) and directory id (%s) &quot; +
+                    &quot;is not one of the voters %s&quot;,
+                    localId,
+                    localDirectoryId,
+<span class="nc" id="L688">                    partitionState.lastVoterSet()</span>
+                )
+            );
+<span class="nc bnc" id="L691" title="All 2 branches missed.">        } else if (!isCandidate()) {</span>
+<span class="nc" id="L692">            throw new IllegalStateException(&quot;Cannot transition to Leader from current state &quot; + state);</span>
+        }
+
+<span class="nc" id="L695">        CandidateState candidateState = candidateStateOrThrow();</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">        if (!candidateState.epochElection().isVoteGranted())</span>
+<span class="nc" id="L697">            throw new IllegalStateException(&quot;Cannot become leader without majority votes granted&quot;);</span>
+
+        // Note that the leader does not retain the high watermark that was known
+        // in the previous state. The reason for this is to protect the monotonicity
+        // of the global high watermark, which is exposed through the leader. The
+        // only way a new leader can be sure that the high watermark is increasing
+        // monotonically is to wait until a majority of the voters have reached the
+        // starting offset of the new epoch. The downside of this is that the local
+        // state machine is temporarily stalled by the advancement of the global
+        // high watermark even though it only depends on local monotonicity. We
+        // could address this problem by decoupling the local high watermark, but
+        // we typically expect the state machine to be caught up anyway.
+
+<span class="nc" id="L710">        LeaderState&lt;T&gt; state = new LeaderState&lt;&gt;(</span>
+            time,
+<span class="nc" id="L712">            localVoterNodeOrThrow(),</span>
+<span class="nc" id="L713">            epoch(),</span>
+            epochStartOffset,
+<span class="nc" id="L715">            partitionState.lastVoterSet(),</span>
+<span class="nc" id="L716">            partitionState.lastVoterSetOffset(),</span>
+<span class="nc" id="L717">            partitionState.lastKraftVersion(),</span>
+<span class="nc" id="L718">            candidateState.epochElection().grantingVoters(),</span>
+            accumulator,
+            fetchTimeoutMs,
+            logContext,
+            kafkaRaftMetrics
+        );
+
+<span class="nc" id="L725">        durableTransitionTo(state);</span>
+<span class="nc" id="L726">        return state;</span>
+    }
+
+    private void durableTransitionTo(EpochState newState) {
+<span class="nc" id="L730">        log.info(&quot;Attempting durable transition to {} from {}&quot;, newState, state);</span>
+<span class="nc" id="L731">        store.writeElectionState(newState.election(), partitionState.lastKraftVersion());</span>
+<span class="nc" id="L732">        memoryTransitionTo(newState);</span>
+<span class="nc" id="L733">    }</span>
+
+    private void memoryTransitionTo(EpochState newState) {
+<span class="nc bnc" id="L736" title="All 2 branches missed.">        if (state != null) {</span>
+<span class="nc" id="L737">            state.close();</span>
+        }
+
+<span class="nc" id="L740">        EpochState from = state;</span>
+<span class="nc" id="L741">        state = newState;</span>
+<span class="nc" id="L742">        log.info(&quot;Completed transition to {} from {}&quot;, newState, from);</span>
+<span class="nc" id="L743">    }</span>
+
+    private int randomElectionTimeoutMs() {
+<span class="nc bnc" id="L746" title="All 2 branches missed.">        if (electionTimeoutMs == 0)</span>
+<span class="nc" id="L747">            return 0;</span>
+<span class="nc" id="L748">        return electionTimeoutMs + random.nextInt(electionTimeoutMs);</span>
+    }
+
+    public boolean canGrantVote(ReplicaKey replicaKey, boolean isLogUpToDate, boolean isPreVote) {
+<span class="nc" id="L752">        return state.canGrantVote(replicaKey, isLogUpToDate, isPreVote);</span>
+    }
+
+    public FollowerState followerStateOrThrow() {
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        if (isFollower())</span>
+<span class="nc" id="L757">            return (FollowerState) state;</span>
+<span class="nc" id="L758">        throw new IllegalStateException(&quot;Expected to be Follower, but the current state is &quot; + state);</span>
+    }
+
+    public Optional&lt;UnattachedState&gt; maybeUnattachedState() {
+<span class="nc" id="L762">        EpochState fixedState = state;</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">        if (fixedState instanceof UnattachedState) {</span>
+<span class="nc" id="L764">            return Optional.of((UnattachedState) fixedState);</span>
+        } else {
+<span class="nc" id="L766">            return Optional.empty();</span>
+        }
+    }
+
+    public UnattachedState unattachedStateOrThrow() {
+<span class="nc" id="L771">        return maybeUnattachedState().orElseThrow(</span>
+<span class="nc" id="L772">            () -&gt; new IllegalStateException(&quot;Expected to be Unattached, but current state is &quot; + state)</span>
+        );
+    }
+
+    public &lt;T&gt; LeaderState&lt;T&gt; leaderStateOrThrow() {
+<span class="nc" id="L777">        return this.&lt;T&gt;maybeLeaderState()</span>
+<span class="nc" id="L778">            .orElseThrow(() -&gt; new IllegalStateException(&quot;Expected to be Leader, but current state is &quot; + state));</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public &lt;T&gt; Optional&lt;LeaderState&lt;T&gt;&gt; maybeLeaderState() {
+<span class="nc" id="L783">        EpochState fixedState = state;</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">        if (fixedState instanceof LeaderState) {</span>
+<span class="nc" id="L785">            return Optional.of((LeaderState&lt;T&gt;) fixedState);</span>
+        } else {
+<span class="nc" id="L787">            return Optional.empty();</span>
+        }
+    }
+
+    public ResignedState resignedStateOrThrow() {
+<span class="nc bnc" id="L792" title="All 2 branches missed.">        if (isResigned())</span>
+<span class="nc" id="L793">            return (ResignedState) state;</span>
+<span class="nc" id="L794">        throw new IllegalStateException(&quot;Expected to be Resigned, but current state is &quot; + state);</span>
+    }
+
+    public Optional&lt;ProspectiveState&gt; maybeProspectiveState() {
+<span class="nc" id="L798">        EpochState fixedState = state;</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">        if (fixedState instanceof ProspectiveState) {</span>
+<span class="nc" id="L800">            return Optional.of((ProspectiveState) fixedState);</span>
+        } else {
+<span class="nc" id="L802">            return Optional.empty();</span>
+        }
+    }
+
+    public ProspectiveState prospectiveStateOrThrow() {
+<span class="nc" id="L807">        return maybeProspectiveState().orElseThrow(</span>
+<span class="nc" id="L808">            () -&gt; new IllegalStateException(&quot;Expected to be Prospective, but current state is &quot; + state)</span>
+        );
+    }
+
+    public boolean isProspectiveNotVoted() {
+<span class="nc" id="L813">        return maybeProspectiveState().filter(prospective -&gt; prospective.votedKey().isEmpty()).isPresent();</span>
+    }
+
+    public boolean isProspectiveAndVoted() {
+<span class="nc" id="L817">        return maybeProspectiveState().flatMap(ProspectiveState::votedKey).isPresent();</span>
+    }
+
+    public CandidateState candidateStateOrThrow() {
+<span class="nc bnc" id="L821" title="All 2 branches missed.">        if (isCandidate())</span>
+<span class="nc" id="L822">            return (CandidateState) state;</span>
+<span class="nc" id="L823">        throw new IllegalStateException(&quot;Expected to be Candidate, but current state is &quot; + state);</span>
+    }
+
+    public NomineeState nomineeStateOrThrow() {
+<span class="nc bnc" id="L827" title="All 2 branches missed.">        if (isNomineeState())</span>
+<span class="nc" id="L828">            return (NomineeState) state;</span>
+<span class="nc" id="L829">        throw new IllegalStateException(&quot;Expected to be a NomineeState (Prospective or Candidate), &quot; +</span>
+            &quot;but current state is &quot; + state);
+    }
+
+    public LeaderAndEpoch leaderAndEpoch() {
+<span class="nc" id="L834">        return state.leaderAndEpoch();</span>
+    }
+
+    public boolean isFollower() {
+<span class="nc" id="L838">        return state instanceof FollowerState;</span>
+    }
+
+    public boolean isUnattached() {
+<span class="nc" id="L842">        return state instanceof UnattachedState;</span>
+    }
+
+    public boolean isUnattachedNotVoted() {
+<span class="nc" id="L846">        return maybeUnattachedState().filter(unattached -&gt; unattached.votedKey().isEmpty()).isPresent();</span>
+    }
+
+    public boolean isUnattachedAndVoted() {
+<span class="nc" id="L850">        return maybeUnattachedState().flatMap(UnattachedState::votedKey).isPresent();</span>
+    }
+
+    public boolean isLeader() {
+<span class="nc" id="L854">        return state instanceof LeaderState;</span>
+    }
+
+    public boolean isResigned() {
+<span class="nc" id="L858">        return state instanceof ResignedState;</span>
+    }
+
+    public boolean isProspective() {
+<span class="nc" id="L862">        return state instanceof ProspectiveState;</span>
+    }
+
+    public boolean isCandidate() {
+<span class="nc" id="L866">        return state instanceof CandidateState;</span>
+    }
+
+    public boolean isNomineeState() {
+<span class="nc" id="L870">        return state instanceof NomineeState;</span>
+    }
+
+    /**
+     * Determines if replica in unattached or prospective state can grant a vote request.
+     *
+     * @param leaderId local replica's optional leader id.
+     * @param votedKey local replica's optional voted key.
+     * @param epoch local replica's epoch
+     * @param replicaKey replicaKey of nominee which sent the vote request
+     * @param isLogUpToDate whether the log of the nominee is up-to-date with the local replica's log
+     * @param isPreVote whether the vote request is a PreVote request
+     * @param log logger
+     * @return true if the local replica can grant the vote request, false otherwise
+     */
+    public static boolean unattachedOrProspectiveCanGrantVote(
+        OptionalInt leaderId,
+        Optional&lt;ReplicaKey&gt; votedKey,
+        int epoch,
+        ReplicaKey replicaKey,
+        boolean isLogUpToDate,
+        boolean isPreVote,
+        Logger log
+    ) {
+<span class="nc bnc" id="L894" title="All 2 branches missed.">        if (isPreVote) {</span>
+<span class="nc bnc" id="L895" title="All 2 branches missed.">            if (!isLogUpToDate) {</span>
+<span class="nc" id="L896">                log.debug(</span>
+                    &quot;Rejecting Vote request (preVote=true) from prospective ({}) since prospective's log is not up to date with us&quot;,
+                    replicaKey
+                );
+            }
+<span class="nc" id="L901">            return isLogUpToDate;</span>
+<span class="nc bnc" id="L902" title="All 2 branches missed.">        } else if (votedKey.isPresent()) {</span>
+<span class="nc" id="L903">            ReplicaKey votedReplicaKey = votedKey.get();</span>
+<span class="nc bnc" id="L904" title="All 2 branches missed.">            if (votedReplicaKey.id() == replicaKey.id()) {</span>
+<span class="nc bnc" id="L905" title="All 4 branches missed.">                return votedReplicaKey.directoryId().isEmpty() || votedReplicaKey.directoryId().equals(replicaKey.directoryId());</span>
+            }
+<span class="nc" id="L907">            log.debug(</span>
+                &quot;Rejecting Vote request (preVote=false) from candidate ({}), already have voted for another &quot; +
+                    &quot;candidate ({}) in epoch {}&quot;,
+                replicaKey,
+                votedKey,
+<span class="nc" id="L912">                epoch</span>
+            );
+<span class="nc" id="L914">            return false;</span>
+<span class="nc bnc" id="L915" title="All 2 branches missed.">        } else if (leaderId.isPresent()) {</span>
+            // If the leader id is known it should behave similar to the follower state
+<span class="nc" id="L917">            log.debug(</span>
+                &quot;Rejecting Vote request (preVote=false) from candidate ({}) since we already have a leader {} in epoch {}&quot;,
+                replicaKey,
+<span class="nc" id="L920">                leaderId.getAsInt(),</span>
+<span class="nc" id="L921">                epoch</span>
+            );
+<span class="nc" id="L923">            return false;</span>
+<span class="nc bnc" id="L924" title="All 2 branches missed.">        } else if (!isLogUpToDate) {</span>
+<span class="nc" id="L925">            log.debug(</span>
+                &quot;Rejecting Vote request (preVote=false) from candidate ({}) since candidate's log is not up to date with us&quot;,
+                replicaKey
+            );
+        }
+
+<span class="nc" id="L931">        return isLogUpToDate;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

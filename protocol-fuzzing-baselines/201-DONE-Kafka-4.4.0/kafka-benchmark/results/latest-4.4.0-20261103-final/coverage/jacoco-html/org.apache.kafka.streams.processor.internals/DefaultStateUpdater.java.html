@@ -1,0 +1,1324 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DefaultStateUpdater.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">DefaultStateUpdater.java</span></div><h1>DefaultStateUpdater.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.internals.StreamsRebalanceData;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.internals.KafkaFutureImpl;
+import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.Sensor.RecordingLevel;
+import org.apache.kafka.common.metrics.stats.Rate;
+import org.apache.kafka.common.metrics.stats.Value;
+import org.apache.kafka.common.metrics.stats.WindowedCount;
+import org.apache.kafka.common.metrics.stats.WindowedSum;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.errors.TaskCorruptedException;
+import org.apache.kafka.streams.processor.StandbyUpdateListener;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.Task.State;
+import org.apache.kafka.streams.processor.internals.TaskAndAction.Action;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+
+import org.slf4j.Logger;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl.RATE_DESCRIPTION;
+import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl.THREAD_ID_TAG;
+import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl.THREAD_TIME_UNIT_DESCRIPTION;
+import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl.WINDOWED_RATIO_DESCRIPTION_PREFIX;
+
+public class DefaultStateUpdater implements StateUpdater {
+
+    private static final String NOT_RUNNING_ERROR_MESSAGE = &quot;The state updater is not running.&quot;;
+    private static final String BUG_ERROR_MESSAGE = &quot;This indicates a bug. &quot; +
+        &quot;Please report at https://issues.apache.org/jira/projects/KAFKA/issues or to the dev-mailing list (https://kafka.apache.org/contact).&quot;;
+
+    private class StateUpdaterThread extends Thread {
+
+        private final ChangelogReader changelogReader;
+        private final StateUpdaterMetrics updaterMetrics;
+<span class="nc" id="L91">        private final AtomicBoolean isRunning = new AtomicBoolean(true);</span>
+<span class="nc" id="L92">        private final AtomicBoolean isIdle = new AtomicBoolean(false);</span>
+<span class="nc" id="L93">        private final Map&lt;TaskId, Task&gt; updatingTasks = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L94">        private final Map&lt;TaskId, Task&gt; pausedTasks = new ConcurrentHashMap&lt;&gt;();</span>
+
+<span class="nc" id="L96">        private final WindowedSum idleTimeWindowedSum = new WindowedSum();</span>
+<span class="nc" id="L97">        private final WindowedSum checkpointTimeWindowedSum = new WindowedSum();</span>
+<span class="nc" id="L98">        private final WindowedSum activeRestoreTimeWindowedSum = new WindowedSum();</span>
+<span class="nc" id="L99">        private final WindowedSum standbyRestoreTimeWindowedSum = new WindowedSum();</span>
+<span class="nc" id="L100">        private final WindowedSum runOnceLatencyWindowedSum = new WindowedSum();</span>
+        private final MetricConfig metricsConfig;
+
+<span class="nc" id="L103">        private boolean timeWindowInitialized = false;</span>
+
+<span class="nc" id="L105">        private long totalCheckpointLatency = 0L;</span>
+
+<span class="nc" id="L107">        private volatile long fetchDeadlineClientInstanceId = -1L;</span>
+<span class="nc" id="L108">        private volatile KafkaFutureImpl&lt;Uuid&gt; clientInstanceIdFuture = new KafkaFutureImpl&lt;&gt;();</span>
+
+        public StateUpdaterThread(final String name,
+                                  final StreamsMetricsImpl metrics,
+<span class="nc" id="L112">                                  final ChangelogReader changelogReader) {</span>
+<span class="nc" id="L113">            super(name);</span>
+            // daemon: internal helper thread must not block JVM shutdown on its own
+<span class="nc" id="L115">            setDaemon(true);</span>
+<span class="nc" id="L116">            this.changelogReader = changelogReader;</span>
+<span class="nc" id="L117">            this.updaterMetrics = new StateUpdaterMetrics(metrics, name);</span>
+<span class="nc" id="L118">            this.metricsConfig = metrics.metricsRegistry().config();</span>
+<span class="nc" id="L119">        }</span>
+
+        public Collection&lt;Task&gt; updatingTasks() {
+<span class="nc" id="L122">            return updatingTasks.values();</span>
+        }
+
+        public Collection&lt;StandbyTask&gt; updatingStandbyTasks() {
+<span class="nc" id="L126">            return updatingTasks.values().stream()</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">                .filter(t -&gt; !t.isActive())</span>
+<span class="nc" id="L128">                .map(t -&gt; (StandbyTask) t)</span>
+<span class="nc" id="L129">                .collect(Collectors.toList());</span>
+        }
+
+        private boolean onlyStandbyTasksUpdating() {
+<span class="nc bnc" id="L133" title="All 4 branches missed.">            return !updatingTasks.isEmpty() &amp;&amp; updatingTasks.values().stream().noneMatch(Task::isActive);</span>
+        }
+
+        public Collection&lt;Task&gt; pausedTasks() {
+<span class="nc" id="L137">            return pausedTasks.values();</span>
+        }
+
+        public long numUpdatingStandbyTasks() {
+<span class="nc" id="L141">            return updatingTasks.values().stream()</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">                .filter(t -&gt; !t.isActive())</span>
+<span class="nc" id="L143">                .count();</span>
+        }
+
+        public long numRestoringActiveTasks() {
+<span class="nc" id="L147">            return updatingTasks.values().stream()</span>
+<span class="nc" id="L148">                .filter(Task::isActive)</span>
+<span class="nc" id="L149">                .count();</span>
+        }
+
+        public long numPausedStandbyTasks() {
+<span class="nc" id="L153">            return pausedTasks.values().stream()</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">                .filter(t -&gt; !t.isActive())</span>
+<span class="nc" id="L155">                .count();</span>
+        }
+
+        public long numPausedActiveTasks() {
+<span class="nc" id="L159">            return pausedTasks.values().stream()</span>
+<span class="nc" id="L160">                .filter(Task::isActive)</span>
+<span class="nc" id="L161">                .count();</span>
+        }
+
+        @Override
+        public void run() {
+<span class="nc" id="L166">            log.info(&quot;State updater thread started&quot;);</span>
+            try {
+<span class="nc" id="L168">                initTimeWindowIfNeeded(time.milliseconds());</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">                while (isRunning.get()) {</span>
+<span class="nc" id="L170">                    runOnce();</span>
+                }
+<span class="nc" id="L172">            } catch (final Throwable anyOtherThrowable) {</span>
+<span class="nc" id="L173">                handleFatalThrowable(anyOtherThrowable);</span>
+            } finally {
+                // report the tasks before the pending actions, so that a task is already reported as failed when the
+                // caller of a failed action looks for it
+<span class="nc" id="L177">                failRemainingTasks();</span>
+<span class="nc" id="L178">                failPendingActions();</span>
+<span class="nc" id="L179">                updaterMetrics.clear();</span>
+<span class="nc" id="L180">                log.info(&quot;State updater thread stopped&quot;);</span>
+            }
+<span class="nc" id="L182">        }</span>
+
+        // Once this thread stopped, nobody will ever perform the actions that are still in the input queue. Hence, we
+        // report them as failed instead of silently dropping them, so that the stream thread does not wait for a
+        // result that will never come and does not lose track of the tasks in the input queue.
+        private void failPendingActions() {
+<span class="nc" id="L188">            tasksAndActionsLock.lock();</span>
+            try {
+                // The flag is published under the lock that guards the input queue. This ensures that an action that is
+                // added concurrently is either failed here or immediately failed by add() or remove().
+<span class="nc" id="L192">                threadStopped.set(true);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">                for (final TaskAndAction taskAndAction : tasksAndActions) {</span>
+<span class="nc" id="L194">                    failAction(taskAndAction);</span>
+<span class="nc" id="L195">                }</span>
+<span class="nc" id="L196">                tasksAndActions.clear();</span>
+            } finally {
+<span class="nc" id="L198">                tasksAndActionsLock.unlock();</span>
+            }
+<span class="nc" id="L200">        }</span>
+
+        // In each iteration:
+        //   1) check if updating tasks need to be paused
+        //   2) check if paused tasks need to be resumed
+        //   3) restore those updating tasks
+        //   4) checkpoint those updating task states
+        //   5) idle waiting if there is no more tasks to be restored
+        //
+        //   Note that, 1-3) are measured as restoring time, while 4) and 5) measured separately
+        //   as checkpointing time and idle time
+        private void runOnce() {
+<span class="nc" id="L212">            final long totalStartTimeMs = time.milliseconds();</span>
+<span class="nc" id="L213">            performActionsOnTasks();</span>
+
+<span class="nc" id="L215">            resumeTasks();</span>
+<span class="nc" id="L216">            pauseTasks();</span>
+<span class="nc" id="L217">            restoreTasks(totalStartTimeMs);</span>
+
+<span class="nc" id="L219">            maybeGetClientInstanceIds();</span>
+
+<span class="nc" id="L221">            final long checkpointStartTimeMs = time.milliseconds();</span>
+<span class="nc" id="L222">            maybeCheckpointTasks(checkpointStartTimeMs);</span>
+
+<span class="nc" id="L224">            updateTaskEndOffsetSumSnapshot();</span>
+
+<span class="nc" id="L226">            final long waitStartTimeMs = time.milliseconds();</span>
+<span class="nc" id="L227">            waitIfAllChangelogsCompletelyRead();</span>
+
+<span class="nc" id="L229">            final long endTimeMs = time.milliseconds();</span>
+<span class="nc" id="L230">            final long totalWaitTime = Math.max(0L, endTimeMs - waitStartTimeMs);</span>
+<span class="nc" id="L231">            final long totalTime = Math.max(0L, endTimeMs - totalStartTimeMs);</span>
+
+<span class="nc" id="L233">            recordMetrics(endTimeMs, totalTime, totalWaitTime);</span>
+<span class="nc" id="L234">        }</span>
+
+        private void performActionsOnTasks() {
+<span class="nc" id="L237">            tasksAndActionsLock.lock();</span>
+            try {
+<span class="nc bnc" id="L239" title="All 2 branches missed.">                while (!tasksAndActions.isEmpty()) {</span>
+<span class="nc" id="L240">                    final TaskAndAction taskAndAction = tasksAndActions.peek();</span>
+<span class="nc" id="L241">                    final Action action = taskAndAction.action();</span>
+<span class="nc bnc" id="L242" title="All 3 branches missed.">                    switch (action) {</span>
+                        case ADD:
+<span class="nc" id="L244">                            addTask(taskAndAction.task());</span>
+<span class="nc" id="L245">                            break;</span>
+                        case REMOVE:
+<span class="nc" id="L247">                            removeTask(taskAndAction.taskId(), taskAndAction.futureForRemove(), taskAndAction.suspendReason());</span>
+<span class="nc" id="L248">                            break;</span>
+                        default:
+<span class="nc" id="L250">                            throw new IllegalStateException(&quot;Unknown action type &quot; + action);</span>
+                    }
+<span class="nc" id="L252">                    tasksAndActions.poll();</span>
+<span class="nc" id="L253">                }</span>
+            } finally {
+<span class="nc" id="L255">                tasksAndActionsLock.unlock();</span>
+            }
+<span class="nc" id="L257">        }</span>
+
+        private void resumeTasks() {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">            if (isTopologyResumed.compareAndSet(true, false)) {</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">                for (final Task task : pausedTasks.values()) {</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                    if (!topologyMetadata.isPaused(task.id().topologyName())) {</span>
+<span class="nc" id="L263">                        resumeTask(task);</span>
+                    }
+<span class="nc" id="L265">                }</span>
+            }
+<span class="nc" id="L267">        }</span>
+
+        private void pauseTasks() {
+<span class="nc bnc" id="L270" title="All 2 branches missed.">            for (final Task task : updatingTasks.values()) {</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">                if (topologyMetadata.isPaused(task.id().topologyName())) {</span>
+<span class="nc" id="L272">                    pauseTask(task);</span>
+                }
+<span class="nc" id="L274">            }</span>
+<span class="nc" id="L275">        }</span>
+
+        private void restoreTasks(final long now) {
+            try {
+<span class="nc" id="L279">                final long restored = changelogReader.restore(updatingTasks);</span>
+<span class="nc" id="L280">                updaterMetrics.restoreSensor.record(restored, now);</span>
+<span class="nc" id="L281">            } catch (final TaskCorruptedException taskCorruptedException) {</span>
+<span class="nc" id="L282">                handleTaskCorruptedException(taskCorruptedException);</span>
+<span class="nc" id="L283">            } catch (final StreamsException streamsException) {</span>
+<span class="nc" id="L284">                handleStreamsException(streamsException);</span>
+<span class="nc" id="L285">            }</span>
+<span class="nc" id="L286">            final Set&lt;TopicPartition&gt; completedChangelogs = changelogReader.completedChangelogs();</span>
+<span class="nc" id="L287">            final List&lt;Task&gt; activeTasks = updatingTasks.values().stream().filter(Task::isActive).collect(Collectors.toList());</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            for (final Task task : activeTasks) {</span>
+<span class="nc" id="L289">                maybeCompleteRestoration((StreamTask) task, completedChangelogs);</span>
+<span class="nc" id="L290">            }</span>
+<span class="nc" id="L291">        }</span>
+
+        private void maybeGetClientInstanceIds() {
+<span class="nc bnc" id="L294" title="All 2 branches missed.">            if (fetchDeadlineClientInstanceId != -1) {</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                if (!clientInstanceIdFuture.isDone()) {</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">                    if (fetchDeadlineClientInstanceId &gt;= time.milliseconds()) {</span>
+                        try {
+                            // if the state-updated thread has active work:
+                            //    we pass in a timeout of zero into each `clientInstanceId()` call
+                            //    to just trigger the &quot;get instance id&quot; background RPC;
+                            //    we don't want to block the state updater thread that can do useful work in the meantime
+                            // otherwise, we pass in 100ms to avoid busy waiting
+<span class="nc" id="L303">                            clientInstanceIdFuture.complete(</span>
+<span class="nc" id="L304">                                restoreConsumer.clientInstanceId(</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                                    allWorkDone() ? Duration.ofMillis(100L) : Duration.ZERO</span>
+                                )
+                            );
+<span class="nc" id="L308">                            fetchDeadlineClientInstanceId = -1L;</span>
+<span class="nc" id="L309">                        } catch (final IllegalStateException disabledError) {</span>
+                            // if telemetry is disabled on a client, we swallow the error,
+                            // to allow returning a partial result for all other clients
+<span class="nc" id="L312">                            clientInstanceIdFuture.complete(null);</span>
+<span class="nc" id="L313">                            fetchDeadlineClientInstanceId = -1L;</span>
+<span class="nc" id="L314">                        } catch (final TimeoutException swallow) {</span>
+                            // swallow
+<span class="nc" id="L316">                        } catch (final Exception error) {</span>
+<span class="nc" id="L317">                            clientInstanceIdFuture.completeExceptionally(error);</span>
+<span class="nc" id="L318">                            fetchDeadlineClientInstanceId = -1L;</span>
+<span class="nc" id="L319">                        }</span>
+                    } else {
+<span class="nc" id="L321">                        clientInstanceIdFuture.completeExceptionally(</span>
+                            new TimeoutException(&quot;Could not retrieve restore consumer client instance id.&quot;)
+                        );
+<span class="nc" id="L324">                        fetchDeadlineClientInstanceId = -1L;</span>
+                    }
+                }
+            }
+<span class="nc" id="L328">        }</span>
+
+        private KafkaFutureImpl&lt;Uuid&gt; restoreConsumerInstanceId(final Duration timeout) {
+<span class="nc" id="L331">            boolean setDeadline = false;</span>
+
+<span class="nc bnc" id="L333" title="All 2 branches missed.">            if (clientInstanceIdFuture.isDone()) {</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                if (clientInstanceIdFuture.isCompletedExceptionally()) {</span>
+<span class="nc" id="L335">                    clientInstanceIdFuture = new KafkaFutureImpl&lt;&gt;();</span>
+<span class="nc" id="L336">                    setDeadline = true;</span>
+                }
+            } else {
+<span class="nc" id="L339">                setDeadline = true;</span>
+            }
+
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            if (setDeadline) {</span>
+<span class="nc" id="L343">                fetchDeadlineClientInstanceId = time.milliseconds() + timeout.toMillis();</span>
+<span class="nc" id="L344">                tasksAndActionsLock.lock();</span>
+                try {
+<span class="nc" id="L346">                    tasksAndActionsCondition.signalAll();</span>
+                } finally {
+<span class="nc" id="L348">                    tasksAndActionsLock.unlock();</span>
+                }
+            }
+
+<span class="nc" id="L352">            return clientInstanceIdFuture;</span>
+        }
+
+
+        // Any throwable that escapes the update loop stops this thread. Even for a throwable that is not recoverable,
+        // like an error, we report the tasks of this thread as failed, so that the stream thread notices that this
+        // thread is gone instead of silently losing its tasks.
+        private void handleFatalThrowable(final Throwable throwable) {
+<span class="nc" id="L360">            log.error(&quot;An unexpected error occurred within the state updater thread.&quot;, throwable);</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            final RuntimeException exception = throwable instanceof RuntimeException</span>
+<span class="nc" id="L362">                ? (RuntimeException) throwable</span>
+<span class="nc" id="L363">                : new StreamsException(&quot;The state updater thread failed with a fatal error.&quot;, throwable);</span>
+            // publish the exception before reporting the tasks as failed, so that the stream thread never sees a task
+            // that failed because this thread died without also seeing why this thread died
+<span class="nc" id="L366">            fatalException.set(exception);</span>
+<span class="nc" id="L367">            addToExceptionsAndFailedTasksThenClearUpdatingAndPausedTasks(exception);</span>
+<span class="nc" id="L368">            isRunning.set(false);</span>
+<span class="nc" id="L369">        }</span>
+
+        private void handleTaskCorruptedException(final TaskCorruptedException taskCorruptedException) {
+<span class="nc" id="L372">            log.info(&quot;Encountered task corrupted exception: &quot;, taskCorruptedException);</span>
+<span class="nc" id="L373">            final Set&lt;TaskId&gt; corruptedTaskIds = taskCorruptedException.corruptedTasks();</span>
+<span class="nc" id="L374">            final Set&lt;Task&gt; corruptedTasks = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L375">            final Set&lt;TopicPartition&gt; changelogsOfCorruptedTasks = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">            for (final TaskId taskId : corruptedTaskIds) {</span>
+<span class="nc" id="L377">                final Task corruptedTask = updatingTasks.get(taskId);</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                if (corruptedTask == null) {</span>
+<span class="nc" id="L379">                    throw new IllegalStateException(&quot;Task &quot; + taskId + &quot; is corrupted but is not updating. &quot; + BUG_ERROR_MESSAGE);</span>
+                }
+<span class="nc" id="L381">                corruptedTasks.add(corruptedTask);</span>
+<span class="nc" id="L382">                removeCheckpointForCorruptedTask(corruptedTask);</span>
+<span class="nc" id="L383">                changelogsOfCorruptedTasks.addAll(corruptedTask.changelogPartitions());</span>
+<span class="nc" id="L384">            }</span>
+<span class="nc" id="L385">            changelogReader.unregister(changelogsOfCorruptedTasks);</span>
+<span class="nc" id="L386">            corruptedTasks.forEach(</span>
+<span class="nc" id="L387">                task -&gt; addToExceptionsAndFailedTasksThenRemoveFromUpdatingTasks(new ExceptionAndTask(taskCorruptedException, task))</span>
+            );
+<span class="nc" id="L389">        }</span>
+
+        // TODO: we can let the exception encode the actual corrupted changelog partitions and only
+        //       mark those instead of marking all changelogs
+        private void removeCheckpointForCorruptedTask(final Task task) {
+            try {
+<span class="nc" id="L395">                task.markChangelogAsCorrupted(task.changelogPartitions());</span>
+
+                // we need to enforce a checkpoint that removes the corrupted partitions
+<span class="nc" id="L398">                measureCheckpointLatency(() -&gt; task.maybeCheckpoint());</span>
+<span class="nc" id="L399">            } catch (final StreamsException swallow) {</span>
+<span class="nc" id="L400">                log.warn(&quot;Checkpoint failed for corrupted task {}&quot;, task.id(), swallow);</span>
+<span class="nc" id="L401">            }</span>
+<span class="nc" id="L402">        }</span>
+
+        private void handleStreamsException(final StreamsException streamsException) {
+<span class="nc" id="L405">            log.info(&quot;Encountered streams exception: &quot;, streamsException);</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">            if (streamsException.taskId().isPresent()) {</span>
+<span class="nc" id="L407">                handleStreamsExceptionWithTask(streamsException, streamsException.taskId().get());</span>
+            } else {
+<span class="nc" id="L409">                handleStreamsExceptionWithoutTask(streamsException);</span>
+            }
+<span class="nc" id="L411">        }</span>
+
+        private void handleStreamsExceptionWithTask(final StreamsException streamsException, final TaskId failedTaskId) {
+<span class="nc bnc" id="L414" title="All 2 branches missed.">            if (updatingTasks.containsKey(failedTaskId)) {</span>
+<span class="nc" id="L415">                addToExceptionsAndFailedTasksThenRemoveFromUpdatingTasks(</span>
+<span class="nc" id="L416">                    new ExceptionAndTask(streamsException, updatingTasks.get(failedTaskId))</span>
+                );
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            } else if (pausedTasks.containsKey(failedTaskId)) {</span>
+<span class="nc" id="L419">                addToExceptionsAndFailedTasksThenRemoveFromPausedTasks(</span>
+<span class="nc" id="L420">                    new ExceptionAndTask(streamsException, pausedTasks.get(failedTaskId))</span>
+                );
+            } else {
+<span class="nc" id="L423">                throw new IllegalStateException(&quot;Task &quot; + failedTaskId + &quot; failed but is not updating or paused. &quot; + BUG_ERROR_MESSAGE);</span>
+            }
+<span class="nc" id="L425">        }</span>
+
+        private void handleStreamsExceptionWithoutTask(final StreamsException streamsException) {
+<span class="nc" id="L428">            addToExceptionsAndFailedTasksThenClearUpdatingAndPausedTasks(streamsException);</span>
+<span class="nc" id="L429">        }</span>
+
+        // It is important to remove the corrupted tasks from the updating tasks after they were added to the
+        // failed tasks.
+        // This ensures that all tasks are found in DefaultStateUpdater#getTasks().
+        private void addToExceptionsAndFailedTasksThenRemoveFromUpdatingTasks(final ExceptionAndTask exceptionAndTask) {
+<span class="nc" id="L435">            exceptionsAndFailedTasksLock.lock();</span>
+            try {
+<span class="nc" id="L437">                exceptionsAndFailedTasks.add(exceptionAndTask);</span>
+<span class="nc" id="L438">                updatingTasks.remove(exceptionAndTask.task().id());</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                if (exceptionAndTask.task().isActive()) {</span>
+<span class="nc" id="L440">                    transitToUpdateStandbysIfOnlyStandbysLeft();</span>
+                }
+            } finally {
+<span class="nc" id="L443">                exceptionsAndFailedTasksLock.unlock();</span>
+            }
+<span class="nc" id="L445">        }</span>
+
+        private void addToExceptionsAndFailedTasksThenRemoveFromPausedTasks(final ExceptionAndTask exceptionAndTask) {
+<span class="nc" id="L448">            exceptionsAndFailedTasksLock.lock();</span>
+            try {
+<span class="nc" id="L450">                exceptionsAndFailedTasks.add(exceptionAndTask);</span>
+<span class="nc" id="L451">                pausedTasks.remove(exceptionAndTask.task().id());</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">                if (exceptionAndTask.task().isActive()) {</span>
+<span class="nc" id="L453">                    transitToUpdateStandbysIfOnlyStandbysLeft();</span>
+                }
+            } finally {
+<span class="nc" id="L456">                exceptionsAndFailedTasksLock.unlock();</span>
+            }
+<span class="nc" id="L458">        }</span>
+
+        private void addToExceptionsAndFailedTasksThenClearUpdatingAndPausedTasks(final RuntimeException runtimeException) {
+<span class="nc" id="L461">            exceptionsAndFailedTasksLock.lock();</span>
+            try {
+<span class="nc" id="L463">                updatingTasks.values().forEach(</span>
+<span class="nc" id="L464">                    task -&gt; exceptionsAndFailedTasks.add(new ExceptionAndTask(runtimeException, task))</span>
+                );
+<span class="nc" id="L466">                updatingTasks.clear();</span>
+<span class="nc" id="L467">                pausedTasks.values().forEach(</span>
+<span class="nc" id="L468">                    task -&gt; exceptionsAndFailedTasks.add(new ExceptionAndTask(runtimeException, task))</span>
+                );
+<span class="nc" id="L470">                pausedTasks.clear();</span>
+            } finally {
+<span class="nc" id="L472">                exceptionsAndFailedTasksLock.unlock();</span>
+            }
+<span class="nc" id="L474">        }</span>
+
+        // Current offset sums are sourced from the StateDirectory (see TaskManager#maybeUpdateTaskOffsetSumSnapshot);
+        // end-offsets are not tracked there, so the end-offset-sum is computed here from the changelog reader's
+        // (logical) end-offsets for the tasks the state updater is currently restoring/updating.
+        private void updateTaskEndOffsetSumSnapshot() {
+            final Map&lt;TopicPartition, Long&gt; changelogEndOffsets;
+<span class="nc bnc" id="L481" title="All 2 branches missed.">            if (!updatingTasks.isEmpty()) {</span>
+<span class="nc" id="L482">                changelogEndOffsets = changelogReader.logicalChangelogEndOffsets();</span>
+            } else {
+<span class="nc" id="L484">                changelogEndOffsets = Collections.emptyMap();</span>
+            }
+
+<span class="nc" id="L487">            final Map&lt;StreamsRebalanceData.TaskId, Long&gt; endOffsetSnapshot = new HashMap&lt;&gt;(updatingTasks.size());</span>
+
+<span class="nc bnc" id="L489" title="All 2 branches missed.">            for (final Task task : updatingTasks.values()) {</span>
+<span class="nc" id="L490">                long endSum = 0L; // ok to init with zero, as we have at least one changelog topic partition</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">                for (final TopicPartition partition : task.changelogPartitions()) {</span>
+<span class="nc" id="L492">                    final Long endOffset = changelogEndOffsets.get(partition);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">                    if (endOffset == null) {</span>
+<span class="nc" id="L494">                        endSum = Long.MAX_VALUE;</span>
+<span class="nc" id="L495">                        break;</span>
+                    }
+<span class="nc bnc" id="L497" title="All 2 branches missed.">                    if (endSum &gt; Long.MAX_VALUE - endOffset) {</span>
+<span class="nc" id="L498">                        endSum = Long.MAX_VALUE;</span>
+<span class="nc" id="L499">                        break;</span>
+                    }
+<span class="nc" id="L501">                    endSum += endOffset;</span>
+<span class="nc" id="L502">                }</span>
+
+<span class="nc" id="L504">                endOffsetSnapshot.put(</span>
+<span class="nc" id="L505">                    new StreamsRebalanceData.TaskId(String.valueOf(task.id().subtopology()), task.id().partition()),</span>
+<span class="nc" id="L506">                    endSum</span>
+                );
+<span class="nc" id="L508">            }</span>
+
+<span class="nc" id="L510">            taskEndOffsetSumSnapshot.set(Collections.unmodifiableMap(endOffsetSnapshot));</span>
+<span class="nc" id="L511">        }</span>
+
+        private void waitIfAllChangelogsCompletelyRead() {
+<span class="nc" id="L514">            tasksAndActionsLock.lock();</span>
+            try {
+<span class="nc bnc" id="L516" title="All 4 branches missed.">                while (allWorkDone() &amp;&amp; fetchDeadlineClientInstanceId == -1L) {</span>
+<span class="nc" id="L517">                    isIdle.set(true);</span>
+<span class="nc" id="L518">                    tasksAndActionsCondition.await();</span>
+                }
+<span class="nc" id="L520">            } catch (final InterruptedException ignored) {</span>
+<span class="nc" id="L521">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L522">                log.warn(&quot;State updater thread was interrupted while waiting for changelogs&quot;);</span>
+            } finally {
+<span class="nc" id="L524">                tasksAndActionsLock.unlock();</span>
+<span class="nc" id="L525">                isIdle.set(false);</span>
+            }
+<span class="nc" id="L527">        }</span>
+
+        private boolean allWorkDone() {
+<span class="nc bnc" id="L530" title="All 4 branches missed.">            final boolean noTasksToUpdate = changelogReader.allChangelogsCompleted() || updatingTasks.isEmpty();</span>
+
+<span class="nc bnc" id="L532" title="All 4 branches missed.">            return isRunning.get() &amp;&amp;</span>
+                noTasksToUpdate &amp;&amp;
+<span class="nc bnc" id="L534" title="All 2 branches missed.">                tasksAndActions.isEmpty() &amp;&amp;</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">                !isTopologyResumed.get();</span>
+        }
+
+        // Once this thread stopped, it cannot update or hand over any of the tasks it still owns. Hence, we report all
+        // of them as failed instead of silently dropping them, so that the stream thread closes them
+        private void failRemainingTasks() {
+<span class="nc bnc" id="L541" title="All 4 branches missed.">            if (!updatingTasks.isEmpty() || !pausedTasks.isEmpty()) {</span>
+<span class="nc" id="L542">                addToExceptionsAndFailedTasksThenClearUpdatingAndPausedTasks(</span>
+                    new StreamsException(NOT_RUNNING_ERROR_MESSAGE)
+                );
+            }
+<span class="nc" id="L546">            restoredActiveTasksLock.lock();</span>
+            try {
+<span class="nc" id="L548">                exceptionsAndFailedTasksLock.lock();</span>
+                try {
+<span class="nc bnc" id="L550" title="All 2 branches missed.">                    for (final StreamTask restoredTask : restoredActiveTasks) {</span>
+<span class="nc" id="L551">                        log.warn(&quot;Restored task {} was not handed over to the stream thread before the state updater &quot;</span>
+<span class="nc" id="L552">                            + &quot;stopped. The task is reported as failed.&quot;, restoredTask.id());</span>
+<span class="nc" id="L553">                        exceptionsAndFailedTasks.add(new ExceptionAndTask(</span>
+<span class="nc" id="L554">                            new StreamsException(NOT_RUNNING_ERROR_MESSAGE, restoredTask.id()),</span>
+                            restoredTask
+                        ));
+<span class="nc" id="L557">                    }</span>
+                } finally {
+<span class="nc" id="L559">                    exceptionsAndFailedTasksLock.unlock();</span>
+                }
+<span class="nc" id="L561">                restoredActiveTasks.clear();</span>
+            } finally {
+<span class="nc" id="L563">                restoredActiveTasksLock.unlock();</span>
+            }
+<span class="nc" id="L565">            changelogReader.clear();</span>
+<span class="nc" id="L566">        }</span>
+
+        private void addTask(final Task task) {
+<span class="nc" id="L569">            final TaskId taskId = task.id();</span>
+
+<span class="nc" id="L571">            Task existingTask = pausedTasks.get(taskId);</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">            if (existingTask != null) {</span>
+<span class="nc" id="L573">                throw new IllegalStateException(</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">                    (existingTask.isActive() ? &quot;Active&quot; : &quot;Standby&quot;) + &quot; task &quot; + taskId + &quot; already exist in paused tasks, &quot; +</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">                        &quot;should not try to add another &quot; + (task.isActive() ? &quot;active&quot; : &quot;standby&quot;) + &quot; task with the same id. &quot;</span>
+                        + BUG_ERROR_MESSAGE);
+            }
+<span class="nc" id="L578">            existingTask = updatingTasks.get(taskId);</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            if (existingTask != null) {</span>
+<span class="nc" id="L580">                throw new IllegalStateException(</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">                    (existingTask.isActive() ? &quot;Active&quot; : &quot;Standby&quot;) + &quot; task &quot; + taskId + &quot; already exist in updating tasks, &quot; +</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">                        &quot;should not try to add another &quot; + (task.isActive() ? &quot;active&quot; : &quot;standby&quot;) + &quot; task with the same id. &quot;</span>
+                        + BUG_ERROR_MESSAGE);
+            }
+
+<span class="nc bnc" id="L586" title="All 2 branches missed.">            if (isStateless(task)) {</span>
+<span class="nc" id="L587">                addToRestoredTasks((StreamTask) task);</span>
+<span class="nc" id="L588">                log.info(&quot;Stateless active task &quot; + taskId + &quot; was added to the restored tasks of the state updater&quot;);</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">            } else if (topologyMetadata.isPaused(taskId.topologyName())) {</span>
+<span class="nc" id="L590">                pausedTasks.put(taskId, task);</span>
+<span class="nc" id="L591">                changelogReader.register(task.changelogPartitions(), task.stateManager());</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">                log.debug((task.isActive() ? &quot;Active&quot; : &quot;Standby&quot;)</span>
+                    + &quot; task &quot; + taskId + &quot; was directly added to the paused tasks.&quot;);
+            } else {
+<span class="nc" id="L595">                updatingTasks.put(taskId, task);</span>
+<span class="nc" id="L596">                changelogReader.register(task.changelogPartitions(), task.stateManager());</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">                if (task.isActive()) {</span>
+<span class="nc" id="L598">                    log.info(&quot;Stateful active task &quot; + taskId + &quot; was added to the state updater&quot;);</span>
+<span class="nc" id="L599">                    changelogReader.enforceRestoreActive();</span>
+                } else {
+<span class="nc" id="L601">                    log.info(&quot;Standby task &quot; + taskId + &quot; was added to the state updater&quot;);</span>
+<span class="nc bnc" id="L602" title="All 2 branches missed.">                    if (updatingTasks.size() == 1) {</span>
+<span class="nc" id="L603">                        changelogReader.transitToUpdateStandby();</span>
+                    }
+                }
+            }
+<span class="nc" id="L607">        }</span>
+
+        private void removeTask(final TaskId taskId,
+                                final CompletableFuture&lt;RemovedTaskResult&gt; future,
+                                final StandbyUpdateListener.SuspendReason suspendReason) {
+            try {
+<span class="nc bnc" id="L613" title="All 2 branches missed.">                if (!removeUpdatingTask(taskId, future, suspendReason)</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">                    &amp;&amp; !removePausedTask(taskId, future, suspendReason)</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">                    &amp;&amp; !removeRestoredTask(taskId, future)</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">                    &amp;&amp; !removeFailedTask(taskId, future)) {</span>
+
+<span class="nc" id="L618">                    future.complete(null);</span>
+<span class="nc" id="L619">                    log.warn(&quot;Task {} could not be removed from the state updater because the state updater does not&quot;</span>
+                        + &quot; own this task.&quot;, taskId);
+                }
+<span class="nc" id="L622">            } catch (final StreamsException streamsException) {</span>
+<span class="nc" id="L623">                handleStreamsExceptionWithTask(streamsException, taskId);</span>
+<span class="nc" id="L624">                future.completeExceptionally(streamsException);</span>
+<span class="nc" id="L625">            }</span>
+<span class="nc" id="L626">        }</span>
+
+        private boolean removeUpdatingTask(final TaskId taskId,
+                                           final CompletableFuture&lt;RemovedTaskResult&gt; future,
+                                           final StandbyUpdateListener.SuspendReason suspendReason) {
+<span class="nc bnc" id="L631" title="All 2 branches missed.">            if (!updatingTasks.containsKey(taskId)) {</span>
+<span class="nc" id="L632">                return false;</span>
+            }
+<span class="nc" id="L634">            final Task task = updatingTasks.get(taskId);</span>
+<span class="nc" id="L635">            prepareUpdatingTaskForRemoval(task, suspendReason);</span>
+<span class="nc" id="L636">            updatingTasks.remove(taskId);</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">            if (task.isActive()) {</span>
+<span class="nc" id="L638">                transitToUpdateStandbysIfOnlyStandbysLeft();</span>
+            }
+<span class="nc bnc" id="L640" title="All 2 branches missed.">            log.info((task.isActive() ? &quot;Active&quot; : &quot;Standby&quot;)</span>
+<span class="nc" id="L641">                + &quot; task &quot; + task.id() + &quot; was removed from the updating tasks.&quot;);</span>
+<span class="nc" id="L642">            future.complete(new RemovedTaskResult(task));</span>
+<span class="nc" id="L643">            return true;</span>
+        }
+
+        private void prepareUpdatingTaskForRemoval(final Task task,
+                                                   final StandbyUpdateListener.SuspendReason suspendReason) {
+<span class="nc" id="L648">            measureCheckpointLatency(() -&gt; task.maybeCheckpoint());</span>
+<span class="nc" id="L649">            final Collection&lt;TopicPartition&gt; changelogPartitions = task.changelogPartitions();</span>
+<span class="nc" id="L650">            changelogReader.unregister(changelogPartitions, suspendReason);</span>
+<span class="nc" id="L651">        }</span>
+
+        private boolean removePausedTask(final TaskId taskId,
+                                         final CompletableFuture&lt;RemovedTaskResult&gt; future,
+                                         final StandbyUpdateListener.SuspendReason suspendReason) {
+<span class="nc bnc" id="L656" title="All 2 branches missed.">            if (!pausedTasks.containsKey(taskId)) {</span>
+<span class="nc" id="L657">                return false;</span>
+            }
+<span class="nc" id="L659">            final Task task = pausedTasks.get(taskId);</span>
+<span class="nc" id="L660">            preparePausedTaskForRemoval(task, suspendReason);</span>
+<span class="nc" id="L661">            pausedTasks.remove(taskId);</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">            log.info((task.isActive() ? &quot;Active&quot; : &quot;Standby&quot;)</span>
+<span class="nc" id="L663">                + &quot; task &quot; + task.id() + &quot; was removed from the paused tasks.&quot;);</span>
+<span class="nc" id="L664">            future.complete(new RemovedTaskResult(task));</span>
+<span class="nc" id="L665">            return true;</span>
+        }
+
+        private void preparePausedTaskForRemoval(final Task task,
+                                                 final StandbyUpdateListener.SuspendReason suspendReason) {
+<span class="nc" id="L670">            final Collection&lt;TopicPartition&gt; changelogPartitions = task.changelogPartitions();</span>
+<span class="nc" id="L671">            changelogReader.unregister(changelogPartitions, suspendReason);</span>
+<span class="nc" id="L672">        }</span>
+
+        private boolean removeRestoredTask(final TaskId taskId, final CompletableFuture&lt;RemovedTaskResult&gt; future) {
+<span class="nc" id="L675">            restoredActiveTasksLock.lock();</span>
+            try {
+<span class="nc" id="L677">                final Iterator&lt;StreamTask&gt; iterator = restoredActiveTasks.iterator();</span>
+<span class="nc bnc" id="L678" title="All 2 branches missed.">                while (iterator.hasNext()) {</span>
+<span class="nc" id="L679">                    final StreamTask restoredTask = iterator.next();</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">                    if (restoredTask.id().equals(taskId)) {</span>
+<span class="nc" id="L681">                        iterator.remove();</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">                        log.info((restoredTask.isActive() ? &quot;Active&quot; : &quot;Standby&quot;)</span>
+<span class="nc" id="L683">                            + &quot; task &quot; + restoredTask.id() + &quot; was removed from the restored tasks.&quot;);</span>
+<span class="nc" id="L684">                        future.complete(new RemovedTaskResult(restoredTask));</span>
+<span class="nc" id="L685">                        return true;</span>
+                    }
+<span class="nc" id="L687">                }</span>
+<span class="nc" id="L688">                return false;</span>
+            } finally {
+<span class="nc" id="L690">                restoredActiveTasksLock.unlock();</span>
+            }
+        }
+
+        private boolean removeFailedTask(final TaskId taskId, final CompletableFuture&lt;RemovedTaskResult&gt; future) {
+<span class="nc" id="L695">            exceptionsAndFailedTasksLock.lock();</span>
+            try {
+<span class="nc" id="L697">                final Iterator&lt;ExceptionAndTask&gt; iterator = exceptionsAndFailedTasks.iterator();</span>
+<span class="nc bnc" id="L698" title="All 2 branches missed.">                while (iterator.hasNext()) {</span>
+<span class="nc" id="L699">                    final ExceptionAndTask exceptionAndTask = iterator.next();</span>
+<span class="nc" id="L700">                    final Task failedTask = exceptionAndTask.task();</span>
+<span class="nc bnc" id="L701" title="All 2 branches missed.">                    if (failedTask.id().equals(taskId)) {</span>
+<span class="nc" id="L702">                        iterator.remove();</span>
+<span class="nc bnc" id="L703" title="All 2 branches missed.">                        log.info((failedTask.isActive() ? &quot;Active&quot; : &quot;Standby&quot;)</span>
+<span class="nc" id="L704">                            + &quot; task &quot; + failedTask.id() + &quot; was removed from the failed tasks.&quot;);</span>
+<span class="nc" id="L705">                        future.complete(new RemovedTaskResult(failedTask, exceptionAndTask.exception()));</span>
+<span class="nc" id="L706">                        return true;</span>
+                    }
+<span class="nc" id="L708">                }</span>
+<span class="nc" id="L709">                return false;</span>
+            } finally {
+<span class="nc" id="L711">                exceptionsAndFailedTasksLock.unlock();</span>
+            }
+        }
+
+        private void pauseTask(final Task task) {
+<span class="nc" id="L716">            final TaskId taskId = task.id();</span>
+            // do not need to unregister changelog partitions for paused tasks
+            try {
+<span class="nc" id="L719">                measureCheckpointLatency(() -&gt; task.maybeCheckpoint());</span>
+<span class="nc" id="L720">                pausedTasks.put(taskId, task);</span>
+<span class="nc" id="L721">                updatingTasks.remove(taskId);</span>
+<span class="nc bnc" id="L722" title="All 2 branches missed.">                if (task.isActive()) {</span>
+<span class="nc" id="L723">                    transitToUpdateStandbysIfOnlyStandbysLeft();</span>
+                }
+<span class="nc bnc" id="L725" title="All 2 branches missed.">                log.info((task.isActive() ? &quot;Active&quot; : &quot;Standby&quot;)</span>
+<span class="nc" id="L726">                    + &quot; task &quot; + task.id() + &quot; was paused from the updating tasks and added to the paused tasks.&quot;);</span>
+
+<span class="nc" id="L728">            } catch (final StreamsException streamsException) {</span>
+<span class="nc" id="L729">                handleStreamsExceptionWithTask(streamsException, taskId);</span>
+<span class="nc" id="L730">            }</span>
+<span class="nc" id="L731">        }</span>
+
+        private void resumeTask(final Task task) {
+<span class="nc" id="L734">            final TaskId taskId = task.id();</span>
+<span class="nc" id="L735">            updatingTasks.put(taskId, task);</span>
+<span class="nc" id="L736">            pausedTasks.remove(taskId);</span>
+
+<span class="nc bnc" id="L738" title="All 2 branches missed.">            if (task.isActive()) {</span>
+<span class="nc" id="L739">                log.info(&quot;Stateful active task &quot; + task.id() + &quot; was resumed to the updating tasks of the state updater&quot;);</span>
+<span class="nc" id="L740">                changelogReader.enforceRestoreActive();</span>
+            } else {
+<span class="nc" id="L742">                log.info(&quot;Standby task &quot; + task.id() + &quot; was resumed to the updating tasks of the state updater&quot;);</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">                if (updatingTasks.size() == 1) {</span>
+<span class="nc" id="L744">                    changelogReader.transitToUpdateStandby();</span>
+                }
+            }
+<span class="nc" id="L747">        }</span>
+
+        private boolean isStateless(final Task task) {
+<span class="nc bnc" id="L750" title="All 4 branches missed.">            return task.changelogPartitions().isEmpty() &amp;&amp; task.isActive();</span>
+        }
+
+        private void maybeCompleteRestoration(final StreamTask task,
+                                              final Set&lt;TopicPartition&gt; restoredChangelogs) {
+<span class="nc" id="L755">            final Collection&lt;TopicPartition&gt; changelogPartitions = task.changelogPartitions();</span>
+<span class="nc bnc" id="L756" title="All 2 branches missed.">            if (restoredChangelogs.containsAll(changelogPartitions)) {</span>
+                try {
+<span class="nc" id="L758">                    measureCheckpointLatency(() -&gt; task.maybeCheckpoint());</span>
+<span class="nc" id="L759">                    changelogReader.unregister(changelogPartitions);</span>
+<span class="nc" id="L760">                    addToRestoredTasks(task);</span>
+<span class="nc" id="L761">                    log.info(&quot;Stateful active task &quot; + task.id() + &quot; completed restoration&quot;);</span>
+<span class="nc" id="L762">                    transitToUpdateStandbysIfOnlyStandbysLeft();</span>
+<span class="nc" id="L763">                } catch (final StreamsException streamsException) {</span>
+<span class="nc" id="L764">                    handleStreamsExceptionWithTask(streamsException, task.id());</span>
+<span class="nc" id="L765">                }</span>
+            }
+<span class="nc" id="L767">        }</span>
+
+        private void transitToUpdateStandbysIfOnlyStandbysLeft() {
+<span class="nc bnc" id="L770" title="All 2 branches missed.">            if (onlyStandbyTasksUpdating()) {</span>
+<span class="nc" id="L771">                changelogReader.transitToUpdateStandby();</span>
+            }
+<span class="nc" id="L773">        }</span>
+
+        private void addToRestoredTasks(final StreamTask task) {
+<span class="nc" id="L776">            restoredActiveTasksLock.lock();</span>
+            try {
+<span class="nc" id="L778">                restoredActiveTasks.add(task);</span>
+<span class="nc" id="L779">                updatingTasks.remove(task.id());</span>
+<span class="nc" id="L780">                log.debug(&quot;Active task &quot; + task.id() + &quot; was added to the restored tasks&quot;);</span>
+<span class="nc" id="L781">                restoredActiveTasksCondition.signalAll();</span>
+            } finally {
+<span class="nc" id="L783">                restoredActiveTasksLock.unlock();</span>
+            }
+<span class="nc" id="L785">        }</span>
+
+        private void maybeCheckpointTasks(final long now) {
+<span class="nc" id="L788">            final long elapsedMsSinceLastCommit = now - lastCommitMs;</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">            if (elapsedMsSinceLastCommit &gt; commitIntervalMs) {</span>
+<span class="nc bnc" id="L790" title="All 2 branches missed.">                if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L791">                    log.debug(&quot;Checkpointing state of all restoring tasks since {}ms has elapsed (commit interval is {}ms)&quot;,</span>
+<span class="nc" id="L792">                        elapsedMsSinceLastCommit, commitIntervalMs);</span>
+                }
+
+<span class="nc" id="L795">                measureCheckpointLatency(() -&gt; {</span>
+<span class="nc bnc" id="L796" title="All 2 branches missed.">                    for (final Task task : updatingTasks.values()) {</span>
+                        try {
+                            // do not enforce checkpointing during restoration if its position has not advanced much
+<span class="nc" id="L799">                            task.maybeCheckpoint();</span>
+<span class="nc" id="L800">                        } catch (final StreamsException streamsException) {</span>
+<span class="nc" id="L801">                            handleStreamsExceptionWithTask(streamsException, task.id());</span>
+<span class="nc" id="L802">                        }</span>
+<span class="nc" id="L803">                    }</span>
+<span class="nc" id="L804">                });</span>
+
+<span class="nc" id="L806">                lastCommitMs = now;</span>
+            }
+<span class="nc" id="L808">        }</span>
+
+        private void measureCheckpointLatency(final Runnable actionToMeasure) {
+<span class="nc" id="L811">            final long startMs = time.milliseconds();</span>
+            try {
+<span class="nc" id="L813">                actionToMeasure.run();</span>
+            } finally {
+<span class="nc" id="L815">                totalCheckpointLatency += Math.max(0L, time.milliseconds() - startMs);</span>
+            }
+<span class="nc" id="L817">        }</span>
+
+        private void recordMetrics(final long now, final long totalLatency, final long totalWaitLatency) {
+<span class="nc" id="L820">            final long totalRestoreLatency = Math.max(0L, totalLatency - totalWaitLatency - totalCheckpointLatency);</span>
+
+<span class="nc" id="L822">            recordWindowedSum(</span>
+                now,
+                totalWaitLatency,
+                totalCheckpointLatency,
+<span class="nc bnc" id="L826" title="All 2 branches missed.">                totalRestoreLatency * (changelogReader.isRestoringActive() ? 1.0d : 0.0d),</span>
+<span class="nc bnc" id="L827" title="All 2 branches missed.">                totalRestoreLatency * (changelogReader.isRestoringActive() ? 0.0d : 1.0d),</span>
+                totalLatency
+            );
+
+<span class="nc" id="L831">            recordRatios(now);</span>
+
+<span class="nc" id="L833">            totalCheckpointLatency = 0L;</span>
+<span class="nc" id="L834">        }</span>
+
+        private void initTimeWindowIfNeeded(final long now) {
+<span class="nc bnc" id="L837" title="All 2 branches missed.">            if (!timeWindowInitialized) {</span>
+<span class="nc" id="L838">                idleTimeWindowedSum.record(metricsConfig, 0.0, now);</span>
+<span class="nc" id="L839">                checkpointTimeWindowedSum.record(metricsConfig, 0.0, now);</span>
+<span class="nc" id="L840">                activeRestoreTimeWindowedSum.record(metricsConfig, 0.0, now);</span>
+<span class="nc" id="L841">                standbyRestoreTimeWindowedSum.record(metricsConfig, 0.0, now);</span>
+<span class="nc" id="L842">                runOnceLatencyWindowedSum.record(metricsConfig, 0.0, now);</span>
+<span class="nc" id="L843">                timeWindowInitialized = true;</span>
+            }
+<span class="nc" id="L845">        }</span>
+
+        private void recordWindowedSum(final long now,
+                                       final double idleTime,
+                                       final double checkpointTime,
+                                       final double activeRestoreTime,
+                                       final double standbyRestoreTime,
+                                       final double totalLatency) {
+<span class="nc" id="L853">            idleTimeWindowedSum.record(metricsConfig, idleTime, now);</span>
+<span class="nc" id="L854">            checkpointTimeWindowedSum.record(metricsConfig, checkpointTime, now);</span>
+<span class="nc" id="L855">            activeRestoreTimeWindowedSum.record(metricsConfig, activeRestoreTime, now);</span>
+<span class="nc" id="L856">            standbyRestoreTimeWindowedSum.record(metricsConfig, standbyRestoreTime, now);</span>
+<span class="nc" id="L857">            runOnceLatencyWindowedSum.record(metricsConfig, totalLatency, now);</span>
+<span class="nc" id="L858">        }</span>
+
+        private void recordRatios(final long now) {
+<span class="nc" id="L861">            final double runOnceLatencyWindow = runOnceLatencyWindowedSum.measure(metricsConfig, now);</span>
+
+<span class="nc" id="L863">            recordRatio(now, runOnceLatencyWindow, idleTimeWindowedSum, updaterMetrics.idleRatioSensor);</span>
+<span class="nc" id="L864">            recordRatio(now, runOnceLatencyWindow, checkpointTimeWindowedSum, updaterMetrics.checkpointRatioSensor);</span>
+<span class="nc" id="L865">            recordRatio(now, runOnceLatencyWindow, activeRestoreTimeWindowedSum, updaterMetrics.activeRestoreRatioSensor);</span>
+<span class="nc" id="L866">            recordRatio(now, runOnceLatencyWindow, standbyRestoreTimeWindowedSum, updaterMetrics.standbyRestoreRatioSensor);</span>
+<span class="nc" id="L867">        }</span>
+
+        private void recordRatio(final long now,
+                                 final double runOnceLatencyWindow,
+                                 final WindowedSum windowedSum,
+                                 final Sensor ratioSensor) {
+<span class="nc bnc" id="L873" title="All 2 branches missed.">            if (runOnceLatencyWindow &gt; 0.0) {</span>
+<span class="nc" id="L874">                final double elapsedTime = windowedSum.measure(metricsConfig, now);</span>
+<span class="nc" id="L875">                ratioSensor.record(elapsedTime / runOnceLatencyWindow, now);</span>
+<span class="nc" id="L876">            } else {</span>
+<span class="nc" id="L877">                ratioSensor.record(0.0, now);</span>
+            }
+<span class="nc" id="L879">        }</span>
+
+    }
+
+    private final Time time;
+    private final Logger log;
+    private final String name;
+    private final StreamsMetricsImpl metrics;
+    private final Consumer&lt;byte[], byte[]&gt; restoreConsumer;
+    private final ChangelogReader changelogReader;
+    private final TopologyMetadata topologyMetadata;
+<span class="nc" id="L890">    private final Queue&lt;TaskAndAction&gt; tasksAndActions = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L891">    private final Lock tasksAndActionsLock = new ReentrantLock();</span>
+<span class="nc" id="L892">    private final Condition tasksAndActionsCondition = tasksAndActionsLock.newCondition();</span>
+<span class="nc" id="L893">    private final Queue&lt;StreamTask&gt; restoredActiveTasks = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L894">    private final Lock restoredActiveTasksLock = new ReentrantLock();</span>
+<span class="nc" id="L895">    private final Condition restoredActiveTasksCondition = restoredActiveTasksLock.newCondition();</span>
+<span class="nc" id="L896">    private final Lock exceptionsAndFailedTasksLock = new ReentrantLock();</span>
+<span class="nc" id="L897">    private final Queue&lt;ExceptionAndTask&gt; exceptionsAndFailedTasks = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L898">    private final BlockingQueue&lt;Task&gt; removedTasks = new LinkedBlockingQueue&lt;&gt;();</span>
+<span class="nc" id="L899">    private final AtomicBoolean isTopologyResumed = new AtomicBoolean(false);</span>
+
+    private final long commitIntervalMs;
+    private long lastCommitMs;
+
+<span class="nc" id="L904">    private final AtomicReference&lt;Map&lt;StreamsRebalanceData.TaskId, Long&gt;&gt; taskEndOffsetSumSnapshot = new AtomicReference&lt;&gt;(Map.of());</span>
+
+<span class="nc" id="L906">    private StateUpdaterThread stateUpdaterThread = null;</span>
+
+<span class="nc" id="L908">    private final AtomicBoolean threadStopped = new AtomicBoolean(false);</span>
+<span class="nc" id="L909">    private final AtomicReference&lt;RuntimeException&gt; fatalException = new AtomicReference&lt;&gt;();</span>
+
+    public DefaultStateUpdater(final String name,
+                               final StreamsMetricsImpl metrics,
+                               final StreamsConfig config,
+                               final Consumer&lt;byte[], byte[]&gt; restoreConsumer,
+                               final ChangelogReader changelogReader,
+                               final TopologyMetadata topologyMetadata,
+<span class="nc" id="L917">                               final Time time) {</span>
+<span class="nc" id="L918">        this.time = time;</span>
+<span class="nc" id="L919">        this.name = name;</span>
+<span class="nc" id="L920">        this.metrics = metrics;</span>
+<span class="nc" id="L921">        this.restoreConsumer = restoreConsumer;</span>
+<span class="nc" id="L922">        this.changelogReader = changelogReader;</span>
+<span class="nc" id="L923">        this.topologyMetadata = topologyMetadata;</span>
+<span class="nc" id="L924">        this.commitIntervalMs = config.getLong(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG);</span>
+
+<span class="nc" id="L926">        final String logPrefix = String.format(&quot;state-updater [%s] &quot;, name);</span>
+<span class="nc" id="L927">        final LogContext logContext = new LogContext(logPrefix);</span>
+<span class="nc" id="L928">        this.log = logContext.logger(DefaultStateUpdater.class);</span>
+<span class="nc" id="L929">    }</span>
+
+    public void start() {
+<span class="nc bnc" id="L932" title="All 2 branches missed.">        if (stateUpdaterThread == null) {</span>
+<span class="nc bnc" id="L933" title="All 4 branches missed.">            if (!restoredActiveTasks.isEmpty() || !exceptionsAndFailedTasks.isEmpty()) {</span>
+<span class="nc" id="L934">                throw new IllegalStateException(&quot;State updater started with non-empty output queues. &quot;</span>
+                    + BUG_ERROR_MESSAGE);
+            }
+<span class="nc bnc" id="L937" title="All 2 branches missed.">            if (threadStopped.get()) {</span>
+<span class="nc" id="L938">                throw new IllegalStateException(&quot;State updater cannot be started again after it was shut down. &quot;</span>
+                    + BUG_ERROR_MESSAGE);
+            }
+<span class="nc" id="L941">            stateUpdaterThread = new StateUpdaterThread(name, metrics, changelogReader);</span>
+<span class="nc" id="L942">            stateUpdaterThread.start();</span>
+
+            // initialize the last commit as of now to prevent first commit happens immediately
+<span class="nc" id="L945">            this.lastCommitMs = time.milliseconds();</span>
+        }
+<span class="nc" id="L947">    }</span>
+
+    @Override
+    public void shutdown(final Duration timeout) {
+<span class="nc bnc" id="L951" title="All 2 branches missed.">        if (stateUpdaterThread != null) {</span>
+<span class="nc" id="L952">            log.info(&quot;Shutting down state updater thread&quot;);</span>
+
+            // first set the running flag and then
+            // notify the condition in case the thread is waiting on it;
+            // note this ordering should not be changed
+<span class="nc" id="L957">            stateUpdaterThread.isRunning.set(false);</span>
+
+<span class="nc" id="L959">            tasksAndActionsLock.lock();</span>
+            try {
+<span class="nc" id="L961">                tasksAndActionsCondition.signalAll();</span>
+            } finally {
+<span class="nc" id="L963">                tasksAndActionsLock.unlock();</span>
+            }
+
+            try {
+<span class="nc" id="L967">                stateUpdaterThread.join(timeout.toMillis());</span>
+<span class="nc bnc" id="L968" title="All 2 branches missed.">                if (stateUpdaterThread.isAlive()) {</span>
+<span class="nc" id="L969">                    throw new StreamsException(&quot;State updater thread did not shutdown within the timeout&quot;);</span>
+                }
+<span class="nc" id="L971">                stateUpdaterThread = null;</span>
+<span class="nc" id="L972">            } catch (final InterruptedException ignored) {</span>
+<span class="nc" id="L973">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L974">                log.warn(&quot;Interrupted while waiting for state updater thread to shut down&quot;);</span>
+<span class="nc" id="L975">            }</span>
+        }
+<span class="nc" id="L977">    }</span>
+
+    @Override
+    public void add(final Task task) {
+<span class="nc" id="L981">        verifyStateFor(task);</span>
+
+<span class="nc" id="L983">        submit(TaskAndAction.createAddTask(task));</span>
+<span class="nc" id="L984">    }</span>
+
+    private void verifyStateFor(final Task task) {
+<span class="nc bnc" id="L987" title="All 4 branches missed.">        if (task.isActive() &amp;&amp; task.state() != State.RESTORING) {</span>
+<span class="nc" id="L988">            throw new IllegalStateException(&quot;Active task &quot; + task.id() + &quot; is not in state RESTORING. &quot; + BUG_ERROR_MESSAGE);</span>
+        }
+<span class="nc bnc" id="L990" title="All 4 branches missed.">        if (!task.isActive() &amp;&amp; task.state() != State.RUNNING) {</span>
+<span class="nc" id="L991">            throw new IllegalStateException(&quot;Standby task &quot; + task.id() + &quot; is not in state RUNNING. &quot; + BUG_ERROR_MESSAGE);</span>
+        }
+<span class="nc" id="L993">    }</span>
+
+    @Override
+    public CompletableFuture&lt;RemovedTaskResult&gt; remove(final TaskId taskId,
+                                                       final StandbyUpdateListener.SuspendReason suspendReason) {
+<span class="nc" id="L998">        final CompletableFuture&lt;RemovedTaskResult&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L999">        submit(TaskAndAction.createRemoveTask(taskId, future, suspendReason));</span>
+<span class="nc" id="L1000">        return future;</span>
+    }
+
+    private void submit(final TaskAndAction taskAndAction) {
+<span class="nc" id="L1004">        tasksAndActionsLock.lock();</span>
+        try {
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">            if (threadStopped.get()) {</span>
+                // The state updater thread will never pick up this action, so we fail it right away instead of
+                // letting the caller wait for a result that will never come.
+<span class="nc" id="L1009">                failAction(taskAndAction);</span>
+            } else {
+<span class="nc" id="L1011">                tasksAndActions.add(taskAndAction);</span>
+<span class="nc" id="L1012">                tasksAndActionsCondition.signalAll();</span>
+            }
+        } finally {
+<span class="nc" id="L1015">            tasksAndActionsLock.unlock();</span>
+        }
+<span class="nc" id="L1017">    }</span>
+
+    private void failAction(final TaskAndAction taskAndAction) {
+<span class="nc" id="L1020">        final StreamsException exception = new StreamsException(NOT_RUNNING_ERROR_MESSAGE);</span>
+<span class="nc bnc" id="L1021" title="All 2 branches missed.">        if (taskAndAction.action() == Action.REMOVE) {</span>
+<span class="nc" id="L1022">            log.warn(&quot;Task {} cannot be removed because the state updater thread is not running.&quot;,</span>
+<span class="nc" id="L1023">                taskAndAction.taskId());</span>
+<span class="nc" id="L1024">            taskAndAction.futureForRemove().completeExceptionally(exception);</span>
+        } else {
+<span class="nc" id="L1026">            final Task task = taskAndAction.task();</span>
+<span class="nc" id="L1027">            log.warn(&quot;Task {} cannot be updated because the state updater thread is not running. The task is &quot;</span>
+<span class="nc" id="L1028">                + &quot;reported as failed.&quot;, task.id());</span>
+<span class="nc" id="L1029">            final ExceptionAndTask exceptionAndTask = new ExceptionAndTask(exception, task);</span>
+<span class="nc" id="L1030">            exceptionsAndFailedTasksLock.lock();</span>
+            try {
+<span class="nc" id="L1032">                exceptionsAndFailedTasks.add(exceptionAndTask);</span>
+            } finally {
+<span class="nc" id="L1034">                exceptionsAndFailedTasksLock.unlock();</span>
+            }
+        }
+<span class="nc" id="L1037">    }</span>
+
+    @Override
+    public void signalResume() {
+<span class="nc" id="L1041">        tasksAndActionsLock.lock();</span>
+        try {
+<span class="nc" id="L1043">            isTopologyResumed.set(true);</span>
+<span class="nc" id="L1044">            tasksAndActionsCondition.signalAll();</span>
+        } finally {
+<span class="nc" id="L1046">            tasksAndActionsLock.unlock();</span>
+        }
+<span class="nc" id="L1048">    }</span>
+
+    @Override
+    public Set&lt;StreamTask&gt; drainRestoredActiveTasks(final Duration timeout) {
+<span class="nc" id="L1052">        final long timeoutMs = timeout.toMillis();</span>
+<span class="nc" id="L1053">        final long startTime = time.milliseconds();</span>
+<span class="nc" id="L1054">        final long deadline = startTime + timeoutMs;</span>
+<span class="nc" id="L1055">        long now = startTime;</span>
+<span class="nc" id="L1056">        final Set&lt;StreamTask&gt; result = new HashSet&lt;&gt;();</span>
+        try {
+<span class="nc bnc" id="L1058" title="All 4 branches missed.">            while (now &lt;= deadline &amp;&amp; result.isEmpty()) {</span>
+<span class="nc" id="L1059">                restoredActiveTasksLock.lock();</span>
+                try {
+<span class="nc bnc" id="L1061" title="All 4 branches missed.">                    while (restoredActiveTasks.isEmpty() &amp;&amp; now &lt;= deadline) {</span>
+                        // We can ignore whether the deadline expired during await, as the while loop condition will
+                        // check again for deadline expiration.
+                        @SuppressWarnings(&quot;UnusedLocalVariable&quot;)
+<span class="nc" id="L1065">                        final boolean ignored = restoredActiveTasksCondition.await(deadline - now, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L1066">                        now = time.milliseconds();</span>
+<span class="nc" id="L1067">                    }</span>
+<span class="nc" id="L1068">                    result.addAll(restoredActiveTasks);</span>
+<span class="nc" id="L1069">                    restoredActiveTasks.clear();</span>
+                } finally {
+<span class="nc" id="L1071">                    restoredActiveTasksLock.unlock();</span>
+                }
+<span class="nc" id="L1073">                now = time.milliseconds();</span>
+            }
+<span class="nc" id="L1075">            return result;</span>
+<span class="nc" id="L1076">        } catch (final InterruptedException e) {</span>
+<span class="nc" id="L1077">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L1078">            log.warn(&quot;StateUpdaterThread was interrupted while waiting&quot;, e);</span>
+        }
+<span class="nc" id="L1080">        return result;</span>
+    }
+
+    @Override
+    public List&lt;ExceptionAndTask&gt; drainExceptionsAndFailedTasks() {
+<span class="nc" id="L1085">        final List&lt;ExceptionAndTask&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1086">        exceptionsAndFailedTasksLock.lock();</span>
+        try {
+<span class="nc" id="L1088">            result.addAll(exceptionsAndFailedTasks);</span>
+<span class="nc" id="L1089">            exceptionsAndFailedTasks.clear();</span>
+        } finally {
+<span class="nc" id="L1091">            exceptionsAndFailedTasksLock.unlock();</span>
+        }
+<span class="nc" id="L1093">        return result;</span>
+    }
+
+    @Override
+    public boolean hasExceptionsAndFailedTasks() {
+<span class="nc" id="L1098">        exceptionsAndFailedTasksLock.lock();</span>
+        try {
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">            return !exceptionsAndFailedTasks.isEmpty();</span>
+        } finally {
+<span class="nc" id="L1102">            exceptionsAndFailedTasksLock.unlock();</span>
+        }
+    }
+
+    @Override
+    public Optional&lt;RuntimeException&gt; fatalException() {
+<span class="nc" id="L1108">        return Optional.ofNullable(fatalException.get());</span>
+    }
+
+    public Set&lt;StandbyTask&gt; updatingStandbyTasks() {
+<span class="nc bnc" id="L1112" title="All 2 branches missed.">        return stateUpdaterThread != null</span>
+<span class="nc" id="L1113">            ? Set.copyOf(stateUpdaterThread.updatingStandbyTasks())</span>
+<span class="nc" id="L1114">            : Collections.emptySet();</span>
+    }
+
+    @Override
+    public Set&lt;Task&gt; updatingTasks() {
+<span class="nc bnc" id="L1119" title="All 2 branches missed.">        return stateUpdaterThread != null</span>
+<span class="nc" id="L1120">            ? Set.copyOf(stateUpdaterThread.updatingTasks())</span>
+<span class="nc" id="L1121">            : Collections.emptySet();</span>
+    }
+
+    public Set&lt;StreamTask&gt; restoredActiveTasks() {
+<span class="nc" id="L1125">        restoredActiveTasksLock.lock();</span>
+        try {
+<span class="nc" id="L1127">            return Set.copyOf(restoredActiveTasks);</span>
+        } finally {
+<span class="nc" id="L1129">            restoredActiveTasksLock.unlock();</span>
+        }
+    }
+
+    public List&lt;ExceptionAndTask&gt; exceptionsAndFailedTasks() {
+<span class="nc" id="L1134">        exceptionsAndFailedTasksLock.lock();</span>
+        try {
+<span class="nc" id="L1136">            return List.copyOf(exceptionsAndFailedTasks);</span>
+        } finally {
+<span class="nc" id="L1138">            exceptionsAndFailedTasksLock.unlock();</span>
+        }
+    }
+
+    public Set&lt;Task&gt; removedTasks() {
+<span class="nc" id="L1143">        return Set.copyOf(removedTasks);</span>
+    }
+
+    public Set&lt;Task&gt; pausedTasks() {
+<span class="nc bnc" id="L1147" title="All 2 branches missed.">        return stateUpdaterThread != null</span>
+<span class="nc" id="L1148">            ? Set.copyOf(stateUpdaterThread.pausedTasks())</span>
+<span class="nc" id="L1149">            : Collections.emptySet();</span>
+    }
+
+    @Override
+    public Set&lt;Task&gt; tasks() {
+<span class="nc" id="L1154">        return executeWithQueuesLocked(() -&gt; streamOfTasks().map(ReadOnlyTask::new).collect(Collectors.toSet()));</span>
+    }
+
+    @Override
+    public boolean restoresActiveTasks() {
+<span class="nc" id="L1159">        return !executeWithQueuesLocked(</span>
+<span class="nc" id="L1160">            () -&gt; streamOfTasks().filter(Task::isActive).collect(Collectors.toSet())</span>
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">        ).isEmpty();</span>
+    }
+
+    public Set&lt;StreamTask&gt; activeTasks() {
+<span class="nc" id="L1165">        return executeWithQueuesLocked(</span>
+<span class="nc" id="L1166">            () -&gt; streamOfTasks().filter(Task::isActive).map(t -&gt; (StreamTask) t).collect(Collectors.toSet())</span>
+        );
+    }
+
+    @Override
+    public Set&lt;StandbyTask&gt; standbyTasks() {
+<span class="nc" id="L1172">        return executeWithQueuesLocked(</span>
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">            () -&gt; streamOfTasks().filter(t -&gt; !t.isActive()).map(t -&gt; (StandbyTask) t).collect(Collectors.toSet())</span>
+        );
+    }
+
+    @Override
+    public KafkaFutureImpl&lt;Uuid&gt; restoreConsumerInstanceId(final Duration timeout) {
+<span class="nc" id="L1179">        return stateUpdaterThread.restoreConsumerInstanceId(timeout);</span>
+    }
+
+    @Override
+    public Map&lt;StreamsRebalanceData.TaskId, Long&gt; taskEndOffsetSumSnapshot() {
+<span class="nc" id="L1184">        return taskEndOffsetSumSnapshot.get();</span>
+    }
+
+    public boolean isRunning() {
+<span class="nc bnc" id="L1188" title="All 4 branches missed.">        return stateUpdaterThread != null &amp;&amp; stateUpdaterThread.isRunning.get();</span>
+    }
+
+    // used for testing
+    boolean isIdle() {
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">        if (stateUpdaterThread != null) {</span>
+<span class="nc" id="L1194">            return stateUpdaterThread.isIdle.get();</span>
+        }
+<span class="nc" id="L1196">        return false;</span>
+    }
+
+    private &lt;T&gt; Set&lt;T&gt; executeWithQueuesLocked(final Supplier&lt;Set&lt;T&gt;&gt; action) {
+<span class="nc" id="L1200">        tasksAndActionsLock.lock();</span>
+<span class="nc" id="L1201">        restoredActiveTasksLock.lock();</span>
+<span class="nc" id="L1202">        exceptionsAndFailedTasksLock.lock();</span>
+        try {
+<span class="nc" id="L1204">            return action.get();</span>
+        } finally {
+<span class="nc" id="L1206">            exceptionsAndFailedTasksLock.unlock();</span>
+<span class="nc" id="L1207">            restoredActiveTasksLock.unlock();</span>
+<span class="nc" id="L1208">            tasksAndActionsLock.unlock();</span>
+        }
+    }
+
+    private Stream&lt;Task&gt; streamOfTasks() {
+<span class="nc" id="L1213">        return</span>
+<span class="nc" id="L1214">            Stream.concat(</span>
+<span class="nc" id="L1215">                streamOfNonPausedTasks(),</span>
+<span class="nc" id="L1216">                pausedTasks().stream()</span>
+            );
+    }
+
+    private Stream&lt;Task&gt; streamOfNonPausedTasks() {
+<span class="nc" id="L1221">        return</span>
+<span class="nc" id="L1222">            Stream.concat(</span>
+<span class="nc" id="L1223">                tasksAndActions.stream()</span>
+<span class="nc bnc" id="L1224" title="All 2 branches missed.">                    .filter(taskAndAction -&gt; taskAndAction.action() == Action.ADD)</span>
+<span class="nc" id="L1225">                    .map(TaskAndAction::task),</span>
+<span class="nc" id="L1226">                Stream.concat(</span>
+<span class="nc" id="L1227">                    updatingTasks().stream(),</span>
+<span class="nc" id="L1228">                    Stream.concat(</span>
+<span class="nc" id="L1229">                        restoredActiveTasks.stream(),</span>
+<span class="nc" id="L1230">                        Stream.concat(</span>
+<span class="nc" id="L1231">                            exceptionsAndFailedTasks.stream().map(ExceptionAndTask::task),</span>
+<span class="nc" id="L1232">                            removedTasks.stream()))));</span>
+    }
+
+    private class StateUpdaterMetrics {
+        private static final String STATE_LEVEL_GROUP = &quot;stream-state-updater-metrics&quot;;
+
+        private static final String IDLE_RATIO_DESCRIPTION = WINDOWED_RATIO_DESCRIPTION_PREFIX + THREAD_TIME_UNIT_DESCRIPTION + &quot;being idle&quot;;
+        private static final String RESTORE_RATIO_DESCRIPTION = WINDOWED_RATIO_DESCRIPTION_PREFIX + THREAD_TIME_UNIT_DESCRIPTION + &quot;restoring active tasks&quot;;
+        private static final String UPDATE_RATIO_DESCRIPTION = WINDOWED_RATIO_DESCRIPTION_PREFIX + THREAD_TIME_UNIT_DESCRIPTION + &quot;updating standby tasks&quot;;
+        private static final String CHECKPOINT_RATIO_DESCRIPTION = WINDOWED_RATIO_DESCRIPTION_PREFIX + THREAD_TIME_UNIT_DESCRIPTION + &quot;checkpointing tasks restored progress&quot;;
+        private static final String RESTORE_RECORDS_RATE_DESCRIPTION = RATE_DESCRIPTION + &quot;records restored&quot;;
+        private static final String RESTORE_RATE_DESCRIPTION = RATE_DESCRIPTION + &quot;restore calls triggered&quot;;
+
+        private final Sensor restoreSensor;
+        private final Sensor idleRatioSensor;
+        private final Sensor activeRestoreRatioSensor;
+        private final Sensor standbyRestoreRatioSensor;
+        private final Sensor checkpointRatioSensor;
+
+<span class="nc" id="L1251">        private final Deque&lt;Sensor&gt; allSensors = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L1252">        private final Deque&lt;MetricName&gt; allMetricNames = new LinkedList&lt;&gt;();</span>
+
+<span class="nc" id="L1254">        private StateUpdaterMetrics(final StreamsMetricsImpl metrics, final String threadId) {</span>
+<span class="nc" id="L1255">            final Map&lt;String, String&gt; threadLevelTags = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L1256">            threadLevelTags.put(THREAD_ID_TAG, threadId);</span>
+<span class="nc" id="L1257">            final Metrics metricsRegistry = metrics.metricsRegistry();</span>
+
+<span class="nc" id="L1259">            MetricName metricName = metricsRegistry.metricName(&quot;active-restoring-tasks&quot;,</span>
+                STATE_LEVEL_GROUP,
+                &quot;The number of active tasks currently undergoing restoration&quot;,
+                threadLevelTags);
+<span class="nc bnc" id="L1263" title="All 2 branches missed.">            metricsRegistry.addMetric(metricName, (config, now) -&gt; stateUpdaterThread != null ?</span>
+<span class="nc" id="L1264">                stateUpdaterThread.numRestoringActiveTasks() : 0);</span>
+<span class="nc" id="L1265">            allMetricNames.push(metricName);</span>
+
+<span class="nc" id="L1267">            metricName = metricsRegistry.metricName(&quot;standby-updating-tasks&quot;,</span>
+                STATE_LEVEL_GROUP,
+                &quot;The number of standby tasks currently undergoing state update&quot;,
+                threadLevelTags);
+<span class="nc bnc" id="L1271" title="All 2 branches missed.">            metricsRegistry.addMetric(metricName, (config, now) -&gt; stateUpdaterThread != null ?</span>
+<span class="nc" id="L1272">                stateUpdaterThread.numUpdatingStandbyTasks() : 0);</span>
+<span class="nc" id="L1273">            allMetricNames.push(metricName);</span>
+
+<span class="nc" id="L1275">            metricName = metricsRegistry.metricName(&quot;active-paused-tasks&quot;,</span>
+                STATE_LEVEL_GROUP,
+                &quot;The number of active tasks paused restoring&quot;,
+                threadLevelTags);
+<span class="nc bnc" id="L1279" title="All 2 branches missed.">            metricsRegistry.addMetric(metricName, (config, now) -&gt; stateUpdaterThread != null ?</span>
+<span class="nc" id="L1280">                stateUpdaterThread.numPausedActiveTasks() : 0);</span>
+<span class="nc" id="L1281">            allMetricNames.push(metricName);</span>
+
+<span class="nc" id="L1283">            metricName = metricsRegistry.metricName(&quot;standby-paused-tasks&quot;,</span>
+                STATE_LEVEL_GROUP,
+                &quot;The number of standby tasks paused state update&quot;,
+                threadLevelTags);
+<span class="nc bnc" id="L1287" title="All 2 branches missed.">            metricsRegistry.addMetric(metricName, (config, now) -&gt; stateUpdaterThread != null ?</span>
+<span class="nc" id="L1288">                stateUpdaterThread.numPausedStandbyTasks() : 0);</span>
+<span class="nc" id="L1289">            allMetricNames.push(metricName);</span>
+
+<span class="nc" id="L1291">            this.idleRatioSensor = metrics.threadLevelSensor(threadId, &quot;idle-ratio&quot;, RecordingLevel.INFO);</span>
+<span class="nc" id="L1292">            this.idleRatioSensor.add(new MetricName(&quot;idle-ratio&quot;, STATE_LEVEL_GROUP, IDLE_RATIO_DESCRIPTION, threadLevelTags), new Value());</span>
+<span class="nc" id="L1293">            allSensors.add(this.idleRatioSensor);</span>
+
+<span class="nc" id="L1295">            this.activeRestoreRatioSensor = metrics.threadLevelSensor(threadId, &quot;active-restore-ratio&quot;, RecordingLevel.INFO);</span>
+<span class="nc" id="L1296">            this.activeRestoreRatioSensor.add(new MetricName(&quot;active-restore-ratio&quot;, STATE_LEVEL_GROUP, RESTORE_RATIO_DESCRIPTION, threadLevelTags), new Value());</span>
+<span class="nc" id="L1297">            allSensors.add(this.activeRestoreRatioSensor);</span>
+
+<span class="nc" id="L1299">            this.standbyRestoreRatioSensor = metrics.threadLevelSensor(threadId, &quot;standby-update-ratio&quot;, RecordingLevel.INFO);</span>
+<span class="nc" id="L1300">            this.standbyRestoreRatioSensor.add(new MetricName(&quot;standby-update-ratio&quot;, STATE_LEVEL_GROUP, UPDATE_RATIO_DESCRIPTION, threadLevelTags), new Value());</span>
+<span class="nc" id="L1301">            allSensors.add(this.standbyRestoreRatioSensor);</span>
+
+<span class="nc" id="L1303">            this.checkpointRatioSensor = metrics.threadLevelSensor(threadId, &quot;checkpoint-ratio&quot;, RecordingLevel.INFO);</span>
+<span class="nc" id="L1304">            this.checkpointRatioSensor.add(new MetricName(&quot;checkpoint-ratio&quot;, STATE_LEVEL_GROUP, CHECKPOINT_RATIO_DESCRIPTION, threadLevelTags), new Value());</span>
+<span class="nc" id="L1305">            allSensors.add(this.checkpointRatioSensor);</span>
+
+<span class="nc" id="L1307">            this.restoreSensor = metrics.threadLevelSensor(threadId, &quot;restore-records&quot;, RecordingLevel.INFO);</span>
+<span class="nc" id="L1308">            this.restoreSensor.add(new MetricName(&quot;restore-records-rate&quot;, STATE_LEVEL_GROUP, RESTORE_RECORDS_RATE_DESCRIPTION, threadLevelTags), new Rate());</span>
+<span class="nc" id="L1309">            this.restoreSensor.add(new MetricName(&quot;restore-call-rate&quot;, STATE_LEVEL_GROUP, RESTORE_RATE_DESCRIPTION, threadLevelTags), new Rate(new WindowedCount()));</span>
+<span class="nc" id="L1310">            allSensors.add(this.restoreSensor);</span>
+<span class="nc" id="L1311">        }</span>
+
+        void clear() {
+<span class="nc bnc" id="L1314" title="All 2 branches missed.">            while (!allSensors.isEmpty()) {</span>
+<span class="nc" id="L1315">                metrics.removeSensor(allSensors.pop());</span>
+            }
+
+<span class="nc bnc" id="L1318" title="All 2 branches missed.">            while (!allMetricNames.isEmpty()) {</span>
+<span class="nc" id="L1319">                metrics.removeMetric(allMetricNames.pop());</span>
+            }
+<span class="nc" id="L1321">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

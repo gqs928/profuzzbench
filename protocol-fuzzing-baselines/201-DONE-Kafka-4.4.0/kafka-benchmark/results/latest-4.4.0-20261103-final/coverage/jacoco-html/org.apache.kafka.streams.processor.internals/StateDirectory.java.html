@@ -1,0 +1,1020 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StateDirectory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">StateDirectory.java</span></div><h1>StateDirectory.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.TopologyConfig;
+import org.apache.kafka.streams.errors.LockException;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.errors.TaskCorruptedException;
+import org.apache.kafka.streams.internals.StreamsConfigUtils;
+import org.apache.kafka.streams.processor.Cancellable;
+import org.apache.kafka.streams.processor.PunctuationType;
+import org.apache.kafka.streams.processor.Punctuator;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.To;
+import org.apache.kafka.streams.processor.api.FixedKeyRecord;
+import org.apache.kafka.streams.processor.api.Record;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.state.internals.LegacyCheckpointingStateStore;
+import org.apache.kafka.streams.state.internals.OffsetCheckpoint;
+import org.apache.kafka.streams.state.internals.ThreadCache;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.FileFilter;
+import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.streams.processor.internals.StateManagerUtil.parseTaskDirectoryName;
+
+/**
+ * Manages the directories where the state of Tasks owned by a {@link StreamThread} are
+ * stored. Handles creation/locking/unlocking/cleaning of the Task Directories. This class is not
+ * thread-safe.
+ */
+public class StateDirectory implements AutoCloseable {
+
+<span class="nc" id="L91">    private static final Pattern TASK_DIR_PATH_NAME = Pattern.compile(&quot;\\d+_\\d+&quot;);</span>
+<span class="nc" id="L92">    private static final Pattern NAMED_TOPOLOGY_DIR_PATH_NAME = Pattern.compile(&quot;__.+__&quot;); // named topology dirs follow '__Topology-Name__'</span>
+<span class="nc" id="L93">    private static final Logger log = LoggerFactory.getLogger(StateDirectory.class);</span>
+    static final String LOCK_FILE_NAME = &quot;.lock&quot;;
+
+    /* The process file is used to persist the process id across restarts.
+     * For compatibility reasons you should only ever add fields to the json schema
+     */
+    static final String PROCESS_FILE_NAME = &quot;kafka-streams-process-metadata&quot;;
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    static class StateDirectoryProcessFile {
+        @JsonProperty
+        private final UUID processId;
+
+        // required by jackson -- do not remove, your IDE may be warning that this is unused but it's lying to you
+<span class="nc" id="L107">        public StateDirectoryProcessFile() {</span>
+<span class="nc" id="L108">            this.processId = null;</span>
+<span class="nc" id="L109">        }</span>
+
+<span class="nc" id="L111">        StateDirectoryProcessFile(final UUID processId) {</span>
+<span class="nc" id="L112">            this.processId = processId;</span>
+<span class="nc" id="L113">        }</span>
+    }
+
+<span class="nc" id="L116">    private final Object taskDirCreationLock = new Object();</span>
+    private final Time time;
+    private final String appId;
+    private final File stateDir;
+    private final boolean hasPersistentStores;
+    private final boolean hasNamedTopologies;
+
+<span class="nc" id="L123">    private final ConcurrentMap&lt;TaskId, Thread&gt; lockedTasksToOwner = new ConcurrentHashMap&lt;&gt;();</span>
+
+    private FileChannel stateDirLockChannel;
+    private FileLock stateDirLock;
+
+    private final StreamsConfig config;
+<span class="nc" id="L129">    private final Set&lt;TaskId&gt; tasksInLocalState = new ConcurrentSkipListSet&lt;&gt;();</span>
+<span class="nc" id="L130">    private final Map&lt;TaskId, Long&gt; taskOffsetSums = new ConcurrentHashMap&lt;&gt;();</span>
+
+    /**
+     * Ensures that the state base directory as well as the application's sub-directory are created.
+     *
+     * @param config              streams application configuration to read the root state directory path
+     * @param time                system timer used to execute periodic cleanup procedure
+     * @param hasPersistentStores only when the application's topology does have stores persisted on local file
+     *                            system, we would go ahead and auto-create the corresponding application / task / store
+     *                            directories whenever necessary; otherwise no directories would be created.
+     * @param hasNamedTopologies  whether this application is composed of independent named topologies
+     *
+     * @throws ProcessorStateException if the base state directory or application state directory does not exist
+     *                                 and could not be created when hasPersistentStores is enabled.
+     */
+<span class="nc" id="L145">    public StateDirectory(final StreamsConfig config, final Time time, final boolean hasPersistentStores, final boolean hasNamedTopologies) {</span>
+<span class="nc" id="L146">        this.time = time;</span>
+<span class="nc" id="L147">        this.hasPersistentStores = hasPersistentStores;</span>
+<span class="nc" id="L148">        this.hasNamedTopologies = hasNamedTopologies;</span>
+<span class="nc" id="L149">        this.appId = config.getString(StreamsConfig.APPLICATION_ID_CONFIG);</span>
+<span class="nc" id="L150">        this.config = config;</span>
+<span class="nc" id="L151">        final String stateDirName = config.getString(StreamsConfig.STATE_DIR_CONFIG);</span>
+<span class="nc" id="L152">        final File baseDir = new File(stateDirName);</span>
+<span class="nc" id="L153">        stateDir = new File(baseDir, appId);</span>
+
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        if (this.hasPersistentStores) {</span>
+<span class="nc bnc" id="L156" title="All 4 branches missed.">            if (!baseDir.exists() &amp;&amp; !baseDir.mkdirs()) {</span>
+<span class="nc" id="L157">                throw new ProcessorStateException(</span>
+<span class="nc" id="L158">                    String.format(&quot;base state directory [%s] doesn't exist and couldn't be created&quot;, stateDirName));</span>
+            }
+<span class="nc bnc" id="L160" title="All 4 branches missed.">            if (!stateDir.exists() &amp;&amp; !stateDir.mkdir()) {</span>
+<span class="nc" id="L161">                throw new ProcessorStateException(</span>
+<span class="nc" id="L162">                    String.format(&quot;state directory [%s] doesn't exist and couldn't be created&quot;, stateDir.getPath()));</span>
+<span class="nc bnc" id="L163" title="All 4 branches missed.">            } else if (stateDir.exists() &amp;&amp; !stateDir.isDirectory()) {</span>
+<span class="nc" id="L164">                throw new ProcessorStateException(</span>
+<span class="nc" id="L165">                    String.format(&quot;state directory [%s] can't be created as there is an existing file with the same name&quot;, stateDir.getPath()));</span>
+            }
+
+<span class="nc bnc" id="L168" title="All 2 branches missed.">            if (stateDirName.startsWith(System.getProperty(&quot;java.io.tmpdir&quot;))) {</span>
+<span class="nc" id="L169">                log.warn(&quot;Using an OS temp directory in the state.dir property can cause failures with writing&quot; +</span>
+                    &quot; the checkpoint file due to the fact that this directory can be cleared by the OS.&quot; +
+                    &quot; Resolved state.dir: [&quot; + stateDirName + &quot;]&quot;);
+
+            }
+            // change the dir permission to &quot;rwxr-x---&quot; to avoid world readable
+<span class="nc" id="L175">            configurePermissions(baseDir);</span>
+<span class="nc" id="L176">            configurePermissions(stateDir);</span>
+        }
+<span class="nc" id="L178">    }</span>
+
+    private void configurePermissions(final File file) {
+<span class="nc" id="L181">        final Path path = file.toPath();</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (path.getFileSystem().supportedFileAttributeViews().contains(&quot;posix&quot;)) {</span>
+<span class="nc" id="L183">            final Set&lt;PosixFilePermission&gt; perms = EnumSet.of(</span>
+                    PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_WRITE,
+                    PosixFilePermission.OWNER_EXECUTE,
+                    PosixFilePermission.GROUP_READ,
+                    PosixFilePermission.GROUP_EXECUTE
+            );
+<span class="nc bnc" id="L190" title="All 2 branches missed.">            if (config.getBoolean(StreamsConfig.ALLOW_OS_GROUP_WRITE_ACCESS_CONFIG)) {</span>
+<span class="nc" id="L191">                perms.add(PosixFilePermission.GROUP_WRITE);</span>
+            }
+            try {
+<span class="nc" id="L194">                Files.setPosixFilePermissions(path, perms);</span>
+<span class="nc" id="L195">            } catch (final IOException e) {</span>
+<span class="nc" id="L196">                log.error(&quot;Error changing permissions for the directory {} &quot;, path, e);</span>
+<span class="nc" id="L197">            }</span>
+<span class="nc" id="L198">        } else {</span>
+<span class="nc" id="L199">            boolean set = file.setReadable(true, true);</span>
+<span class="nc" id="L200">            set &amp;= file.setWritable(true, true);</span>
+<span class="nc" id="L201">            set &amp;= file.setExecutable(true, true);</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">            if (!set) {</span>
+<span class="nc" id="L203">                log.error(&quot;Failed to change permissions for the directory {}&quot;, file);</span>
+            }
+        }
+<span class="nc" id="L206">    }</span>
+
+    /**
+     * @return true if the state directory was successfully locked
+     */
+    private boolean lockStateDirectory() {
+<span class="nc" id="L212">        final File lockFile = new File(stateDir, LOCK_FILE_NAME);</span>
+        try {
+<span class="nc" id="L214">            stateDirLockChannel = FileChannel.open(lockFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);</span>
+<span class="nc" id="L215">            stateDirLock = tryLock(stateDirLockChannel);</span>
+<span class="nc" id="L216">        } catch (final IOException e) {</span>
+<span class="nc" id="L217">            log.error(&quot;Unable to lock the state directory due to unexpected exception&quot;, e);</span>
+<span class="nc" id="L218">            throw new ProcessorStateException(String.format(&quot;Failed to lock the state directory [%s] during startup&quot;,</span>
+<span class="nc" id="L219">                stateDir.getAbsolutePath()), e);</span>
+<span class="nc" id="L220">        }</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        return stateDirLock != null;</span>
+    }
+
+    /**
+     * @throws LockException If another process already locks any of StateDirectory
+     * @throws ProcessorStateException if any of task directory does not exist and could not be created
+    */
+    public void initializeStartupStores(final TopologyMetadata topologyMetadata,
+                                        final LogContext logContext,
+                                        final StreamsMetricsImpl metricsImpl) {
+<span class="nc" id="L231">        final List&lt;TaskDirectory&gt; nonEmptyTaskDirectories = listNonEmptyTaskDirectories();</span>
+<span class="nc bnc" id="L232" title="All 4 branches missed.">        if (hasPersistentStores &amp;&amp; !nonEmptyTaskDirectories.isEmpty()) {</span>
+<span class="nc" id="L233">            final boolean eosEnabled = StreamsConfigUtils.eosEnabled(config);</span>
+<span class="nc" id="L234">            final boolean transactionalStateStoresEnabled = new TopologyConfig(config).transactionalStateStoresEnabled;</span>
+
+            // Initialize thread-specific resources needed to open stores in the state directory
+<span class="nc" id="L237">            final String threadLogPrefix = String.format(&quot;[%s]&quot;, Thread.currentThread().getName());</span>
+<span class="nc" id="L238">            final ThreadCache dummyCache = new ThreadCache(new LogContext(threadLogPrefix), 0L, metricsImpl);</span>
+
+            // discover all non-empty task directories in StateDirectory
+<span class="nc bnc" id="L241" title="All 2 branches missed.">            for (final TaskDirectory taskDirectory : nonEmptyTaskDirectories) {</span>
+<span class="nc" id="L242">                final String dirName = taskDirectory.file().getName();</span>
+<span class="nc" id="L243">                final TaskId task = parseTaskDirectoryName(dirName, taskDirectory.namedTopology());</span>
+<span class="nc" id="L244">                final ProcessorTopology subTopology = topologyMetadata.buildSubtopology(task);</span>
+
+                // we still check if the task's sub-topology is stateful, even though we know its directory contains state,
+                // because it's possible that the topology has changed since that data was written, and is now stateless
+                // this therefore prevents us from creating unnecessary stores just because of some left-over state
+<span class="nc bnc" id="L249" title="All 2 branches missed.">                if (subTopology.hasStateWithChangelogs()) {</span>
+<span class="nc" id="L250">                    final Set&lt;TopicPartition&gt; inputPartitions = topologyMetadata.nodeToSourceTopics(task).values().stream()</span>
+<span class="nc" id="L251">                            .flatMap(Collection::stream)</span>
+<span class="nc" id="L252">                            .map(t -&gt; new TopicPartition(t, task.partition()))</span>
+<span class="nc" id="L253">                            .collect(Collectors.toSet());</span>
+                    // Open a temporary state manager that will open the stores inside the subtopology
+<span class="nc" id="L255">                    final ProcessorStateManager temporaryStateManager = ProcessorStateManager.createStartupTaskStateManager(</span>
+                        task,
+                        eosEnabled,
+                        logContext,
+                        this,
+                        time,
+<span class="nc" id="L261">                        subTopology.storeToChangelogTopic(),</span>
+                        inputPartitions
+                    );
+
+<span class="nc" id="L265">                    final StartupContext initContext = new StartupContext(task, config, temporaryStateManager, metricsImpl, dummyCache);</span>
+                    try {
+                        // We only handle TaskCorruptedException at this point. Any other exception is considered fatal.
+<span class="nc" id="L268">                        StateManagerUtil.registerStateStores(log, threadLogPrefix, subTopology, temporaryStateManager, this, initContext);</span>
+<span class="nc" id="L269">                        temporaryStateManager.commit();</span>
+<span class="nc" id="L270">                    } catch (final TaskCorruptedException tce) {</span>
+                        // At this point, we only log a warning and continue with the startup store initialization.
+                        // The task-corrupted exception will be handled in the first Task assignment phase.
+<span class="nc" id="L273">                        log.warn(&quot;Failed to register startup state stores for task {}: {}&quot;, task, tce.getMessage());</span>
+                    } finally {
+                        // Make sure the state manager writes the local checkpoint file before closing the stores
+                        // This will be replaced in the future when removing the checkpoint file dependency.
+<span class="nc" id="L277">                        StateManagerUtil.closeStateManager(</span>
+                            log, threadLogPrefix, true, eosEnabled,
+                            transactionalStateStoresEnabled,
+                            temporaryStateManager, this, Task.TaskType.ACTIVE
+                        );
+                    }
+<span class="nc" id="L283">                    tasksInLocalState.add(task);</span>
+                }
+<span class="nc" id="L285">            }</span>
+        }
+<span class="nc" id="L287">    }</span>
+
+    public boolean hasStartupTasks() {
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        return !tasksInLocalState.isEmpty();</span>
+    }
+
+    public synchronized boolean removeStartupState(final TaskId taskId) {
+<span class="nc" id="L294">        final boolean removed = tasksInLocalState.remove(taskId);</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        if (removed) {</span>
+<span class="nc" id="L296">            lockedTasksToOwner.put(taskId, Thread.currentThread());</span>
+        }
+<span class="nc" id="L298">        return removed;</span>
+    }
+
+
+    private void unlockStartupStores() {
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        for (final TaskId task : tasksInLocalState) {</span>
+<span class="nc" id="L304">            unlock(task);</span>
+<span class="nc" id="L305">        }</span>
+<span class="nc" id="L306">    }</span>
+
+    public Map&lt;TaskId, Long&gt; taskOffsetSums(final Set&lt;TaskId&gt; tasks) {
+<span class="nc" id="L309">        return taskOffsetSums.entrySet().stream()</span>
+<span class="nc" id="L310">                .filter(e -&gt; tasks.contains(e.getKey()))</span>
+<span class="nc" id="L311">                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+    }
+
+    public Map&lt;TaskId, Long&gt; taskOffsetSums() {
+<span class="nc" id="L315">        return Collections.unmodifiableMap(taskOffsetSums);</span>
+    }
+
+    public void updateTaskOffsets(final TaskId taskId, final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        if (!changelogOffsets.isEmpty()) {</span>
+<span class="nc" id="L320">            taskOffsetSums.put(taskId, sumOfChangelogOffsets(taskId, changelogOffsets));</span>
+        }
+<span class="nc" id="L322">    }</span>
+
+    public void removeTaskOffsets(final TaskId taskId) {
+<span class="nc" id="L325">        taskOffsetSums.remove(taskId);</span>
+<span class="nc" id="L326">    }</span>
+
+    static long sumOfChangelogOffsets(final TaskId taskId, final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc" id="L329">        long offsetSum = 0L;</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        for (final Map.Entry&lt;TopicPartition, Long&gt; changelogEntry : changelogOffsets.entrySet()) {</span>
+<span class="nc" id="L331">            final long offset = changelogEntry.getValue();</span>
+
+<span class="nc bnc" id="L333" title="All 2 branches missed.">            if (offset != OffsetCheckpoint.OFFSET_UNKNOWN) {</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                if (offset &lt; 0) {</span>
+<span class="nc" id="L335">                    throw new StreamsException(</span>
+                            new IllegalStateException(&quot;Expected not to get a sentinel offset, but got: &quot; + changelogEntry),
+                            taskId);
+                }
+<span class="nc" id="L339">                offsetSum += offset;</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">                if (offsetSum &lt; 0) {</span>
+<span class="nc" id="L341">                    log.warn(&quot;Sum of changelog offsets for task {} overflowed, pinning to Long.MAX_VALUE&quot;, taskId);</span>
+<span class="nc" id="L342">                    return Long.MAX_VALUE;</span>
+                }
+            }
+<span class="nc" id="L345">        }</span>
+
+<span class="nc" id="L347">        return offsetSum;</span>
+    }
+
+    public UUID initializeProcessId() {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (!hasPersistentStores) {</span>
+<span class="nc" id="L352">            final UUID processId = UUID.randomUUID();</span>
+<span class="nc" id="L353">            log.info(&quot;Created new process id: {}&quot;, processId);</span>
+<span class="nc" id="L354">            return processId;</span>
+        }
+
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        if (!lockStateDirectory()) {</span>
+<span class="nc" id="L358">            log.error(&quot;Unable to obtain lock as state directory is already locked by another process&quot;);</span>
+<span class="nc" id="L359">            throw new StreamsException(String.format(&quot;Unable to initialize state, this can happen if multiple instances of &quot; +</span>
+                                           &quot;Kafka Streams are running in the same state directory &quot; +
+<span class="nc" id="L361">                                           &quot;(current state directory is [%s]&quot;, stateDir.getAbsolutePath()));</span>
+        }
+
+<span class="nc" id="L364">        final File processFile = new File(stateDir, PROCESS_FILE_NAME);</span>
+<span class="nc" id="L365">        final ObjectMapper mapper = new ObjectMapper();</span>
+
+        try {
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            if (processFile.exists()) {</span>
+                try {
+<span class="nc" id="L370">                    final StateDirectoryProcessFile processFileData = mapper.readValue(processFile, StateDirectoryProcessFile.class);</span>
+<span class="nc" id="L371">                    log.info(&quot;Reading UUID from process file: {}&quot;, processFileData.processId);</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                    if (processFileData.processId != null) {</span>
+<span class="nc" id="L373">                        return processFileData.processId;</span>
+                    }
+<span class="nc" id="L375">                } catch (final Exception e) {</span>
+<span class="nc" id="L376">                    log.warn(&quot;Failed to read json process file&quot;, e);</span>
+<span class="nc" id="L377">                }</span>
+            }
+
+<span class="nc" id="L380">            final StateDirectoryProcessFile processFileData = new StateDirectoryProcessFile(UUID.randomUUID());</span>
+<span class="nc" id="L381">            log.info(&quot;No process id found on disk, got fresh process id {}&quot;, processFileData.processId);</span>
+
+<span class="nc" id="L383">            mapper.writeValue(processFile, processFileData);</span>
+<span class="nc" id="L384">            return processFileData.processId;</span>
+<span class="nc" id="L385">        } catch (final IOException e) {</span>
+<span class="nc" id="L386">            log.error(&quot;Unable to read/write process file due to unexpected exception&quot;, e);</span>
+<span class="nc" id="L387">            throw new ProcessorStateException(e);</span>
+        }
+    }
+
+    /**
+     * Get or create the directory for the provided {@link TaskId}.
+     * @return directory for the {@link TaskId}
+     * @throws ProcessorStateException if the task directory does not exist and could not be created
+     */
+    public File getOrCreateDirectoryForTask(final TaskId taskId) {
+<span class="nc" id="L397">        final File taskParentDir = getTaskDirectoryParentName(taskId);</span>
+<span class="nc" id="L398">        final File taskDir = new File(taskParentDir, StateManagerUtil.toTaskDirString(taskId));</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">        if (hasPersistentStores) {</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">            if (!taskDir.exists()) {</span>
+<span class="nc" id="L401">                synchronized (taskDirCreationLock) {</span>
+                    // to avoid a race condition, we need to check again if the directory does not exist:
+                    // otherwise, two threads might pass the outer `if` (and enter the `then` block),
+                    // one blocks on `synchronized` while the other creates the directory,
+                    // and the blocking one fails when trying to create it after it's unblocked
+<span class="nc bnc" id="L406" title="All 4 branches missed.">                    if (!taskParentDir.exists() &amp;&amp; !taskParentDir.mkdir()) {</span>
+<span class="nc" id="L407">                        throw new ProcessorStateException(</span>
+<span class="nc" id="L408">                            String.format(&quot;Parent [%s] of task directory [%s] doesn't exist and couldn't be created&quot;,</span>
+<span class="nc" id="L409">                                taskParentDir.getPath(), taskDir.getPath()));</span>
+                    }
+<span class="nc bnc" id="L411" title="All 4 branches missed.">                    if (!taskDir.exists() &amp;&amp; !taskDir.mkdir()) {</span>
+<span class="nc" id="L412">                        throw new ProcessorStateException(</span>
+<span class="nc" id="L413">                            String.format(&quot;task directory [%s] doesn't exist and couldn't be created&quot;, taskDir.getPath()));</span>
+                    }
+<span class="nc" id="L415">                }</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            } else if (!taskDir.isDirectory()) {</span>
+<span class="nc" id="L417">                throw new ProcessorStateException(</span>
+<span class="nc" id="L418">                    String.format(&quot;state directory [%s] can't be created as there is an existing file with the same name&quot;, taskDir.getPath()));</span>
+            }
+        }
+<span class="nc" id="L421">        return taskDir;</span>
+    }
+
+    private File getTaskDirectoryParentName(final TaskId taskId) {
+<span class="nc" id="L425">        final String namedTopology = taskId.topologyName();</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">        if (namedTopology != null) {</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">            if (!hasNamedTopologies) {</span>
+<span class="nc" id="L428">                throw new IllegalStateException(&quot;Tried to lookup taskId with named topology, but StateDirectory thinks hasNamedTopologies = false&quot;);</span>
+            }
+<span class="nc" id="L430">            return new File(stateDir, getNamedTopologyDirName(namedTopology));</span>
+        } else {
+<span class="nc" id="L432">            return stateDir;</span>
+        }
+    }
+
+    private String getNamedTopologyDirName(final String topologyName) {
+<span class="nc" id="L437">        return &quot;__&quot; + topologyName + &quot;__&quot;;</span>
+    }
+
+    /**
+     * Decide if the directory of the task is empty or not
+     */
+    boolean directoryForTaskIsEmpty(final TaskId taskId) {
+<span class="nc" id="L444">        final File taskDir = getOrCreateDirectoryForTask(taskId);</span>
+
+<span class="nc" id="L446">        return taskDirIsEmpty(taskDir);</span>
+    }
+
+    private boolean taskDirIsEmpty(final File taskDir) {
+<span class="nc" id="L450">        final File[] storeDirs = taskDir.listFiles(pathname -&gt;</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">                !pathname.getName().startsWith(LegacyCheckpointingStateStore.CHECKPOINT_FILE_NAME));</span>
+
+<span class="nc" id="L453">        boolean taskDirEmpty = true;</span>
+
+        // if the task is stateless, storeDirs would be null
+<span class="nc bnc" id="L456" title="All 4 branches missed.">        if (storeDirs != null &amp;&amp; storeDirs.length &gt; 0) {</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">            for (final File file : storeDirs) {</span>
+                // We removed the task directory locking but some upgrading applications may still have old lock files on disk,
+                // we just lazily delete those in this method since it's the only thing that would be affected by these
+<span class="nc bnc" id="L460" title="All 2 branches missed.">                if (file.getName().endsWith(LOCK_FILE_NAME)) {</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">                    if (!file.delete()) {</span>
+                        // If we hit an error deleting this just ignore it and move on, we'll retry again at some point
+<span class="nc" id="L463">                        log.warn(&quot;Error encountered deleting lock file in {}&quot;, taskDir);</span>
+                    }
+                } else {
+                    // If it's not a lock file then the directory is not empty,
+                    // but finish up the loop in case there's a lock file left to delete
+<span class="nc" id="L468">                    log.trace(&quot;TaskDir {} was not empty, found {}&quot;, taskDir, file);</span>
+<span class="nc" id="L469">                    taskDirEmpty = false;</span>
+                }
+            }
+        }
+<span class="nc" id="L473">        return taskDirEmpty;</span>
+    }
+
+    /**
+     * Get or create the directory for the global stores.
+     * @return directory for the global stores
+     * @throws ProcessorStateException if the global store directory does not exist and could not be created
+     */
+    public File globalStateDir() {
+<span class="nc" id="L482">        final File dir = new File(stateDir, &quot;global&quot;);</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">        if (hasPersistentStores) {</span>
+<span class="nc bnc" id="L484" title="All 4 branches missed.">            if (!dir.exists() &amp;&amp; !dir.mkdir()) {</span>
+<span class="nc" id="L485">                throw new ProcessorStateException(</span>
+<span class="nc" id="L486">                    String.format(&quot;global state directory [%s] doesn't exist and couldn't be created&quot;, dir.getPath()));</span>
+<span class="nc bnc" id="L487" title="All 4 branches missed.">            } else if (dir.exists() &amp;&amp; !dir.isDirectory()) {</span>
+<span class="nc" id="L488">                throw new ProcessorStateException(</span>
+<span class="nc" id="L489">                    String.format(&quot;global state directory [%s] can't be created as there is an existing file with the same name&quot;, dir.getPath()));</span>
+            }
+        }
+<span class="nc" id="L492">        return dir;</span>
+    }
+
+    private String logPrefix() {
+<span class="nc" id="L496">        return String.format(&quot;stream-thread [%s]&quot;, Thread.currentThread().getName());</span>
+    }
+
+    /**
+     * Get the lock for the {@link TaskId}s directory if it is available
+     * @param taskId task id
+     * @return true if successful
+     */
+    synchronized boolean lock(final TaskId taskId) {
+<span class="nc bnc" id="L505" title="All 2 branches missed.">        if (!hasPersistentStores) {</span>
+<span class="nc" id="L506">            return true;</span>
+        }
+
+<span class="nc" id="L509">        final Thread lockOwner = lockedTasksToOwner.get(taskId);</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        if (lockOwner != null) {</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">            if (lockOwner.equals(Thread.currentThread())) {</span>
+<span class="nc" id="L512">                log.trace(&quot;{} Found cached state dir lock for task {}&quot;, logPrefix(), taskId);</span>
+                // we already own the lock
+<span class="nc" id="L514">                return true;</span>
+            } else {
+                // another thread owns the lock
+<span class="nc" id="L517">                return false;</span>
+            }
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        } else if (!stateDir.exists()) {</span>
+<span class="nc" id="L520">            log.error(&quot;Tried to lock task directory for {} but the state directory does not exist&quot;, taskId);</span>
+<span class="nc" id="L521">            throw new IllegalStateException(&quot;The state directory has been deleted&quot;);</span>
+        } else {
+<span class="nc" id="L523">            lockedTasksToOwner.put(taskId, Thread.currentThread());</span>
+<span class="nc" id="L524">            return true;</span>
+        }
+    }
+
+    /**
+     * Unlock the state directory for the given {@link TaskId}.
+     */
+    synchronized void unlock(final TaskId taskId) {
+<span class="nc" id="L532">        final Thread lockOwner = lockedTasksToOwner.get(taskId);</span>
+<span class="nc bnc" id="L533" title="All 4 branches missed.">        if (lockOwner != null &amp;&amp; lockOwner.equals(Thread.currentThread())) {</span>
+<span class="nc" id="L534">            lockedTasksToOwner.remove(taskId);</span>
+<span class="nc" id="L535">            log.debug(&quot;{} Released state dir lock for task {}&quot;, logPrefix(), taskId);</span>
+        }
+<span class="nc" id="L537">    }</span>
+
+    /**
+     * Expose for tests.
+     */
+    Thread lockOwner(final TaskId taskId) {
+<span class="nc" id="L543">        return lockedTasksToOwner.get(taskId);</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc bnc" id="L548" title="All 2 branches missed.">        if (hasPersistentStores) {</span>
+<span class="nc" id="L549">            unlockStartupStores();</span>
+<span class="nc" id="L550">            taskOffsetSums.clear();</span>
+            try {
+<span class="nc" id="L552">                stateDirLock.release();</span>
+<span class="nc" id="L553">                stateDirLockChannel.close();</span>
+
+<span class="nc" id="L555">                stateDirLock = null;</span>
+<span class="nc" id="L556">                stateDirLockChannel = null;</span>
+<span class="nc" id="L557">            } catch (final IOException e) {</span>
+<span class="nc" id="L558">                log.error(&quot;Unexpected exception while unlocking the state dir&quot;, e);</span>
+<span class="nc" id="L559">                throw new StreamsException(String.format(&quot;Failed to release the lock on the state directory [%s]&quot;, stateDir.getAbsolutePath()), e);</span>
+<span class="nc" id="L560">            }</span>
+
+            // all threads should be stopped and cleaned up by now, so none should remain holding a lock
+<span class="nc bnc" id="L563" title="All 2 branches missed.">            if (!lockedTasksToOwner.isEmpty()) {</span>
+<span class="nc" id="L564">                log.error(&quot;Some task directories still locked while closing state, this indicates unclean shutdown: {}&quot;, lockedTasksToOwner);</span>
+            }
+        }
+<span class="nc" id="L567">    }</span>
+
+    public synchronized void clean() {
+        try {
+<span class="nc" id="L571">            cleanStateAndTaskDirectoriesCalledByUser();</span>
+<span class="nc" id="L572">        } catch (final Exception e) {</span>
+<span class="nc" id="L573">            throw new StreamsException(e);</span>
+<span class="nc" id="L574">        }</span>
+
+        try {
+<span class="nc bnc" id="L577" title="All 2 branches missed.">            if (stateDir.exists()) {</span>
+<span class="nc" id="L578">                Utils.delete(globalStateDir().getAbsoluteFile());</span>
+            }
+<span class="nc" id="L580">        } catch (final IOException exception) {</span>
+<span class="nc" id="L581">            log.error(</span>
+<span class="nc" id="L582">                String.format(&quot;%s Failed to delete global state directory of %s due to an unexpected exception&quot;,</span>
+<span class="nc" id="L583">                    logPrefix(), appId),</span>
+                exception
+            );
+<span class="nc" id="L586">            throw new StreamsException(exception);</span>
+<span class="nc" id="L587">        }</span>
+
+        try {
+<span class="nc bnc" id="L590" title="All 6 branches missed.">            if (hasPersistentStores &amp;&amp; stateDir.exists() &amp;&amp; !stateDir.delete()) {</span>
+<span class="nc" id="L591">                final File[] remainingFiles = stateDir.listFiles();</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">                if (remainingFiles == null) {</span>
+<span class="nc" id="L593">                    log.warn(&quot;{} Failed to delete state store directory {}. It is not a directory, or it is inaccessible.&quot;,</span>
+<span class="nc" id="L594">                            logPrefix(), stateDir.getAbsolutePath());</span>
+<span class="nc" id="L595">                    return;</span>
+                }
+
+<span class="nc" id="L598">                boolean hasProcessOrLockFiles = false;</span>
+<span class="nc" id="L599">                boolean hasUnexpectedFiles = false;</span>
+
+<span class="nc bnc" id="L601" title="All 2 branches missed.">                for (final File file : remainingFiles) {</span>
+<span class="nc" id="L602">                    final String name = file.getName();</span>
+<span class="nc bnc" id="L603" title="All 4 branches missed.">                    if (PROCESS_FILE_NAME.equals(name) || LOCK_FILE_NAME.equals(name)) {</span>
+<span class="nc" id="L604">                        hasProcessOrLockFiles = true;</span>
+                    } else {
+<span class="nc" id="L606">                        hasUnexpectedFiles = true;</span>
+<span class="nc" id="L607">                        break;</span>
+                    }
+                }
+                
+<span class="nc bnc" id="L611" title="All 4 branches missed.">                if (hasProcessOrLockFiles &amp;&amp; !hasUnexpectedFiles) {</span>
+                    // KAFKA-10716: The processId file is persisted in the state directory to keep the
+                    // processId stable across restarts. Removing it would cause a new processId to be
+                    // generated and may lead to unnecessary task movements during rebalances.
+<span class="nc" id="L615">                    log.debug(</span>
+                            &quot;{} State store directory {} was not deleted because it still contains expected metadata files ({} and/or {}).&quot;,
+<span class="nc" id="L617">                            logPrefix(), stateDir.getAbsolutePath(), PROCESS_FILE_NAME, LOCK_FILE_NAME</span>
+                    );
+                } else {
+<span class="nc" id="L620">                    log.warn(</span>
+                            &quot;{} Failed to fully clean up state store directory {} because unexpected files remain.&quot;,
+<span class="nc" id="L622">                            logPrefix(),</span>
+<span class="nc" id="L623">                            stateDir.getAbsolutePath()</span>
+                    );
+                }
+            }
+<span class="nc" id="L627">        } catch (final SecurityException exception) {</span>
+<span class="nc" id="L628">            log.error(</span>
+<span class="nc" id="L629">                String.format(&quot;%s Failed to delete state store directory of %s due to an unexpected exception&quot;,</span>
+<span class="nc" id="L630">                    logPrefix(), stateDir.getAbsolutePath()),</span>
+                exception
+            );
+<span class="nc" id="L633">            throw new StreamsException(exception);</span>
+<span class="nc" id="L634">        }</span>
+<span class="nc" id="L635">    }</span>
+
+    /**
+     * Remove the directories for any {@link TaskId}s that are no-longer
+     * owned by this {@link StreamThread} and aren't locked by either
+     * another process or another {@link StreamThread}
+     * @param cleanupDelayMs only remove directories if they haven't been modified for at least
+     *                       this amount of time (milliseconds)
+     */
+    public synchronized void cleanRemovedTasks(final long cleanupDelayMs) {
+        try {
+<span class="nc" id="L646">            cleanRemovedTasksCalledByCleanerThread(cleanupDelayMs);</span>
+<span class="nc" id="L647">        } catch (final Exception cannotHappen) {</span>
+<span class="nc" id="L648">            throw new IllegalStateException(&quot;Should have swallowed exception.&quot;, cannotHappen);</span>
+<span class="nc" id="L649">        }</span>
+<span class="nc" id="L650">    }</span>
+
+    private void cleanRemovedTasksCalledByCleanerThread(final long cleanupDelayMs) {
+<span class="nc bnc" id="L653" title="All 2 branches missed.">        for (final TaskDirectory taskDir : listAllTaskDirectories()) {</span>
+<span class="nc" id="L654">            final String dirName = taskDir.file().getName();</span>
+<span class="nc" id="L655">            final TaskId id = parseTaskDirectoryName(dirName, taskDir.namedTopology());</span>
+<span class="nc bnc" id="L656" title="All 2 branches missed.">            if (!lockedTasksToOwner.containsKey(id)) {</span>
+                try {
+<span class="nc bnc" id="L658" title="All 2 branches missed.">                    if (lock(id)) {</span>
+<span class="nc" id="L659">                        final long now = time.milliseconds();</span>
+<span class="nc" id="L660">                        final long lastModifiedMs = taskDir.file().lastModified();</span>
+<span class="nc bnc" id="L661" title="All 2 branches missed.">                        if (now - cleanupDelayMs &gt; lastModifiedMs) {</span>
+<span class="nc" id="L662">                            removeTaskOffsets(id);</span>
+<span class="nc" id="L663">                            log.info(&quot;{} Deleting obsolete state directory {} for task {} as {}ms has elapsed (cleanup delay is {}ms).&quot;,</span>
+<span class="nc" id="L664">                                logPrefix(), dirName, id, now - lastModifiedMs, cleanupDelayMs);</span>
+<span class="nc" id="L665">                            removeStartupState(id);</span>
+<span class="nc" id="L666">                            Utils.delete(taskDir.file());</span>
+                        }
+                    }
+<span class="nc" id="L669">                } catch (final IOException exception) {</span>
+<span class="nc" id="L670">                    log.warn(</span>
+<span class="nc" id="L671">                        String.format(&quot;%s Swallowed the following exception during deletion of obsolete state directory %s for task %s:&quot;,</span>
+<span class="nc" id="L672">                            logPrefix(), dirName, id),</span>
+                        exception
+                    );
+                } finally {
+<span class="nc" id="L676">                    unlock(id);</span>
+                }
+            }
+<span class="nc" id="L679">        }</span>
+        // Ok to ignore returned exception as it should be swallowed
+<span class="nc" id="L681">        maybeCleanEmptyNamedTopologyDirs(true);</span>
+<span class="nc" id="L682">    }</span>
+
+    /**
+     * Purges local state directories and checkpoint files during application startup.
+     *
+     * @param dirMaxAgeMs the time-based threshold in milliseconds. Only state directories
+     * and checkpoint files that have not been modified for at least
+     * this amount of time (corresponding to the
+     * {@code state.cleanup.dir.max.age.ms} property) will be removed.
+     */
+    public synchronized void cleanOutdatedDirsOnStartup(final long dirMaxAgeMs) {
+        try {
+<span class="nc" id="L694">            cleanStateAndTaskDirectoriesOnStartup(dirMaxAgeMs);</span>
+<span class="nc" id="L695">        } catch (final Exception e) {</span>
+<span class="nc" id="L696">            throw new StreamsException(e);</span>
+<span class="nc" id="L697">        }</span>
+<span class="nc" id="L698">    }</span>
+
+    private void cleanStateAndTaskDirectoriesOnStartup(final long dirMaxAgeMs) throws Exception {
+<span class="nc" id="L701">        final AtomicReference&lt;Exception&gt; firstException = new AtomicReference&lt;&gt;();</span>
+<span class="nc bnc" id="L702" title="All 2 branches missed.">        for (final TaskDirectory taskDir : listAllTaskDirectories()) {</span>
+<span class="nc" id="L703">            final String dirName = taskDir.file().getName();</span>
+            try {
+<span class="nc" id="L705">                final long now = time.milliseconds();</span>
+<span class="nc" id="L706">                final long lastModifiedMs = taskDir.file().lastModified();</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">                if (now - dirMaxAgeMs &gt; lastModifiedMs) {</span>
+<span class="nc" id="L708">                    log.info(&quot;Deleting outdated state directory {} as {}ms has elapsed from last update (max directory age is {}ms).&quot;,</span>
+<span class="nc" id="L709">                            dirName, now - lastModifiedMs, dirMaxAgeMs);</span>
+<span class="nc" id="L710">                    Utils.delete(taskDir.file());</span>
+                }
+<span class="nc" id="L712">            } catch (final IOException exception) {</span>
+<span class="nc" id="L713">                log.error(&quot;Failed to delete task directory {} with exception:&quot;, dirName, exception);</span>
+<span class="nc" id="L714">                firstException.compareAndSet(null, exception);</span>
+<span class="nc" id="L715">            }</span>
+<span class="nc" id="L716">        }</span>
+
+<span class="nc" id="L718">        final Exception exception = firstException.get();</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L720">            throw exception;</span>
+        }
+<span class="nc" id="L722">    }</span>
+
+    /**
+     * Cleans up any leftover named topology directories that are empty, if any exist
+     * @param logExceptionAsWarn if true, an exception will be logged as a warning
+     *                       if false, an exception will be logged as error
+     * @return the first IOException to be encountered
+     */
+    private IOException maybeCleanEmptyNamedTopologyDirs(final boolean logExceptionAsWarn) {
+<span class="nc bnc" id="L731" title="All 2 branches missed.">        if (!hasNamedTopologies) {</span>
+<span class="nc" id="L732">            return null;</span>
+        }
+
+<span class="nc" id="L735">        final AtomicReference&lt;IOException&gt; firstException = new AtomicReference&lt;&gt;(null);</span>
+<span class="nc" id="L736">        final File[] namedTopologyDirs = stateDir.listFiles(pathname -&gt;</span>
+<span class="nc bnc" id="L737" title="All 4 branches missed.">                pathname.isDirectory() &amp;&amp; NAMED_TOPOLOGY_DIR_PATH_NAME.matcher(pathname.getName()).matches()</span>
+        );
+<span class="nc bnc" id="L739" title="All 2 branches missed.">        if (namedTopologyDirs != null) {</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">            for (final File namedTopologyDir : namedTopologyDirs) {</span>
+<span class="nc" id="L741">                final String topologyName = parseNamedTopologyFromDirectory(namedTopologyDir.getName());</span>
+<span class="nc" id="L742">                final Set&lt;TaskId&gt; taskKeys = taskOffsetSums.keySet();</span>
+<span class="nc" id="L743">                taskKeys.removeIf(taskId -&gt; taskId.topologyName().equals(topologyName));</span>
+<span class="nc" id="L744">                final File[] contents = namedTopologyDir.listFiles();</span>
+<span class="nc bnc" id="L745" title="All 4 branches missed.">                if (contents != null &amp;&amp; contents.length == 0) {</span>
+                    try {
+<span class="nc" id="L747">                        Utils.delete(namedTopologyDir);</span>
+<span class="nc" id="L748">                    } catch (final IOException exception) {</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">                        if (logExceptionAsWarn) {</span>
+<span class="nc" id="L750">                            log.warn(</span>
+<span class="nc" id="L751">                                String.format(&quot;%sSwallowed the following exception during deletion of named topology directory %s&quot;,</span>
+<span class="nc" id="L752">                                    logPrefix(), namedTopologyDir.getName()),</span>
+                                exception
+                            );
+                        } else {
+<span class="nc" id="L756">                            log.error(</span>
+<span class="nc" id="L757">                                String.format(&quot;%s Failed to delete named topology directory %s with exception:&quot;,</span>
+<span class="nc" id="L758">                                    logPrefix(), namedTopologyDir.getName()),</span>
+                                exception
+                            );
+                        }
+<span class="nc" id="L762">                        firstException.compareAndSet(null, exception);</span>
+<span class="nc" id="L763">                    }</span>
+                }
+            }
+        }
+<span class="nc" id="L767">        return firstException.get();</span>
+    }
+
+    /**
+     * Clears out any local state found for the given NamedTopology after it was removed
+     *
+     * @throws StreamsException if cleanup failed
+     */
+    public void clearLocalStateForNamedTopology(final String topologyName) {
+<span class="nc" id="L776">        final File namedTopologyDir = new File(stateDir, getNamedTopologyDirName(topologyName));</span>
+<span class="nc bnc" id="L777" title="All 4 branches missed.">        if (!namedTopologyDir.exists() || !namedTopologyDir.isDirectory()) {</span>
+<span class="nc" id="L778">            log.debug(&quot;Tried to clear out the local state for NamedTopology {} but none was found&quot;, topologyName);</span>
+        }
+        try {
+<span class="nc" id="L781">            final Set&lt;TaskId&gt; taskKeys = taskOffsetSums.keySet();</span>
+<span class="nc" id="L782">            taskKeys.removeIf(taskId -&gt; taskId.topologyName().equals(topologyName));</span>
+<span class="nc" id="L783">            Utils.delete(namedTopologyDir);</span>
+<span class="nc" id="L784">        } catch (final IOException e) {</span>
+<span class="nc" id="L785">            log.error(&quot;Hit an unexpected error while clearing local state for topology &quot; + topologyName, e);</span>
+<span class="nc" id="L786">            throw new StreamsException(&quot;Unable to delete state for the named topology &quot; + topologyName,</span>
+                                       e, new TaskId(-1, -1, topologyName)); // use dummy taskid to report source topology for this error
+<span class="nc" id="L788">        }</span>
+<span class="nc" id="L789">    }</span>
+
+    private void cleanStateAndTaskDirectoriesCalledByUser() throws Exception {
+<span class="nc bnc" id="L792" title="All 2 branches missed.">        if (!lockedTasksToOwner.isEmpty()) {</span>
+<span class="nc" id="L793">            log.warn(&quot;Found some still-locked task directories when user requested to cleaning up the state, &quot;</span>
+                + &quot;since Streams is not running any more these will be ignored to complete the cleanup&quot;);
+        }
+<span class="nc" id="L796">        taskOffsetSums.clear();</span>
+<span class="nc" id="L797">        final AtomicReference&lt;Exception&gt; firstException = new AtomicReference&lt;&gt;();</span>
+<span class="nc bnc" id="L798" title="All 2 branches missed.">        for (final TaskDirectory taskDir : listAllTaskDirectories()) {</span>
+<span class="nc" id="L799">            final String dirName = taskDir.file().getName();</span>
+<span class="nc" id="L800">            final TaskId id = parseTaskDirectoryName(dirName, taskDir.namedTopology());</span>
+            try {
+<span class="nc" id="L802">                log.info(&quot;{} Deleting task directory {} for {} as user calling cleanup.&quot;,</span>
+<span class="nc" id="L803">                    logPrefix(), dirName, id);</span>
+
+<span class="nc bnc" id="L805" title="All 2 branches missed.">                if (lockedTasksToOwner.containsKey(id)) {</span>
+<span class="nc" id="L806">                    log.warn(&quot;{} Task {} in state directory {} was still locked by {}&quot;,</span>
+<span class="nc" id="L807">                        logPrefix(), dirName, id, lockedTasksToOwner.get(id));</span>
+                }
+<span class="nc" id="L809">                Utils.delete(taskDir.file());</span>
+<span class="nc" id="L810">            } catch (final IOException exception) {</span>
+<span class="nc" id="L811">                log.error(</span>
+<span class="nc" id="L812">                    String.format(&quot;%s Failed to delete task directory %s for %s with exception:&quot;,</span>
+<span class="nc" id="L813">                        logPrefix(), dirName, id),</span>
+                    exception
+                );
+<span class="nc" id="L816">                firstException.compareAndSet(null, exception);</span>
+<span class="nc" id="L817">            }</span>
+<span class="nc" id="L818">        }</span>
+
+<span class="nc" id="L820">        firstException.compareAndSet(null, maybeCleanEmptyNamedTopologyDirs(false));</span>
+
+<span class="nc" id="L822">        final Exception exception = firstException.get();</span>
+<span class="nc bnc" id="L823" title="All 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L824">            throw exception;</span>
+        }
+<span class="nc" id="L826">    }</span>
+
+    /**
+     * List all of the task directories that are non-empty
+     * @return The list of all the non-empty local directories for stream tasks
+     */
+    List&lt;TaskDirectory&gt; listNonEmptyTaskDirectories() {
+<span class="nc" id="L833">        return listTaskDirectories(pathname -&gt; {</span>
+<span class="nc bnc" id="L834" title="All 4 branches missed.">            if (!pathname.isDirectory() || !TASK_DIR_PATH_NAME.matcher(pathname.getName()).matches()) {</span>
+<span class="nc" id="L835">                return false;</span>
+            } else {
+<span class="nc bnc" id="L837" title="All 2 branches missed.">                return !taskDirIsEmpty(pathname);</span>
+            }
+        });
+    }
+
+    /**
+     * List all of the task directories along with their parent directory if they belong to a named topology
+     * @return The list of all the existing local directories for stream tasks
+     */
+    List&lt;TaskDirectory&gt; listAllTaskDirectories() {
+<span class="nc bnc" id="L847" title="All 4 branches missed.">        return listTaskDirectories(pathname -&gt; pathname.isDirectory() &amp;&amp; TASK_DIR_PATH_NAME.matcher(pathname.getName()).matches());</span>
+    }
+
+    private List&lt;TaskDirectory&gt; listTaskDirectories(final FileFilter filter) {
+<span class="nc" id="L851">        final List&lt;TaskDirectory&gt; taskDirectories = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L852" title="All 4 branches missed.">        if (hasPersistentStores &amp;&amp; stateDir.exists()) {</span>
+<span class="nc bnc" id="L853" title="All 2 branches missed.">            if (hasNamedTopologies) {</span>
+<span class="nc bnc" id="L854" title="All 2 branches missed.">                for (final File namedTopologyDir : listNamedTopologyDirs()) {</span>
+<span class="nc" id="L855">                    final String namedTopology = parseNamedTopologyFromDirectory(namedTopologyDir.getName());</span>
+<span class="nc" id="L856">                    final File[] taskDirs = namedTopologyDir.listFiles(filter);</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">                    if (taskDirs != null) {</span>
+<span class="nc" id="L858">                        taskDirectories.addAll(Arrays.stream(taskDirs)</span>
+<span class="nc" id="L859">                            .map(f -&gt; new TaskDirectory(f, namedTopology)).collect(Collectors.toList()));</span>
+                    }
+<span class="nc" id="L861">                }</span>
+            } else {
+<span class="nc" id="L863">                final File[] taskDirs =</span>
+<span class="nc" id="L864">                    stateDir.listFiles(filter);</span>
+<span class="nc bnc" id="L865" title="All 2 branches missed.">                if (taskDirs != null) {</span>
+<span class="nc" id="L866">                    taskDirectories.addAll(Arrays.stream(taskDirs)</span>
+<span class="nc" id="L867">                                               .map(f -&gt; new TaskDirectory(f, null)).collect(Collectors.toList()));</span>
+                }
+            }
+        }
+
+<span class="nc" id="L872">        return taskDirectories;</span>
+    }
+
+    private List&lt;File&gt; listNamedTopologyDirs() {
+<span class="nc bnc" id="L876" title="All 4 branches missed.">        final File[] namedTopologyDirectories = stateDir.listFiles(f -&gt; f.getName().startsWith(&quot;__&quot;) &amp;&amp;  f.getName().endsWith(&quot;__&quot;));</span>
+<span class="nc bnc" id="L877" title="All 2 branches missed.">        return namedTopologyDirectories != null ? Arrays.asList(namedTopologyDirectories) : Collections.emptyList();</span>
+    }
+
+    private String parseNamedTopologyFromDirectory(final String dirName) {
+<span class="nc" id="L881">        return dirName.substring(2, dirName.length() - 2);</span>
+    }
+
+    private FileLock tryLock(final FileChannel channel) throws IOException {
+        try {
+<span class="nc" id="L886">            return channel.tryLock();</span>
+<span class="nc" id="L887">        } catch (final OverlappingFileLockException e) {</span>
+<span class="nc" id="L888">            return null;</span>
+        }
+    }
+
+    public static class TaskDirectory {
+        private final File file;
+        private final String namedTopology; // may be null if hasNamedTopologies = false
+
+<span class="nc" id="L896">        TaskDirectory(final File file, final String namedTopology) {</span>
+<span class="nc" id="L897">            this.file = file;</span>
+<span class="nc" id="L898">            this.namedTopology = namedTopology;</span>
+<span class="nc" id="L899">        }</span>
+
+        public File file() {
+<span class="nc" id="L902">            return file;</span>
+        }
+
+        public String namedTopology() {
+<span class="nc" id="L906">            return namedTopology;</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L911" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L912">                return true;</span>
+            }
+<span class="nc bnc" id="L914" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L915">                return false;</span>
+            }
+<span class="nc" id="L917">            final TaskDirectory that = (TaskDirectory) o;</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">            return file.equals(that.file) &amp;&amp;</span>
+<span class="nc bnc" id="L919" title="All 2 branches missed.">                Objects.equals(namedTopology, that.namedTopology);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L924">            return Objects.hash(file, namedTopology);</span>
+        }
+    }
+
+    private static class StartupContext extends AbstractProcessorContext&lt;Object, Object&gt; {
+
+        private final StateManager stateManager;
+        final StreamsMetricsImpl metricsImpl;
+
+        public StartupContext(final TaskId taskId, final StreamsConfig config, final StateManager stateManager, final StreamsMetricsImpl metricsImpl, final ThreadCache cache) {
+<span class="nc" id="L934">            super(taskId, config, metricsImpl, cache);</span>
+<span class="nc" id="L935">            this.stateManager = stateManager;</span>
+<span class="nc" id="L936">            this.metricsImpl = metricsImpl;</span>
+<span class="nc" id="L937">        }</span>
+
+        @Override
+        protected StateManager stateManager() {
+<span class="nc" id="L941">            return stateManager;</span>
+        }
+
+        @Override
+        public void transitionToActive(final StreamTask streamTask, final RecordCollector recordCollector, final ThreadCache newCache) {
+<span class="nc" id="L946">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public void transitionToStandby(final ThreadCache newCache) {
+<span class="nc" id="L951">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public void registerCacheFlushListener(final String namespace, final ThreadCache.DirtyEntryFlushListener listener) {
+<span class="nc" id="L956">        }</span>
+
+        @Override
+        public void logChange(final String storeName, final Bytes key, final byte[] value, final long timestamp, final Headers headers, final Position position) {
+<span class="nc" id="L960">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public &lt;K, V&gt; void forward(final K key, final V value) {
+<span class="nc" id="L965">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public &lt;K, V&gt; void forward(final K key, final V value, final To to) {
+<span class="nc" id="L970">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public void commit() {
+<span class="nc" id="L975">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public long currentStreamTimeMs() {
+<span class="nc" id="L980">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public &lt;S extends StateStore&gt; S getStateStore(final String name) {
+<span class="nc" id="L985">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public Cancellable schedule(final Duration interval, final PunctuationType type, final Punctuator callback) {
+<span class="nc" id="L990">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public Cancellable schedule(final Instant startTime, final Duration interval, final PunctuationType type, final Punctuator callback) {
+<span class="nc" id="L995">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+
+        @Override
+        public &lt;K, V&gt; void forward(final FixedKeyRecord&lt;K, V&gt; record) {
+<span class="nc" id="L1001">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public &lt;K, V&gt; void forward(final FixedKeyRecord&lt;K, V&gt; record, final String childName) {
+<span class="nc" id="L1006">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public &lt;K, V&gt; void forward(final Record&lt;K, V&gt; record) {
+<span class="nc" id="L1011">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+
+        @Override
+        public &lt;K, V&gt; void forward(final Record&lt;K, V&gt; record, final String childName) {
+<span class="nc" id="L1016">            throw new IllegalStateException(&quot;Should not be called&quot;);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

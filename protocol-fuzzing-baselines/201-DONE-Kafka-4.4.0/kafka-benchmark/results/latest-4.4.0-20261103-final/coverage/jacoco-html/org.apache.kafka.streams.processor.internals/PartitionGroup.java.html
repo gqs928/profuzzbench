@@ -1,0 +1,408 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PartitionGroup.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">PartitionGroup.java</span></div><h1>PartitionGroup.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.streams.StreamsConfig;
+
+import org.slf4j.Logger;
+
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.function.Function;
+
+/**
+ * PartitionGroup is used to buffer all co-partitioned records for processing.
+ *
+ * In other words, it represents the &quot;same&quot; partition over multiple co-partitioned topics, and it is used
+ * to buffer records from that partition in each of the contained topic-partitions.
+ * Each StreamTask has exactly one PartitionGroup.
+ *
+ * PartitionGroup implements the algorithm that determines in what order buffered records are selected for processing.
+ *
+ * Specifically, when polled, it returns the record from the topic-partition with the lowest stream-time.
+ * Stream-time for a topic-partition is defined as the highest timestamp
+ * yet observed at the head of that topic-partition.
+ *
+ * PartitionGroup also maintains a stream-time for the group as a whole.
+ * This is defined as the highest timestamp of any record yet polled from the PartitionGroup.
+ * Note however that any computation that depends on stream-time should track it on a per-operator basis to obtain an
+ * accurate view of the local time as seen by that processor.
+ *
+ * The PartitionGroups's stream-time is initially UNKNOWN (-1), and it set to a known value upon first poll.
+ * As a consequence of the definition, the PartitionGroup's stream-time is non-decreasing
+ * (i.e., it increases or stays the same over time).
+ */
+class PartitionGroup extends AbstractPartitionGroup {
+
+    private final Logger logger;
+    private final Map&lt;TopicPartition, RecordQueue&gt; partitionQueues;
+    private final Function&lt;TopicPartition, OptionalLong&gt; lagProvider;
+    private final Sensor enforcedProcessingSensor;
+    private final long maxTaskIdleMs;
+    private final Sensor recordLatenessSensor;
+    private final PriorityQueue&lt;RecordQueue&gt; nonEmptyQueuesByTime;
+
+    private long streamTime;
+    private int totalBuffered;
+    private boolean allBuffered;
+<span class="nc" id="L74">    private final Map&lt;TopicPartition, Long&gt; idlePartitionDeadlines = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L75">    private final Map&lt;TopicPartition, Long&gt; fetchedLags = new HashMap&lt;&gt;();</span>
+
+    PartitionGroup(final LogContext logContext,
+                   final Map&lt;TopicPartition, RecordQueue&gt; partitionQueues,
+                   final Function&lt;TopicPartition, OptionalLong&gt; lagProvider,
+                   final Sensor recordLatenessSensor,
+                   final Sensor enforcedProcessingSensor,
+<span class="nc" id="L82">                   final long maxTaskIdleMs) {</span>
+<span class="nc" id="L83">        this.logger = logContext.logger(PartitionGroup.class);</span>
+<span class="nc" id="L84">        nonEmptyQueuesByTime = new PriorityQueue&lt;&gt;(partitionQueues.size(), Comparator.comparingLong(RecordQueue::headRecordTimestamp));</span>
+<span class="nc" id="L85">        this.partitionQueues = partitionQueues;</span>
+<span class="nc" id="L86">        this.lagProvider = lagProvider;</span>
+<span class="nc" id="L87">        this.enforcedProcessingSensor = enforcedProcessingSensor;</span>
+<span class="nc" id="L88">        this.maxTaskIdleMs = maxTaskIdleMs;</span>
+<span class="nc" id="L89">        this.recordLatenessSensor = recordLatenessSensor;</span>
+<span class="nc" id="L90">        totalBuffered = 0;</span>
+<span class="nc" id="L91">        allBuffered = false;</span>
+<span class="nc" id="L92">        streamTime = RecordQueue.UNKNOWN;</span>
+<span class="nc" id="L93">    }</span>
+
+    @Override
+    ReadyToProcessResult readyToProcess(final long wallClockTime) {
+<span class="nc bnc" id="L97" title="All 2 branches missed.">        if (maxTaskIdleMs == StreamsConfig.MAX_TASK_IDLE_MS_DISABLED) {</span>
+<span class="nc bnc" id="L98" title="All 6 branches missed.">            if (logger.isTraceEnabled() &amp;&amp; !allBuffered &amp;&amp; totalBuffered &gt; 0) {</span>
+<span class="nc" id="L99">                final Set&lt;TopicPartition&gt; bufferedPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L100">                final Set&lt;TopicPartition&gt; emptyPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">                for (final Map.Entry&lt;TopicPartition, RecordQueue&gt; entry : partitionQueues.entrySet()) {</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">                    if (entry.getValue().isEmpty()) {</span>
+<span class="nc" id="L103">                        emptyPartitions.add(entry.getKey());</span>
+                    } else {
+<span class="nc" id="L105">                        bufferedPartitions.add(entry.getKey());</span>
+                    }
+<span class="nc" id="L107">                }</span>
+<span class="nc" id="L108">                logger.trace(&quot;Ready for processing because max.task.idle.ms is disabled.&quot; +</span>
+                                &quot;\n\tThere may be out-of-order processing for this task as a result.&quot; +
+                                &quot;\n\tBuffered partitions: {}&quot; +
+                                &quot;\n\tNon-buffered partitions: {}&quot;,
+                        bufferedPartitions,
+                        emptyPartitions);
+            }
+<span class="nc" id="L115">            return new ReadyToProcessResult(true, Optional.empty());</span>
+        }
+
+<span class="nc" id="L118">        final Set&lt;TopicPartition&gt; queued = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L119">        Map&lt;TopicPartition, Long&gt; enforced = null;</span>
+<span class="nc" id="L120">        final StringBuilder logMessageBuilder = new StringBuilder();</span>
+
+<span class="nc bnc" id="L122" title="All 2 branches missed.">        for (final Map.Entry&lt;TopicPartition, RecordQueue&gt; entry : partitionQueues.entrySet()) {</span>
+<span class="nc" id="L123">            final TopicPartition partition = entry.getKey();</span>
+<span class="nc" id="L124">            final RecordQueue queue = entry.getValue();</span>
+
+<span class="nc bnc" id="L126" title="All 2 branches missed.">            if (!queue.isEmpty()) {</span>
+                // this partition is ready for processing
+<span class="nc" id="L128">                logger.trace(&quot;Partition {} has buffered data, ready for processing&quot;, partition);</span>
+<span class="nc" id="L129">                idlePartitionDeadlines.remove(partition);</span>
+<span class="nc" id="L130">                queued.add(partition);</span>
+            } else {
+<span class="nc" id="L132">                final Long fetchedLag = fetchedLags.getOrDefault(partition, -1L);</span>
+<span class="nc" id="L133">                appendLog(logMessageBuilder, String.format(&quot;Partition %s has fetched lag of %d&quot;, partition, fetchedLag));</span>
+                
+<span class="nc bnc" id="L135" title="All 2 branches missed.">                if (fetchedLag == -1L) {</span>
+                    // must wait to fetch metadata for the partition
+<span class="nc" id="L137">                    idlePartitionDeadlines.remove(partition);</span>
+<span class="nc" id="L138">                    appendLog(logMessageBuilder, String.format(&quot;\tWaiting to fetch data for %s&quot;, partition));</span>
+
+<span class="nc" id="L140">                    return new ReadyToProcessResult(false, Optional.of(logMessageBuilder.toString()));</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">                } else if (fetchedLag &gt; 0L) {</span>
+                    // must wait to poll the data we know to be on the broker
+<span class="nc" id="L143">                    idlePartitionDeadlines.remove(partition);</span>
+<span class="nc" id="L144">                    appendLog(logMessageBuilder,</span>
+<span class="nc" id="L145">                        String.format(&quot;Partition %s has current lag %d, but no data is buffered locally. Waiting to buffer some records.&quot;,</span>
+                        partition, fetchedLag));
+
+<span class="nc" id="L148">                    return new ReadyToProcessResult(false, Optional.of(logMessageBuilder.toString()));</span>
+                } else {
+                    // p is known to have zero lag. wait for maxTaskIdleMs to see if more data shows up.
+                    // One alternative would be to set the deadline to nullableMetadata.receivedTimestamp + maxTaskIdleMs
+                    // instead. That way, we would start the idling timer as of the freshness of our knowledge about the zero
+                    // lag instead of when we happen to run this method, but realistically it's probably a small difference
+                    // and using wall clock time seems more intuitive for users,
+                    // since the log message will be as of wallClockTime.
+<span class="nc" id="L156">                    idlePartitionDeadlines.putIfAbsent(partition, wallClockTime + maxTaskIdleMs);</span>
+<span class="nc" id="L157">                    final long deadline = idlePartitionDeadlines.get(partition);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                    if (wallClockTime &lt; deadline) {</span>
+<span class="nc" id="L159">                        appendLog(logMessageBuilder, String.format(</span>
+                            &quot;Partition %s has current lag 0 and current time is %d. &quot; +
+                                &quot;Waiting for new data to be produced for configured idle time %d (deadline is %d).&quot;,
+<span class="nc" id="L162">                            partition, wallClockTime, maxTaskIdleMs, deadline));</span>
+
+<span class="nc" id="L164">                        return new ReadyToProcessResult(false, Optional.of(logMessageBuilder.toString()));</span>
+                    } else {
+                        // this partition is ready for processing due to the task idling deadline passing
+<span class="nc" id="L167">                        logger.trace(&quot;Partition {} is ready for processing due to the task idling deadline passing&quot;, partition);</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                        if (enforced == null) {</span>
+<span class="nc" id="L169">                            enforced = new HashMap&lt;&gt;();</span>
+                        }
+<span class="nc" id="L171">                        enforced.put(partition, deadline);</span>
+                    }
+                }
+            }
+<span class="nc" id="L175">        }</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        if (enforced == null) {</span>
+<span class="nc" id="L177">            logger.trace(&quot;All partitions were buffered locally, so this task is ready for processing.&quot;);</span>
+<span class="nc" id="L178">            return new ReadyToProcessResult(true, Optional.empty());</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        } else if (queued.isEmpty()) {</span>
+<span class="nc" id="L180">            appendLog(logMessageBuilder, &quot;No partitions were buffered locally, so this task is not ready for processing.&quot;);</span>
+<span class="nc" id="L181">            return new ReadyToProcessResult(false, Optional.of(logMessageBuilder.toString()));</span>
+        } else {
+<span class="nc" id="L183">            enforcedProcessingSensor.record(1.0d, wallClockTime);</span>
+<span class="nc" id="L184">            logger.trace(&quot;Continuing to process although some partitions are empty on the broker.&quot; +</span>
+                            &quot;\n\tThere may be out-of-order processing for this task as a result.&quot; +
+                            &quot;\n\tPartitions with local data: {}.&quot; +
+                            &quot;\n\tPartitions we gave up waiting for, with their corresponding deadlines: {}.&quot; +
+                            &quot;\n\tConfigured max.task.idle.ms: {}.&quot; +
+                            &quot;\n\tCurrent wall-clock time: {}.&quot;,
+                    queued,
+                    enforced,
+<span class="nc" id="L192">                    maxTaskIdleMs,</span>
+<span class="nc" id="L193">                    wallClockTime);</span>
+<span class="nc" id="L194">            return new ReadyToProcessResult(true, Optional.empty());</span>
+        }
+    }
+
+    @Override
+    long partitionTimestamp(final TopicPartition partition) {
+<span class="nc" id="L200">        final RecordQueue queue = partitionQueues.get(partition);</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        if (queue == null) {</span>
+<span class="nc" id="L202">            throw new IllegalStateException(&quot;Partition &quot; + partition + &quot; not found.&quot;);</span>
+        }
+<span class="nc" id="L204">        return queue.partitionTime();</span>
+    }
+
+    // creates queues for new partitions, removes old queues, saves cached records for previously assigned partitions
+    @Override
+    void updatePartitions(final Set&lt;TopicPartition&gt; inputPartitions, final Function&lt;TopicPartition, RecordQueue&gt; recordQueueCreator) {
+<span class="nc" id="L210">        final Set&lt;TopicPartition&gt; removedPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L211">        final Set&lt;TopicPartition&gt; newInputPartitions = new HashSet&lt;&gt;(inputPartitions);</span>
+<span class="nc" id="L212">        final Iterator&lt;Map.Entry&lt;TopicPartition, RecordQueue&gt;&gt; queuesIterator = partitionQueues.entrySet().iterator();</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        while (queuesIterator.hasNext()) {</span>
+<span class="nc" id="L214">            final Map.Entry&lt;TopicPartition, RecordQueue&gt; queueEntry = queuesIterator.next();</span>
+<span class="nc" id="L215">            final TopicPartition topicPartition = queueEntry.getKey();</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            if (!newInputPartitions.contains(topicPartition)) {</span>
+                // if partition is removed should delete its queue
+<span class="nc" id="L218">                totalBuffered -= queueEntry.getValue().size();</span>
+<span class="nc" id="L219">                queuesIterator.remove();</span>
+<span class="nc" id="L220">                removedPartitions.add(topicPartition);</span>
+            }
+<span class="nc" id="L222">            newInputPartitions.remove(topicPartition);</span>
+<span class="nc" id="L223">        }</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        for (final TopicPartition newInputPartition : newInputPartitions) {</span>
+<span class="nc" id="L225">            partitionQueues.put(newInputPartition, recordQueueCreator.apply(newInputPartition));</span>
+<span class="nc" id="L226">        }</span>
+<span class="nc" id="L227">        nonEmptyQueuesByTime.removeIf(q -&gt; removedPartitions.contains(q.partition()));</span>
+<span class="nc bnc" id="L228" title="All 4 branches missed.">        allBuffered = allBuffered &amp;&amp; newInputPartitions.isEmpty();</span>
+<span class="nc" id="L229">    }</span>
+
+    @Override
+    void setPartitionTime(final TopicPartition partition, final long partitionTime) {
+<span class="nc" id="L233">        final RecordQueue queue = partitionQueues.get(partition);</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        if (queue == null) {</span>
+<span class="nc" id="L235">            throw new IllegalStateException(&quot;Partition &quot; + partition + &quot; not found.&quot;);</span>
+        }
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if (streamTime &lt; partitionTime) {</span>
+<span class="nc" id="L238">            streamTime = partitionTime;</span>
+        }
+<span class="nc" id="L240">        queue.setPartitionTime(partitionTime);</span>
+<span class="nc" id="L241">    }</span>
+
+    @Override
+    StampedRecord nextRecord(final RecordInfo info, final long wallClockTime) {
+<span class="nc" id="L245">        StampedRecord record = null;</span>
+
+<span class="nc" id="L247">        final RecordQueue queue = nonEmptyQueuesByTime.poll();</span>
+<span class="nc" id="L248">        info.queue = queue;</span>
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (queue != null) {</span>
+            // get the first record from this queue.
+<span class="nc" id="L252">            final int oldSize = queue.size();</span>
+<span class="nc" id="L253">            record = queue.poll(wallClockTime);</span>
+
+<span class="nc bnc" id="L255" title="All 2 branches missed.">            if (record != null) {</span>
+<span class="nc" id="L256">                totalBuffered -= oldSize - queue.size();</span>
+<span class="nc" id="L257">                logger.trace(&quot;Partition {} polling next record:, oldSize={}, newSize={}, totalBuffered={}, recordTimestamp={}&quot;,</span>
+<span class="nc" id="L258">                    queue.partition(), oldSize, queue.size(), totalBuffered, record.timestamp);</span>
+
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                if (queue.isEmpty()) {</span>
+                    // if a certain queue has been drained, reset the flag
+<span class="nc" id="L262">                    allBuffered = false;</span>
+<span class="nc" id="L263">                    logger.trace(&quot;Partition {} queue is now empty, allBuffered=false&quot;, queue.partition());</span>
+                } else {
+<span class="nc" id="L265">                    nonEmptyQueuesByTime.offer(queue);</span>
+                }
+
+                // always update the stream-time to the record's timestamp yet to be processed if it is larger
+<span class="nc bnc" id="L269" title="All 2 branches missed.">                if (record.timestamp &gt; streamTime) {</span>
+<span class="nc" id="L270">                    final long oldStreamTime = streamTime;</span>
+<span class="nc" id="L271">                    streamTime = record.timestamp;</span>
+<span class="nc" id="L272">                    recordLatenessSensor.record(0, wallClockTime);</span>
+<span class="nc" id="L273">                    logger.trace(&quot;Partition {} stream time updated from {} to {}&quot;, queue.partition(), oldStreamTime, streamTime);</span>
+<span class="nc" id="L274">                } else {</span>
+<span class="nc" id="L275">                    recordLatenessSensor.record(streamTime - record.timestamp, wallClockTime);</span>
+                }
+            }
+<span class="nc" id="L278">        } else {</span>
+<span class="nc" id="L279">            logger.trace(&quot;Partition pulling nextRecord: no queue available&quot;);</span>
+        }
+<span class="nc" id="L281">        return record;</span>
+    }
+
+    @Override
+    int addRawRecords(final TopicPartition partition, final Iterable&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; rawRecords) {
+<span class="nc" id="L286">        final RecordQueue recordQueue = partitionQueues.get(partition);</span>
+
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        if (recordQueue == null) {</span>
+<span class="nc" id="L289">            throw new IllegalStateException(&quot;Partition &quot; + partition + &quot; not found.&quot;);</span>
+        }
+
+<span class="nc" id="L292">        final int oldSize = recordQueue.size();</span>
+<span class="nc" id="L293">        final int newSize = recordQueue.addRawRecords(rawRecords);</span>
+
+        // add this record queue to be considered for processing in the future if it was empty before
+<span class="nc bnc" id="L296" title="All 4 branches missed.">        if (oldSize == 0 &amp;&amp; newSize &gt; 0) {</span>
+<span class="nc" id="L297">            nonEmptyQueuesByTime.offer(recordQueue);</span>
+
+            // if all partitions now are non-empty, set the flag
+            // we do not need to update the stream-time here since this task will definitely be
+            // processed next, and hence the stream-time will be updated when we retrieved records by then
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            if (nonEmptyQueuesByTime.size() == this.partitionQueues.size()) {</span>
+<span class="nc" id="L303">                allBuffered = true;</span>
+            }
+        }
+
+<span class="nc" id="L307">        totalBuffered += newSize - oldSize;</span>
+
+<span class="nc" id="L309">        return newSize;</span>
+    }
+
+    Set&lt;TopicPartition&gt; partitions() {
+<span class="nc" id="L313">        return Collections.unmodifiableSet(partitionQueues.keySet());</span>
+    }
+
+    @Override
+    long streamTime() {
+<span class="nc" id="L318">        return streamTime;</span>
+    }
+
+    @Override
+    Long headRecordOffset(final TopicPartition partition) {
+<span class="nc" id="L323">        final RecordQueue recordQueue = partitionQueues.get(partition);</span>
+
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (recordQueue == null) {</span>
+<span class="nc" id="L326">            throw new IllegalStateException(&quot;Partition &quot; + partition + &quot; not found.&quot;);</span>
+        }
+
+<span class="nc" id="L329">        return recordQueue.headRecordOffset();</span>
+    }
+
+    @Override
+    Optional&lt;Integer&gt; headRecordLeaderEpoch(final TopicPartition partition) {
+<span class="nc" id="L334">        final RecordQueue recordQueue = partitionQueues.get(partition);</span>
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        if (recordQueue == null) {</span>
+<span class="nc" id="L337">            throw new IllegalStateException(&quot;Partition &quot; + partition + &quot; not found.&quot;);</span>
+        }
+
+<span class="nc" id="L340">        return recordQueue.headRecordLeaderEpoch();</span>
+    }
+
+
+    /**
+     * @throws IllegalStateException if the record's partition does not belong to this partition group
+     */
+    @Override
+    int numBuffered(final TopicPartition partition) {
+<span class="nc" id="L349">        final RecordQueue recordQueue = partitionQueues.get(partition);</span>
+
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (recordQueue == null) {</span>
+<span class="nc" id="L352">            throw new IllegalStateException(&quot;Partition &quot; + partition + &quot; not found.&quot;);</span>
+        }
+
+<span class="nc" id="L355">        return recordQueue.size();</span>
+    }
+
+    @Override
+    int numBuffered() {
+<span class="nc" id="L360">        return totalBuffered;</span>
+    }
+
+    // for testing only
+    boolean allPartitionsBufferedLocally() {
+<span class="nc" id="L365">        return allBuffered;</span>
+    }
+
+    @Override
+    void clear() {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        for (final RecordQueue queue : partitionQueues.values()) {</span>
+<span class="nc" id="L371">            queue.clear();</span>
+<span class="nc" id="L372">        }</span>
+<span class="nc" id="L373">        nonEmptyQueuesByTime.clear();</span>
+<span class="nc" id="L374">        totalBuffered = 0;</span>
+<span class="nc" id="L375">        streamTime = RecordQueue.UNKNOWN;</span>
+<span class="nc" id="L376">        fetchedLags.clear();</span>
+<span class="nc" id="L377">    }</span>
+
+    @Override
+    void close() {
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        for (final RecordQueue queue : partitionQueues.values()) {</span>
+<span class="nc" id="L382">            queue.close();</span>
+<span class="nc" id="L383">        }</span>
+<span class="nc" id="L384">    }</span>
+
+    @Override
+    void updateLags() {
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        if (maxTaskIdleMs != StreamsConfig.MAX_TASK_IDLE_MS_DISABLED) {</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            for (final TopicPartition tp : partitionQueues.keySet()) {</span>
+<span class="nc" id="L390">                final OptionalLong l = lagProvider.apply(tp);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                if (l.isPresent()) {</span>
+<span class="nc" id="L392">                    fetchedLags.put(tp, l.getAsLong());</span>
+<span class="nc" id="L393">                    logger.trace(&quot;Updated lag for {} to {}&quot;, tp, l.getAsLong());</span>
+                } else {
+<span class="nc" id="L395">                    fetchedLags.remove(tp);</span>
+                }
+<span class="nc" id="L397">            }</span>
+        }
+<span class="nc" id="L399">    }</span>
+
+    private void appendLog(final StringBuilder sb, final String msg) {
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        if (sb.length() &gt; 0) {</span>
+<span class="nc" id="L403">            sb.append(&quot;\n&quot;);</span>
+        }
+<span class="nc" id="L405">        sb.append(msg);</span>
+<span class="nc" id="L406">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

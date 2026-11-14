@@ -1,0 +1,536 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MeteredSessionStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">MeteredSessionStore.java</span></div><h1>MeteredSessionStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.kstream.internals.Change;
+import org.apache.kafka.streams.kstream.internals.WrappingNullableUtils;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
+import org.apache.kafka.streams.processor.internals.ProcessorContextUtils;
+import org.apache.kafka.streams.processor.internals.SerdeGetter;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+import org.apache.kafka.streams.query.FailureReason;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.query.WindowRangeQuery;
+import org.apache.kafka.streams.query.internals.InternalQueryResultUtil;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.ReadOnlySessionStore;
+import org.apache.kafka.streams.state.SessionStore;
+import org.apache.kafka.streams.state.StateSerdes;
+import org.apache.kafka.streams.state.internals.StoreQueryUtils.QueryHandler;
+import org.apache.kafka.streams.state.internals.metrics.StateStoreMetrics;
+
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.NavigableSet;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.atomic.LongAdder;
+
+import static org.apache.kafka.common.utils.Utils.mkEntry;
+import static org.apache.kafka.common.utils.Utils.mkMap;
+import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl.maybeMeasureLatency;
+
+public class MeteredSessionStore&lt;K, V&gt;
+    extends WrappedStateStore&lt;SessionStore&lt;Bytes, byte[]&gt;, Windowed&lt;K&gt;, V&gt;
+    implements SessionStore&lt;K, V&gt;, MeteredStateStore {
+
+    protected final String metricsScope;
+    protected final Serde&lt;K&gt; keySerde;
+    protected final Serde&lt;V&gt; valueSerde;
+    protected final Time time;
+    protected StateSerdes&lt;K, V&gt; serdes;
+    protected StreamsMetricsImpl streamsMetrics;
+    protected Sensor putSensor;
+    protected Sensor fetchSensor;
+    protected Sensor commitSensor;
+    protected Sensor removeSensor;
+    protected Sensor e2eLatencySensor;
+    protected Sensor iteratorDurationSensor;
+    protected InternalProcessorContext&lt;?, ?&gt; internalContext;
+    protected TaskId taskId;
+    protected Sensor restoreSensor;
+
+<span class="nc" id="L83">    protected final LongAdder numOpenIterators = new LongAdder();</span>
+<span class="nc" id="L84">    protected final NavigableSet&lt;MeteredIterator&gt; openIterators = new ConcurrentSkipListSet&lt;&gt;(Comparator.comparingLong(MeteredIterator::startTimestamp));</span>
+
+<span class="nc" id="L86">    private final Map&lt;Class&lt;?&gt;, QueryHandler&lt;?&gt;&gt; queryHandlers =</span>
+<span class="nc" id="L87">        mkMap(</span>
+<span class="nc" id="L88">            mkEntry(</span>
+                WindowRangeQuery.class,
+<span class="nc" id="L90">                (query, positionBound, config, store) -&gt; runRangeQuery(query, positionBound, config)</span>
+            )
+        );
+
+
+    MeteredSessionStore(
+        final SessionStore&lt;Bytes, byte[]&gt; inner,
+        final String metricsScope,
+        final Serde&lt;K&gt; keySerde,
+        final Serde&lt;V&gt; valueSerde,
+        final Time time
+    ) {
+<span class="nc" id="L102">        super(inner);</span>
+<span class="nc" id="L103">        this.metricsScope = metricsScope;</span>
+<span class="nc" id="L104">        this.keySerde = keySerde;</span>
+<span class="nc" id="L105">        this.valueSerde = valueSerde;</span>
+<span class="nc" id="L106">        this.time = time;</span>
+<span class="nc" id="L107">    }</span>
+
+    @Override
+    public void init(
+        final StateStoreContext stateStoreContext,
+        final StateStore root
+    ) {
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        internalContext = stateStoreContext instanceof InternalProcessorContext ? (InternalProcessorContext&lt;?, ?&gt;) stateStoreContext : null;</span>
+<span class="nc" id="L115">        taskId = stateStoreContext.taskId();</span>
+<span class="nc" id="L116">        initStoreSerde(stateStoreContext);</span>
+<span class="nc" id="L117">        streamsMetrics = (StreamsMetricsImpl) stateStoreContext.metrics();</span>
+
+<span class="nc" id="L119">        registerMetrics();</span>
+<span class="nc" id="L120">        restoreSensor = StateStoreMetrics.restoreSensor(taskId.toString(), metricsScope, name(), streamsMetrics);</span>
+
+<span class="nc" id="L122">        super.init(stateStoreContext, root);</span>
+<span class="nc" id="L123">    }</span>
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    private void registerMetrics() {
+<span class="nc" id="L127">        putSensor = StateStoreMetrics.putSensor(taskId.toString(), metricsScope, name(), streamsMetrics);</span>
+<span class="nc" id="L128">        fetchSensor = StateStoreMetrics.fetchSensor(taskId.toString(), metricsScope, name(), streamsMetrics);</span>
+        // flushSensor is deprecated per KIP-1035 and will be removed in the next major release.
+        // Here we just register the sensor without recording
+<span class="nc" id="L131">        StateStoreMetrics.flushSensor(taskId.toString(), metricsScope, name(), streamsMetrics);</span>
+<span class="nc" id="L132">        commitSensor = StateStoreMetrics.commitSensor(taskId.toString(), metricsScope, name(), streamsMetrics);</span>
+<span class="nc" id="L133">        removeSensor = StateStoreMetrics.removeSensor(taskId.toString(), metricsScope, name(), streamsMetrics);</span>
+<span class="nc" id="L134">        e2eLatencySensor = StateStoreMetrics.e2ELatencySensor(taskId.toString(), metricsScope, name(), streamsMetrics);</span>
+<span class="nc" id="L135">        iteratorDurationSensor = StateStoreMetrics.iteratorDurationSensor(taskId.toString(), metricsScope, name(), streamsMetrics);</span>
+<span class="nc" id="L136">        StateStoreMetrics.addNumOpenIteratorsGauge(taskId.toString(), metricsScope, name(), streamsMetrics,</span>
+<span class="nc" id="L137">                (config, now) -&gt; numOpenIterators.sum());</span>
+<span class="nc" id="L138">        StateStoreMetrics.addOldestOpenIteratorGauge(taskId.toString(), metricsScope, name(), streamsMetrics,</span>
+                (config, now) -&gt; {
+                try {
+<span class="nc" id="L141">                    final Iterator&lt;MeteredIterator&gt; openIteratorsIterator = openIterators.iterator();</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">                    return openIteratorsIterator.hasNext() ? openIteratorsIterator.next().startTimestamp() : 0L;</span>
+<span class="nc" id="L143">                } catch (final NoSuchElementException e) {</span>
+<span class="nc" id="L144">                    return 0L;</span>
+                }
+            }
+        );
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (!persistent()) {</span>
+<span class="nc" id="L149">            StateStoreMetrics.addNumKeysGauge(taskId.toString(), metricsScope, name(), streamsMetrics,</span>
+                    (config, now) -&gt; {
+<span class="nc" id="L151">                        final InMemorySessionStore inMemoryStore = findInner(InMemorySessionStore.class);</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">                        return inMemoryStore != null ? inMemoryStore.numEntries() : -1L;</span>
+                    }
+            );
+        }
+<span class="nc" id="L156">    }</span>
+
+    @Override
+    public void recordRestoreTime(final long restoreTimeNs) {
+<span class="nc" id="L160">        restoreSensor.record(restoreTimeNs);</span>
+<span class="nc" id="L161">    }</span>
+
+    protected Serde&lt;V&gt; prepareValueSerdeForStore(final Serde&lt;V&gt; valueSerde, final SerdeGetter getter) {
+<span class="nc" id="L164">        return WrappingNullableUtils.prepareValueSerde(valueSerde, getter);</span>
+    }
+
+    private void initStoreSerde(final StateStoreContext context) {
+<span class="nc" id="L168">        final String storeName = name();</span>
+<span class="nc" id="L169">        final String changelogTopic = ProcessorContextUtils.changelogFor(context, storeName, Boolean.FALSE);</span>
+<span class="nc" id="L170">        serdes = StoreSerdeInitializer.prepareStoreSerde(</span>
+            context, storeName, changelogTopic, keySerde, valueSerde, this::prepareValueSerdeForStore);
+<span class="nc" id="L172">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public boolean setFlushListener(
+        final CacheFlushListener&lt;Windowed&lt;K&gt;, V&gt; listener,
+        final boolean sendOldValues
+    ) {
+<span class="nc" id="L180">        final SessionStore&lt;Bytes, byte[]&gt; wrapped = wrapped();</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (wrapped instanceof CachedStateStore) {</span>
+<span class="nc" id="L182">            return ((CachedStateStore&lt;byte[], byte[]&gt;) wrapped).setFlushListener(</span>
+                record -&gt; {
+<span class="nc" id="L184">                    final Change&lt;byte[]&gt; change = record.value();</span>
+<span class="nc" id="L185">                    listener.apply(</span>
+                        record
+<span class="nc" id="L187">                            .withKey(SessionKeySchema.from(record.key(), serdes.keyDeserializer(), record.headers(), serdes.topic()))</span>
+<span class="nc" id="L188">                            .withValue(new Change&lt;&gt;(</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">                                change.newValue != null ? serdes.valueFrom(change.newValue, record.headers()) : null,</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">                                change.oldValue != null ? serdes.valueFrom(change.oldValue, record.headers()) : null,</span>
+                                change.isLatest
+                            ))
+                    );
+<span class="nc" id="L194">                },</span>
+                sendOldValues);
+        }
+<span class="nc" id="L197">        return false;</span>
+    }
+
+    @Override
+    public void put(
+        final Windowed&lt;K&gt; sessionKey,
+        final V aggregate
+    ) {
+<span class="nc" id="L205">        Objects.requireNonNull(sessionKey, &quot;sessionKey can't be null&quot;);</span>
+<span class="nc" id="L206">        Objects.requireNonNull(sessionKey.key(), &quot;sessionKey.key() can't be null&quot;);</span>
+<span class="nc" id="L207">        Objects.requireNonNull(sessionKey.window(), &quot;sessionKey.window() can't be null&quot;);</span>
+
+        try {
+<span class="nc" id="L210">            maybeMeasureLatency(</span>
+                () -&gt; {
+<span class="nc" id="L212">                    final Bytes key = serializeKey(sessionKey.key());</span>
+<span class="nc" id="L213">                    wrapped().put(new Windowed&lt;&gt;(key, sessionKey.window()), serializeValue(aggregate));</span>
+<span class="nc" id="L214">                },</span>
+                time,
+                putSensor
+            );
+<span class="nc" id="L218">            maybeRecordE2ELatency();</span>
+<span class="nc" id="L219">        } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L220">            final String message = String.format(e.getMessage(), sessionKey.key(), aggregate);</span>
+<span class="nc" id="L221">            throw new ProcessorStateException(message, e);</span>
+<span class="nc" id="L222">        }</span>
+<span class="nc" id="L223">    }</span>
+
+    @Override
+    public void remove(final Windowed&lt;K&gt; sessionKey) {
+<span class="nc" id="L227">        Objects.requireNonNull(sessionKey, &quot;sessionKey can't be null&quot;);</span>
+<span class="nc" id="L228">        Objects.requireNonNull(sessionKey.key(), &quot;sessionKey.key() can't be null&quot;);</span>
+<span class="nc" id="L229">        Objects.requireNonNull(sessionKey.window(), &quot;sessionKey.window() can't be null&quot;);</span>
+
+        try {
+<span class="nc" id="L232">            maybeMeasureLatency(</span>
+                () -&gt; {
+<span class="nc" id="L234">                    final Bytes key = serializeKey(sessionKey.key());</span>
+<span class="nc" id="L235">                    wrapped().remove(new Windowed&lt;&gt;(key, sessionKey.window()));</span>
+<span class="nc" id="L236">                },</span>
+                time,
+                removeSensor
+            );
+<span class="nc" id="L240">        } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L241">            final String message = String.format(e.getMessage(), sessionKey.key());</span>
+<span class="nc" id="L242">            throw new ProcessorStateException(message, e);</span>
+<span class="nc" id="L243">        }</span>
+<span class="nc" id="L244">    }</span>
+
+    @Override
+    public V fetchSession(final K key, final long earliestSessionEndTime, final long latestSessionStartTime) {
+<span class="nc" id="L248">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L249">        return maybeMeasureLatency(</span>
+<span class="nc" id="L250">            () -&gt; deserializeValue(wrapped().fetchSession(serializeKey(key), earliestSessionEndTime, latestSessionStartTime)),</span>
+            time,
+            fetchSensor
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; fetch(final K key) {
+<span class="nc" id="L258">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L259">        return meteredWindowedIterator(wrapped().fetch(serializeKey(key)));</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; backwardFetch(final K key) {
+<span class="nc" id="L264">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L265">        return meteredWindowedIterator(wrapped().backwardFetch(serializeKey(key)));</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; fetch(final K keyFrom, final K keyTo) {
+<span class="nc" id="L270">        return meteredWindowedIterator(wrapped().fetch(serializeKey(keyFrom), serializeKey(keyTo)));</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; backwardFetch(final K keyFrom, final K keyTo) {
+<span class="nc" id="L275">        return meteredWindowedIterator(wrapped().backwardFetch(serializeKey(keyFrom), serializeKey(keyTo)));</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; findSessions(final K key,
+                                                         final long earliestSessionEndTime,
+                                                         final long latestSessionStartTime) {
+<span class="nc" id="L282">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L283">        return meteredWindowedIterator(wrapped().findSessions(serializeKey(key), earliestSessionEndTime, latestSessionStartTime));</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; backwardFindSessions(final K key,
+                                                                 final long earliestSessionEndTime,
+                                                                 final long latestSessionStartTime) {
+<span class="nc" id="L290">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L291">        return meteredWindowedIterator(wrapped().backwardFindSessions(serializeKey(key), earliestSessionEndTime, latestSessionStartTime));</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; findSessions(final K keyFrom,
+                                                         final K keyTo,
+                                                         final long earliestSessionEndTime,
+                                                         final long latestSessionStartTime) {
+<span class="nc" id="L299">        return meteredWindowedIterator(wrapped().findSessions(serializeKey(keyFrom), serializeKey(keyTo), earliestSessionEndTime, latestSessionStartTime));</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; findSessions(final long earliestSessionEndTime,
+                                                         final long latestSessionEndTime) {
+<span class="nc" id="L305">        return meteredWindowedIterator(wrapped().findSessions(earliestSessionEndTime, latestSessionEndTime));</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; backwardFindSessions(final K keyFrom,
+                                                                 final K keyTo,
+                                                                 final long earliestSessionEndTime,
+                                                                 final long latestSessionStartTime) {
+<span class="nc" id="L313">        return meteredWindowedIterator(wrapped().backwardFindSessions(serializeKey(keyFrom), serializeKey(keyTo), earliestSessionEndTime, latestSessionStartTime));</span>
+    }
+
+    @Override
+    public ReadOnlySessionStore&lt;K, V&gt; readOnly(final IsolationLevel isolationLevel) {
+<span class="nc" id="L318">        Objects.requireNonNull(isolationLevel, &quot;isolationLevel cannot be null&quot;);</span>
+<span class="nc" id="L319">        return new ReadOnlyView(wrapped().readOnly(isolationLevel));</span>
+    }
+
+    private final class ReadOnlyView implements ReadOnlySessionStore&lt;K, V&gt; {
+
+        private final ReadOnlySessionStore&lt;Bytes, byte[]&gt; underlying;
+
+<span class="nc" id="L326">        ReadOnlyView(final ReadOnlySessionStore&lt;Bytes, byte[]&gt; underlying) {</span>
+<span class="nc" id="L327">            this.underlying = underlying;</span>
+<span class="nc" id="L328">        }</span>
+
+        @Override
+        public V fetchSession(
+            final K key,
+            final long earliestSessionEndTime,
+            final long latestSessionStartTime
+        ) {
+<span class="nc" id="L336">            Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L337">            return maybeMeasureLatency(</span>
+<span class="nc" id="L338">                () -&gt; deserializeValue(underlying.fetchSession(serializeKey(key), earliestSessionEndTime, latestSessionStartTime)),</span>
+                time,
+                fetchSensor
+            );
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; fetch(final K key) {
+<span class="nc" id="L346">            Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L347">            return meteredWindowedIterator(underlying.fetch(serializeKey(key)));</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; backwardFetch(final K key) {
+<span class="nc" id="L352">            Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L353">            return meteredWindowedIterator(underlying.backwardFetch(serializeKey(key)));</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; fetch(final K keyFrom, final K keyTo) {
+<span class="nc" id="L358">            return meteredWindowedIterator(underlying.fetch(serializeKey(keyFrom), serializeKey(keyTo)));</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; backwardFetch(final K keyFrom, final K keyTo) {
+<span class="nc" id="L363">            return meteredWindowedIterator(underlying.backwardFetch(serializeKey(keyFrom), serializeKey(keyTo)));</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; findSessions(
+            final K key,
+            final long earliestSessionEndTime,
+            final long latestSessionStartTime
+        ) {
+<span class="nc" id="L372">            Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L373">            return meteredWindowedIterator(underlying.findSessions(serializeKey(key), earliestSessionEndTime, latestSessionStartTime));</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; backwardFindSessions(
+            final K key,
+            final long earliestSessionEndTime,
+            final long latestSessionStartTime
+        ) {
+<span class="nc" id="L382">            Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L383">            return meteredWindowedIterator(underlying.backwardFindSessions(serializeKey(key), earliestSessionEndTime, latestSessionStartTime));</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; findSessions(
+            final K keyFrom,
+            final K keyTo,
+            final long earliestSessionEndTime,
+            final long latestSessionStartTime
+        ) {
+<span class="nc" id="L393">            return meteredWindowedIterator(underlying.findSessions(serializeKey(keyFrom), serializeKey(keyTo), earliestSessionEndTime, latestSessionStartTime));</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; backwardFindSessions(
+            final K keyFrom,
+            final K keyTo,
+            final long earliestSessionEndTime,
+            final long latestSessionStartTime
+        ) {
+<span class="nc" id="L403">            return meteredWindowedIterator(underlying.backwardFindSessions(serializeKey(keyFrom), serializeKey(keyTo), earliestSessionEndTime, latestSessionStartTime));</span>
+        }
+
+    }
+
+    private KeyValueIterator&lt;Windowed&lt;K&gt;, V&gt; meteredWindowedIterator(final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; iter) {
+<span class="nc" id="L409">        return new MeteredWindowedKeyValueIterator&lt;&gt;(</span>
+            iter,
+            fetchSensor,
+            iteratorDurationSensor,
+            this::deserializeKey,
+            this::deserializeValue,
+            time,
+            numOpenIterators,
+            openIterators
+        );
+    }
+
+    @Override
+    public void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc" id="L423">        maybeMeasureLatency(() -&gt; super.commit(changelogOffsets), time, commitSensor);</span>
+<span class="nc" id="L424">    }</span>
+
+    @Override
+    public void close() {
+        try {
+<span class="nc" id="L429">            wrapped().close();</span>
+        } finally {
+<span class="nc" id="L431">            streamsMetrics.removeAllStoreLevelSensorsAndMetrics(taskId.toString(), name());</span>
+        }
+<span class="nc" id="L433">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public &lt;R&gt; QueryResult&lt;R&gt; query(
+        final Query&lt;R&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+<span class="nc" id="L442">        final long start = time.nanoseconds();</span>
+        final QueryResult&lt;R&gt; result;
+
+<span class="nc" id="L445">        final QueryHandler&lt;?&gt; handler = queryHandlers.get(query.getClass());</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">        if (handler == null) {</span>
+<span class="nc" id="L447">            result = wrapped().query(query, positionBound, config);</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            if (config.isCollectExecutionInfo()) {</span>
+<span class="nc" id="L449">                result.addExecutionInfo(&quot;Handled in &quot; + getClass() + &quot; in &quot; + (time.nanoseconds() - start) + &quot;ns&quot;);</span>
+            }
+        } else {
+<span class="nc" id="L452">            result = ((QueryHandler&lt;R&gt;) handler).apply(</span>
+                query,
+                positionBound,
+                config,
+                this
+            );
+<span class="nc bnc" id="L458" title="All 2 branches missed.">            if (config.isCollectExecutionInfo()) {</span>
+<span class="nc" id="L459">                result.addExecutionInfo(&quot;Handled in &quot; + getClass() + &quot; with serdes &quot; + serdes + &quot; in &quot; + (time.nanoseconds() - start) + &quot;ns&quot;);</span>
+            }
+        }
+<span class="nc" id="L462">        return result;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;R&gt; QueryResult&lt;R&gt; runRangeQuery(
+        final Query&lt;R&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+        final QueryResult&lt;R&gt; result;
+<span class="nc" id="L472">        final WindowRangeQuery&lt;K, V&gt; typedQuery = (WindowRangeQuery&lt;K, V&gt;) query;</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">        if (typedQuery.getKey().isPresent()) {</span>
+<span class="nc" id="L474">            final WindowRangeQuery&lt;Bytes, byte[]&gt; rawKeyQuery =</span>
+<span class="nc" id="L475">                WindowRangeQuery.withKey(serializeKey(typedQuery.getKey().get()));</span>
+<span class="nc" id="L476">            final QueryResult&lt;KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt;&gt; rawResult =</span>
+<span class="nc" id="L477">                wrapped().query(rawKeyQuery, positionBound, config);</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">            if (rawResult.isSuccess()) {</span>
+<span class="nc" id="L479">                final MeteredWindowedKeyValueIterator&lt;K, V&gt; typedResult =</span>
+                    new MeteredWindowedKeyValueIterator&lt;&gt;(
+<span class="nc" id="L481">                        rawResult.getResult(),</span>
+                        fetchSensor,
+                        iteratorDurationSensor,
+                        this::deserializeKey,
+<span class="nc" id="L485">                        StoreQueryUtils.deserializeValue(serdes, wrapped()),</span>
+                        time,
+                        numOpenIterators,
+                        openIterators
+                    );
+<span class="nc" id="L490">                final QueryResult&lt;MeteredWindowedKeyValueIterator&lt;K, V&gt;&gt; typedQueryResult =</span>
+<span class="nc" id="L491">                    InternalQueryResultUtil.copyAndSubstituteDeserializedResult(rawResult, typedResult);</span>
+<span class="nc" id="L492">                result = (QueryResult&lt;R&gt;) typedQueryResult;</span>
+<span class="nc" id="L493">            } else {</span>
+                // the generic type doesn't matter, since failed queries have no result set.
+<span class="nc" id="L495">                result = (QueryResult&lt;R&gt;) rawResult;</span>
+            }
+<span class="nc" id="L497">        } else {</span>
+<span class="nc" id="L498">            result = QueryResult.forFailure(</span>
+                FailureReason.UNKNOWN_QUERY_TYPE,
+<span class="nc" id="L500">                &quot;This store (&quot; + getClass() + &quot;) doesn't know how to&quot;</span>
+                    + &quot; execute the given query (&quot; + query + &quot;) because&quot;
+                    + &quot; SessionStores only support WindowRangeQuery.withKey.&quot;
+                    + &quot; Contact the store maintainer if you need support&quot;
+                    + &quot; for a new query type.&quot;
+            );
+        }
+<span class="nc" id="L507">        return result;</span>
+    }
+
+    private Bytes serializeKey(final K key) {
+<span class="nc" id="L511">        return Bytes.wrap(serdes.rawKey(key, internalContext.headers()));</span>
+    }
+
+    private K deserializeKey(final byte[] rawKey) {
+<span class="nc" id="L515">        return serdes.keyFrom(rawKey, internalContext.headers());</span>
+    }
+
+    protected byte[] serializeValue(final V value) {
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        return value != null ? serdes.rawValue(value, internalContext.headers()) : null;</span>
+    }
+
+    protected V deserializeValue(final byte[] rawValue) {
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        return rawValue != null ? serdes.valueFrom(rawValue, internalContext.headers()) : null;</span>
+    }
+
+    void maybeRecordE2ELatency() {
+        // Context is null if the provided context isn't an implementation of InternalProcessorContext.
+        // In that case, we _can't_ get the current timestamp, so we don't record anything.
+<span class="nc bnc" id="L529" title="All 4 branches missed.">        if (e2eLatencySensor.shouldRecord() &amp;&amp; internalContext != null) {</span>
+<span class="nc" id="L530">            final long currentTime = time.milliseconds();</span>
+<span class="nc" id="L531">            final long e2eLatency =  currentTime - internalContext.recordContext().timestamp();</span>
+<span class="nc" id="L532">            e2eLatencySensor.record(e2eLatency, currentTime);</span>
+        }
+<span class="nc" id="L534">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

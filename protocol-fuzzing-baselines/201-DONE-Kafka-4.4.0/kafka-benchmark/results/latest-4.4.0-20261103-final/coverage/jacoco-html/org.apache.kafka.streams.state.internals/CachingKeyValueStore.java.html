@@ -1,0 +1,574 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CachingKeyValueStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">CachingKeyValueStore.java</span></div><h1>CachingKeyValueStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.Serializer;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.utils.internals.ByteUtils;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.kstream.internals.Change;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.api.Record;
+import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
+import org.apache.kafka.streams.processor.internals.ProcessorRecordContext;
+import org.apache.kafka.streams.query.KeyQuery;
+import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.KeyValueStore;
+import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import static org.apache.kafka.common.utils.Utils.mkEntry;
+import static org.apache.kafka.common.utils.Utils.mkMap;
+import static org.apache.kafka.streams.processor.internals.ProcessorContextUtils.asInternalProcessorContext;
+import static org.apache.kafka.streams.state.internals.ExceptionUtils.executeAll;
+import static org.apache.kafka.streams.state.internals.ExceptionUtils.throwSuppressed;
+
+public class CachingKeyValueStore
+    extends WrappedStateStore&lt;KeyValueStore&lt;Bytes, byte[]&gt;, byte[], byte[]&gt;
+    implements KeyValueStore&lt;Bytes, byte[]&gt;, CachedStateStore&lt;byte[], byte[]&gt; {
+
+<span class="nc" id="L62">    private static final Logger LOG = LoggerFactory.getLogger(CachingKeyValueStore.class);</span>
+
+    private CacheFlushListener&lt;byte[], byte[]&gt; flushListener;
+    private boolean sendOldValues;
+    private String cacheName;
+    private InternalProcessorContext&lt;?, ?&gt; internalContext;
+    private Thread streamThread;
+<span class="nc" id="L69">    private final ReadWriteLock lock = new ReentrantReadWriteLock();</span>
+    private final Position position;
+    private final CacheType cacheType;
+
+    @FunctionalInterface
+    public interface CacheQueryHandler {
+        QueryResult&lt;?&gt; apply(
+            final Query&lt;?&gt; query,
+            final Position mergedPosition,
+            final PositionBound positionBound,
+            final QueryConfig config,
+            final StateStore store
+        );
+    }
+
+<span class="nc" id="L84">    @SuppressWarnings(&quot;rawtypes&quot;)</span>
+    private final Map&lt;Class, CacheQueryHandler&gt; queryHandlers =
+<span class="nc" id="L86">        mkMap(</span>
+<span class="nc" id="L87">            mkEntry(</span>
+                KeyQuery.class,
+                (query, mergedPosition, positionBound, config, store) -&gt;
+<span class="nc" id="L90">                    runKeyQuery(query, mergedPosition, positionBound, config)</span>
+            )
+        );
+
+
+    CachingKeyValueStore(final KeyValueStore&lt;Bytes, byte[]&gt; underlying, final CacheType cacheType) {
+<span class="nc" id="L96">        super(underlying);</span>
+<span class="nc" id="L97">        position = Position.emptyPosition();</span>
+<span class="nc" id="L98">        this.cacheType = cacheType;</span>
+<span class="nc" id="L99">    }</span>
+
+    @Override
+    public void init(final StateStoreContext stateStoreContext, final StateStore root) {
+<span class="nc" id="L103">        internalContext = asInternalProcessorContext(stateStoreContext);</span>
+<span class="nc" id="L104">        cacheName = ThreadCache.nameSpaceFromTaskIdAndStore(internalContext.taskId().toString(), name());</span>
+<span class="nc" id="L105">        internalContext.registerCacheFlushListener(cacheName, entries -&gt; {</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">            for (final ThreadCache.DirtyEntry entry : entries) {</span>
+<span class="nc" id="L107">                putAndMaybeForward(entry, internalContext);</span>
+<span class="nc" id="L108">            }</span>
+<span class="nc" id="L109">        });</span>
+<span class="nc" id="L110">        super.init(stateStoreContext, root);</span>
+        // save the stream thread as we only ever want to trigger a flush
+        // when the stream thread is the current thread.
+<span class="nc" id="L113">        streamThread = Thread.currentThread();</span>
+<span class="nc" id="L114">    }</span>
+
+    @Override
+    public Position getPosition() {
+        // We return the merged position since the query uses the merged position as well
+<span class="nc" id="L119">        final Position mergedPosition = Position.emptyPosition();</span>
+<span class="nc" id="L120">        final Position wrappedPosition = wrapped().getPosition();</span>
+<span class="nc" id="L121">        synchronized (position) {</span>
+<span class="nc" id="L122">            synchronized (wrappedPosition) {</span>
+<span class="nc" id="L123">                mergedPosition.merge(position);</span>
+<span class="nc" id="L124">                mergedPosition.merge(wrappedPosition);</span>
+<span class="nc" id="L125">            }</span>
+<span class="nc" id="L126">        }</span>
+<span class="nc" id="L127">        return mergedPosition;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public &lt;R&gt; QueryResult&lt;R&gt; query(final Query&lt;R&gt; query,
+                                    final PositionBound positionBound,
+                                    final QueryConfig config) {
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        final long start = config.isCollectExecutionInfo() ? System.nanoTime() : -1L;</span>
+        final QueryResult&lt;R&gt; result;
+
+<span class="nc" id="L138">        final CacheQueryHandler handler = queryHandlers.get(query.getClass());</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        if (handler == null) {</span>
+<span class="nc" id="L140">            result = wrapped().query(query, positionBound, config);</span>
+
+        } else {
+<span class="nc" id="L143">            final int partition = internalContext.taskId().partition();</span>
+<span class="nc" id="L144">            final Lock lock = this.lock.readLock();</span>
+<span class="nc" id="L145">            lock.lock();</span>
+            try {
+<span class="nc" id="L147">                validateStoreOpen();</span>
+<span class="nc" id="L148">                final Position mergedPosition = getPosition();</span>
+
+                // We use the merged position since the cache and the store may be at different positions
+<span class="nc bnc" id="L151" title="All 2 branches missed.">                if (!StoreQueryUtils.isPermitted(mergedPosition, positionBound, partition)) {</span>
+<span class="nc" id="L152">                    result = QueryResult.notUpToBound(mergedPosition, positionBound, partition);</span>
+                } else {
+<span class="nc" id="L154">                    result = (QueryResult&lt;R&gt;) handler.apply(</span>
+                        query,
+                        mergedPosition,
+                        positionBound,
+                        config,
+                        this
+                    );
+                }
+            } finally {
+<span class="nc" id="L163">                lock.unlock();</span>
+            }
+        }
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        if (config.isCollectExecutionInfo()) {</span>
+<span class="nc" id="L167">            result.addExecutionInfo(</span>
+<span class="nc" id="L168">                &quot;Handled in &quot; + getClass() + &quot; in &quot; + (System.nanoTime() - start) + &quot;ns&quot;);</span>
+        }
+<span class="nc" id="L170">        return result;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;R&gt; QueryResult&lt;R&gt; runKeyQuery(final Query&lt;R&gt; query,
+                                           final Position mergedPosition,
+                                           final PositionBound positionBound,
+                                           final QueryConfig config) {
+<span class="nc" id="L178">        QueryResult&lt;R&gt; result = null;</span>
+<span class="nc" id="L179">        final KeyQuery&lt;Bytes, byte[]&gt; keyQuery = (KeyQuery&lt;Bytes, byte[]&gt;) query;</span>
+
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (keyQuery.isSkipCache()) {</span>
+<span class="nc" id="L182">            return wrapped().query(query, positionBound, config);</span>
+        }
+
+<span class="nc" id="L185">        final Bytes key = keyQuery.getKey();</span>
+
+<span class="nc" id="L187">        synchronized (mergedPosition) {</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">            if (internalContext.cache() != null) {</span>
+<span class="nc" id="L189">                final LRUCacheEntry lruCacheEntry = internalContext.cache().get(cacheName, key);</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">                if (lruCacheEntry != null) {</span>
+                    final byte[] rawValue;
+<span class="nc bnc" id="L192" title="All 6 branches missed.">                    if (cacheType == CacheType.TIMESTAMPED_KEY_VALUE_STORE &amp;&amp; !WrappedStateStore.isTimestamped(wrapped()) &amp;&amp; !StoreQueryUtils.isAdapter(wrapped())) {</span>
+<span class="nc" id="L193">                        rawValue = ValueAndTimestampDeserializer.rawValue(lruCacheEntry.value());</span>
+                    } else {
+<span class="nc" id="L195">                        rawValue = lruCacheEntry.value();</span>
+                    }
+<span class="nc" id="L197">                    result = (QueryResult&lt;R&gt;) QueryResult.forResult(rawValue);</span>
+                }
+            }
+
+            // We don't need to check the position at the state store since we already performed the check on
+            // the merged position above
+<span class="nc bnc" id="L203" title="All 2 branches missed.">            if (result == null) {</span>
+<span class="nc" id="L204">                result = wrapped().query(query, PositionBound.unbounded(), config);</span>
+            }
+<span class="nc" id="L206">            result.setPosition(mergedPosition.copy());</span>
+<span class="nc" id="L207">        }</span>
+<span class="nc" id="L208">        return result;</span>
+    }
+
+    private void putAndMaybeForward(final ThreadCache.DirtyEntry entry,
+                                    final InternalProcessorContext&lt;?, ?&gt; context) {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        if (flushListener != null) {</span>
+<span class="nc" id="L214">            final byte[] rawNewValue = entry.newValue();</span>
+<span class="nc bnc" id="L215" title="All 4 branches missed.">            final byte[] rawOldValue = rawNewValue == null || sendOldValues ? wrapped().get(entry.key()) : null;</span>
+
+            // this is an optimization: if this key did not exist in underlying store and also not in the cache,
+            // we can skip flushing to downstream as well as writing to underlying store
+<span class="nc bnc" id="L219" title="All 4 branches missed.">            if (rawNewValue != null || rawOldValue != null) {</span>
+                // we need to get the old values if needed, and then put to store, and then flush
+<span class="nc" id="L221">                final ProcessorRecordContext current = context.recordContext();</span>
+                try {
+<span class="nc" id="L223">                    context.setRecordContext(entry.entry().context());</span>
+<span class="nc" id="L224">                    wrapped().put(entry.key(), entry.newValue());</span>
+<span class="nc" id="L225">                    flushListener.apply(</span>
+                        new Record&lt;&gt;(
+<span class="nc" id="L227">                            entry.key().get(),</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">                            new Change&lt;&gt;(rawNewValue, sendOldValues ? rawOldValue : null),</span>
+<span class="nc" id="L229">                            entry.entry().context().timestamp(),</span>
+<span class="nc" id="L230">                            entry.entry().context().headers()));</span>
+                } finally {
+<span class="nc" id="L232">                    context.setRecordContext(current);</span>
+                }
+            }
+<span class="nc" id="L235">        } else {</span>
+<span class="nc" id="L236">            final ProcessorRecordContext current = context.recordContext();</span>
+            try {
+<span class="nc" id="L238">                context.setRecordContext(entry.entry().context());</span>
+<span class="nc" id="L239">                wrapped().put(entry.key(), entry.newValue());</span>
+            } finally {
+<span class="nc" id="L241">                context.setRecordContext(current);</span>
+            }
+        }
+<span class="nc" id="L244">    }</span>
+
+    @Override
+    public boolean setFlushListener(final CacheFlushListener&lt;byte[], byte[]&gt; flushListener,
+                                    final boolean sendOldValues) {
+<span class="nc" id="L249">        this.flushListener = flushListener;</span>
+<span class="nc" id="L250">        this.sendOldValues = sendOldValues;</span>
+
+<span class="nc" id="L252">        return true;</span>
+    }
+
+    @Override
+    public void put(final Bytes key,
+                    final byte[] value) {
+<span class="nc" id="L258">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L259">        validateStoreOpen();</span>
+<span class="nc" id="L260">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L262">            validateStoreOpen();</span>
+            // for null bytes, we still put it into cache indicating tombstones
+<span class="nc" id="L264">            putInternal(key, value);</span>
+        } finally {
+<span class="nc" id="L266">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L268">    }</span>
+
+    private void putInternal(final Bytes key,
+                             final byte[] value) {
+<span class="nc" id="L272">        synchronized (position) {</span>
+<span class="nc" id="L273">            internalContext.cache().put(</span>
+                cacheName,
+                key,
+                new LRUCacheEntry(
+                    value,
+<span class="nc" id="L278">                    internalContext.recordContext().headers(),</span>
+                    true,
+<span class="nc" id="L280">                    internalContext.recordContext().offset(),</span>
+<span class="nc" id="L281">                    internalContext.recordContext().timestamp(),</span>
+<span class="nc" id="L282">                    internalContext.recordContext().partition(),</span>
+<span class="nc" id="L283">                    internalContext.recordContext().topic(),</span>
+<span class="nc" id="L284">                    internalContext.recordContext().sourceRawKey(),</span>
+<span class="nc" id="L285">                    internalContext.recordContext().sourceRawValue()</span>
+                )
+            );
+
+<span class="nc" id="L289">            StoreQueryUtils.updatePosition(position, internalContext);</span>
+<span class="nc" id="L290">        }</span>
+<span class="nc" id="L291">    }</span>
+
+    @Override
+    public byte[] putIfAbsent(final Bytes key,
+                              final byte[] value) {
+<span class="nc" id="L296">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L297">        validateStoreOpen();</span>
+<span class="nc" id="L298">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L300">            validateStoreOpen();</span>
+<span class="nc" id="L301">            final byte[] v = getInternal(key, wrapped());</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            if (v == null) {</span>
+<span class="nc" id="L303">                putInternal(key, value);</span>
+            }
+<span class="nc" id="L305">            return v;</span>
+        } finally {
+<span class="nc" id="L307">            lock.writeLock().unlock();</span>
+        }
+    }
+
+    @Override
+    public void putAll(final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; entries) {
+<span class="nc" id="L313">        validateStoreOpen();</span>
+<span class="nc" id="L314">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L316">            validateStoreOpen();</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">            for (final KeyValue&lt;Bytes, byte[]&gt; entry : entries) {</span>
+<span class="nc" id="L318">                Objects.requireNonNull(entry.key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L319">                put(entry.key, entry.value);</span>
+<span class="nc" id="L320">            }</span>
+        } finally {
+<span class="nc" id="L322">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L324">    }</span>
+
+    @Override
+    public byte[] delete(final Bytes key) {
+<span class="nc" id="L328">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L329">        validateStoreOpen();</span>
+<span class="nc" id="L330">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L332">            validateStoreOpen();</span>
+<span class="nc" id="L333">            return deleteInternal(key);</span>
+        } finally {
+<span class="nc" id="L335">            lock.writeLock().unlock();</span>
+        }
+    }
+
+    private byte[] deleteInternal(final Bytes key) {
+<span class="nc" id="L340">        final byte[] v = getInternal(key, wrapped());</span>
+<span class="nc" id="L341">        putInternal(key, null);</span>
+<span class="nc" id="L342">        return v;</span>
+    }
+
+    @Override
+    public byte[] get(final Bytes key) {
+<span class="nc" id="L347">        return getInternal(key, wrapped());</span>
+    }
+
+    private byte[] getInternal(final Bytes key, final ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; underlying) {
+<span class="nc" id="L351">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L352">        validateStoreOpen();</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">        final Lock theLock = Thread.currentThread().equals(streamThread) ? lock.writeLock() : lock.readLock();</span>
+<span class="nc" id="L354">        theLock.lock();</span>
+        try {
+<span class="nc" id="L356">            validateStoreOpen();</span>
+<span class="nc" id="L357">            LRUCacheEntry entry = null;</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">            if (internalContext.cache() != null) {</span>
+<span class="nc" id="L359">                entry = internalContext.cache().get(cacheName, key);</span>
+            }
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            if (entry == null) {</span>
+<span class="nc" id="L362">                final byte[] rawValue = underlying.get(key);</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                if (rawValue == null) {</span>
+<span class="nc" id="L364">                    return null;</span>
+                }
+                // only update the cache if this call is on the streamThread
+                // as we don't want other threads to trigger an eviction/flush
+<span class="nc bnc" id="L368" title="All 2 branches missed.">                if (Thread.currentThread().equals(streamThread)) {</span>
+<span class="nc" id="L369">                    internalContext.cache().put(cacheName, key, new LRUCacheEntry(rawValue));</span>
+                }
+<span class="nc" id="L371">                return rawValue;</span>
+            } else {
+<span class="nc" id="L373">                return entry.value();</span>
+            }
+        } finally {
+<span class="nc" id="L376">            theLock.unlock();</span>
+        }
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; range(final Bytes from,
+                                                 final Bytes to) {
+<span class="nc" id="L383">        return rangeInternal(from, to, wrapped(), true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; reverseRange(final Bytes from,
+                                                        final Bytes to) {
+<span class="nc" id="L389">        return rangeInternal(from, to, wrapped(), false);</span>
+    }
+
+    private KeyValueIterator&lt;Bytes, byte[]&gt; rangeInternal(final Bytes from,
+                                                          final Bytes to,
+                                                          final ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; underlying,
+                                                          final boolean forward) {
+<span class="nc bnc" id="L396" title="All 6 branches missed.">        if (from != null &amp;&amp; to != null &amp;&amp; from.compareTo(to) &gt; 0) {</span>
+<span class="nc" id="L397">            LOG.warn(&quot;Returning empty iterator for fetch with invalid key range: from &gt; to. &quot; +</span>
+                &quot;This may be due to range arguments set in the wrong order, &quot; +
+                &quot;or serdes that don't preserve ordering when lexicographically comparing the serialized bytes. &quot; +
+                &quot;Note that the built-in numerical serdes do not follow this for negative numbers&quot;);
+<span class="nc" id="L401">            return KeyValueIterators.emptyIterator();</span>
+        }
+<span class="nc" id="L403">        validateStoreOpen();</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        final KeyValueIterator&lt;Bytes, byte[]&gt; storeIterator = forward ? underlying.range(from, to) : underlying.reverseRange(from, to);</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        final ThreadCache.MemoryLRUCacheBytesIterator cacheIterator = forward ?</span>
+<span class="nc" id="L406">            internalContext.cache().range(cacheName, from, to) :</span>
+<span class="nc" id="L407">            internalContext.cache().reverseRange(cacheName, from, to);</span>
+<span class="nc" id="L408">        return new MergedSortedCacheKeyValueBytesStoreIterator(cacheIterator, storeIterator, forward);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; all() {
+<span class="nc" id="L413">        return allInternal(wrapped(), true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; reverseAll() {
+<span class="nc" id="L418">        return allInternal(wrapped(), false);</span>
+    }
+
+    private KeyValueIterator&lt;Bytes, byte[]&gt; allInternal(final ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; underlying,
+                                                        final boolean forward) {
+<span class="nc" id="L423">        validateStoreOpen();</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">        final KeyValueIterator&lt;Bytes, byte[]&gt; storeIterator = forward ? underlying.all() : underlying.reverseAll();</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        final ThreadCache.MemoryLRUCacheBytesIterator cacheIterator = forward ?</span>
+<span class="nc" id="L426">            internalContext.cache().all(cacheName) :</span>
+<span class="nc" id="L427">            internalContext.cache().reverseAll(cacheName);</span>
+<span class="nc" id="L428">        return new MergedSortedCacheKeyValueBytesStoreIterator(cacheIterator, storeIterator, forward);</span>
+    }
+
+    @Override
+    public &lt;PS extends Serializer&lt;P&gt;, P&gt; KeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final P prefix, final PS prefixKeySerializer) {
+<span class="nc" id="L433">        return prefixScanInternal(prefix, prefixKeySerializer, wrapped());</span>
+    }
+
+    private &lt;PS extends Serializer&lt;P&gt;, P&gt; KeyValueIterator&lt;Bytes, byte[]&gt; prefixScanInternal(final P prefix,
+                                                                                              final PS prefixKeySerializer,
+                                                                                              final ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; underlying) {
+<span class="nc" id="L439">        validateStoreOpen();</span>
+<span class="nc" id="L440">        final KeyValueIterator&lt;Bytes, byte[]&gt; storeIterator = underlying.prefixScan(prefix, prefixKeySerializer);</span>
+        // headers aren't needed because the prefix already arrives serialized
+<span class="nc" id="L442">        final Bytes from = Bytes.wrap(prefixKeySerializer.serialize(null, prefix));</span>
+<span class="nc" id="L443">        final Bytes to = ByteUtils.increment(from);</span>
+<span class="nc" id="L444">        final ThreadCache.MemoryLRUCacheBytesIterator cacheIterator = internalContext.cache().range(cacheName, from, to, false);</span>
+<span class="nc" id="L445">        return new MergedSortedCacheKeyValueBytesStoreIterator(cacheIterator, storeIterator, true);</span>
+    }
+
+    @Override
+    public ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; readOnly(final IsolationLevel isolationLevel) {
+<span class="nc" id="L450">        Objects.requireNonNull(isolationLevel, &quot;isolationLevel cannot be null&quot;);</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">        if (isolationLevel == IsolationLevel.READ_COMMITTED) {</span>
+<span class="nc" id="L452">            return wrapped().readOnly(isolationLevel);</span>
+        }
+<span class="nc" id="L454">        return new ReadOnlyView(wrapped().readOnly(isolationLevel));</span>
+    }
+
+    private final class ReadOnlyView implements ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; {
+
+        private final ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; underlying;
+
+<span class="nc" id="L461">        ReadOnlyView(final ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; underlying) {</span>
+<span class="nc" id="L462">            this.underlying = underlying;</span>
+<span class="nc" id="L463">        }</span>
+
+        @Override
+        public byte[] get(final Bytes key) {
+<span class="nc" id="L467">            return getInternal(key, underlying);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Bytes, byte[]&gt; range(final Bytes from, final Bytes to) {
+<span class="nc" id="L472">            return rangeInternal(from, to, underlying, true);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Bytes, byte[]&gt; reverseRange(final Bytes from, final Bytes to) {
+<span class="nc" id="L477">            return rangeInternal(from, to, underlying, false);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Bytes, byte[]&gt; all() {
+<span class="nc" id="L482">            return allInternal(underlying, true);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Bytes, byte[]&gt; reverseAll() {
+<span class="nc" id="L487">            return allInternal(underlying, false);</span>
+        }
+
+        @Override
+        public &lt;PS extends Serializer&lt;P&gt;, P&gt; KeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final P prefix, final PS prefixKeySerializer) {
+<span class="nc" id="L492">            return prefixScanInternal(prefix, prefixKeySerializer, underlying);</span>
+        }
+
+        @Override
+        public long approximateNumEntries() {
+<span class="nc" id="L497">            return underlying.approximateNumEntries();</span>
+        }
+    }
+
+    @Override
+    public long approximateNumEntries() {
+<span class="nc" id="L503">        validateStoreOpen();</span>
+<span class="nc" id="L504">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L506">            validateStoreOpen();</span>
+<span class="nc" id="L507">            return wrapped().approximateNumEntries();</span>
+        } finally {
+<span class="nc" id="L509">            lock.readLock().unlock();</span>
+        }
+    }
+
+    @Override
+    public void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc" id="L515">        validateStoreOpen();</span>
+<span class="nc" id="L516">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L518">            validateStoreOpen();</span>
+<span class="nc" id="L519">            internalContext.cache().flush(cacheName);</span>
+<span class="nc" id="L520">            wrapped().commit(changelogOffsets);</span>
+        } finally {
+<span class="nc" id="L522">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L524">    }</span>
+
+    @Override
+    public void flushCache() {
+<span class="nc" id="L528">        validateStoreOpen();</span>
+<span class="nc" id="L529">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L531">            validateStoreOpen();</span>
+<span class="nc" id="L532">            internalContext.cache().flush(cacheName);</span>
+        } finally {
+<span class="nc" id="L534">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L536">    }</span>
+
+    @Override
+    public void clearCache() {
+<span class="nc" id="L540">        validateStoreOpen();</span>
+<span class="nc" id="L541">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L543">            validateStoreOpen();</span>
+<span class="nc" id="L544">            internalContext.cache().clear(cacheName);</span>
+        } finally {
+<span class="nc" id="L546">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L548">    }</span>
+
+    @Override
+    public void close() {
+<span class="nc" id="L552">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L554">            final LinkedList&lt;RuntimeException&gt; suppressed = executeAll(</span>
+<span class="nc" id="L555">                () -&gt; internalContext.cache().flush(cacheName),</span>
+<span class="nc" id="L556">                () -&gt; internalContext.cache().close(cacheName),</span>
+<span class="nc" id="L557">                wrapped()::close</span>
+            );
+<span class="nc bnc" id="L559" title="All 2 branches missed.">            if (!suppressed.isEmpty()) {</span>
+<span class="nc" id="L560">                throwSuppressed(&quot;Caught an exception while closing caching key value store for store &quot; + name(),</span>
+                    suppressed);
+            }
+        } finally {
+<span class="nc" id="L564">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L566">    }</span>
+
+<span class="nc" id="L568">    public enum CacheType {</span>
+<span class="nc" id="L569">        KEY_VALUE_STORE,</span>
+<span class="nc" id="L570">        TIMESTAMPED_KEY_VALUE_STORE,</span>
+<span class="nc" id="L571">        TIMESTAMPED_KEY_VALUE_STORE_WITH_HEADERS</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

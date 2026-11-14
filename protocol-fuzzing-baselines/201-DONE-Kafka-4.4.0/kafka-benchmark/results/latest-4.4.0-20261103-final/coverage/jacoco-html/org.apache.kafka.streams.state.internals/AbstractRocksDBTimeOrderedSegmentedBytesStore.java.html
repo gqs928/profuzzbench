@@ -1,0 +1,481 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractRocksDBTimeOrderedSegmentedBytesStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">AbstractRocksDBTimeOrderedSegmentedBytesStore.java</span></div><h1>AbstractRocksDBTimeOrderedSegmentedBytesStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.processor.internals.ChangelogRecordDeserializationHelper;
+import org.apache.kafka.streams.state.KeyValueIterator;
+
+import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
+
+/**
+ * RocksDB store backed by two SegmentedBytesStores which can optimize scan by time as well as window
+ * lookup for a specific key.
+ *
+ * Schema for first SegmentedBytesStore (base store) is as below:
+ *     Key schema: | timestamp + [timestamp] + recordkey |
+ *     Value schema: | value |. Value here is determined by caller.
+ *
+ * Schema for second SegmentedBytesStore (index store) is as below:
+ *     Key schema: | record + timestamp + [timestamp]|
+ *     Value schema: ||
+ *
+ * Note there could be two timestamps if we store both window end time and window start time.
+ *
+ * Operations:
+ *     Put: 1. Put to index store. 2. Put to base store.
+ *     Delete: 1. Delete from base store. 2. Delete from index store.
+ * Since we need to update two stores, failure can happen in the middle. We put in index store first
+ * to make sure if a failure happens in second step and the view is inconsistent, we can't get the
+ * value for the key. We delete from base store first to make sure if a failure happens in second step
+ * and the view is inconsistent, we can't get the value for the key.
+ *
+ * Note:
+ *     Index store can be optional if we can construct the timestamp in base store instead of looking
+ *     them up from index store.
+ *
+ * @see RocksDBTimeOrderedSessionSegmentedBytesStore
+ * @see RocksDBTimeOrderedWindowSegmentedBytesStore
+ */
+public abstract class AbstractRocksDBTimeOrderedSegmentedBytesStore&lt;S extends Segment&gt; extends AbstractDualSchemaRocksDBSegmentedBytesStore&lt;S&gt; {
+<span class="nc" id="L72">    private static final Logger LOG = LoggerFactory.getLogger(AbstractRocksDBTimeOrderedSegmentedBytesStore.class);</span>
+
+    private long minTimestamp;
+
+    public abstract class IndexToBaseStoreIterator implements KeyValueIterator&lt;Bytes, byte[]&gt; {
+        private final KeyValueIterator&lt;Bytes, byte[]&gt; indexIterator;
+        private byte[] cachedValue;
+        // Null for the owner path (live base reads plus stale-index repair); non-null for isolation-bound
+        // interactive queries, which read the base store through its isolation view and never mutate the index.
+        private final IsolationLevel isolationLevel;
+
+<span class="nc" id="L83">        IndexToBaseStoreIterator(final KeyValueIterator&lt;Bytes, byte[]&gt; indexIterator, final IsolationLevel isolationLevel) {</span>
+<span class="nc" id="L84">            this.indexIterator = indexIterator;</span>
+<span class="nc" id="L85">            this.isolationLevel = isolationLevel;</span>
+<span class="nc" id="L86">        }</span>
+
+        @Override
+        public void close() {
+<span class="nc" id="L90">            indexIterator.close();</span>
+<span class="nc" id="L91">        }</span>
+
+        @Override
+        public Bytes peekNextKey() {
+<span class="nc bnc" id="L95" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L96">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L98">            return getBaseKey(indexIterator.peekNextKey());</span>
+        }
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L103" title="All 2 branches missed.">            while (indexIterator.hasNext()) {</span>
+<span class="nc" id="L104">                final Bytes key = indexIterator.peekNextKey();</span>
+<span class="nc" id="L105">                final Bytes baseKey = getBaseKey(key);</span>
+
+<span class="nc" id="L107">                cachedValue = get(baseKey, isolationLevel);</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">                if (cachedValue == null) {</span>
+                    // Key not in base store or key is expired, inconsistency happened and remove from index.
+                    // Interactive queries read through an isolation view and must not mutate, so skip the repair.
+<span class="nc" id="L111">                    indexIterator.next();</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">                    if (isolationLevel == null) {</span>
+<span class="nc" id="L113">                        AbstractRocksDBTimeOrderedSegmentedBytesStore.this.removeIndex(key);</span>
+                    }
+                } else {
+<span class="nc" id="L116">                    return true;</span>
+                }
+<span class="nc" id="L118">            }</span>
+<span class="nc" id="L119">            return false;</span>
+        }
+
+        @Override
+        public KeyValue&lt;Bytes, byte[]&gt; next() {
+<span class="nc bnc" id="L124" title="All 4 branches missed.">            if (cachedValue == null &amp;&amp; !hasNext()) {</span>
+<span class="nc" id="L125">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L127">            final KeyValue&lt;Bytes, byte[]&gt; ret = indexIterator.next();</span>
+<span class="nc" id="L128">            final byte[] value = cachedValue;</span>
+<span class="nc" id="L129">            cachedValue = null;</span>
+<span class="nc" id="L130">            return KeyValue.pair(getBaseKey(ret.key), value);</span>
+        }
+
+        protected abstract Bytes getBaseKey(final Bytes indexKey);
+    }
+
+    AbstractRocksDBTimeOrderedSegmentedBytesStore(final String name,
+                                                  final long retention,
+                                                  final KeySchema baseKeySchema,
+                                                  final Optional&lt;KeySchema&gt; indexKeySchema,
+                                                  final AbstractSegments&lt;S&gt; segments) {
+<span class="nc" id="L141">        super(name, baseKeySchema, indexKeySchema, segments, retention);</span>
+
+<span class="nc" id="L143">        minTimestamp = Long.MAX_VALUE;</span>
+<span class="nc" id="L144">    }</span>
+
+    Map&lt;S, WriteBatch&gt; getWriteBatches(
+        final Collection&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; records,
+        final Function&lt;byte[], Long&gt; timestampExtractor,
+        final Function&lt;byte[], byte[]&gt; indexedKeyExtractor,
+        final Function&lt;byte[], byte[]&gt; baseKeyExtractor
+    ) {
+        // advance stream time to the max timestamp in the batch
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        for (final ConsumerRecord&lt;byte[], byte[]&gt; record : records) {</span>
+<span class="nc" id="L154">            final long timestamp = timestampExtractor.apply(record.key());</span>
+<span class="nc" id="L155">            minTimestamp = Math.min(minTimestamp, timestamp);</span>
+<span class="nc" id="L156">            observedStreamTime = Math.max(observedStreamTime, timestamp);</span>
+<span class="nc" id="L157">        }</span>
+
+<span class="nc" id="L159">        final Map&lt;S, WriteBatch&gt; writeBatchMap = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        for (final ConsumerRecord&lt;byte[], byte[]&gt; record : records) {</span>
+<span class="nc" id="L161">            final long timestamp = timestampExtractor.apply(record.key());</span>
+<span class="nc" id="L162">            final long segmentId = segments.segmentId(timestamp);</span>
+<span class="nc" id="L163">            final S segment = segments.getOrCreateSegmentIfLive(segmentId, internalProcessorContext, observedStreamTime);</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            if (segment != null) {</span>
+<span class="nc" id="L165">                ChangelogRecordDeserializationHelper.applyChecksAndUpdatePosition(</span>
+                    record,
+                    consistencyEnabled,
+                    position
+                );
+                try {
+<span class="nc" id="L171">                    final WriteBatch batch = writeBatchMap.computeIfAbsent(segment, s -&gt; new WriteBatch());</span>
+
+                    // Assuming changelog record is serialized using SessionKeySchema
+                    // from ChangeLoggingSessionBytesStore. Reconstruct key/value to restore
+<span class="nc bnc" id="L175" title="All 2 branches missed.">                    if (hasIndex()) {</span>
+<span class="nc" id="L176">                        final byte[] indexKey = indexedKeyExtractor.apply(record.key());</span>
+                        // Take care of tombstone
+<span class="nc bnc" id="L178" title="All 2 branches missed.">                        final byte[] value = record.value() == null ? null : new byte[0];</span>
+<span class="nc" id="L179">                        segment.addToBatch(new KeyValue&lt;&gt;(indexKey, value), batch);</span>
+                    }
+
+<span class="nc" id="L182">                    final byte[] baseKey = baseKeyExtractor.apply(record.key());</span>
+<span class="nc" id="L183">                    segment.addToBatch(new KeyValue&lt;&gt;(baseKey, record.value()), batch);</span>
+<span class="nc" id="L184">                } catch (final RocksDBException e) {</span>
+<span class="nc" id="L185">                    throw new ProcessorStateException(&quot;Error restoring batch to store &quot; + name(), e);</span>
+<span class="nc" id="L186">                }</span>
+            }
+<span class="nc" id="L188">        }</span>
+<span class="nc" id="L189">        return writeBatchMap;</span>
+    }
+
+    protected long minTimestamp() {
+<span class="nc" id="L193">        return minTimestamp;</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; fetch(final Bytes key,
+                                                 final long from,
+                                                 final long to) {
+<span class="nc" id="L200">        return fetch(key, from, to, true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; backwardFetch(final Bytes key,
+                                                         final long from,
+                                                         final long to) {
+<span class="nc" id="L207">        return fetch(key, from, to, false);</span>
+    }
+
+    protected abstract IndexToBaseStoreIterator getIndexToBaseStoreIterator(final SegmentIterator&lt;S&gt; segmentIterator,
+                                                                            final IsolationLevel isolationLevel);
+
+    public void put(final Bytes key, final long timestamp, final int seqnum, final byte[] value) {
+<span class="nc" id="L214">        throw new UnsupportedOperationException(&quot;This store does not support put with timestamp and seqnum&quot;);</span>
+    }
+
+    public byte[] fetch(final Bytes key, final long timestamp, final int seqnum) {
+<span class="nc" id="L218">        throw new UnsupportedOperationException(&quot;This store does not support fetch with timestamp and seqnum&quot;);</span>
+    }
+
+    public byte[] fetchSession(final Bytes key, final long sessionStartTime, final long sessionEndTime) {
+<span class="nc" id="L222">        throw new UnsupportedOperationException(&quot;This store does not support fetchSession&quot;);</span>
+    }
+
+    public KeyValueIterator&lt;Bytes, byte[]&gt; fetchSessions(final long earliestSessionEndTime, final long latestSessionEndTime) {
+<span class="nc" id="L226">        throw new UnsupportedOperationException(&quot;This store does not support fetchSessions&quot;);</span>
+    }
+
+    public void remove(final Windowed&lt;Bytes&gt; key) {
+<span class="nc" id="L230">        throw new UnsupportedOperationException(&quot;This store does not support remove with Windowed key&quot;);</span>
+    }
+
+    public void put(final Windowed&lt;Bytes&gt; sessionKey, final byte[] aggregate) {
+<span class="nc" id="L234">        throw new UnsupportedOperationException(&quot;This store does not support put with Windowed key&quot;);</span>
+    }
+
+    KeyValueIterator&lt;Bytes, byte[]&gt; fetch(final Bytes key,
+                                          final long from,
+                                          final long to,
+                                          final boolean forward) {
+<span class="nc" id="L241">        return fetch(key, from, to, forward, null);</span>
+    }
+
+    KeyValueIterator&lt;Bytes, byte[]&gt; fetch(final Bytes key,
+                                          final long from,
+                                          final long to,
+                                          final boolean forward,
+                                          final IsolationLevel isolationLevel) {
+
+<span class="nc" id="L250">        final long actualFrom = getActualFrom(from, baseKeySchema instanceof PrefixedWindowKeySchemas.TimeFirstWindowKeySchema);</span>
+
+<span class="nc bnc" id="L252" title="All 4 branches missed.">        if (baseKeySchema instanceof PrefixedWindowKeySchemas.TimeFirstWindowKeySchema &amp;&amp; to &lt; actualFrom) {</span>
+<span class="nc" id="L253">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        if (indexKeySchema.isPresent()) {</span>
+<span class="nc" id="L257">            final List&lt;S&gt; searchSpace = indexKeySchema.get().segmentsToSearch(segments, actualFrom, to,</span>
+                forward);
+
+<span class="nc" id="L260">            final Bytes binaryFrom = indexKeySchema.get().lowerRangeFixedSize(key, actualFrom);</span>
+<span class="nc" id="L261">            final Bytes binaryTo = indexKeySchema.get().upperRangeFixedSize(key, to);</span>
+
+<span class="nc" id="L263">            return getIndexToBaseStoreIterator(new SegmentIterator&lt;&gt;(</span>
+<span class="nc" id="L264">                searchSpace.iterator(),</span>
+<span class="nc" id="L265">                indexKeySchema.get().hasNextCondition(key, key, actualFrom, to, forward),</span>
+                binaryFrom,
+                binaryTo,
+                forward,
+                isolationLevel), isolationLevel);
+        }
+
+
+<span class="nc" id="L273">        final List&lt;S&gt; searchSpace = baseKeySchema.segmentsToSearch(segments, actualFrom, to,</span>
+            forward);
+
+<span class="nc" id="L276">        final Bytes binaryFrom = baseKeySchema.lowerRangeFixedSize(key, actualFrom);</span>
+<span class="nc" id="L277">        final Bytes binaryTo = baseKeySchema.upperRangeFixedSize(key, to);</span>
+
+<span class="nc" id="L279">        return new SegmentIterator&lt;&gt;(</span>
+<span class="nc" id="L280">            searchSpace.iterator(),</span>
+<span class="nc" id="L281">            baseKeySchema.hasNextCondition(key, key, actualFrom, to, forward),</span>
+            binaryFrom,
+            binaryTo,
+            forward,
+            isolationLevel);
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; fetch(final Bytes keyFrom,
+                                                 final Bytes keyTo,
+                                                 final long from,
+                                                 final long to) {
+<span class="nc" id="L293">        return fetch(keyFrom, keyTo, from, to, true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; backwardFetch(final Bytes keyFrom,
+                                                         final Bytes keyTo,
+                                                         final long from,
+                                                         final long to) {
+<span class="nc" id="L301">        return fetch(keyFrom, keyTo, from, to, false);</span>
+    }
+
+    KeyValueIterator&lt;Bytes, byte[]&gt; fetch(final Bytes keyFrom,
+                                          final Bytes keyTo,
+                                          final long from,
+                                          final long to,
+                                          final boolean forward) {
+<span class="nc" id="L309">        return fetch(keyFrom, keyTo, from, to, forward, null);</span>
+    }
+
+    KeyValueIterator&lt;Bytes, byte[]&gt; fetch(final Bytes keyFrom,
+                                          final Bytes keyTo,
+                                          final long from,
+                                          final long to,
+                                          final boolean forward,
+                                          final IsolationLevel isolationLevel) {
+<span class="nc bnc" id="L318" title="All 6 branches missed.">        if (keyFrom != null &amp;&amp; keyTo != null &amp;&amp; keyFrom.compareTo(keyTo) &gt; 0) {</span>
+<span class="nc" id="L319">            LOG.warn(&quot;Returning empty iterator for fetch with invalid key range: from &gt; to. &quot; +</span>
+                    &quot;This may be due to range arguments set in the wrong order, &quot; +
+                    &quot;or serdes that don't preserve ordering when lexicographically comparing the serialized bytes. &quot; +
+                    &quot;Note that the built-in numerical serdes do not follow this for negative numbers&quot;);
+<span class="nc" id="L323">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+<span class="nc" id="L326">        final long actualFrom = getActualFrom(from, baseKeySchema instanceof PrefixedWindowKeySchemas.TimeFirstWindowKeySchema);</span>
+
+<span class="nc bnc" id="L328" title="All 4 branches missed.">        if (baseKeySchema instanceof PrefixedWindowKeySchemas.TimeFirstWindowKeySchema &amp;&amp; to &lt; actualFrom) {</span>
+<span class="nc" id="L329">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        if (indexKeySchema.isPresent()) {</span>
+<span class="nc" id="L333">            final List&lt;S&gt; searchSpace = indexKeySchema.get().segmentsToSearch(segments, actualFrom, to,</span>
+                forward);
+
+<span class="nc" id="L336">            final Bytes binaryFrom = indexKeySchema.get().lowerRange(keyFrom, actualFrom);</span>
+<span class="nc" id="L337">            final Bytes binaryTo = indexKeySchema.get().upperRange(keyTo, to);</span>
+
+<span class="nc" id="L339">            return getIndexToBaseStoreIterator(new SegmentIterator&lt;&gt;(</span>
+<span class="nc" id="L340">                searchSpace.iterator(),</span>
+<span class="nc" id="L341">                indexKeySchema.get().hasNextCondition(keyFrom, keyTo, actualFrom, to, forward),</span>
+                binaryFrom,
+                binaryTo,
+                forward,
+                isolationLevel), isolationLevel);
+        }
+
+<span class="nc" id="L348">        final List&lt;S&gt; searchSpace = baseKeySchema.segmentsToSearch(segments, actualFrom, to,</span>
+            forward);
+
+<span class="nc" id="L351">        final Bytes binaryFrom = baseKeySchema.lowerRange(keyFrom, actualFrom);</span>
+<span class="nc" id="L352">        final Bytes binaryTo = baseKeySchema.upperRange(keyTo, to);</span>
+
+<span class="nc" id="L354">        return new SegmentIterator&lt;&gt;(</span>
+<span class="nc" id="L355">            searchSpace.iterator(),</span>
+<span class="nc" id="L356">            baseKeySchema.hasNextCondition(keyFrom, keyTo, actualFrom, to, forward),</span>
+            binaryFrom,
+            binaryTo,
+            forward,
+            isolationLevel);
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; fetchAll(final long timeFrom,
+                                                    final long timeTo) {
+<span class="nc" id="L366">        return fetchAll(timeFrom, timeTo, true, null);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; backwardFetchAll(final long timeFrom,
+                                                            final long timeTo) {
+<span class="nc" id="L372">        return fetchAll(timeFrom, timeTo, false, null);</span>
+    }
+
+    KeyValueIterator&lt;Bytes, byte[]&gt; fetchAll(final long timeFrom,
+                                             final long timeTo,
+                                             final boolean forward,
+                                             final IsolationLevel isolationLevel) {
+
+<span class="nc" id="L380">        final long actualFrom = getActualFrom(timeFrom, baseKeySchema instanceof PrefixedWindowKeySchemas.TimeFirstWindowKeySchema);</span>
+
+<span class="nc bnc" id="L382" title="All 4 branches missed.">        if (baseKeySchema instanceof PrefixedWindowKeySchemas.TimeFirstWindowKeySchema &amp;&amp; timeTo &lt; actualFrom) {</span>
+<span class="nc" id="L383">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+<span class="nc" id="L386">        final List&lt;S&gt; searchSpace = segments.segments(actualFrom, timeTo, forward);</span>
+<span class="nc" id="L387">        final Bytes binaryFrom = baseKeySchema.lowerRange(null, actualFrom);</span>
+<span class="nc" id="L388">        final Bytes binaryTo = baseKeySchema.upperRange(null, timeTo);</span>
+
+<span class="nc" id="L390">        return new SegmentIterator&lt;&gt;(</span>
+<span class="nc" id="L391">                searchSpace.iterator(),</span>
+<span class="nc" id="L392">                baseKeySchema.hasNextCondition(null, null, actualFrom, timeTo, forward),</span>
+                binaryFrom,
+                binaryTo,
+                forward,
+                isolationLevel);
+    }
+
+    /**
+     * As {@link #fetchSession(Bytes, long, long)}, but reading through the segment isolation view for the
+     * given level. Only the session store supports this; other stores throw.
+     */
+    byte[] fetchSession(final Bytes key,
+                        final long sessionStartTime,
+                        final long sessionEndTime,
+                        final IsolationLevel isolationLevel) {
+<span class="nc" id="L407">        throw new UnsupportedOperationException(&quot;This store does not support fetchSession&quot;);</span>
+    }
+
+    /**
+     * As {@link #fetchSessions(long, long)}, but reading through the segment isolation view for the given
+     * level. Only the session store supports this; other stores throw.
+     */
+    KeyValueIterator&lt;Bytes, byte[]&gt; fetchSessions(final long earliestSessionEndTime,
+                                                  final long latestSessionEndTime,
+                                                  final IsolationLevel isolationLevel) {
+<span class="nc" id="L417">        throw new UnsupportedOperationException(&quot;This store does not support fetchSessions&quot;);</span>
+    }
+
+    /** An isolation-bound read view over this store, delegating to the store's isolation-aware read utilities. */
+    ReadOnlyView readOnly(final IsolationLevel isolationLevel) {
+<span class="nc" id="L422">        Objects.requireNonNull(isolationLevel, &quot;isolationLevel cannot be null&quot;);</span>
+<span class="nc" id="L423">        return new ReadOnlyView(this, isolationLevel);</span>
+    }
+
+    /** Read view bound to an {@link IsolationLevel}; used by the wrapping window and session stores for IQ reads. */
+    static final class ReadOnlyView {
+        private final AbstractRocksDBTimeOrderedSegmentedBytesStore&lt;?&gt; store;
+        private final IsolationLevel isolationLevel;
+
+<span class="nc" id="L431">        private ReadOnlyView(final AbstractRocksDBTimeOrderedSegmentedBytesStore&lt;?&gt; store, final IsolationLevel isolationLevel) {</span>
+<span class="nc" id="L432">            this.store = store;</span>
+<span class="nc" id="L433">            this.isolationLevel = isolationLevel;</span>
+<span class="nc" id="L434">        }</span>
+
+        byte[] get(final Bytes rawKey) {
+<span class="nc" id="L437">            return store.get(rawKey, isolationLevel);</span>
+        }
+
+        KeyValueIterator&lt;Bytes, byte[]&gt; fetch(final Bytes key, final long from, final long to) {
+<span class="nc" id="L441">            return store.fetch(key, from, to, true, isolationLevel);</span>
+        }
+
+        KeyValueIterator&lt;Bytes, byte[]&gt; backwardFetch(final Bytes key, final long from, final long to) {
+<span class="nc" id="L445">            return store.fetch(key, from, to, false, isolationLevel);</span>
+        }
+
+        KeyValueIterator&lt;Bytes, byte[]&gt; fetch(final Bytes keyFrom, final Bytes keyTo, final long from, final long to) {
+<span class="nc" id="L449">            return store.fetch(keyFrom, keyTo, from, to, true, isolationLevel);</span>
+        }
+
+        KeyValueIterator&lt;Bytes, byte[]&gt; backwardFetch(final Bytes keyFrom, final Bytes keyTo, final long from, final long to) {
+<span class="nc" id="L453">            return store.fetch(keyFrom, keyTo, from, to, false, isolationLevel);</span>
+        }
+
+        KeyValueIterator&lt;Bytes, byte[]&gt; fetchAll(final long from, final long to) {
+<span class="nc" id="L457">            return store.fetchAll(from, to, true, isolationLevel);</span>
+        }
+
+        KeyValueIterator&lt;Bytes, byte[]&gt; backwardFetchAll(final long from, final long to) {
+<span class="nc" id="L461">            return store.fetchAll(from, to, false, isolationLevel);</span>
+        }
+
+        KeyValueIterator&lt;Bytes, byte[]&gt; all() {
+<span class="nc" id="L465">            return store.all(true, isolationLevel);</span>
+        }
+
+        KeyValueIterator&lt;Bytes, byte[]&gt; backwardAll() {
+<span class="nc" id="L469">            return store.all(false, isolationLevel);</span>
+        }
+
+        byte[] fetchSession(final Bytes key, final long sessionStartTime, final long sessionEndTime) {
+<span class="nc" id="L473">            return store.fetchSession(key, sessionStartTime, sessionEndTime, isolationLevel);</span>
+        }
+
+        KeyValueIterator&lt;Bytes, byte[]&gt; fetchSessions(final long earliestSessionEndTime, final long latestSessionEndTime) {
+<span class="nc" id="L477">            return store.fetchSessions(earliestSessionEndTime, latestSessionEndTime, isolationLevel);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

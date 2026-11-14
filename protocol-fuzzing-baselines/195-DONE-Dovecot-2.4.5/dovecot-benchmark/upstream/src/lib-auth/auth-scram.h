@@ -1,0 +1,50 @@
+#ifndef AUTH_SCRAM_H
+#define AUTH_SCRAM_H
+
+/* SCRAM allowed iteration count range. RFC says it SHOULD be at least 4096 */
+#define AUTH_SCRAM_MIN_ITERATE_COUNT 4096
+#define AUTH_SCRAM_MAX_ITERATE_COUNT INT_MAX
+
+#define AUTH_SCRAM_DEFAULT_ITERATE_COUNT 4096
+
+/* The level of SCRAM channel binding support at the server */
+enum auth_scram_cbind_server_support {
+	AUTH_SCRAM_CBIND_SERVER_SUPPORT_NONE = 0,
+	AUTH_SCRAM_CBIND_SERVER_SUPPORT_AVAILABLE,
+	AUTH_SCRAM_CBIND_SERVER_SUPPORT_REQUIRED,
+};
+
+struct auth_scram_key_data {
+	pool_t pool;
+	const struct hash_method *hmethod;
+
+	unsigned int iter_count;
+	const char *salt;
+	unsigned char *stored_key;
+	unsigned char *server_key;
+};
+
+void auth_scram_key_data_clear(struct auth_scram_key_data *data);
+
+void auth_scram_hi(const struct hash_method *hmethod,
+		   const unsigned char *str, size_t str_size,
+		   const unsigned char *salt, size_t salt_size, unsigned int i,
+		   unsigned char *result);
+
+void auth_scram_generate_key_data(const struct hash_method *hmethod,
+				  const char *plaintext, unsigned int rounds,
+				  unsigned int *iter_count_r,
+				  const char **salt_r,
+				  unsigned char stored_key_r[],
+				  unsigned char server_key_r[]);
+
+int auth_scram_credentials_parse(const struct hash_method *hmethod,
+				 const char *name,
+				 const unsigned char *credentials, size_t size,
+				 unsigned int *iter_count_r,
+				 const char **salt_r,
+				 unsigned char stored_key_r[],
+				 unsigned char server_key_r[],
+				 const char **error_r);
+
+#endif

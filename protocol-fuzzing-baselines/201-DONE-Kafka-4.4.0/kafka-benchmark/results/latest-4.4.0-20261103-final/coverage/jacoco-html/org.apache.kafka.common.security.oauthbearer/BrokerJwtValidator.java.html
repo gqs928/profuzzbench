@@ -1,0 +1,264 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BrokerJwtValidator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.security.oauthbearer</a> &gt; <span class="el_source">BrokerJwtValidator.java</span></div><h1>BrokerJwtValidator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.common.security.oauthbearer;
+
+import org.apache.kafka.common.annotation.InterfaceAudience;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.BasicOAuthBearerToken;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.ClaimValidationUtils;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.CloseableVerificationKeyResolver;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtils;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.SerializedJwt;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.VerificationKeyResolverFactory;
+
+import org.jose4j.jwt.JwtClaims;
+import org.jose4j.jwt.MalformedClaimException;
+import org.jose4j.jwt.NumericDate;
+import org.jose4j.jwt.ReservedClaimNames;
+import org.jose4j.jwt.consumer.InvalidJwtException;
+import org.jose4j.jwt.consumer.JwtConsumer;
+import org.jose4j.jwt.consumer.JwtConsumerBuilder;
+import org.jose4j.jwt.consumer.JwtContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+import javax.security.auth.login.AppConfigurationEntry;
+
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_ALLOW_UNVERIFIED_AUDIENCE;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_ALLOW_UNVERIFIED_ISSUER;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_CLOCK_SKEW_SECONDS;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_EXPECTED_AUDIENCE;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_EXPECTED_ISSUER;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_SCOPE_CLAIM_NAME;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_SUB_CLAIM_NAME;
+import static org.jose4j.jwa.AlgorithmConstraints.DISALLOW_NONE;
+
+/**
+ * {@code BrokerJwtValidator} is an implementation of {@link JwtValidator} that is used
+ * by the broker to perform more extensive validation of the JWT access token that is received
+ * from the client, but ultimately from posting the client credentials to the OAuth/OIDC provider's
+ * token endpoint.
+ *
+ * The validation steps performed (primarily by the jose4j library) are:
+ *
+ * &lt;ol&gt;
+ *     &lt;li&gt;
+ *         Basic structural validation of the &lt;code&gt;b64token&lt;/code&gt; value as defined in
+ *         &lt;a href=&quot;https://tools.ietf.org/html/rfc6750#section-2.1&quot;&gt;RFC 6750 Section 2.1&lt;/a&gt;
+ *     &lt;/li&gt;
+ *     &lt;li&gt;
+ *         Basic conversion of the token into an in-memory data structure
+ *     &lt;/li&gt;
+ *     &lt;li&gt;
+ *         Presence of &lt;code&gt;scope&lt;/code&gt;, &lt;code&gt;exp&lt;/code&gt;, &lt;code&gt;subject&lt;/code&gt;, &lt;code&gt;iss&lt;/code&gt;, and
+ *         &lt;code&gt;iat&lt;/code&gt; claims
+ *     &lt;/li&gt;
+ *     &lt;li&gt;
+ *         Signature matching validation against the &lt;code&gt;kid&lt;/code&gt; and those provided by
+ *         the OAuth/OIDC provider's JWKS
+ *     &lt;/li&gt;
+ *     &lt;li&gt;
+ *         Validation of the &lt;code&gt;aud&lt;/code&gt; (audience) claim. The broker must be configured with
+ *         {@code sasl.oauthbearer.expected.audience}; the token's &lt;code&gt;aud&lt;/code&gt; claim is matched
+ *         against those values. If no expected audience is configured, the audience cannot be
+ *         verified, so configuration fails fast (the broker refuses to start) unless
+ *         {@code sasl.oauthbearer.allow.unverified.audience} is set to {@code true}.
+ *     &lt;/li&gt;
+ *     &lt;li&gt;
+ *         Validation of the &lt;code&gt;iss&lt;/code&gt; (issuer) claim. The broker must be configured with
+ *         {@code sasl.oauthbearer.expected.issuer}; the token's &lt;code&gt;iss&lt;/code&gt; claim is matched
+ *         exactly against that value. If the expected issuer is not configured, the issuer cannot be
+ *         verified, so configuration fails fast (the broker refuses to start) unless
+ *         {@code sasl.oauthbearer.allow.unverified.issuer} is set to {@code true}.
+ *     &lt;/li&gt;
+ * &lt;/ol&gt;
+ */
+@InterfaceAudience.Public
+public class BrokerJwtValidator implements JwtValidator {
+
+<span class="nc" id="L100">    private static final Logger log = LoggerFactory.getLogger(BrokerJwtValidator.class);</span>
+
+    private final Optional&lt;CloseableVerificationKeyResolver&gt; verificationKeyResolverOpt;
+
+    private JwtConsumer jwtConsumer;
+
+    private String scopeClaimName;
+
+    private String subClaimName;
+
+    /**
+     * A public, no-args constructor is necessary for instantiation via configuration.
+     */
+<span class="nc" id="L113">    public BrokerJwtValidator() {</span>
+<span class="nc" id="L114">        this.verificationKeyResolverOpt = Optional.empty();</span>
+<span class="nc" id="L115">    }</span>
+
+    /*
+     * Package-visible for testing.
+     */
+<span class="nc" id="L120">    BrokerJwtValidator(CloseableVerificationKeyResolver verificationKeyResolver) {</span>
+<span class="nc" id="L121">        this.verificationKeyResolverOpt = Optional.of(verificationKeyResolver);</span>
+<span class="nc" id="L122">    }</span>
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs, String saslMechanism, List&lt;AppConfigurationEntry&gt; jaasConfigEntries) {
+<span class="nc" id="L126">        ConfigurationUtils cu = new ConfigurationUtils(configs, saslMechanism);</span>
+<span class="nc" id="L127">        Set&lt;String&gt; expectedAudiences = Set.copyOf(cu.get(SASL_OAUTHBEARER_EXPECTED_AUDIENCE));</span>
+<span class="nc" id="L128">        Integer clockSkew = cu.validateInteger(SASL_OAUTHBEARER_CLOCK_SKEW_SECONDS, false);</span>
+<span class="nc" id="L129">        String expectedIssuer = cu.validateString(SASL_OAUTHBEARER_EXPECTED_ISSUER, false);</span>
+<span class="nc" id="L130">        String scopeClaimName = cu.validateString(SASL_OAUTHBEARER_SCOPE_CLAIM_NAME);</span>
+<span class="nc" id="L131">        String subClaimName = cu.validateString(SASL_OAUTHBEARER_SUB_CLAIM_NAME);</span>
+<span class="nc" id="L132">        boolean allowUnverifiedAudience = Boolean.TRUE.equals(cu.validateBoolean(SASL_OAUTHBEARER_ALLOW_UNVERIFIED_AUDIENCE, false));</span>
+<span class="nc" id="L133">        boolean allowUnverifiedIssuer = Boolean.TRUE.equals(cu.validateBoolean(SASL_OAUTHBEARER_ALLOW_UNVERIFIED_ISSUER, false));</span>
+
+        // The broker must be configured with at least one expected audience so it can verify that the token was minted
+        // for this cluster. Without it, a token issued for any other service by the same provider would be accepted.
+        // Fail fast at configuration time unless the operator has explicitly opted out.
+<span class="nc bnc" id="L138" title="All 4 branches missed.">        if (expectedAudiences.isEmpty() &amp;&amp; !allowUnverifiedAudience) {</span>
+<span class="nc" id="L139">            throw new ConfigException(String.format(</span>
+                &quot;The OAuth validator for the broker requires \&quot;%s\&quot; to be configured so that the token's audience&quot; +
+                &quot; (\&quot;aud\&quot;) claim can be verified, but it was not set. Set \&quot;%s\&quot; to the audience(s) that identify this&quot; +
+                &quot; cluster, or set \&quot;%s\&quot; to true to accept tokens regardless of their audience.&quot;,
+                SASL_OAUTHBEARER_EXPECTED_AUDIENCE, SASL_OAUTHBEARER_EXPECTED_AUDIENCE, SASL_OAUTHBEARER_ALLOW_UNVERIFIED_AUDIENCE));
+        }
+
+        // The broker must be configured with an expected issuer. Without it, jose4j accepts a token bearing any (or no)
+        // &quot;iss&quot; claim, so the issuer cannot be verified. Fail fast at configuration time unless the operator has
+        // explicitly opted out.
+<span class="nc bnc" id="L149" title="All 4 branches missed.">        if (expectedIssuer == null &amp;&amp; !allowUnverifiedIssuer) {</span>
+<span class="nc" id="L150">            throw new ConfigException(String.format(</span>
+                &quot;The OAuth validator for the broker requires \&quot;%s\&quot; to be configured so that the token's issuer&quot; +
+                &quot; (\&quot;iss\&quot;) claim can be verified, but it was not set. Set \&quot;%s\&quot; to the issuer URL of the OAuth/OIDC&quot; +
+                &quot; provider that signs the tokens, or set \&quot;%s\&quot; to true to accept tokens regardless of their issuer.&quot;,
+                SASL_OAUTHBEARER_EXPECTED_ISSUER, SASL_OAUTHBEARER_EXPECTED_ISSUER, SASL_OAUTHBEARER_ALLOW_UNVERIFIED_ISSUER));
+        }
+
+<span class="nc" id="L157">        CloseableVerificationKeyResolver verificationKeyResolver = verificationKeyResolverOpt.orElseGet(</span>
+<span class="nc" id="L158">            () -&gt; VerificationKeyResolverFactory.get(configs, saslMechanism, jaasConfigEntries)</span>
+        );
+
+<span class="nc" id="L161">        final JwtConsumerBuilder jwtConsumerBuilder = new JwtConsumerBuilder();</span>
+
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (clockSkew != null)</span>
+<span class="nc" id="L164">            jwtConsumerBuilder.setAllowedClockSkewInSeconds(clockSkew);</span>
+
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        if (!expectedAudiences.isEmpty()) {</span>
+<span class="nc" id="L167">            jwtConsumerBuilder.setExpectedAudience(expectedAudiences.toArray(new String[0]));</span>
+        } else {
+            // Reached only when the audience opt-out is enabled (otherwise configuration fails fast above). jose4j
+            // otherwise rejects any token that carries an &quot;aud&quot; claim when no expected audience is set, so skip its
+            // default audience validation entirely.
+<span class="nc" id="L172">            log.warn(&quot;The OAuth broker validator is configured with a JWKS endpoint but without \&quot;{}\&quot;, and \&quot;{}\&quot; is&quot; +</span>
+                &quot; set to true, so it will accept a JWT regardless of its \&quot;aud\&quot; (audience) claim.&quot;,
+                SASL_OAUTHBEARER_EXPECTED_AUDIENCE, SASL_OAUTHBEARER_ALLOW_UNVERIFIED_AUDIENCE);
+<span class="nc" id="L175">            jwtConsumerBuilder.setSkipDefaultAudienceValidation();</span>
+        }
+
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        if (expectedIssuer != null) {</span>
+<span class="nc" id="L179">            jwtConsumerBuilder.setExpectedIssuer(expectedIssuer);</span>
+        } else {
+            // Reached only when the issuer opt-out is enabled (otherwise configuration fails fast above).
+<span class="nc" id="L182">            log.warn(&quot;The OAuth broker validator is configured with a JWKS endpoint but without \&quot;{}\&quot;, and \&quot;{}\&quot; is&quot; +</span>
+                &quot; set to true, so it will accept a JWT bearing any (or no) \&quot;iss\&quot; (issuer) claim.&quot;,
+                SASL_OAUTHBEARER_EXPECTED_ISSUER, SASL_OAUTHBEARER_ALLOW_UNVERIFIED_ISSUER);
+        }
+
+<span class="nc" id="L187">        this.jwtConsumer = jwtConsumerBuilder</span>
+<span class="nc" id="L188">            .setJwsAlgorithmConstraints(DISALLOW_NONE)</span>
+<span class="nc" id="L189">            .setRequireExpirationTime()</span>
+<span class="nc" id="L190">            .setRequireIssuedAt()</span>
+<span class="nc" id="L191">            .setVerificationKeyResolver(verificationKeyResolver)</span>
+<span class="nc" id="L192">            .build();</span>
+<span class="nc" id="L193">        this.scopeClaimName = scopeClaimName;</span>
+<span class="nc" id="L194">        this.subClaimName = subClaimName;</span>
+<span class="nc" id="L195">    }</span>
+
+    /**
+     * Accepts an OAuth JWT access token in base-64 encoded format, validates, and returns an
+     * OAuthBearerToken.
+     *
+     * @param accessToken Non-&lt;code&gt;null&lt;/code&gt; JWT access token
+     * @return {@link OAuthBearerToken}
+     * @throws JwtValidatorException Thrown on errors performing validation of given token
+     */
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public OAuthBearerToken validate(String accessToken) throws JwtValidatorException {
+<span class="nc" id="L208">        SerializedJwt serializedJwt = new SerializedJwt(accessToken);</span>
+
+        JwtContext jwt;
+
+        try {
+<span class="nc" id="L213">            jwt = jwtConsumer.process(serializedJwt.getToken());</span>
+<span class="nc" id="L214">        } catch (InvalidJwtException e) {</span>
+<span class="nc" id="L215">            throw new JwtValidatorException(String.format(&quot;Could not validate the access token: %s&quot;, e.getMessage()), e);</span>
+<span class="nc" id="L216">        }</span>
+
+<span class="nc" id="L218">        JwtClaims claims = jwt.getJwtClaims();</span>
+
+<span class="nc" id="L220">        Object scopeRaw = getClaim(() -&gt; claims.getClaimValue(scopeClaimName), scopeClaimName);</span>
+        Collection&lt;String&gt; scopeRawCollection;
+
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (scopeRaw instanceof String)</span>
+<span class="nc" id="L224">            scopeRawCollection = List.of((String) scopeRaw);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        else if (scopeRaw instanceof Collection)</span>
+<span class="nc" id="L226">            scopeRawCollection = (Collection&lt;String&gt;) scopeRaw;</span>
+        else
+<span class="nc" id="L228">            scopeRawCollection = Set.of();</span>
+
+<span class="nc" id="L230">        NumericDate expirationRaw = getClaim(claims::getExpirationTime, ReservedClaimNames.EXPIRATION_TIME);</span>
+<span class="nc" id="L231">        String subRaw = getClaim(() -&gt; claims.getStringClaimValue(subClaimName), subClaimName);</span>
+<span class="nc" id="L232">        NumericDate issuedAtRaw = getClaim(claims::getIssuedAt, ReservedClaimNames.ISSUED_AT);</span>
+
+<span class="nc" id="L234">        Set&lt;String&gt; scopes = ClaimValidationUtils.validateScopes(scopeClaimName, scopeRawCollection);</span>
+<span class="nc" id="L235">        long expiration = ClaimValidationUtils.validateExpiration(ReservedClaimNames.EXPIRATION_TIME,</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">            expirationRaw != null ? expirationRaw.getValueInMillis() : null);</span>
+<span class="nc" id="L237">        String sub = ClaimValidationUtils.validateSubject(subClaimName, subRaw);</span>
+<span class="nc" id="L238">        Long issuedAt = ClaimValidationUtils.validateIssuedAt(ReservedClaimNames.ISSUED_AT,</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">            issuedAtRaw != null ? issuedAtRaw.getValueInMillis() : null);</span>
+
+<span class="nc" id="L241">        return new BasicOAuthBearerToken(accessToken,</span>
+            scopes,
+            expiration,
+            sub,
+            issuedAt);
+    }
+
+    private &lt;T&gt; T getClaim(ClaimSupplier&lt;T&gt; supplier, String claimName) throws JwtValidatorException {
+        try {
+<span class="nc" id="L250">            T value = supplier.get();</span>
+<span class="nc" id="L251">            log.debug(&quot;getClaim - {}: {}&quot;, claimName, value);</span>
+<span class="nc" id="L252">            return value;</span>
+<span class="nc" id="L253">        } catch (MalformedClaimException e) {</span>
+<span class="nc" id="L254">            throw new JwtValidatorException(String.format(&quot;Could not extract the '%s' claim from the access token&quot;, claimName), e);</span>
+        }
+    }
+
+    public interface ClaimSupplier&lt;T&gt; {
+
+        T get() throws MalformedClaimException;
+
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

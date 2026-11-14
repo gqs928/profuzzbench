@@ -1,0 +1,462 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShareCompletedFetch.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">ShareCompletedFetch.java</span></div><h1>ShareCompletedFetch.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.consumer.AcknowledgeType;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.CorruptRecordException;
+import org.apache.kafka.common.errors.RecordDeserializationException;
+import org.apache.kafka.common.errors.SerializationException;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.message.ShareFetchResponseData;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.record.internal.Record;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.requests.ShareFetchRequest;
+import org.apache.kafka.common.requests.ShareFetchResponse;
+import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.utils.internals.BufferSupplier;
+import org.apache.kafka.common.utils.internals.CloseableIterator;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.io.Closeable;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Optional;
+import java.util.Set;
+
+/**
+ * {@link ShareCompletedFetch} represents a {@link RecordBatch batch} of {@link Record records}
+ * that was returned from the broker via a {@link ShareFetchRequest}. It contains logic to maintain
+ * state between calls to {@link #fetchRecords(Deserializers, int, boolean)}. Although it has
+ * similarities with {@link CompletedFetch}, the details are quite different, such as not needing
+ * to keep track of aborted transactions or the need to keep track of fetch position.
+ */
+public class ShareCompletedFetch {
+    final int nodeId;
+    final TopicIdPartition partition;
+    final ShareFetchResponseData.PartitionData partitionData;
+    final Optional&lt;Integer&gt; acquisitionLockTimeoutMs;
+    final short requestVersion;
+
+    private final Logger log;
+    private final BufferSupplier decompressionBufferSupplier;
+    private final Iterator&lt;? extends RecordBatch&gt; batches;
+    private int recordsRead;
+    private int bytesRead;
+    private RecordBatch currentBatch;
+    private Record lastRecord;
+    private CloseableIterator&lt;Record&gt; records;
+<span class="nc" id="L74">    private KafkaException cachedBatchException = null;</span>
+<span class="nc" id="L75">    private KafkaException cachedRecordException = null;</span>
+<span class="nc" id="L76">    private boolean isConsumed = false;</span>
+<span class="nc" id="L77">    private boolean initialized = false;</span>
+    private ShareInFlightBatch&lt;?, ?&gt; deliveredBatch;
+    private final List&lt;OffsetAndDeliveryCount&gt; acquiredRecordList;
+    private ListIterator&lt;OffsetAndDeliveryCount&gt; acquiredRecordIterator;
+    private OffsetAndDeliveryCount nextAcquired;
+    private final ShareFetchMetricsAggregator metricsAggregator;
+
+    ShareCompletedFetch(final LogContext logContext,
+                        final BufferSupplier decompressionBufferSupplier,
+                        final int nodeId,
+                        final TopicIdPartition partition,
+                        final ShareFetchResponseData.PartitionData partitionData,
+                        final Optional&lt;Integer&gt; acquisitionLockTimeoutMs,
+                        final ShareFetchMetricsAggregator metricsAggregator,
+<span class="nc" id="L91">                        final short requestVersion) {</span>
+<span class="nc" id="L92">        this.log = logContext.logger(org.apache.kafka.clients.consumer.internals.ShareCompletedFetch.class);</span>
+<span class="nc" id="L93">        this.decompressionBufferSupplier = decompressionBufferSupplier;</span>
+<span class="nc" id="L94">        this.nodeId = nodeId;</span>
+<span class="nc" id="L95">        this.partition = partition;</span>
+<span class="nc" id="L96">        this.partitionData = partitionData;</span>
+<span class="nc" id="L97">        this.acquisitionLockTimeoutMs = acquisitionLockTimeoutMs;</span>
+<span class="nc" id="L98">        this.metricsAggregator = metricsAggregator;</span>
+<span class="nc" id="L99">        this.requestVersion = requestVersion;</span>
+<span class="nc" id="L100">        this.batches = ShareFetchResponse.recordsOrFail(partitionData).batches().iterator();</span>
+<span class="nc" id="L101">        this.acquiredRecordList = buildAcquiredRecordList(partitionData.acquiredRecords());</span>
+<span class="nc" id="L102">        this.nextAcquired = null;</span>
+<span class="nc" id="L103">    }</span>
+
+    private List&lt;OffsetAndDeliveryCount&gt; buildAcquiredRecordList(List&lt;ShareFetchResponseData.AcquiredRecords&gt; partitionAcquiredRecords) {
+        // Setting the size of the array to the size of the first batch of acquired records. In case there is only 1 batch acquired, resizing would not happen.
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        if (partitionAcquiredRecords.isEmpty()) {</span>
+<span class="nc" id="L108">            return List.of();</span>
+        }
+<span class="nc" id="L110">        int initialListSize = (int) (partitionAcquiredRecords.get(0).lastOffset() - partitionAcquiredRecords.get(0).firstOffset() + 1);</span>
+<span class="nc" id="L111">        List&lt;OffsetAndDeliveryCount&gt; acquiredRecordList = new ArrayList&lt;&gt;(initialListSize);</span>
+
+        // Set to find duplicates in case of overlapping acquired records
+<span class="nc" id="L114">        Set&lt;Long&gt; offsets = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L115">        partitionAcquiredRecords.forEach(acquiredRecords -&gt; {</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">            for (long offset = acquiredRecords.firstOffset(); offset &lt;= acquiredRecords.lastOffset(); offset++) {</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">                if (!offsets.add(offset)) {</span>
+<span class="nc" id="L118">                    log.error(&quot;Duplicate acquired record offset {} found in share fetch response for partition {}. &quot; +</span>
+<span class="nc" id="L119">                            &quot;This indicates a broker processing issue.&quot;, offset, partition.topicPartition());</span>
+                } else {
+<span class="nc" id="L121">                    acquiredRecordList.add(new OffsetAndDeliveryCount(offset, acquiredRecords.deliveryCount()));</span>
+                }
+            }
+<span class="nc" id="L124">        });</span>
+<span class="nc" id="L125">        return acquiredRecordList;</span>
+    }
+
+    boolean isInitialized() {
+<span class="nc" id="L129">        return initialized;</span>
+    }
+
+    void setInitialized() {
+<span class="nc" id="L133">        this.initialized = true;</span>
+<span class="nc" id="L134">    }</span>
+
+    public boolean isConsumed() {
+<span class="nc" id="L137">        return isConsumed;</span>
+    }
+
+    /**
+     * Track the batch that carries records delivered to the application so we can tell when their acknowledgements
+     * are still outstanding. We only advance to a new batch once the previous one has been drained of its
+     * in-flight records and its acknowledgements have been taken by the background thread to be sent.
+     */
+    void trackDeliveredBatch(ShareInFlightBatch&lt;?, ?&gt; inFlightBatch) {
+<span class="nc bnc" id="L146" title="All 6 branches missed.">        if (deliveredBatch == null || (deliveredBatch.numRecords() == 0 &amp;&amp; !deliveredBatch.hasRenewals())) {</span>
+<span class="nc" id="L147">            deliveredBatch = inFlightBatch;</span>
+        }
+<span class="nc" id="L149">    }</span>
+
+    public boolean hasPendingAcknowledgements() {
+        // Records being renewed are removed and readded to the in-flight set as the renewals are confirmed.
+<span class="nc bnc" id="L153" title="All 6 branches missed.">        return deliveredBatch != null &amp;&amp; (deliveredBatch.numRecords() &gt; 0 || deliveredBatch.hasRenewals());</span>
+    }
+
+    /**
+     * Draining a {@link ShareCompletedFetch} will signal that the data has been consumed and the underlying resources
+     * are closed. This is somewhat analogous to {@link Closeable#close() closing}, though no error will result if a
+     * caller invokes {@link #fetchRecords(Deserializers, int, boolean)}; an empty {@link List list} will be
+     * returned instead.
+     */
+    void drain() {
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (!isConsumed) {</span>
+<span class="nc" id="L164">            maybeCloseRecordStream();</span>
+<span class="nc" id="L165">            cachedRecordException = null;</span>
+<span class="nc" id="L166">            cachedBatchException = null;</span>
+<span class="nc" id="L167">            this.isConsumed = true;</span>
+<span class="nc" id="L168">            recordAggregatedMetrics(bytesRead, recordsRead);</span>
+        }
+<span class="nc" id="L170">    }</span>
+
+    /**
+     * After each partition is parsed, we update the current metric totals with the total bytes
+     * and number of records parsed. After all partitions have reported, we write the metric.
+     */
+    void recordAggregatedMetrics(int bytes, int records) {
+<span class="nc" id="L177">        metricsAggregator.record(partition.topicPartition(), bytes, records);</span>
+<span class="nc" id="L178">    }</span>
+
+    /**
+     * The {@link RecordBatch batch} of {@link Record records} is converted to a {@link List list} of
+     * {@link ConsumerRecord consumer records} and returned. {@link BufferSupplier Decompression} and
+     * {@link Deserializer deserialization} of the {@link Record record's} key and value are performed in
+     * this step.
+     *
+     * @param deserializers {@link Deserializer}s to use to convert the raw bytes to the expected key and value types
+     * @param maxRecords The number of records to return; the number returned may be {@code 0 &lt;= maxRecords}
+     * @param checkCrcs Whether to check the CRC of fetched records
+     *
+     * @return {@link ShareInFlightBatch The ShareInFlightBatch containing records and their acknowledgements}
+     */
+    &lt;K, V&gt; ShareInFlightBatch&lt;K, V&gt; fetchRecords(final Deserializers&lt;K, V&gt; deserializers,
+                                                 final int maxRecords,
+                                                 final boolean checkCrcs) {
+        // Creating an empty ShareInFlightBatch
+<span class="nc" id="L196">        ShareInFlightBatch&lt;K, V&gt; inFlightBatch = new ShareInFlightBatch&lt;&gt;(nodeId, partition, acquisitionLockTimeoutMs);</span>
+<span class="nc" id="L197">        trackDeliveredBatch(inFlightBatch);</span>
+
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        if (cachedBatchException != null) {</span>
+            // In the event that a CRC check fails, reject the entire record batch because it is corrupt.
+<span class="nc" id="L201">            Set&lt;Long&gt; offsets = rejectRecordBatch(inFlightBatch, currentBatch);</span>
+<span class="nc" id="L202">            inFlightBatch.setException(new ShareInFlightBatchException(cachedBatchException, offsets));</span>
+<span class="nc" id="L203">            cachedBatchException = null;</span>
+<span class="nc" id="L204">            return inFlightBatch;</span>
+        }
+
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        if (cachedRecordException != null) {</span>
+<span class="nc" id="L208">            inFlightBatch.addAcknowledgement(lastRecord.offset(), AcknowledgeType.RELEASE);</span>
+<span class="nc" id="L209">            inFlightBatch.setException(new ShareInFlightBatchException(cachedRecordException, Set.of(lastRecord.offset())));</span>
+<span class="nc" id="L210">            cachedRecordException = null;</span>
+<span class="nc" id="L211">            return inFlightBatch;</span>
+        }
+
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        if (isConsumed)</span>
+<span class="nc" id="L215">            return inFlightBatch;</span>
+
+<span class="nc" id="L217">        initializeNextAcquired();</span>
+
+        try {
+<span class="nc" id="L220">            int recordsInBatch = 0;</span>
+<span class="nc" id="L221">            boolean currentBatchHasMoreRecords = false;</span>
+
+<span class="nc bnc" id="L223" title="All 4 branches missed.">            while (recordsInBatch &lt; maxRecords || currentBatchHasMoreRecords) {</span>
+<span class="nc" id="L224">                currentBatchHasMoreRecords = nextFetchedRecord(checkCrcs);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">                if (lastRecord == null) {</span>
+                    // Any remaining acquired records are gaps
+<span class="nc bnc" id="L227" title="All 2 branches missed.">                    while (nextAcquired != null) {</span>
+<span class="nc" id="L228">                        inFlightBatch.addGap(nextAcquired.offset);</span>
+<span class="nc" id="L229">                        nextAcquired = nextAcquiredRecord();</span>
+                    }
+                    break;
+                }
+
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                while (nextAcquired != null) {</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                    if (lastRecord.offset() == nextAcquired.offset) {</span>
+                        // It's acquired, so we parse it and add it to the batch
+<span class="nc" id="L237">                        Optional&lt;Integer&gt; leaderEpoch = maybeLeaderEpoch(currentBatch.partitionLeaderEpoch());</span>
+<span class="nc" id="L238">                        TimestampType timestampType = currentBatch.timestampType();</span>
+<span class="nc" id="L239">                        ConsumerRecord&lt;K, V&gt; record = parseRecord(deserializers, partition, leaderEpoch,</span>
+                                timestampType, lastRecord, nextAcquired.deliveryCount);
+<span class="nc" id="L241">                        inFlightBatch.addRecord(record);</span>
+<span class="nc" id="L242">                        recordsRead++;</span>
+<span class="nc" id="L243">                        bytesRead += lastRecord.sizeInBytes();</span>
+<span class="nc" id="L244">                        recordsInBatch++;</span>
+
+<span class="nc" id="L246">                        nextAcquired = nextAcquiredRecord();</span>
+<span class="nc" id="L247">                        break;</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                    } else if (lastRecord.offset() &lt; nextAcquired.offset) {</span>
+                        // It's not acquired, so we skip it
+<span class="nc" id="L250">                        break;</span>
+                    } else {
+                        // It's acquired, but there's no non-control record at this offset, so it's a gap
+<span class="nc" id="L253">                        inFlightBatch.addGap(nextAcquired.offset);</span>
+                    }
+
+<span class="nc" id="L256">                    nextAcquired = nextAcquiredRecord();</span>
+                }
+            }
+<span class="nc" id="L259">        } catch (SerializationException se) {</span>
+<span class="nc" id="L260">            nextAcquired = nextAcquiredRecord();</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">            if (inFlightBatch.isEmpty()) {</span>
+<span class="nc" id="L262">                inFlightBatch.addAcknowledgement(lastRecord.offset(), AcknowledgeType.RELEASE);</span>
+<span class="nc" id="L263">                inFlightBatch.setException(new ShareInFlightBatchException(se, Set.of(lastRecord.offset())));</span>
+            } else {
+<span class="nc" id="L265">                cachedRecordException = se;</span>
+<span class="nc" id="L266">                inFlightBatch.setHasCachedException(true);</span>
+            }
+<span class="nc" id="L268">        } catch (CorruptRecordException e) {</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            if (inFlightBatch.isEmpty()) {</span>
+                // In the event that a CRC check fails, reject the entire record batch because it is corrupt.
+<span class="nc" id="L271">                Set&lt;Long&gt; offsets = rejectRecordBatch(inFlightBatch, currentBatch);</span>
+<span class="nc" id="L272">                inFlightBatch.setException(new ShareInFlightBatchException(e, offsets));</span>
+<span class="nc" id="L273">            } else {</span>
+<span class="nc" id="L274">                cachedBatchException = e;</span>
+<span class="nc" id="L275">                inFlightBatch.setHasCachedException(true);</span>
+            }
+<span class="nc" id="L277">        }</span>
+
+<span class="nc" id="L279">        return inFlightBatch;</span>
+    }
+
+    private void initializeNextAcquired() {
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if (nextAcquired == null) {</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            if (acquiredRecordIterator == null) {</span>
+<span class="nc" id="L285">                acquiredRecordIterator = acquiredRecordList.listIterator();</span>
+            }
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (acquiredRecordIterator.hasNext()) {</span>
+<span class="nc" id="L288">                nextAcquired = acquiredRecordIterator.next();</span>
+            }
+        }
+<span class="nc" id="L291">    }</span>
+
+    private OffsetAndDeliveryCount nextAcquiredRecord() {
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if (acquiredRecordIterator.hasNext()) {</span>
+<span class="nc" id="L295">            return acquiredRecordIterator.next();</span>
+        }
+<span class="nc" id="L297">        return null;</span>
+    }
+
+    private &lt;K, V&gt; Set&lt;Long&gt; rejectRecordBatch(final ShareInFlightBatch&lt;K, V&gt; inFlightBatch,
+                                               final RecordBatch currentBatch) {
+        // Rewind the acquiredRecordIterator to the start, so we are in a known state
+<span class="nc" id="L303">        acquiredRecordIterator = acquiredRecordList.listIterator();</span>
+
+<span class="nc" id="L305">        OffsetAndDeliveryCount acquired = nextAcquiredRecord();</span>
+<span class="nc" id="L306">        Set&lt;Long&gt; offsets = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        for (long offset = currentBatch.baseOffset(); offset &lt;= currentBatch.lastOffset(); offset++) {</span>
+<span class="nc bnc" id="L308" title="All 4 branches missed.">            while (acquired != null &amp;&amp; acquired.offset &lt; offset) {</span>
+<span class="nc" id="L309">                acquired = nextAcquiredRecord();</span>
+            }
+
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            if (acquired == null) {</span>
+                // No more acquired records, so we are done
+<span class="nc" id="L314">                break;</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            } else if (offset == acquired.offset) {</span>
+                // It's acquired, so we reject it
+<span class="nc" id="L317">                inFlightBatch.addAcknowledgement(offset, AcknowledgeType.REJECT);</span>
+<span class="nc" id="L318">                offsets.add(offset);</span>
+            } else {
+                // It's not acquired, so we skip it
+                continue;
+            }
+
+<span class="nc" id="L324">            acquired = nextAcquiredRecord();</span>
+        }
+<span class="nc" id="L326">        this.nextAcquired = acquired;</span>
+<span class="nc" id="L327">        return offsets;</span>
+    }
+
+    /**
+     * Parse the record entry, deserializing the key / value fields if necessary
+     */
+    &lt;K, V&gt; ConsumerRecord&lt;K, V&gt; parseRecord(final Deserializers&lt;K, V&gt; deserializers,
+                                            final TopicIdPartition partition,
+                                            final Optional&lt;Integer&gt; leaderEpoch,
+                                            final TimestampType timestampType,
+                                            final Record record,
+                                            final short deliveryCount) {
+<span class="nc" id="L339">        Headers headers = new RecordHeaders(record.headers());</span>
+<span class="nc" id="L340">        ByteBuffer keyBytes = record.key();</span>
+<span class="nc" id="L341">        ByteBuffer valueBytes = record.value();</span>
+        K key;
+        V value;
+        try {
+<span class="nc bnc" id="L345" title="All 2 branches missed.">            key = keyBytes == null ? null : deserializers.keyDeserializer().deserialize(partition.topic(), headers, keyBytes);</span>
+<span class="nc" id="L346">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L347">            log.error(&quot;Key deserializers with error: {}&quot;, deserializers);</span>
+<span class="nc" id="L348">            throw newRecordDeserializationException(RecordDeserializationException.DeserializationExceptionOrigin.KEY, partition.topicPartition(), timestampType, record, e, headers);</span>
+<span class="nc" id="L349">        }</span>
+        try {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">            value = valueBytes == null ? null : deserializers.valueDeserializer().deserialize(partition.topic(), headers, valueBytes);</span>
+<span class="nc" id="L352">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L353">            log.error(&quot;Value deserializers with error: {}&quot;, deserializers);</span>
+<span class="nc" id="L354">            throw newRecordDeserializationException(RecordDeserializationException.DeserializationExceptionOrigin.VALUE, partition.topicPartition(), timestampType, record, e, headers);</span>
+<span class="nc" id="L355">        }</span>
+<span class="nc" id="L356">        return new ConsumerRecord&lt;&gt;(partition.topic(), partition.partition(), record.offset(),</span>
+<span class="nc" id="L357">                record.timestamp(), timestampType,</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                keyBytes == null ? ConsumerRecord.NULL_SIZE : keyBytes.remaining(),</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">                valueBytes == null ? ConsumerRecord.NULL_SIZE : valueBytes.remaining(),</span>
+<span class="nc" id="L360">                key, value, headers, leaderEpoch, Optional.of(deliveryCount));</span>
+    }
+
+    private static RecordDeserializationException newRecordDeserializationException(RecordDeserializationException.DeserializationExceptionOrigin origin,
+                                                                                    TopicPartition partition,
+                                                                                    TimestampType timestampType,
+                                                                                    Record record,
+                                                                                    RuntimeException e,
+                                                                                    Headers headers) {
+<span class="nc" id="L369">        return new RecordDeserializationException(origin, partition, record.offset(), record.timestamp(), timestampType, record.key(), record.value(), headers,</span>
+<span class="nc" id="L370">                &quot;Error deserializing &quot; + origin.name() + &quot; for partition &quot; + partition + &quot; at offset &quot; + record.offset()</span>
+                        + &quot;. The record has been released.&quot;, e);
+    }
+
+    /**
+     * Scans for the next record in the available batches, skipping control records
+     *
+     * @param checkCrcs Whether to check the CRC of fetched records
+     *
+     * @return true if the current batch has more records, else false
+     */
+    private boolean nextFetchedRecord(final boolean checkCrcs) {
+        while (true) {
+<span class="nc bnc" id="L383" title="All 4 branches missed.">            if (records == null || !records.hasNext()) {</span>
+<span class="nc" id="L384">                maybeCloseRecordStream();</span>
+
+<span class="nc bnc" id="L386" title="All 2 branches missed.">                if (!batches.hasNext()) {</span>
+<span class="nc" id="L387">                    drain();</span>
+<span class="nc" id="L388">                    lastRecord = null;</span>
+<span class="nc" id="L389">                    break;</span>
+                }
+
+<span class="nc" id="L392">                currentBatch = batches.next();</span>
+<span class="nc" id="L393">                maybeEnsureValid(currentBatch, checkCrcs);</span>
+
+<span class="nc" id="L395">                records = currentBatch.streamingIterator(decompressionBufferSupplier);</span>
+            } else {
+<span class="nc" id="L397">                Record record = records.next();</span>
+<span class="nc" id="L398">                maybeEnsureValid(record, checkCrcs);</span>
+
+                // control records are not returned to the user
+<span class="nc bnc" id="L401" title="All 2 branches missed.">                if (!currentBatch.isControlBatch()) {</span>
+<span class="nc" id="L402">                    lastRecord = record;</span>
+<span class="nc" id="L403">                    break;</span>
+                }
+<span class="nc" id="L405">            }</span>
+        }
+
+<span class="nc bnc" id="L408" title="All 4 branches missed.">        return records != null &amp;&amp; records.hasNext();</span>
+    }
+
+    private Optional&lt;Integer&gt; maybeLeaderEpoch(final int leaderEpoch) {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">        return leaderEpoch == RecordBatch.NO_PARTITION_LEADER_EPOCH ? Optional.empty() : Optional.of(leaderEpoch);</span>
+    }
+
+    private void maybeEnsureValid(RecordBatch batch, boolean checkCrcs) {
+<span class="nc bnc" id="L416" title="All 4 branches missed.">        if (checkCrcs &amp;&amp; batch.magic() &gt;= RecordBatch.MAGIC_VALUE_V2) {</span>
+            try {
+<span class="nc" id="L418">                batch.ensureValid();</span>
+<span class="nc" id="L419">            } catch (CorruptRecordException e) {</span>
+<span class="nc" id="L420">                throw new CorruptRecordException(&quot;Record batch for partition &quot; + partition.topicPartition()</span>
+<span class="nc" id="L421">                        + &quot; at offset &quot; + batch.baseOffset() + &quot; is invalid, cause: &quot; + e.getMessage());</span>
+<span class="nc" id="L422">            }</span>
+        }
+<span class="nc" id="L424">    }</span>
+
+    private void maybeEnsureValid(final Record record, final boolean checkCrcs) {
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        if (checkCrcs) {</span>
+            try {
+<span class="nc" id="L429">                record.ensureValid();</span>
+<span class="nc" id="L430">            } catch (CorruptRecordException e) {</span>
+<span class="nc" id="L431">                throw new CorruptRecordException(&quot;Record for partition &quot; + partition.topicPartition()</span>
+<span class="nc" id="L432">                        + &quot; at offset &quot; + record.offset() + &quot; is invalid, cause: &quot; + e.getMessage());</span>
+<span class="nc" id="L433">            }</span>
+        }
+<span class="nc" id="L435">    }</span>
+
+    private void maybeCloseRecordStream() {
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        if (records != null) {</span>
+<span class="nc" id="L439">            records.close();</span>
+<span class="nc" id="L440">            records = null;</span>
+        }
+<span class="nc" id="L442">    }</span>
+
+    private static class OffsetAndDeliveryCount {
+        final long offset;
+        final short deliveryCount;
+
+<span class="nc" id="L448">        OffsetAndDeliveryCount(long offset, short deliveryCount) {</span>
+<span class="nc" id="L449">            this.offset = offset;</span>
+<span class="nc" id="L450">            this.deliveryCount = deliveryCount;</span>
+<span class="nc" id="L451">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L455">            return &quot;OffsetAndDeliveryCount{&quot; +</span>
+                    &quot;offset=&quot; + offset +
+                    &quot;, deliveryCount=&quot; + deliveryCount +
+                    &quot;}&quot;;
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

@@ -1,0 +1,1764 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConsumerCoordinator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">ConsumerCoordinator.java</span></div><h1>ConsumerCoordinator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.GroupRebalanceConfig;
+import org.apache.kafka.clients.consumer.CloseOptions;
+import org.apache.kafka.clients.consumer.CommitFailedException;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
+import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor;
+import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor.Assignment;
+import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor.GroupSubscription;
+import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor.RebalanceProtocol;
+import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor.Subscription;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.OffsetCommitCallback;
+import org.apache.kafka.clients.consumer.RetriableCommitFailedException;
+import org.apache.kafka.clients.consumer.internals.Utils.TopicPartitionComparator;
+import org.apache.kafka.clients.consumer.internals.metrics.MetricsLedger;
+import org.apache.kafka.clients.consumer.internals.metrics.RebalanceCallbackMetricsManager;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.FencedInstanceIdException;
+import org.apache.kafka.common.errors.GroupAuthorizationException;
+import org.apache.kafka.common.errors.InterruptException;
+import org.apache.kafka.common.errors.RebalanceInProgressException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
+import org.apache.kafka.common.errors.UnstableOffsetCommitException;
+import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.common.message.JoinGroupRequestData;
+import org.apache.kafka.common.message.JoinGroupResponseData;
+import org.apache.kafka.common.message.OffsetCommitRequestData;
+import org.apache.kafka.common.message.OffsetCommitResponseData;
+import org.apache.kafka.common.message.OffsetFetchRequestData;
+import org.apache.kafka.common.metrics.Measurable;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.requests.JoinGroupRequest;
+import org.apache.kafka.common.requests.OffsetCommitRequest;
+import org.apache.kafka.common.requests.OffsetCommitResponse;
+import org.apache.kafka.common.requests.OffsetFetchRequest;
+import org.apache.kafka.common.requests.OffsetFetchResponse;
+import org.apache.kafka.common.requests.RequestUtils;
+import org.apache.kafka.common.telemetry.internals.ClientTelemetryReporter;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.clients.consumer.ConsumerConfig.ASSIGN_FROM_SUBSCRIBED_ASSIGNORS;
+import static org.apache.kafka.clients.consumer.CooperativeStickyAssignor.COOPERATIVE_STICKY_ASSIGNOR_NAME;
+import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.COORDINATOR_METRICS_SUFFIX;
+import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.refreshCommittedOffsets;
+
+/**
+ * This class manages the coordination process with the consumer coordinator.
+ */
+public final class ConsumerCoordinator extends AbstractCoordinator {
+<span class="nc" id="L104">    private static final TopicPartitionComparator COMPARATOR = new TopicPartitionComparator();</span>
+
+    private final GroupRebalanceConfig rebalanceConfig;
+    private final Logger log;
+    private final List&lt;ConsumerPartitionAssignor&gt; assignors;
+    private final ConsumerMetadata metadata;
+    private final ConsumerCoordinatorMetrics coordinatorMetrics;
+    private final RebalanceCallbackMetricsManager rebalanceCallbackMetricsManager;
+    private final SubscriptionState subscriptions;
+    private final OffsetCommitCallback defaultOffsetCommitCallback;
+    private final boolean autoCommitEnabled;
+    private final int autoCommitIntervalMs;
+    private final ConsumerInterceptors&lt;?, ?&gt; interceptors;
+    // track number of async commits for which callback must be called
+    // package private for testing
+    final AtomicInteger inFlightAsyncCommits;
+    // track the number of pending async commits waiting on the coordinator lookup to complete
+    private final AtomicInteger pendingAsyncCommits;
+
+    // this collection must be thread-safe because it is modified from the response handler
+    // of offset commit requests, which may be invoked from the heartbeat thread
+    private final ConcurrentLinkedQueue&lt;OffsetCommitCompletion&gt; completedOffsetCommits;
+    private final AtomicBoolean asyncCommitFenced;
+    private final boolean throwOnFetchStableOffsetsUnsupported;
+    private final Optional&lt;String&gt; rackId;
+<span class="nc" id="L129">    private boolean isLeader = false;</span>
+    private Set&lt;String&gt; joinedSubscription;
+    private MetadataSnapshot metadataSnapshot;
+    private MetadataSnapshot assignmentSnapshot;
+    private Timer nextAutoCommitTimer;
+    private ConsumerGroupMetadata groupMetadata;
+    // hold onto request&amp;future for committed offset requests to enable async calls.
+<span class="nc" id="L136">    private PendingCommittedOffsetRequest pendingCommittedOffsetRequest = null;</span>
+
+    private static class PendingCommittedOffsetRequest {
+        private final Set&lt;TopicPartition&gt; requestedPartitions;
+        private final Generation requestedGeneration;
+        private final RequestFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; response;
+
+        private PendingCommittedOffsetRequest(final Set&lt;TopicPartition&gt; requestedPartitions,
+                                              final Generation generationAtRequestTime,
+<span class="nc" id="L145">                                              final RequestFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; response) {</span>
+<span class="nc" id="L146">            this.requestedPartitions = Objects.requireNonNull(requestedPartitions);</span>
+<span class="nc" id="L147">            this.response = Objects.requireNonNull(response);</span>
+<span class="nc" id="L148">            this.requestedGeneration = generationAtRequestTime;</span>
+<span class="nc" id="L149">        }</span>
+
+        private boolean sameRequest(final Set&lt;TopicPartition&gt; currentRequest, final Generation currentGeneration) {
+<span class="nc bnc" id="L152" title="All 4 branches missed.">            return Objects.equals(requestedGeneration, currentGeneration) &amp;&amp; requestedPartitions.equals(currentRequest);</span>
+        }
+    }
+
+    private final RebalanceProtocol protocol;
+    // Wraps the logic for invoking the ConsumerRebalanceListener methods
+    private final ConsumerRebalanceListenerInvoker rebalanceListenerInvoker;
+    // pending commit offset request in onJoinPrepare
+<span class="nc" id="L160">    private RequestFuture&lt;Void&gt; autoCommitOffsetRequestFuture = null;</span>
+    // a timer for join prepare to know when to stop.
+    // it'll set to rebalance timeout so that the member can join the group successfully
+    // even though offset commit failed.
+<span class="nc" id="L164">    private Timer joinPrepareTimer = null;</span>
+
+    /**
+     * Initialize the coordination manager.
+     */
+    public ConsumerCoordinator(GroupRebalanceConfig rebalanceConfig,
+                               LogContext logContext,
+                               ConsumerNetworkClient client,
+                               List&lt;ConsumerPartitionAssignor&gt; assignors,
+                               ConsumerMetadata metadata,
+                               SubscriptionState subscriptions,
+                               Metrics metrics,
+                               String metricGrpPrefix,
+                               Time time,
+                               boolean autoCommitEnabled,
+                               int autoCommitIntervalMs,
+                               ConsumerInterceptors&lt;?, ?&gt; interceptors,
+                               boolean throwOnFetchStableOffsetsUnsupported,
+                               Optional&lt;ClientTelemetryReporter&gt; clientTelemetryReporter) {
+<span class="nc" id="L183">        this(rebalanceConfig,</span>
+            logContext,
+            client,
+            assignors,
+            metadata,
+            subscriptions,
+            metrics,
+            metricGrpPrefix,
+            time,
+            autoCommitEnabled,
+            autoCommitIntervalMs,
+            interceptors,
+            throwOnFetchStableOffsetsUnsupported,
+            clientTelemetryReporter,
+<span class="nc" id="L197">            Optional.empty());</span>
+<span class="nc" id="L198">    }</span>
+
+    /**
+     * Initialize the coordination manager.
+     */
+    @SuppressWarnings(&quot;removal&quot;)
+    public ConsumerCoordinator(GroupRebalanceConfig rebalanceConfig,
+                               LogContext logContext,
+                               ConsumerNetworkClient client,
+                               List&lt;ConsumerPartitionAssignor&gt; assignors,
+                               ConsumerMetadata metadata,
+                               SubscriptionState subscriptions,
+                               Metrics metrics,
+                               String metricGrpPrefix,
+                               Time time,
+                               boolean autoCommitEnabled,
+                               int autoCommitIntervalMs,
+                               ConsumerInterceptors&lt;?, ?&gt; interceptors,
+                               boolean throwOnFetchStableOffsetsUnsupported,
+                               Optional&lt;ClientTelemetryReporter&gt; clientTelemetryReporter,
+                               Optional&lt;Supplier&lt;BaseHeartbeatThread&gt;&gt; heartbeatThreadSupplier) {
+<span class="nc" id="L219">        super(rebalanceConfig,</span>
+              logContext,
+              client,
+              metrics,
+              metricGrpPrefix,
+              time,
+              clientTelemetryReporter,
+              heartbeatThreadSupplier);
+<span class="nc" id="L227">        this.rebalanceConfig = rebalanceConfig;</span>
+<span class="nc" id="L228">        this.log = logContext.logger(ConsumerCoordinator.class);</span>
+<span class="nc" id="L229">        this.metadata = metadata;</span>
+<span class="nc" id="L230">        this.rackId = rebalanceConfig.rackId;</span>
+<span class="nc" id="L231">        this.metadataSnapshot = new MetadataSnapshot(this.rackId, subscriptions, metadata.fetch(), metadata.updateVersion());</span>
+<span class="nc" id="L232">        this.subscriptions = subscriptions;</span>
+<span class="nc" id="L233">        this.defaultOffsetCommitCallback = new DefaultOffsetCommitCallback();</span>
+<span class="nc" id="L234">        this.autoCommitEnabled = autoCommitEnabled;</span>
+<span class="nc" id="L235">        this.autoCommitIntervalMs = autoCommitIntervalMs;</span>
+<span class="nc" id="L236">        this.assignors = assignors;</span>
+<span class="nc" id="L237">        this.completedOffsetCommits = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="nc" id="L238">        this.coordinatorMetrics = new ConsumerCoordinatorMetrics(metrics, metricGrpPrefix);</span>
+<span class="nc" id="L239">        this.interceptors = interceptors;</span>
+<span class="nc" id="L240">        this.inFlightAsyncCommits = new AtomicInteger();</span>
+<span class="nc" id="L241">        this.pendingAsyncCommits = new AtomicInteger();</span>
+<span class="nc" id="L242">        this.asyncCommitFenced = new AtomicBoolean(false);</span>
+<span class="nc" id="L243">        this.groupMetadata = new ConsumerGroupMetadata(rebalanceConfig.groupId,</span>
+            JoinGroupRequest.UNKNOWN_GENERATION_ID, JoinGroupRequest.UNKNOWN_MEMBER_ID, rebalanceConfig.groupInstanceId);
+<span class="nc" id="L245">        this.throwOnFetchStableOffsetsUnsupported = throwOnFetchStableOffsetsUnsupported;</span>
+
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (autoCommitEnabled)</span>
+<span class="nc" id="L248">            this.nextAutoCommitTimer = time.timer(autoCommitIntervalMs);</span>
+
+        // select the rebalance protocol such that:
+        //   1. only consider protocols that are supported by all the assignors. If there is no common protocols supported
+        //      across all the assignors, throw an exception.
+        //   2. if there are multiple protocols that are commonly supported, select the one with the highest id (i.e. the
+        //      id number indicates how advanced the protocol is).
+        // we know there are at least one assignor in the list, no need to double check for NPE
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        if (!assignors.isEmpty()) {</span>
+<span class="nc" id="L257">            List&lt;RebalanceProtocol&gt; supportedProtocols = new ArrayList&lt;&gt;(assignors.get(0).supportedProtocols());</span>
+
+<span class="nc bnc" id="L259" title="All 2 branches missed.">            for (ConsumerPartitionAssignor assignor : assignors) {</span>
+<span class="nc" id="L260">                supportedProtocols.retainAll(assignor.supportedProtocols());</span>
+<span class="nc" id="L261">            }</span>
+
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            if (supportedProtocols.isEmpty()) {</span>
+<span class="nc" id="L264">                throw new IllegalArgumentException(&quot;Specified assignors &quot; +</span>
+<span class="nc" id="L265">                    assignors.stream().map(ConsumerPartitionAssignor::name).collect(Collectors.toSet()) +</span>
+                    &quot; do not have commonly supported rebalance protocol&quot;);
+            }
+
+<span class="nc" id="L269">            Collections.sort(supportedProtocols);</span>
+
+<span class="nc" id="L271">            protocol = supportedProtocols.get(supportedProtocols.size() - 1);</span>
+<span class="nc" id="L272">        } else {</span>
+<span class="nc" id="L273">            protocol = null;</span>
+        }
+
+<span class="nc" id="L276">        this.rebalanceCallbackMetricsManager = new RebalanceCallbackMetricsManager(metrics, metricGrpPrefix);</span>
+<span class="nc" id="L277">        this.rebalanceListenerInvoker = new ConsumerRebalanceListenerInvoker(</span>
+            logContext,
+            subscriptions,
+            time,
+            rebalanceCallbackMetricsManager
+        );
+<span class="nc" id="L283">        this.metadata.requestUpdate(true);</span>
+<span class="nc" id="L284">    }</span>
+
+    // package private for testing
+    boolean isLeader() {
+<span class="nc" id="L288">        return this.isLeader;</span>
+    }
+
+    // package private for testing
+    SubscriptionState subscriptionState() {
+<span class="nc" id="L293">        return this.subscriptions;</span>
+    }
+
+    @Override
+    public String protocolType() {
+<span class="nc" id="L298">        return ConsumerProtocol.PROTOCOL_TYPE;</span>
+    }
+
+    @Override
+    protected JoinGroupRequestData.JoinGroupRequestProtocolCollection metadata() {
+<span class="nc" id="L303">        log.debug(&quot;Joining group with current subscription: {}&quot;, subscriptions.subscription());</span>
+<span class="nc" id="L304">        this.joinedSubscription = subscriptions.subscription();</span>
+<span class="nc" id="L305">        JoinGroupRequestData.JoinGroupRequestProtocolCollection protocolSet = new JoinGroupRequestData.JoinGroupRequestProtocolCollection();</span>
+
+<span class="nc" id="L307">        List&lt;String&gt; topics = new ArrayList&lt;&gt;(joinedSubscription);</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">        for (ConsumerPartitionAssignor assignor : assignors) {</span>
+<span class="nc" id="L309">            Subscription subscription = new Subscription(topics,</span>
+<span class="nc" id="L310">                                                         assignor.subscriptionUserData(joinedSubscription),</span>
+<span class="nc" id="L311">                                                         subscriptions.assignedPartitionsList(),</span>
+<span class="nc" id="L312">                                                         generation().generationId,</span>
+                                                         rackId);
+<span class="nc" id="L314">            ByteBuffer metadata = ConsumerProtocol.serializeSubscription(subscription);</span>
+
+<span class="nc" id="L316">            protocolSet.add(new JoinGroupRequestData.JoinGroupRequestProtocol()</span>
+<span class="nc" id="L317">                    .setName(assignor.name())</span>
+<span class="nc" id="L318">                    .setMetadata(Utils.toArray(metadata)));</span>
+<span class="nc" id="L319">        }</span>
+<span class="nc" id="L320">        return protocolSet;</span>
+    }
+
+    public void updatePatternSubscription(Cluster cluster) {
+<span class="nc" id="L324">        final Set&lt;String&gt; topicsToSubscribe = cluster.topics().stream()</span>
+<span class="nc" id="L325">                .filter(subscriptions::matchesSubscribedPattern)</span>
+<span class="nc" id="L326">                .collect(Collectors.toSet());</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">        if (subscriptions.subscribeFromPattern(topicsToSubscribe))</span>
+<span class="nc" id="L328">            metadata.requestUpdateForNewTopics();</span>
+<span class="nc" id="L329">    }</span>
+
+    private ConsumerPartitionAssignor lookupAssignor(String name) {
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        for (ConsumerPartitionAssignor assignor : this.assignors) {</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">            if (assignor.name().equals(name))</span>
+<span class="nc" id="L334">                return assignor;</span>
+<span class="nc" id="L335">        }</span>
+<span class="nc" id="L336">        return null;</span>
+    }
+
+    private void maybeUpdateJoinedSubscription(Set&lt;TopicPartition&gt; assignedPartitions) {
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        if (subscriptions.hasPatternSubscription()) {</span>
+            // Check if the assignment contains some topics that were not in the original
+            // subscription, if yes we will obey what leader has decided and add these topics
+            // into the subscriptions as long as they still match the subscribed pattern
+
+<span class="nc" id="L345">            Set&lt;String&gt; addedTopics = new HashSet&lt;&gt;();</span>
+            // this is a copy because it's handed to listener below
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            for (TopicPartition tp : assignedPartitions) {</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">                if (!joinedSubscription.contains(tp.topic()))</span>
+<span class="nc" id="L349">                    addedTopics.add(tp.topic());</span>
+<span class="nc" id="L350">            }</span>
+
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            if (!addedTopics.isEmpty()) {</span>
+<span class="nc" id="L353">                Set&lt;String&gt; newSubscription = new HashSet&lt;&gt;(subscriptions.subscription());</span>
+<span class="nc" id="L354">                Set&lt;String&gt; newJoinedSubscription = new HashSet&lt;&gt;(joinedSubscription);</span>
+<span class="nc" id="L355">                newSubscription.addAll(addedTopics);</span>
+<span class="nc" id="L356">                newJoinedSubscription.addAll(addedTopics);</span>
+
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                if (this.subscriptions.subscribeFromPattern(newSubscription))</span>
+<span class="nc" id="L359">                    metadata.requestUpdateForNewTopics();</span>
+<span class="nc" id="L360">                this.joinedSubscription = newJoinedSubscription;</span>
+            }
+        }
+<span class="nc" id="L363">    }</span>
+
+    private Exception invokeOnAssignment(final ConsumerPartitionAssignor assignor, final Assignment assignment) {
+<span class="nc" id="L366">        log.info(&quot;Notifying assignor about the new {}&quot;, assignment);</span>
+
+        try {
+<span class="nc" id="L369">            assignor.onAssignment(assignment, groupMetadata);</span>
+<span class="nc" id="L370">        } catch (Exception e) {</span>
+<span class="nc" id="L371">            return e;</span>
+<span class="nc" id="L372">        }</span>
+
+<span class="nc" id="L374">        return null;</span>
+    }
+
+    @SuppressWarnings(&quot;removal&quot;)
+    @Override
+    protected void onJoinComplete(int generation,
+                                  String memberId,
+                                  String assignmentStrategy,
+                                  ByteBuffer assignmentBuffer) {
+<span class="nc" id="L383">        log.debug(&quot;Executing onJoinComplete with generation {} and memberId {}&quot;, generation, memberId);</span>
+
+        // Only the leader is responsible for monitoring for metadata changes (i.e. partition changes)
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        if (!isLeader)</span>
+<span class="nc" id="L387">            assignmentSnapshot = null;</span>
+
+<span class="nc" id="L389">        ConsumerPartitionAssignor assignor = lookupAssignor(assignmentStrategy);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (assignor == null)</span>
+<span class="nc" id="L391">            throw new IllegalStateException(&quot;Coordinator selected invalid assignment protocol: &quot; + assignmentStrategy);</span>
+
+        // Give the assignor a chance to update internal state based on the received assignment
+<span class="nc" id="L394">        groupMetadata = new ConsumerGroupMetadata(rebalanceConfig.groupId, generation, memberId, rebalanceConfig.groupInstanceId);</span>
+
+<span class="nc" id="L396">        SortedSet&lt;TopicPartition&gt; ownedPartitions = new TreeSet&lt;&gt;(COMPARATOR);</span>
+<span class="nc" id="L397">        ownedPartitions.addAll(subscriptions.assignedPartitions());</span>
+
+        // should at least encode the short version
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (assignmentBuffer.remaining() &lt; 2)</span>
+<span class="nc" id="L401">            throw new IllegalStateException(&quot;There are insufficient bytes available to read assignment from the sync-group response (&quot; +</span>
+<span class="nc" id="L402">                &quot;actual byte size &quot; + assignmentBuffer.remaining() + &quot;) , this is not expected; &quot; +</span>
+                &quot;it is possible that the leader's assign function is buggy and did not return any assignment for this member, &quot; +
+                &quot;or because static member is configured and the protocol is buggy hence did not get the assignment for this member&quot;);
+
+<span class="nc" id="L406">        Assignment assignment = ConsumerProtocol.deserializeAssignment(assignmentBuffer);</span>
+
+<span class="nc" id="L408">        SortedSet&lt;TopicPartition&gt; assignedPartitions = new TreeSet&lt;&gt;(COMPARATOR);</span>
+<span class="nc" id="L409">        assignedPartitions.addAll(assignment.partitions());</span>
+
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        if (!subscriptions.checkAssignmentMatchedSubscription(assignedPartitions)) {</span>
+<span class="nc" id="L412">            final String fullReason = String.format(&quot;received assignment %s does not match the current subscription %s; &quot; +</span>
+                    &quot;it is likely that the subscription has changed since we joined the group, will re-join with current subscription&quot;,
+<span class="nc" id="L414">                    assignment.partitions(), subscriptions.prettyString());</span>
+<span class="nc" id="L415">            requestRejoin(&quot;received assignment does not match the current subscription&quot;, fullReason);</span>
+
+<span class="nc" id="L417">            return;</span>
+        }
+
+<span class="nc" id="L420">        final AtomicReference&lt;Exception&gt; firstException = new AtomicReference&lt;&gt;(null);</span>
+<span class="nc" id="L421">        SortedSet&lt;TopicPartition&gt; addedPartitions = new TreeSet&lt;&gt;(COMPARATOR);</span>
+<span class="nc" id="L422">        addedPartitions.addAll(assignedPartitions);</span>
+<span class="nc" id="L423">        addedPartitions.removeAll(ownedPartitions);</span>
+
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        if (protocol == RebalanceProtocol.COOPERATIVE) {</span>
+<span class="nc" id="L426">            SortedSet&lt;TopicPartition&gt; revokedPartitions = new TreeSet&lt;&gt;(COMPARATOR);</span>
+<span class="nc" id="L427">            revokedPartitions.addAll(ownedPartitions);</span>
+<span class="nc" id="L428">            revokedPartitions.removeAll(assignedPartitions);</span>
+
+<span class="nc" id="L430">            log.info(&quot;Updating assignment with\n&quot; +</span>
+                    &quot;\tAssigned partitions:                       {}\n&quot; +
+                    &quot;\tCurrent owned partitions:                  {}\n&quot; +
+                    &quot;\tAdded partitions (assigned - owned):       {}\n&quot; +
+                    &quot;\tRevoked partitions (owned - assigned):     {}\n&quot;,
+                assignedPartitions,
+                ownedPartitions,
+                addedPartitions,
+                revokedPartitions
+            );
+
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (!revokedPartitions.isEmpty()) {</span>
+                // Revoke partitions that were previously owned but no longer assigned;
+                // note that we should only change the assignment (or update the assignor's state)
+                // AFTER we've triggered  the revoke callback
+<span class="nc" id="L445">                firstException.compareAndSet(null, rebalanceListenerInvoker.invokePartitionsRevoked(revokedPartitions));</span>
+
+                // If revoked any partitions, need to re-join the group afterwards
+<span class="nc" id="L448">                final String fullReason = String.format(&quot;need to revoke partitions %s as indicated &quot; +</span>
+                        &quot;by the current assignment and re-join&quot;, revokedPartitions);
+<span class="nc" id="L450">                requestRejoin(&quot;need to revoke partitions and re-join&quot;, fullReason);</span>
+            }
+        }
+
+        // The leader may have assigned partitions which match our subscription pattern, but which
+        // were not explicitly requested, so we update the joined subscription here.
+<span class="nc" id="L456">        maybeUpdateJoinedSubscription(assignedPartitions);</span>
+
+        // Catch any exception here to make sure we could complete the user callback.
+<span class="nc" id="L459">        firstException.compareAndSet(null, invokeOnAssignment(assignor, assignment));</span>
+
+        // Reschedule the auto commit starting from now
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        if (autoCommitEnabled)</span>
+<span class="nc" id="L463">            this.nextAutoCommitTimer.updateAndReset(autoCommitIntervalMs);</span>
+
+<span class="nc" id="L465">        subscriptions.assignFromSubscribed(assignedPartitions);</span>
+
+        // Add partitions that were not previously owned but are now assigned
+<span class="nc" id="L468">        firstException.compareAndSet(null, rebalanceListenerInvoker.invokePartitionsAssigned(addedPartitions));</span>
+
+<span class="nc bnc" id="L470" title="All 2 branches missed.">        if (firstException.get() != null) {</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            if (firstException.get() instanceof KafkaException) {</span>
+<span class="nc" id="L472">                throw (KafkaException) firstException.get();</span>
+            } else {
+<span class="nc" id="L474">                throw new KafkaException(&quot;User rebalance callback throws an error&quot;, firstException.get());</span>
+            }
+        }
+<span class="nc" id="L477">    }</span>
+
+    void maybeUpdateSubscriptionMetadata() {
+<span class="nc" id="L480">        int version = metadata.updateVersion();</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        if (version &gt; metadataSnapshot.version) {</span>
+<span class="nc" id="L482">            Cluster cluster = metadata.fetch();</span>
+
+<span class="nc bnc" id="L484" title="All 2 branches missed.">            if (subscriptions.hasPatternSubscription())</span>
+<span class="nc" id="L485">                updatePatternSubscription(cluster);</span>
+
+            // Update the current snapshot, which will be used to check for subscription
+            // changes that would require a rebalance (e.g. new partitions).
+<span class="nc" id="L489">            metadataSnapshot = new MetadataSnapshot(rackId, subscriptions, cluster, version);</span>
+        }
+<span class="nc" id="L491">    }</span>
+
+    private boolean coordinatorUnknownAndUnreadySync(Timer timer) {
+<span class="nc bnc" id="L494" title="All 4 branches missed.">        return coordinatorUnknown() &amp;&amp; !ensureCoordinatorReady(timer);</span>
+    }
+
+    private boolean coordinatorUnknownAndUnreadyAsync() {
+<span class="nc bnc" id="L498" title="All 4 branches missed.">        return coordinatorUnknown() &amp;&amp; !ensureCoordinatorReadyAsync();</span>
+    }
+
+    /**
+     * Poll for coordinator events. This ensures that the coordinator is known and that the consumer
+     * has joined the group (if it is using group management). This also handles periodic offset commits
+     * if they are enabled.
+     * &lt;p&gt;
+     * Returns early if the timeout expires or if waiting on rejoin is not required
+     *
+     * @param timer Timer bounding how long this method can block
+     * @param waitForJoinGroup Boolean flag indicating if we should wait until re-join group completes
+     * @throws KafkaException if the rebalance callback throws an exception
+     * @return true iff the operation succeeded
+     */
+    public boolean poll(Timer timer, boolean waitForJoinGroup) {
+<span class="nc" id="L514">        maybeUpdateSubscriptionMetadata();</span>
+
+<span class="nc" id="L516">        invokeCompletedOffsetCommitCallbacks();</span>
+
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        if (subscriptions.hasAutoAssignedPartitions()) {</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">            if (protocol == null) {</span>
+<span class="nc" id="L520">                throw new IllegalStateException(&quot;User configured &quot; + ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG +</span>
+                    &quot; to empty while trying to subscribe for group protocol to auto assign partitions&quot;);
+            }
+            // Always update the heartbeat last poll time so that the heartbeat thread does not leave the
+            // group proactively due to application inactivity even if (say) the coordinator cannot be found.
+<span class="nc" id="L525">            pollHeartbeat(timer.currentTimeMs());</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">            if (coordinatorUnknownAndUnreadySync(timer)) {</span>
+<span class="nc" id="L527">                return false;</span>
+            }
+
+<span class="nc bnc" id="L530" title="All 2 branches missed.">            if (rejoinNeededOrPending()) {</span>
+                // due to a race condition between the initial metadata fetch and the initial rebalance,
+                // we need to ensure that the metadata is fresh before joining initially. This ensures
+                // that we have matched the pattern against the cluster's topics at least once before joining.
+<span class="nc bnc" id="L534" title="All 2 branches missed.">                if (subscriptions.hasPatternSubscription()) {</span>
+                    // For consumer group that uses pattern-based subscription, after a topic is created,
+                    // any consumer that discovers the topic after metadata refresh can trigger rebalance
+                    // across the entire consumer group. Multiple rebalances can be triggered after one topic
+                    // creation if consumers refresh metadata at vastly different times. We can significantly
+                    // reduce the number of rebalances caused by single topic creation by asking consumer to
+                    // refresh metadata before re-joining the group as long as the refresh backoff time has
+                    // passed.
+<span class="nc bnc" id="L542" title="All 2 branches missed.">                    if (this.metadata.timeToAllowUpdate(timer.currentTimeMs()) == 0) {</span>
+<span class="nc" id="L543">                        this.metadata.requestUpdate(true);</span>
+                    }
+
+<span class="nc bnc" id="L546" title="All 2 branches missed.">                    if (!client.ensureFreshMetadata(timer)) {</span>
+<span class="nc" id="L547">                        return false;</span>
+                    }
+
+<span class="nc" id="L550">                    maybeUpdateSubscriptionMetadata();</span>
+                }
+
+                // if not wait for join group, we would just use a timer of 0
+<span class="nc bnc" id="L554" title="All 4 branches missed.">                if (!ensureActiveGroup(waitForJoinGroup ? timer : time.timer(0L))) {</span>
+                    // since we may use a different timer in the callee, we'd still need
+                    // to update the original timer's current time after the call
+<span class="nc" id="L557">                    timer.update(time.milliseconds());</span>
+
+<span class="nc" id="L559">                    return false;</span>
+                }
+            }
+        } else {
+            // For manually assigned partitions, we do not try to pro-actively lookup coordinator;
+            // instead we only try to refresh metadata when necessary.
+            // If connections to all nodes fail, wakeups triggered while attempting to send fetch
+            // requests result in polls returning immediately, causing a tight loop of polls. Without
+            // the wakeup, poll() with no channels would block for the timeout, delaying re-connection.
+            // awaitMetadataUpdate() in ensureCoordinatorReady initiates new connections with configured backoff and avoids the busy loop.
+<span class="nc bnc" id="L569" title="All 4 branches missed.">            if (metadata.updateRequested() &amp;&amp; !client.hasReadyNodes(timer.currentTimeMs())) {</span>
+<span class="nc" id="L570">                client.awaitMetadataUpdate(timer);</span>
+            }
+
+            // if there is pending coordinator requests, ensure they have a chance to be transmitted.
+<span class="nc" id="L574">            client.pollNoWakeup();</span>
+        }
+
+<span class="nc" id="L577">        maybeAutoCommitOffsetsAsync(timer.currentTimeMs());</span>
+<span class="nc" id="L578">        return true;</span>
+    }
+
+    /**
+     * Return the time to the next needed invocation of {@link ConsumerNetworkClient#poll(Timer)}.
+     * @param now current time in milliseconds
+     * @return the maximum time in milliseconds the caller should wait before the next invocation of poll()
+     */
+    public long timeToNextPoll(long now) {
+<span class="nc bnc" id="L587" title="All 2 branches missed.">        if (!autoCommitEnabled)</span>
+<span class="nc" id="L588">            return timeToNextHeartbeat(now);</span>
+
+<span class="nc" id="L590">        return Math.min(nextAutoCommitTimer.remainingMs(), timeToNextHeartbeat(now));</span>
+    }
+
+    private void updateGroupSubscription(Set&lt;String&gt; topics) {
+        // the leader will begin watching for changes to any of the topics the group is interested in,
+        // which ensures that all metadata changes will eventually be seen
+<span class="nc bnc" id="L596" title="All 2 branches missed.">        if (this.subscriptions.groupSubscribe(topics))</span>
+<span class="nc" id="L597">            metadata.requestUpdateForNewTopics();</span>
+
+        // update metadata (if needed) and keep track of the metadata used for assignment so that
+        // we can check after rebalance completion whether anything has changed
+<span class="nc bnc" id="L601" title="All 2 branches missed.">        if (!client.ensureFreshMetadata(time.timer(Long.MAX_VALUE)))</span>
+<span class="nc" id="L602">            throw new TimeoutException();</span>
+
+<span class="nc" id="L604">        maybeUpdateSubscriptionMetadata();</span>
+<span class="nc" id="L605">    }</span>
+
+    private boolean isAssignFromSubscribedTopicsAssignor(String name) {
+<span class="nc" id="L608">        return ASSIGN_FROM_SUBSCRIBED_ASSIGNORS.contains(name);</span>
+    }
+
+    /**
+     * user-customized assignor may have created some topics that are not in the subscription list
+     * and assign their partitions to the members; in this case we would like to update the leader's
+     * own metadata with the newly added topics so that it will not trigger a subsequent rebalance
+     * when these topics gets updated from metadata refresh.
+     *
+     * We skip the check for in-product assignors since this will not happen in in-product assignors.
+     *
+     * TODO: this is a hack and not something we want to support long-term unless we push regex into the protocol
+     *       we may need to modify the ConsumerPartitionAssignor API to better support this case.
+     *
+     * @param assignorName          the selected assignor name
+     * @param assignments           the assignments after assignor assigned
+     * @param allSubscribedTopics   all consumers' subscribed topics
+     */
+    private void maybeUpdateGroupSubscription(String assignorName,
+                                              Map&lt;String, Assignment&gt; assignments,
+                                              Set&lt;String&gt; allSubscribedTopics) {
+<span class="nc bnc" id="L629" title="All 2 branches missed.">        if (!isAssignFromSubscribedTopicsAssignor(assignorName)) {</span>
+<span class="nc" id="L630">            Set&lt;String&gt; assignedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L631" title="All 2 branches missed.">            for (Assignment assigned : assignments.values()) {</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">                for (TopicPartition tp : assigned.partitions())</span>
+<span class="nc" id="L633">                    assignedTopics.add(tp.topic());</span>
+<span class="nc" id="L634">            }</span>
+
+<span class="nc bnc" id="L636" title="All 2 branches missed.">            if (!assignedTopics.containsAll(allSubscribedTopics)) {</span>
+<span class="nc" id="L637">                SortedSet&lt;String&gt; notAssignedTopics = new TreeSet&lt;&gt;(allSubscribedTopics);</span>
+<span class="nc" id="L638">                notAssignedTopics.removeAll(assignedTopics);</span>
+<span class="nc" id="L639">                log.warn(&quot;The following subscribed topics are not assigned to any members: {} &quot;, notAssignedTopics);</span>
+            }
+
+<span class="nc bnc" id="L642" title="All 2 branches missed.">            if (!allSubscribedTopics.containsAll(assignedTopics)) {</span>
+<span class="nc" id="L643">                SortedSet&lt;String&gt; newlyAddedTopics = new TreeSet&lt;&gt;(assignedTopics);</span>
+<span class="nc" id="L644">                newlyAddedTopics.removeAll(allSubscribedTopics);</span>
+<span class="nc" id="L645">                log.info(&quot;The following not-subscribed topics are assigned, and their metadata will be &quot; +</span>
+                    &quot;fetched from the brokers: {}&quot;, newlyAddedTopics);
+
+<span class="nc" id="L648">                allSubscribedTopics.addAll(newlyAddedTopics);</span>
+<span class="nc" id="L649">                updateGroupSubscription(allSubscribedTopics);</span>
+            }
+        }
+<span class="nc" id="L652">    }</span>
+
+    @Override
+    protected Map&lt;String, ByteBuffer&gt; onLeaderElected(String leaderId,
+                                                      String assignmentStrategy,
+                                                      List&lt;JoinGroupResponseData.JoinGroupResponseMember&gt; allSubscriptions,
+                                                      boolean skipAssignment) {
+<span class="nc" id="L659">        ConsumerPartitionAssignor assignor = lookupAssignor(assignmentStrategy);</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">        if (assignor == null)</span>
+<span class="nc" id="L661">            throw new IllegalStateException(&quot;Coordinator selected invalid assignment protocol: &quot; + assignmentStrategy);</span>
+<span class="nc" id="L662">        String assignorName = assignor.name();</span>
+
+<span class="nc" id="L664">        Set&lt;String&gt; allSubscribedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L665">        Map&lt;String, Subscription&gt; subscriptions = new HashMap&lt;&gt;();</span>
+
+        // collect all the owned partitions
+<span class="nc" id="L668">        Map&lt;String, List&lt;TopicPartition&gt;&gt; ownedPartitions = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L670" title="All 2 branches missed.">        for (JoinGroupResponseData.JoinGroupResponseMember memberSubscription : allSubscriptions) {</span>
+<span class="nc" id="L671">            Subscription subscription = ConsumerProtocol.deserializeSubscription(ByteBuffer.wrap(memberSubscription.metadata()));</span>
+<span class="nc" id="L672">            subscription.setGroupInstanceId(Optional.ofNullable(memberSubscription.groupInstanceId()));</span>
+<span class="nc" id="L673">            subscriptions.put(memberSubscription.memberId(), subscription);</span>
+<span class="nc" id="L674">            allSubscribedTopics.addAll(subscription.topics());</span>
+<span class="nc" id="L675">            ownedPartitions.put(memberSubscription.memberId(), subscription.ownedPartitions());</span>
+<span class="nc" id="L676">        }</span>
+
+        // the leader will begin watching for changes to any of the topics the group is interested in,
+        // which ensures that all metadata changes will eventually be seen
+<span class="nc" id="L680">        updateGroupSubscription(allSubscribedTopics);</span>
+
+<span class="nc" id="L682">        isLeader = true;</span>
+
+<span class="nc bnc" id="L684" title="All 2 branches missed.">        if (skipAssignment) {</span>
+<span class="nc" id="L685">            log.info(&quot;Skipped assignment for returning static leader at generation {}. The static leader &quot; +</span>
+<span class="nc" id="L686">                &quot;will continue with its existing assignment.&quot;, generation().generationId);</span>
+<span class="nc" id="L687">            assignmentSnapshot = metadataSnapshot;</span>
+<span class="nc" id="L688">            return Collections.emptyMap();</span>
+        }
+
+<span class="nc" id="L691">        log.debug(&quot;Performing assignment using strategy {} with subscriptions {}&quot;, assignorName, subscriptions);</span>
+
+<span class="nc" id="L693">        Map&lt;String, Assignment&gt; assignments = assignor.assign(metadata.fetch(), new GroupSubscription(subscriptions)).groupAssignment();</span>
+
+        // skip the validation for built-in cooperative sticky assignor since we've considered
+        // the &quot;generation&quot; of ownedPartition inside the assignor
+<span class="nc bnc" id="L697" title="All 4 branches missed.">        if (protocol == RebalanceProtocol.COOPERATIVE &amp;&amp; !assignorName.equals(COOPERATIVE_STICKY_ASSIGNOR_NAME)) {</span>
+<span class="nc" id="L698">            validateCooperativeAssignment(ownedPartitions, assignments);</span>
+        }
+
+<span class="nc" id="L701">        maybeUpdateGroupSubscription(assignorName, assignments, allSubscribedTopics);</span>
+
+        // metadataSnapshot could be updated when the subscription is updated therefore
+        // we must take the assignment snapshot after.
+<span class="nc" id="L705">        assignmentSnapshot = metadataSnapshot;</span>
+
+<span class="nc" id="L707">        log.info(&quot;Finished assignment for group at generation {}: {}&quot;, generation().generationId, assignments);</span>
+
+<span class="nc" id="L709">        Map&lt;String, ByteBuffer&gt; groupAssignment = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">        for (Map.Entry&lt;String, Assignment&gt; assignmentEntry : assignments.entrySet()) {</span>
+<span class="nc" id="L711">            ByteBuffer buffer = ConsumerProtocol.serializeAssignment(assignmentEntry.getValue());</span>
+<span class="nc" id="L712">            groupAssignment.put(assignmentEntry.getKey(), buffer);</span>
+<span class="nc" id="L713">        }</span>
+
+<span class="nc" id="L715">        return groupAssignment;</span>
+    }
+
+    /**
+     * Used by COOPERATIVE rebalance protocol only.
+     *
+     * Validate the assignments returned by the assignor such that no owned partitions are going to
+     * be reassigned to a different consumer directly: if the assignor wants to reassign an owned partition,
+     * it must first remove it from the new assignment of the current owner so that it is not assigned to any
+     * member, and then in the next rebalance it can finally reassign those partitions not owned by anyone to consumers.
+     */
+    private void validateCooperativeAssignment(final Map&lt;String, List&lt;TopicPartition&gt;&gt; ownedPartitions,
+                                               final Map&lt;String, Assignment&gt; assignments) {
+<span class="nc" id="L728">        Set&lt;TopicPartition&gt; totalRevokedPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L729">        SortedSet&lt;TopicPartition&gt; totalAddedPartitions = new TreeSet&lt;&gt;(COMPARATOR);</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">        for (final Map.Entry&lt;String, Assignment&gt; entry : assignments.entrySet()) {</span>
+<span class="nc" id="L731">            final Assignment assignment = entry.getValue();</span>
+<span class="nc" id="L732">            final Set&lt;TopicPartition&gt; addedPartitions = new HashSet&lt;&gt;(assignment.partitions());</span>
+<span class="nc" id="L733">            addedPartitions.removeAll(ownedPartitions.get(entry.getKey()));</span>
+<span class="nc" id="L734">            final Set&lt;TopicPartition&gt; revokedPartitions = new HashSet&lt;&gt;(ownedPartitions.get(entry.getKey()));</span>
+<span class="nc" id="L735">            revokedPartitions.removeAll(assignment.partitions());</span>
+
+<span class="nc" id="L737">            totalAddedPartitions.addAll(addedPartitions);</span>
+<span class="nc" id="L738">            totalRevokedPartitions.addAll(revokedPartitions);</span>
+<span class="nc" id="L739">        }</span>
+
+        // if there are overlap between revoked partitions and added partitions, it means some partitions
+        // immediately gets re-assigned to another member while it is still claimed by some member
+<span class="nc" id="L743">        totalAddedPartitions.retainAll(totalRevokedPartitions);</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">        if (!totalAddedPartitions.isEmpty()) {</span>
+<span class="nc" id="L745">            log.error(&quot;With the COOPERATIVE protocol, owned partitions cannot be &quot; +</span>
+                &quot;reassigned to other members; however the assignor has reassigned partitions {} which are still owned &quot; +
+                &quot;by some members&quot;, totalAddedPartitions);
+
+<span class="nc" id="L749">            throw new IllegalStateException(&quot;Assignor supporting the COOPERATIVE protocol violates its requirements&quot;);</span>
+        }
+<span class="nc" id="L751">    }</span>
+
+    @Override
+    protected boolean onJoinPrepare(Timer timer, int generation, String memberId) {
+<span class="nc" id="L755">        log.debug(&quot;Executing onJoinPrepare with generation {} and memberId {}&quot;, generation, memberId);</span>
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        if (joinPrepareTimer == null) {</span>
+            // We should complete onJoinPrepare before rebalanceTimeoutMs,
+            // and continue to join group to avoid member got kicked out from group
+<span class="nc" id="L759">            joinPrepareTimer = time.timer(rebalanceConfig.rebalanceTimeoutMs);</span>
+        } else {
+<span class="nc" id="L761">            joinPrepareTimer.update();</span>
+        }
+
+        // async commit offsets prior to rebalance if auto-commit enabled
+        // and there is no in-flight offset commit request
+<span class="nc bnc" id="L766" title="All 4 branches missed.">        if (autoCommitEnabled &amp;&amp; autoCommitOffsetRequestFuture == null) {</span>
+<span class="nc" id="L767">            maybeMarkPartitionsPendingRevocation();</span>
+<span class="nc" id="L768">            autoCommitOffsetRequestFuture = maybeAutoCommitOffsetsAsync();</span>
+        }
+
+        // wait for commit offset response before timer expired
+<span class="nc bnc" id="L772" title="All 2 branches missed.">        if (autoCommitOffsetRequestFuture != null) {</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">            Timer pollTimer = timer.remainingMs() &lt; joinPrepareTimer.remainingMs() ?</span>
+<span class="nc" id="L774">                    timer : joinPrepareTimer;</span>
+<span class="nc" id="L775">            client.poll(autoCommitOffsetRequestFuture, pollTimer);</span>
+<span class="nc" id="L776">            joinPrepareTimer.update();</span>
+
+            // Keep retrying/waiting the offset commit when:
+            // 1. offset commit haven't done (and joinPrepareTimer not expired)
+            // 2. failed with retriable exception (and joinPrepareTimer not expired)
+            // Otherwise, continue to revoke partitions, ex:
+            // 1. if joinPrepareTimer has expired
+            // 2. if offset commit failed with non-retriable exception
+            // 3. if offset commit success
+<span class="nc" id="L785">            boolean onJoinPrepareAsyncCommitCompleted = true;</span>
+<span class="nc bnc" id="L786" title="All 2 branches missed.">            if (joinPrepareTimer.isExpired()) {</span>
+<span class="nc" id="L787">                log.error(&quot;Asynchronous auto-commit of offsets failed: joinPrepare timeout. Will continue to join group&quot;);</span>
+<span class="nc bnc" id="L788" title="All 2 branches missed.">            } else if (!autoCommitOffsetRequestFuture.isDone()) {</span>
+<span class="nc" id="L789">                onJoinPrepareAsyncCommitCompleted = false;</span>
+<span class="nc bnc" id="L790" title="All 4 branches missed.">            } else if (autoCommitOffsetRequestFuture.failed() &amp;&amp; autoCommitOffsetRequestFuture.isRetriable()) {</span>
+<span class="nc" id="L791">                log.debug(&quot;Asynchronous auto-commit of offsets failed with retryable error: {}. Will retry it.&quot;,</span>
+<span class="nc" id="L792">                        autoCommitOffsetRequestFuture.exception().getMessage());</span>
+<span class="nc" id="L793">                onJoinPrepareAsyncCommitCompleted = false;</span>
+<span class="nc bnc" id="L794" title="All 4 branches missed.">            } else if (autoCommitOffsetRequestFuture.failed() &amp;&amp; !autoCommitOffsetRequestFuture.isRetriable()) {</span>
+<span class="nc" id="L795">                log.error(&quot;Asynchronous auto-commit of offsets failed: {}. Will continue to join group.&quot;,</span>
+<span class="nc" id="L796">                        autoCommitOffsetRequestFuture.exception().getMessage());</span>
+            }
+<span class="nc bnc" id="L798" title="All 2 branches missed.">            if (autoCommitOffsetRequestFuture.isDone()) {</span>
+<span class="nc" id="L799">                autoCommitOffsetRequestFuture = null;</span>
+            }
+<span class="nc bnc" id="L801" title="All 2 branches missed.">            if (!onJoinPrepareAsyncCommitCompleted) {</span>
+<span class="nc" id="L802">                pollTimer.sleep(Math.min(pollTimer.remainingMs(), rebalanceConfig.retryBackoffMs));</span>
+<span class="nc" id="L803">                timer.update();</span>
+<span class="nc" id="L804">                return false;</span>
+            }
+        }
+
+        // the generation / member-id can possibly be reset by the heartbeat thread
+        // upon getting errors or heartbeat timeouts; in this case whatever is previously
+        // owned partitions would be lost, we should trigger the callback and cleanup the assignment;
+        // otherwise we can proceed normally and revoke the partitions depending on the protocol,
+        // and in that case we should only change the assignment AFTER the revoke callback is triggered
+        // so that users can still access the previously owned partitions to commit offsets etc.
+<span class="nc" id="L814">        Exception exception = null;</span>
+<span class="nc" id="L815">        final SortedSet&lt;TopicPartition&gt; revokedPartitions = new TreeSet&lt;&gt;(COMPARATOR);</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">        if (generation == Generation.NO_GENERATION.generationId ||</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">            memberId.equals(Generation.NO_GENERATION.memberId)) {</span>
+<span class="nc" id="L818">            revokedPartitions.addAll(subscriptions.assignedPartitions());</span>
+
+<span class="nc bnc" id="L820" title="All 2 branches missed.">            if (!revokedPartitions.isEmpty()) {</span>
+<span class="nc" id="L821">                log.info(&quot;Giving away all assigned partitions as lost since generation/memberID has been reset,&quot; +</span>
+                    &quot;indicating that consumer is in old state or no longer part of the group&quot;);
+<span class="nc" id="L823">                exception = rebalanceListenerInvoker.invokePartitionsLost(revokedPartitions);</span>
+
+<span class="nc" id="L825">                subscriptions.assignFromSubscribed(Collections.emptySet());</span>
+            }
+        } else {
+<span class="nc bnc" id="L828" title="All 3 branches missed.">            switch (protocol) {</span>
+                case EAGER:
+                    // revoke all partitions
+<span class="nc" id="L831">                    revokedPartitions.addAll(subscriptions.assignedPartitions());</span>
+<span class="nc" id="L832">                    exception = rebalanceListenerInvoker.invokePartitionsRevoked(revokedPartitions);</span>
+
+<span class="nc" id="L834">                    subscriptions.assignFromSubscribed(Collections.emptySet());</span>
+
+<span class="nc" id="L836">                    break;</span>
+
+                case COOPERATIVE:
+                    // only revoke those partitions that are not in the subscription anymore.
+<span class="nc" id="L840">                    Set&lt;TopicPartition&gt; ownedPartitions = new HashSet&lt;&gt;(subscriptions.assignedPartitions());</span>
+<span class="nc" id="L841">                    revokedPartitions.addAll(ownedPartitions.stream()</span>
+<span class="nc bnc" id="L842" title="All 2 branches missed.">                        .filter(tp -&gt; !subscriptions.subscription().contains(tp.topic()))</span>
+<span class="nc" id="L843">                        .collect(Collectors.toSet()));</span>
+
+<span class="nc bnc" id="L845" title="All 2 branches missed.">                    if (!revokedPartitions.isEmpty()) {</span>
+<span class="nc" id="L846">                        exception = rebalanceListenerInvoker.invokePartitionsRevoked(revokedPartitions);</span>
+
+<span class="nc" id="L848">                        ownedPartitions.removeAll(revokedPartitions);</span>
+<span class="nc" id="L849">                        subscriptions.assignFromSubscribed(ownedPartitions);</span>
+                    }
+
+                    break;
+            }
+        }
+
+<span class="nc" id="L856">        isLeader = false;</span>
+<span class="nc" id="L857">        subscriptions.resetGroupSubscription();</span>
+<span class="nc" id="L858">        joinPrepareTimer = null;</span>
+<span class="nc" id="L859">        autoCommitOffsetRequestFuture = null;</span>
+<span class="nc" id="L860">        timer.update();</span>
+
+<span class="nc bnc" id="L862" title="All 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L863">            throw new KafkaException(&quot;User rebalance callback throws an error&quot;, exception);</span>
+        }
+<span class="nc" id="L865">        return true;</span>
+    }
+
+    private void maybeMarkPartitionsPendingRevocation() {
+<span class="nc bnc" id="L869" title="All 2 branches missed.">        if (protocol != RebalanceProtocol.EAGER) {</span>
+<span class="nc" id="L870">            return;</span>
+        }
+
+        // When asynchronously committing offsets prior to the revocation of a set of partitions, there will be a
+        // window of time between when the offset commit is sent and when it returns and revocation completes. It is
+        // possible for pending fetches for these partitions to return during this time, which means the application's
+        // position may get ahead of the committed position prior to revocation. This can cause duplicate consumption.
+        // To prevent this, we mark the partitions as &quot;pending revocation,&quot; which stops the Fetcher from sending new
+        // fetches or returning data from previous fetches to the user.
+<span class="nc" id="L879">        Set&lt;TopicPartition&gt; partitions = subscriptions.assignedPartitions();</span>
+<span class="nc" id="L880">        log.debug(&quot;Marking assigned partitions pending for revocation: {}&quot;, partitions);</span>
+<span class="nc" id="L881">        subscriptions.markPendingRevocation(partitions);</span>
+<span class="nc" id="L882">    }</span>
+
+    @Override
+    public void onLeavePrepare() {
+        // Save the current Generation, as the hb thread can change it at any time
+<span class="nc" id="L887">        final Generation currentGeneration = generation();</span>
+
+<span class="nc" id="L889">        log.debug(&quot;Executing onLeavePrepare with generation {}&quot;, currentGeneration);</span>
+
+        // we should reset assignment and trigger the callback before leaving group
+<span class="nc" id="L892">        SortedSet&lt;TopicPartition&gt; droppedPartitions = new TreeSet&lt;&gt;(COMPARATOR);</span>
+<span class="nc" id="L893">        droppedPartitions.addAll(subscriptions.assignedPartitions());</span>
+
+<span class="nc bnc" id="L895" title="All 4 branches missed.">        if (subscriptions.hasAutoAssignedPartitions() &amp;&amp; !droppedPartitions.isEmpty()) {</span>
+            final Exception e;
+<span class="nc bnc" id="L897" title="All 2 branches missed.">            if ((currentGeneration.generationId == Generation.NO_GENERATION.generationId ||</span>
+<span class="nc bnc" id="L898" title="All 2 branches missed.">                currentGeneration.memberId.equals(Generation.NO_GENERATION.memberId)) ||</span>
+<span class="nc bnc" id="L899" title="All 2 branches missed.">                rebalanceInProgress()) {</span>
+<span class="nc" id="L900">                e = rebalanceListenerInvoker.invokePartitionsLost(droppedPartitions);</span>
+            } else {
+<span class="nc" id="L902">                e = rebalanceListenerInvoker.invokePartitionsRevoked(droppedPartitions);</span>
+            }
+
+<span class="nc" id="L905">            subscriptions.assignFromSubscribed(Collections.emptySet());</span>
+
+<span class="nc bnc" id="L907" title="All 2 branches missed.">            if (e != null) {</span>
+<span class="nc" id="L908">                throw new KafkaException(&quot;User rebalance callback throws an error&quot;, e);</span>
+            }
+        }
+<span class="nc" id="L911">    }</span>
+
+    /**
+     * @throws KafkaException if the callback throws exception
+     */
+    @Override
+    public boolean rejoinNeededOrPending() {
+<span class="nc bnc" id="L918" title="All 2 branches missed.">        if (!subscriptions.hasAutoAssignedPartitions())</span>
+<span class="nc" id="L919">            return false;</span>
+
+        // we need to rejoin if we performed the assignment and metadata has changed;
+        // also for those owned-but-no-longer-existed partitions we should drop them as lost
+<span class="nc bnc" id="L923" title="All 4 branches missed.">        if (assignmentSnapshot != null &amp;&amp; !assignmentSnapshot.matches(metadataSnapshot)) {</span>
+<span class="nc" id="L924">            final String fullReason = String.format(&quot;cached metadata has changed from %s at the beginning of the rebalance to %s&quot;,</span>
+                assignmentSnapshot, metadataSnapshot);
+<span class="nc" id="L926">            requestRejoinIfNecessary(&quot;cached metadata has changed&quot;, fullReason);</span>
+<span class="nc" id="L927">            return true;</span>
+        }
+
+        // we need to join if our subscription has changed since the last join
+<span class="nc bnc" id="L931" title="All 4 branches missed.">        if (joinedSubscription != null &amp;&amp; !joinedSubscription.equals(subscriptions.subscription())) {</span>
+<span class="nc" id="L932">            final String fullReason = String.format(&quot;subscription has changed from %s at the beginning of the rebalance to %s&quot;,</span>
+<span class="nc" id="L933">                joinedSubscription, subscriptions.subscription());</span>
+<span class="nc" id="L934">            requestRejoinIfNecessary(&quot;subscription has changed&quot;, fullReason);</span>
+<span class="nc" id="L935">            return true;</span>
+        }
+
+<span class="nc" id="L938">        return super.rejoinNeededOrPending();</span>
+    }
+
+    /**
+     * Refresh the committed offsets for partitions that require initialization.
+     *
+     * @param timer Timer bounding how long this method can block
+     * @return true iff the operation completed within the timeout
+     */
+    public boolean initWithCommittedOffsetsIfNeeded(Timer timer) {
+<span class="nc" id="L948">        final Set&lt;TopicPartition&gt; initializingPartitions = subscriptions.initializingPartitions();</span>
+<span class="nc" id="L949">        final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets = fetchCommittedOffsets(initializingPartitions, timer);</span>
+
+        // &quot;offsets&quot; will be null if the offset fetch requests did not receive responses within the given timeout
+<span class="nc bnc" id="L952" title="All 2 branches missed.">        if (offsets == null)</span>
+<span class="nc" id="L953">            return false;</span>
+
+<span class="nc" id="L955">        refreshCommittedOffsets(offsets, this.metadata, this.subscriptions);</span>
+<span class="nc" id="L956">        return true;</span>
+    }
+
+    /**
+     * Fetch the current committed offsets from the coordinator for a set of partitions.
+     *
+     * @param partitions The partitions to fetch offsets for
+     * @return A map from partition to the committed offset or null if the operation timed out
+     */
+    public Map&lt;TopicPartition, OffsetAndMetadata&gt; fetchCommittedOffsets(final Set&lt;TopicPartition&gt; partitions,
+                                                                        final Timer timer) {
+<span class="nc bnc" id="L967" title="All 2 branches missed.">        if (partitions.isEmpty()) return Collections.emptyMap();</span>
+
+<span class="nc" id="L969">        final Generation generationForOffsetRequest = generationIfStable();</span>
+<span class="nc bnc" id="L970" title="All 2 branches missed.">        if (pendingCommittedOffsetRequest != null &amp;&amp;</span>
+<span class="nc bnc" id="L971" title="All 2 branches missed.">            !pendingCommittedOffsetRequest.sameRequest(partitions, generationForOffsetRequest)) {</span>
+            // if we were waiting for a different request, then just clear it.
+<span class="nc" id="L973">            pendingCommittedOffsetRequest = null;</span>
+        }
+
+<span class="nc" id="L976">        long attempts = 0L;</span>
+        do {
+<span class="nc bnc" id="L978" title="All 2 branches missed.">            if (!ensureCoordinatorReady(timer)) return null;</span>
+
+            // contact coordinator to fetch committed offsets
+            final RequestFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; future;
+<span class="nc bnc" id="L982" title="All 2 branches missed.">            if (pendingCommittedOffsetRequest != null) {</span>
+<span class="nc" id="L983">                future = pendingCommittedOffsetRequest.response;</span>
+            } else {
+<span class="nc" id="L985">                future = sendOffsetFetchRequest(partitions);</span>
+<span class="nc" id="L986">                pendingCommittedOffsetRequest = new PendingCommittedOffsetRequest(partitions, generationForOffsetRequest, future);</span>
+            }
+<span class="nc" id="L988">            client.poll(future, timer);</span>
+
+<span class="nc bnc" id="L990" title="All 2 branches missed.">            if (future.isDone()) {</span>
+<span class="nc" id="L991">                pendingCommittedOffsetRequest = null;</span>
+
+<span class="nc bnc" id="L993" title="All 2 branches missed.">                if (future.succeeded()) {</span>
+<span class="nc" id="L994">                    return future.value();</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">                } else if (!future.isRetriable()) {</span>
+<span class="nc" id="L996">                    throw future.exception();</span>
+                } else {
+<span class="nc" id="L998">                    timer.sleep(retryBackoff.backoff(attempts++));</span>
+                }
+            } else {
+<span class="nc" id="L1001">                return null;</span>
+            }
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">        } while (timer.notExpired());</span>
+<span class="nc" id="L1004">        return null;</span>
+    }
+
+    /**
+     * Return the consumer group metadata.
+     *
+     * @return the current consumer group metadata
+     */
+    public ConsumerGroupMetadata groupMetadata() {
+<span class="nc" id="L1013">        return groupMetadata;</span>
+    }
+
+    /**
+     * @throws KafkaException if the rebalance callback throws exception
+     */
+    public void close(final Timer timer, CloseOptions.GroupMembershipOperation membershipOperation) {
+        // we do not need to re-enable wakeups since we are closing already
+<span class="nc" id="L1021">        client.disableWakeups();</span>
+        try {
+<span class="nc" id="L1023">            maybeAutoCommitOffsetsSync(timer);</span>
+<span class="nc bnc" id="L1024" title="All 4 branches missed.">            while (pendingAsyncCommits.get() &gt; 0 &amp;&amp; timer.notExpired()) {</span>
+<span class="nc" id="L1025">                ensureCoordinatorReady(timer);</span>
+<span class="nc" id="L1026">                client.poll(timer);</span>
+<span class="nc" id="L1027">                invokeCompletedOffsetCommitCallbacks();</span>
+            }
+        } finally {
+<span class="nc" id="L1030">            super.close(timer, membershipOperation);</span>
+<span class="nc" id="L1031">            Utils.closeQuietly(coordinatorMetrics, &quot;consumer coordinator metrics&quot;);</span>
+<span class="nc" id="L1032">            Utils.closeQuietly(rebalanceCallbackMetricsManager, &quot;consumer rebalance callback metrics&quot;);</span>
+        }
+<span class="nc" id="L1034">    }</span>
+
+    // visible for testing
+    void invokeCompletedOffsetCommitCallbacks() {
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">        if (asyncCommitFenced.get()) {</span>
+<span class="nc" id="L1039">            throw new FencedInstanceIdException(&quot;Get fenced exception for group.instance.id &quot;</span>
+<span class="nc" id="L1040">                + rebalanceConfig.groupInstanceId.orElse(&quot;unset_instance_id&quot;)</span>
+<span class="nc" id="L1041">                + &quot;, current member.id is &quot; + memberId());</span>
+        }
+        while (true) {
+<span class="nc" id="L1044">            OffsetCommitCompletion completion = completedOffsetCommits.poll();</span>
+<span class="nc bnc" id="L1045" title="All 2 branches missed.">            if (completion == null) {</span>
+<span class="nc" id="L1046">                break;</span>
+            }
+<span class="nc" id="L1048">            completion.invoke();</span>
+<span class="nc" id="L1049">        }</span>
+<span class="nc" id="L1050">    }</span>
+
+    public RequestFuture&lt;Void&gt; commitOffsetsAsync(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, final OffsetCommitCallback callback) {
+<span class="nc" id="L1053">        invokeCompletedOffsetCommitCallbacks();</span>
+
+<span class="nc" id="L1055">        RequestFuture&lt;Void&gt; future = null;</span>
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">        if (offsets.isEmpty()) {</span>
+            // No need to check coordinator if offsets is empty since commit of empty offsets is completed locally.
+<span class="nc" id="L1058">            future = doCommitOffsetsAsync(offsets, callback);</span>
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">        } else if (!coordinatorUnknownAndUnreadyAsync()) {</span>
+            // we need to make sure coordinator is ready before committing, since
+            // this is for async committing we do not try to block, but just try once to
+            // clear the previous discover-coordinator future, resend, or get responses;
+            // if the coordinator is not ready yet then we would just proceed and put that into the
+            // pending requests, and future poll calls would still try to complete them.
+            //
+            // the key here though is that we have to try sending the discover-coordinator if
+            // it's not known or ready, since this is the only place we can send such request
+            // under manual assignment (there we would not have heartbeat thread trying to auto-rediscover
+            // the coordinator).
+<span class="nc" id="L1070">            future = doCommitOffsetsAsync(offsets, callback);</span>
+        } else {
+            // we don't know the current coordinator, so try to find it and then send the commit
+            // or fail (we don't want recursive retries which can cause offset commits to arrive
+            // out of order). Note that there may be multiple offset commits chained to the same
+            // coordinator lookup request. This is fine because the listeners will be invoked in
+            // the same order that they were added. Note also that AbstractCoordinator prevents
+            // multiple concurrent coordinator lookup requests.
+<span class="nc" id="L1078">            pendingAsyncCommits.incrementAndGet();</span>
+<span class="nc" id="L1079">            lookupCoordinator().addListener(new RequestFutureListener&lt;&gt;() {</span>
+                @Override
+                public void onSuccess(Void value) {
+<span class="nc" id="L1082">                    pendingAsyncCommits.decrementAndGet();</span>
+<span class="nc" id="L1083">                    doCommitOffsetsAsync(offsets, callback);</span>
+<span class="nc" id="L1084">                    client.pollNoWakeup();</span>
+<span class="nc" id="L1085">                }</span>
+
+                @Override
+                public void onFailure(RuntimeException e) {
+<span class="nc" id="L1089">                    pendingAsyncCommits.decrementAndGet();</span>
+<span class="nc" id="L1090">                    completedOffsetCommits.add(new OffsetCommitCompletion(callback, offsets,</span>
+                            new RetriableCommitFailedException(e)));
+<span class="nc" id="L1092">                }</span>
+            });
+        }
+
+        // ensure the commit has a chance to be transmitted (without blocking on its completion).
+        // Note that commits are treated as heartbeats by the coordinator, so there is no need to
+        // explicitly allow heartbeats through delayed task execution.
+<span class="nc" id="L1099">        client.pollNoWakeup();</span>
+<span class="nc" id="L1100">        return future;</span>
+    }
+
+    private RequestFuture&lt;Void&gt; doCommitOffsetsAsync(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, final OffsetCommitCallback callback) {
+<span class="nc" id="L1104">        RequestFuture&lt;Void&gt; future = sendOffsetCommitRequest(offsets);</span>
+<span class="nc" id="L1105">        inFlightAsyncCommits.incrementAndGet();</span>
+<span class="nc bnc" id="L1106" title="All 2 branches missed.">        final OffsetCommitCallback cb = callback == null ? defaultOffsetCommitCallback : callback;</span>
+<span class="nc" id="L1107">        future.addListener(new RequestFutureListener&lt;&gt;() {</span>
+            @Override
+            public void onSuccess(Void value) {
+<span class="nc" id="L1110">                inFlightAsyncCommits.decrementAndGet();</span>
+
+<span class="nc bnc" id="L1112" title="All 2 branches missed.">                if (interceptors != null)</span>
+<span class="nc" id="L1113">                    interceptors.onCommit(offsets);</span>
+<span class="nc" id="L1114">                completedOffsetCommits.add(new OffsetCommitCompletion(cb, offsets, null));</span>
+<span class="nc" id="L1115">            }</span>
+
+            @Override
+            public void onFailure(RuntimeException e) {
+<span class="nc" id="L1119">                inFlightAsyncCommits.decrementAndGet();</span>
+
+<span class="nc" id="L1121">                Exception commitException = e;</span>
+
+<span class="nc bnc" id="L1123" title="All 2 branches missed.">                if (e instanceof RetriableException) {</span>
+<span class="nc" id="L1124">                    commitException = new RetriableCommitFailedException(e);</span>
+                }
+<span class="nc" id="L1126">                completedOffsetCommits.add(new OffsetCommitCompletion(cb, offsets, commitException));</span>
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">                if (commitException instanceof FencedInstanceIdException) {</span>
+<span class="nc" id="L1128">                    asyncCommitFenced.set(true);</span>
+                }
+<span class="nc" id="L1130">            }</span>
+        });
+<span class="nc" id="L1132">        return future;</span>
+    }
+
+    /**
+     * Commit offsets synchronously. This method will retry until the commit completes successfully
+     * or an unrecoverable error is encountered.
+     * @param offsets The offsets to be committed
+     * @throws org.apache.kafka.common.errors.AuthorizationException if the consumer is not authorized to the group
+     *             or to any of the specified partitions. See the exception for more details
+     * @throws CommitFailedException if an unrecoverable error occurs before the commit can be completed
+     * @throws FencedInstanceIdException if a static member gets fenced
+     * @return If the offset commit was successfully sent and a successful response was received from
+     *         the coordinator
+     */
+    public boolean commitOffsetsSync(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, Timer timer) {
+<span class="nc" id="L1147">        invokeCompletedOffsetCommitCallbacks();</span>
+
+<span class="nc bnc" id="L1149" title="All 2 branches missed.">        if (offsets.isEmpty()) {</span>
+            // We guarantee that the callbacks for all commitAsync() will be invoked when
+            // commitSync() completes, even if the user tries to commit empty offsets.
+<span class="nc" id="L1152">            return invokePendingAsyncCommits(timer);</span>
+        }
+
+<span class="nc" id="L1155">        long attempts = 0L;</span>
+        do {
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">            if (coordinatorUnknownAndUnreadySync(timer)) {</span>
+<span class="nc" id="L1158">                return false;</span>
+            }
+
+<span class="nc" id="L1161">            RequestFuture&lt;Void&gt; future = sendOffsetCommitRequest(offsets);</span>
+<span class="nc" id="L1162">            client.poll(future, timer);</span>
+
+            // We may have had in-flight offset commits when the synchronous commit began. If so, ensure that
+            // the corresponding callbacks are invoked prior to returning in order to preserve the order that
+            // the offset commits were applied.
+<span class="nc" id="L1167">            invokeCompletedOffsetCommitCallbacks();</span>
+
+<span class="nc bnc" id="L1169" title="All 2 branches missed.">            if (future.succeeded()) {</span>
+<span class="nc bnc" id="L1170" title="All 2 branches missed.">                if (interceptors != null)</span>
+<span class="nc" id="L1171">                    interceptors.onCommit(offsets);</span>
+<span class="nc" id="L1172">                return true;</span>
+            }
+
+<span class="nc bnc" id="L1175" title="All 4 branches missed.">            if (future.failed() &amp;&amp; !future.isRetriable())</span>
+<span class="nc" id="L1176">                throw future.exception();</span>
+
+<span class="nc" id="L1178">            timer.sleep(retryBackoff.backoff(attempts++));</span>
+<span class="nc bnc" id="L1179" title="All 2 branches missed.">        } while (timer.notExpired());</span>
+
+<span class="nc" id="L1181">        return false;</span>
+    }
+
+    private void maybeAutoCommitOffsetsSync(Timer timer) {
+<span class="nc bnc" id="L1185" title="All 2 branches missed.">        if (autoCommitEnabled) {</span>
+<span class="nc" id="L1186">            Map&lt;TopicPartition, OffsetAndMetadata&gt; allConsumedOffsets = subscriptions.allConsumed();</span>
+            try {
+<span class="nc" id="L1188">                log.debug(&quot;Sending synchronous auto-commit of offsets {}&quot;, allConsumedOffsets);</span>
+<span class="nc bnc" id="L1189" title="All 2 branches missed.">                if (!commitOffsetsSync(allConsumedOffsets, timer))</span>
+<span class="nc" id="L1190">                    log.debug(&quot;Auto-commit of offsets {} timed out before completion&quot;, allConsumedOffsets);</span>
+<span class="nc" id="L1191">            } catch (WakeupException | InterruptException e) {</span>
+<span class="nc" id="L1192">                log.debug(&quot;Auto-commit of offsets {} was interrupted before completion&quot;, allConsumedOffsets);</span>
+                // rethrow wakeups since they are triggered by the user
+<span class="nc" id="L1194">                throw e;</span>
+<span class="nc" id="L1195">            } catch (Exception e) {</span>
+                // consistent with async auto-commit failures, we do not propagate the exception
+<span class="nc" id="L1197">                log.warn(&quot;Synchronous auto-commit of offsets {} failed: {}&quot;, allConsumedOffsets, e.getMessage());</span>
+<span class="nc" id="L1198">            }</span>
+        }
+<span class="nc" id="L1200">    }</span>
+
+    public void maybeAutoCommitOffsetsAsync(long now) {
+<span class="nc bnc" id="L1203" title="All 2 branches missed.">        if (autoCommitEnabled) {</span>
+<span class="nc" id="L1204">            nextAutoCommitTimer.update(now);</span>
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">            if (nextAutoCommitTimer.isExpired()) {</span>
+<span class="nc" id="L1206">                nextAutoCommitTimer.reset(autoCommitIntervalMs);</span>
+<span class="nc" id="L1207">                autoCommitOffsetsAsync();</span>
+            }
+        }
+<span class="nc" id="L1210">    }</span>
+
+    private boolean invokePendingAsyncCommits(Timer timer) {
+<span class="nc bnc" id="L1213" title="All 2 branches missed.">        if (inFlightAsyncCommits.get() == 0) {</span>
+<span class="nc" id="L1214">            return true;</span>
+        }
+
+<span class="nc" id="L1217">        long attempts = 0L;</span>
+        do {
+<span class="nc" id="L1219">            ensureCoordinatorReady(timer);</span>
+<span class="nc" id="L1220">            client.poll(timer);</span>
+<span class="nc" id="L1221">            invokeCompletedOffsetCommitCallbacks();</span>
+
+<span class="nc bnc" id="L1223" title="All 2 branches missed.">            if (inFlightAsyncCommits.get() == 0) {</span>
+<span class="nc" id="L1224">                return true;</span>
+            }
+
+<span class="nc" id="L1227">            timer.sleep(retryBackoff.backoff(attempts++));</span>
+<span class="nc bnc" id="L1228" title="All 2 branches missed.">        } while (timer.notExpired());</span>
+
+<span class="nc" id="L1230">        return false;</span>
+    }
+
+    private RequestFuture&lt;Void&gt; autoCommitOffsetsAsync() {
+<span class="nc" id="L1234">        Map&lt;TopicPartition, OffsetAndMetadata&gt; allConsumedOffsets = subscriptions.allConsumed();</span>
+<span class="nc" id="L1235">        log.debug(&quot;Sending asynchronous auto-commit of offsets {}&quot;, allConsumedOffsets);</span>
+
+<span class="nc" id="L1237">        return commitOffsetsAsync(allConsumedOffsets, (offsets, exception) -&gt; {</span>
+<span class="nc bnc" id="L1238" title="All 2 branches missed.">            if (exception != null) {</span>
+<span class="nc bnc" id="L1239" title="All 2 branches missed.">                if (exception instanceof RetriableCommitFailedException) {</span>
+<span class="nc" id="L1240">                    log.debug(&quot;Asynchronous auto-commit of offsets {} failed due to retriable error.&quot;, offsets,</span>
+                        exception);
+<span class="nc" id="L1242">                    nextAutoCommitTimer.updateAndReset(rebalanceConfig.retryBackoffMs);</span>
+                } else {
+<span class="nc" id="L1244">                    log.warn(&quot;Asynchronous auto-commit of offsets {} failed: {}&quot;, offsets, exception.getMessage());</span>
+                }
+            } else {
+<span class="nc" id="L1247">                log.debug(&quot;Completed asynchronous auto-commit of offsets {}&quot;, offsets);</span>
+            }
+<span class="nc" id="L1249">        });</span>
+    }
+
+    private RequestFuture&lt;Void&gt; maybeAutoCommitOffsetsAsync() {
+<span class="nc bnc" id="L1253" title="All 2 branches missed.">        if (autoCommitEnabled)</span>
+<span class="nc" id="L1254">            return autoCommitOffsetsAsync();</span>
+<span class="nc" id="L1255">        return null;</span>
+    }
+
+<span class="nc" id="L1258">    private class DefaultOffsetCommitCallback implements OffsetCommitCallback {</span>
+        @Override
+        public void onComplete(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, Exception exception) {
+<span class="nc bnc" id="L1261" title="All 2 branches missed.">            if (exception != null)</span>
+<span class="nc" id="L1262">                log.error(&quot;Offset commit with offsets {} failed&quot;, offsets, exception);</span>
+<span class="nc" id="L1263">        }</span>
+    }
+
+    /**
+     * Commit offsets for the specified list of topics and partitions. This is a non-blocking call
+     * which returns a request future that can be polled in the case of a synchronous commit or ignored in the
+     * asynchronous case.
+     *
+     * NOTE: This is visible only for testing
+     *
+     * @param offsets The list of offsets per partition that should be committed.
+     * @return A request future whose value indicates whether the commit was successful or not
+     */
+    RequestFuture&lt;Void&gt; sendOffsetCommitRequest(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets) {
+<span class="nc bnc" id="L1277" title="All 2 branches missed.">        if (offsets.isEmpty())</span>
+<span class="nc" id="L1278">            return RequestFuture.voidSuccess();</span>
+
+<span class="nc" id="L1280">        Node coordinator = checkAndGetCoordinator();</span>
+<span class="nc bnc" id="L1281" title="All 2 branches missed.">        if (coordinator == null)</span>
+<span class="nc" id="L1282">            return RequestFuture.coordinatorNotAvailable();</span>
+
+        // create the offset commit request
+<span class="nc" id="L1285">        Map&lt;String, OffsetCommitRequestData.OffsetCommitRequestTopic&gt; requestTopicDataMap = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1286" title="All 2 branches missed.">        for (Map.Entry&lt;TopicPartition, OffsetAndMetadata&gt; entry : offsets.entrySet()) {</span>
+<span class="nc" id="L1287">            TopicPartition topicPartition = entry.getKey();</span>
+<span class="nc" id="L1288">            OffsetAndMetadata offsetAndMetadata = entry.getValue();</span>
+<span class="nc bnc" id="L1289" title="All 2 branches missed.">            if (offsetAndMetadata.offset() &lt; 0) {</span>
+<span class="nc" id="L1290">                return RequestFuture.failure(new IllegalArgumentException(&quot;Invalid offset: &quot; + offsetAndMetadata.offset()));</span>
+            }
+
+<span class="nc" id="L1293">            OffsetCommitRequestData.OffsetCommitRequestTopic topic = requestTopicDataMap</span>
+<span class="nc" id="L1294">                    .getOrDefault(topicPartition.topic(),</span>
+                            new OffsetCommitRequestData.OffsetCommitRequestTopic()
+<span class="nc" id="L1296">                                    .setName(topicPartition.topic())</span>
+                    );
+
+<span class="nc" id="L1299">            topic.partitions().add(new OffsetCommitRequestData.OffsetCommitRequestPartition()</span>
+<span class="nc" id="L1300">                    .setPartitionIndex(topicPartition.partition())</span>
+<span class="nc" id="L1301">                    .setCommittedOffset(offsetAndMetadata.offset())</span>
+<span class="nc" id="L1302">                    .setCommittedLeaderEpoch(offsetAndMetadata.leaderEpoch().orElse(RecordBatch.NO_PARTITION_LEADER_EPOCH))</span>
+<span class="nc" id="L1303">                    .setCommittedMetadata(offsetAndMetadata.metadata())</span>
+            );
+<span class="nc" id="L1305">            requestTopicDataMap.put(topicPartition.topic(), topic);</span>
+<span class="nc" id="L1306">        }</span>
+
+        final Generation generation;
+        final String groupInstanceId;
+<span class="nc bnc" id="L1310" title="All 2 branches missed.">        if (subscriptions.hasAutoAssignedPartitions()) {</span>
+<span class="nc" id="L1311">            synchronized (ConsumerCoordinator.this) {</span>
+<span class="nc" id="L1312">                generation = generationIfStable();</span>
+<span class="nc" id="L1313">                groupInstanceId = rebalanceConfig.groupInstanceId.orElse(null);</span>
+                // if the generation is null, we are not part of an active group (and we expect to be).
+                // the only thing we can do is fail the commit and let the user rejoin the group in poll().
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">                if (generation == null) {</span>
+<span class="nc" id="L1317">                    log.info(&quot;Failing OffsetCommit request since the consumer is not part of an active group&quot;);</span>
+
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">                    if (rebalanceInProgress()) {</span>
+                        // if the client knows it is already rebalancing, we can use RebalanceInProgressException instead of
+                        // CommitFailedException to indicate this is not a fatal error
+<span class="nc" id="L1322">                        return RequestFuture.failure(new RebalanceInProgressException(&quot;Offset commit cannot be completed since the &quot; +</span>
+                            &quot;consumer is undergoing a rebalance for auto partition assignment. You can try completing the rebalance &quot; +
+                            &quot;by calling poll() and then retry the operation.&quot;));
+                    } else {
+<span class="nc" id="L1326">                        return RequestFuture.failure(new CommitFailedException(&quot;Offset commit cannot be completed since the &quot; +</span>
+                            &quot;consumer is not part of an active group for auto partition assignment; it is likely that the consumer &quot; +
+                            &quot;was kicked out of the group.&quot;));
+                    }
+                }
+<span class="nc" id="L1331">            }</span>
+        } else {
+<span class="nc" id="L1333">            generation = Generation.NO_GENERATION;</span>
+<span class="nc" id="L1334">            groupInstanceId = null;</span>
+        }
+
+<span class="nc" id="L1337">        OffsetCommitRequest.Builder builder = OffsetCommitRequest.Builder.forTopicNames(</span>
+                new OffsetCommitRequestData()
+<span class="nc" id="L1339">                        .setGroupId(this.rebalanceConfig.groupId)</span>
+<span class="nc" id="L1340">                        .setGenerationIdOrMemberEpoch(generation.generationId)</span>
+<span class="nc" id="L1341">                        .setMemberId(generation.memberId)</span>
+<span class="nc" id="L1342">                        .setGroupInstanceId(groupInstanceId)</span>
+<span class="nc" id="L1343">                        .setTopics(new ArrayList&lt;&gt;(requestTopicDataMap.values()))</span>
+        );
+
+<span class="nc" id="L1346">        log.trace(&quot;Sending OffsetCommit request with {} to coordinator {}&quot;, offsets, coordinator);</span>
+
+<span class="nc" id="L1348">        return client.send(coordinator, builder)</span>
+<span class="nc" id="L1349">                .compose(new OffsetCommitResponseHandler(offsets, generation));</span>
+    }
+
+    private class OffsetCommitResponseHandler extends CoordinatorResponseHandler&lt;OffsetCommitResponse, Void&gt; {
+        private final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets;
+
+<span class="nc" id="L1355">        private OffsetCommitResponseHandler(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, Generation generation) {</span>
+<span class="nc" id="L1356">            super(generation);</span>
+<span class="nc" id="L1357">            this.offsets = offsets;</span>
+<span class="nc" id="L1358">        }</span>
+
+        @Override
+        public void handle(OffsetCommitResponse commitResponse, RequestFuture&lt;Void&gt; future) {
+<span class="nc" id="L1362">            coordinatorMetrics.commitSensor.record(response.requestLatencyMs());</span>
+<span class="nc" id="L1363">            Set&lt;String&gt; unauthorizedTopics = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1365" title="All 2 branches missed.">            for (OffsetCommitResponseData.OffsetCommitResponseTopic topic : commitResponse.data().topics()) {</span>
+<span class="nc bnc" id="L1366" title="All 2 branches missed.">                for (OffsetCommitResponseData.OffsetCommitResponsePartition partition : topic.partitions()) {</span>
+<span class="nc" id="L1367">                    TopicPartition tp = new TopicPartition(topic.name(), partition.partitionIndex());</span>
+<span class="nc" id="L1368">                    OffsetAndMetadata offsetAndMetadata = this.offsets.get(tp);</span>
+
+<span class="nc" id="L1370">                    long offset = offsetAndMetadata.offset();</span>
+
+<span class="nc" id="L1372">                    Errors error = Errors.forCode(partition.errorCode());</span>
+<span class="nc bnc" id="L1373" title="All 2 branches missed.">                    if (error == Errors.NONE) {</span>
+<span class="nc" id="L1374">                        log.debug(&quot;Committed offset {} for partition {}&quot;, offset, tp);</span>
+                    } else {
+<span class="nc bnc" id="L1376" title="All 2 branches missed.">                        if (error.exception() instanceof RetriableException) {</span>
+<span class="nc" id="L1377">                            log.warn(&quot;Offset commit failed on partition {} at offset {}: {}&quot;, tp, offset, error.message());</span>
+                        } else {
+<span class="nc" id="L1379">                            log.error(&quot;Offset commit failed on partition {} at offset {}: {}&quot;, tp, offset, error.message());</span>
+                        }
+
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">                        if (error == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1383">                            future.raise(GroupAuthorizationException.forGroupId(rebalanceConfig.groupId));</span>
+<span class="nc" id="L1384">                            return;</span>
+<span class="nc bnc" id="L1385" title="All 2 branches missed.">                        } else if (error == Errors.TOPIC_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1386">                            unauthorizedTopics.add(tp.topic());</span>
+<span class="nc bnc" id="L1387" title="All 4 branches missed.">                        } else if (error == Errors.OFFSET_METADATA_TOO_LARGE</span>
+                                || error == Errors.INVALID_COMMIT_OFFSET_SIZE) {
+                            // raise the error to the user
+<span class="nc" id="L1390">                            future.raise(error);</span>
+<span class="nc" id="L1391">                            return;</span>
+<span class="nc bnc" id="L1392" title="All 4 branches missed.">                        } else if (error == Errors.COORDINATOR_LOAD_IN_PROGRESS</span>
+                                || error == Errors.UNKNOWN_TOPIC_OR_PARTITION) {
+                            // just retry
+<span class="nc" id="L1395">                            future.raise(error);</span>
+<span class="nc" id="L1396">                            return;</span>
+<span class="nc bnc" id="L1397" title="All 6 branches missed.">                        } else if (error == Errors.COORDINATOR_NOT_AVAILABLE</span>
+                                || error == Errors.NOT_COORDINATOR
+                                || error == Errors.REQUEST_TIMED_OUT) {
+<span class="nc" id="L1400">                            markCoordinatorUnknown(error);</span>
+<span class="nc" id="L1401">                            future.raise(error);</span>
+<span class="nc" id="L1402">                            return;</span>
+<span class="nc bnc" id="L1403" title="All 2 branches missed.">                        } else if (error == Errors.FENCED_INSTANCE_ID) {</span>
+<span class="nc" id="L1404">                            log.info(&quot;OffsetCommit failed with {} due to group instance id {} fenced&quot;, sentGeneration, rebalanceConfig.groupInstanceId);</span>
+
+                            // if the generation has changed or we are not in rebalancing, do not raise the fatal error but rebalance-in-progress
+<span class="nc bnc" id="L1407" title="All 2 branches missed.">                            if (generationUnchanged()) {</span>
+<span class="nc" id="L1408">                                future.raise(error);</span>
+                            } else {
+                                KafkaException exception;
+<span class="nc" id="L1411">                                synchronized (ConsumerCoordinator.this) {</span>
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">                                    if (ConsumerCoordinator.this.state == MemberState.PREPARING_REBALANCE) {</span>
+<span class="nc" id="L1413">                                        exception = new RebalanceInProgressException(&quot;Offset commit cannot be completed since the &quot; +</span>
+                                            &quot;consumer member's old generation is fenced by its group instance id, it is possible that &quot; +
+                                            &quot;this consumer has already participated in another rebalance and got a new generation&quot;);
+                                    } else {
+<span class="nc" id="L1417">                                        exception = new CommitFailedException();</span>
+                                    }
+<span class="nc" id="L1419">                                }</span>
+<span class="nc" id="L1420">                                future.raise(exception);</span>
+                            }
+<span class="nc" id="L1422">                            return;</span>
+<span class="nc bnc" id="L1423" title="All 2 branches missed.">                        } else if (error == Errors.REBALANCE_IN_PROGRESS) {</span>
+                            /* Consumer should not try to commit offset in between join-group and sync-group,
+                             * and hence on broker-side it is not expected to see a commit offset request
+                             * during CompletingRebalance phase; if it ever happens then broker would return
+                             * this error to indicate that we are still in the middle of a rebalance.
+                             * In this case we would throw a RebalanceInProgressException,
+                             * request re-join but do not reset generations. If the callers decide to retry they
+                             * can go ahead and call poll to finish up the rebalance first, and then try commit again.
+                             */
+<span class="nc" id="L1432">                            requestRejoin(&quot;offset commit failed since group is already rebalancing&quot;);</span>
+<span class="nc" id="L1433">                            future.raise(new RebalanceInProgressException(&quot;Offset commit cannot be completed since the &quot; +</span>
+                                &quot;consumer group is executing a rebalance at the moment. You can try completing the rebalance &quot; +
+                                &quot;by calling poll() and then retry commit again&quot;));
+<span class="nc" id="L1436">                            return;</span>
+<span class="nc bnc" id="L1437" title="All 4 branches missed.">                        } else if (error == Errors.UNKNOWN_MEMBER_ID</span>
+                                || error == Errors.ILLEGAL_GENERATION) {
+<span class="nc" id="L1439">                            log.info(&quot;OffsetCommit failed with {}: {}&quot;, sentGeneration, error.message());</span>
+
+                            // only need to reset generation and re-join group if generation has not changed or we are not in rebalancing;
+                            // otherwise only raise rebalance-in-progress error
+                            KafkaException exception;
+<span class="nc" id="L1444">                            synchronized (ConsumerCoordinator.this) {</span>
+<span class="nc bnc" id="L1445" title="All 4 branches missed.">                                if (!generationUnchanged() &amp;&amp; ConsumerCoordinator.this.state == MemberState.PREPARING_REBALANCE) {</span>
+<span class="nc" id="L1446">                                    exception = new RebalanceInProgressException(&quot;Offset commit cannot be completed since the &quot; +</span>
+                                        &quot;consumer member's generation is already stale, meaning it has already participated another rebalance and &quot; +
+                                        &quot;got a new generation. You can try completing the rebalance by calling poll() and then retry commit again&quot;);
+                                } else {
+                                    // don't reset generation member ID when ILLEGAL_GENERATION, since the member might be still valid
+<span class="nc bnc" id="L1451" title="All 2 branches missed.">                                    resetStateOnResponseError(ApiKeys.OFFSET_COMMIT, error, error != Errors.ILLEGAL_GENERATION);</span>
+<span class="nc" id="L1452">                                    exception = new CommitFailedException();</span>
+                                }
+<span class="nc" id="L1454">                            }</span>
+<span class="nc" id="L1455">                            future.raise(exception);</span>
+<span class="nc" id="L1456">                            return;</span>
+                        } else {
+<span class="nc" id="L1458">                            future.raise(new KafkaException(&quot;Unexpected error in commit: &quot; + error.message()));</span>
+<span class="nc" id="L1459">                            return;</span>
+                        }
+                    }
+<span class="nc" id="L1462">                }</span>
+<span class="nc" id="L1463">            }</span>
+
+<span class="nc bnc" id="L1465" title="All 2 branches missed.">            if (!unauthorizedTopics.isEmpty()) {</span>
+<span class="nc" id="L1466">                log.error(&quot;Not authorized to commit to topics {}&quot;, unauthorizedTopics);</span>
+<span class="nc" id="L1467">                future.raise(new TopicAuthorizationException(unauthorizedTopics));</span>
+            } else {
+<span class="nc" id="L1469">                future.complete(null);</span>
+            }
+<span class="nc" id="L1471">        }</span>
+    }
+
+    /**
+     * Fetch the committed offsets for a set of partitions. This is a non-blocking call. The
+     * returned future can be polled to get the actual offsets returned from the broker.
+     *
+     * @param partitions The set of partitions to get offsets for.
+     * @return A request future containing the committed offsets.
+     */
+    private RequestFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; sendOffsetFetchRequest(Set&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L1482">        Node coordinator = checkAndGetCoordinator();</span>
+<span class="nc bnc" id="L1483" title="All 2 branches missed.">        if (coordinator == null)</span>
+<span class="nc" id="L1484">            return RequestFuture.coordinatorNotAvailable();</span>
+
+<span class="nc" id="L1486">        log.debug(&quot;Fetching committed offsets for partitions: {}&quot;, partitions);</span>
+
+        // construct the request
+<span class="nc" id="L1489">        List&lt;OffsetFetchRequestData.OffsetFetchRequestTopics&gt; topics = partitions.stream()</span>
+<span class="nc" id="L1490">            .collect(Collectors.groupingBy(TopicPartition::topic))</span>
+<span class="nc" id="L1491">            .entrySet()</span>
+<span class="nc" id="L1492">            .stream()</span>
+<span class="nc" id="L1493">            .map(entry -&gt; new OffsetFetchRequestData.OffsetFetchRequestTopics()</span>
+<span class="nc" id="L1494">                .setName(entry.getKey())</span>
+<span class="nc" id="L1495">                .setPartitionIndexes(entry.getValue().stream()</span>
+<span class="nc" id="L1496">                    .map(TopicPartition::partition)</span>
+<span class="nc" id="L1497">                    .collect(Collectors.toList())))</span>
+<span class="nc" id="L1498">            .collect(Collectors.toList());</span>
+
+<span class="nc" id="L1500">        OffsetFetchRequest.Builder requestBuilder = OffsetFetchRequest.Builder.forTopicNames(</span>
+            new OffsetFetchRequestData()
+<span class="nc" id="L1502">                .setRequireStable(true)</span>
+<span class="nc" id="L1503">                .setGroups(List.of(</span>
+                    new OffsetFetchRequestData.OffsetFetchRequestGroup()
+<span class="nc" id="L1505">                        .setGroupId(this.rebalanceConfig.groupId)</span>
+<span class="nc" id="L1506">                        .setTopics(topics))),</span>
+            throwOnFetchStableOffsetsUnsupported);
+
+        // send the request with a callback
+<span class="nc" id="L1510">        return client.send(coordinator, requestBuilder)</span>
+<span class="nc" id="L1511">                .compose(new OffsetFetchResponseHandler());</span>
+    }
+
+    private class OffsetFetchResponseHandler extends CoordinatorResponseHandler&lt;OffsetFetchResponse, Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; {
+<span class="nc" id="L1515">        private OffsetFetchResponseHandler() {</span>
+<span class="nc" id="L1516">            super(Generation.NO_GENERATION);</span>
+<span class="nc" id="L1517">        }</span>
+
+        @Override
+        public void handle(OffsetFetchResponse response, RequestFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; future) {
+<span class="nc" id="L1521">            var group = response.group(rebalanceConfig.groupId);</span>
+<span class="nc" id="L1522">            var groupError = Errors.forCode(group.errorCode());</span>
+
+<span class="nc bnc" id="L1524" title="All 2 branches missed.">            if (groupError != Errors.NONE) {</span>
+<span class="nc" id="L1525">                log.debug(&quot;Offset fetch failed: {}&quot;, groupError.message());</span>
+
+<span class="nc bnc" id="L1527" title="All 4 branches missed.">                if (groupError == Errors.COORDINATOR_NOT_AVAILABLE ||</span>
+                    groupError == Errors.NOT_COORDINATOR) {
+                    // re-discover the coordinator and retry
+<span class="nc" id="L1530">                    markCoordinatorUnknown(groupError);</span>
+<span class="nc" id="L1531">                    future.raise(groupError);</span>
+<span class="nc bnc" id="L1532" title="All 2 branches missed.">                } else if (groupError == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1533">                    future.raise(GroupAuthorizationException.forGroupId(rebalanceConfig.groupId));</span>
+<span class="nc bnc" id="L1534" title="All 2 branches missed.">                } else if (groupError.exception() instanceof RetriableException) {</span>
+                    // retry
+<span class="nc" id="L1536">                    future.raise(groupError);</span>
+                } else {
+<span class="nc" id="L1538">                    future.raise(new KafkaException(&quot;Unexpected error in fetch offset response: &quot; + groupError.message()));</span>
+                }
+<span class="nc" id="L1540">                return;</span>
+            }
+
+<span class="nc" id="L1543">            var offsets = new HashMap&lt;TopicPartition, OffsetAndMetadata&gt;();</span>
+<span class="nc" id="L1544">            var unstableTxnOffsetTopicPartitions = new HashSet&lt;TopicPartition&gt;();</span>
+<span class="nc" id="L1545">            var unauthorizedTopics = new HashSet&lt;String&gt;();</span>
+
+<span class="nc bnc" id="L1547" title="All 2 branches missed.">            for (var topic : group.topics()) {</span>
+<span class="nc bnc" id="L1548" title="All 2 branches missed.">                for (var partition : topic.partitions()) {</span>
+<span class="nc" id="L1549">                    var tp = new TopicPartition(</span>
+<span class="nc" id="L1550">                        topic.name(),</span>
+<span class="nc" id="L1551">                        partition.partitionIndex()</span>
+                    );
+<span class="nc" id="L1553">                    var error = Errors.forCode(partition.errorCode());</span>
+
+<span class="nc bnc" id="L1555" title="All 2 branches missed.">                    if (error != Errors.NONE) {</span>
+<span class="nc" id="L1556">                        log.debug(&quot;Failed to fetch offset for partition {}: {}&quot;, tp, error.message());</span>
+
+<span class="nc bnc" id="L1558" title="All 2 branches missed.">                        if (error == Errors.UNKNOWN_TOPIC_OR_PARTITION) {</span>
+<span class="nc" id="L1559">                            future.raise(new KafkaException(&quot;Topic or Partition &quot; + tp + &quot; does not exist&quot;));</span>
+<span class="nc" id="L1560">                            return;</span>
+<span class="nc bnc" id="L1561" title="All 2 branches missed.">                        } else if (error == Errors.TOPIC_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1562">                            unauthorizedTopics.add(tp.topic());</span>
+<span class="nc bnc" id="L1563" title="All 2 branches missed.">                        } else if (error == Errors.UNSTABLE_OFFSET_COMMIT) {</span>
+<span class="nc" id="L1564">                            unstableTxnOffsetTopicPartitions.add(tp);</span>
+                        } else {
+<span class="nc" id="L1566">                            future.raise(new KafkaException(&quot;Unexpected error in fetch offset response for partition &quot; +</span>
+<span class="nc" id="L1567">                                tp + &quot;: &quot; + error.message()));</span>
+<span class="nc" id="L1568">                            return;</span>
+                        }
+<span class="nc bnc" id="L1570" title="All 2 branches missed.">                    } else if (partition.committedOffset() &gt;= 0) {</span>
+                        // record the position with the offset (-1 indicates no committed offset to fetch);
+                        // if there's no committed offset, record as null
+<span class="nc" id="L1573">                        offsets.put(tp, new OffsetAndMetadata(</span>
+<span class="nc" id="L1574">                            partition.committedOffset(),</span>
+<span class="nc" id="L1575">                            RequestUtils.getLeaderEpoch(partition.committedLeaderEpoch()),</span>
+<span class="nc" id="L1576">                            partition.metadata()</span>
+                        ));
+                    } else {
+<span class="nc" id="L1579">                        log.info(&quot;Found no committed offset for partition {}&quot;, tp);</span>
+<span class="nc" id="L1580">                        offsets.put(tp, null);</span>
+                    }
+<span class="nc" id="L1582">                }</span>
+<span class="nc" id="L1583">            }</span>
+
+<span class="nc bnc" id="L1585" title="All 2 branches missed.">            if (!unauthorizedTopics.isEmpty()) {</span>
+<span class="nc" id="L1586">                future.raise(new TopicAuthorizationException(unauthorizedTopics));</span>
+<span class="nc bnc" id="L1587" title="All 2 branches missed.">            } else if (!unstableTxnOffsetTopicPartitions.isEmpty()) {</span>
+                // just retry
+<span class="nc" id="L1589">                log.info(&quot;The following partitions still have unstable offsets &quot; +</span>
+                             &quot;which are not cleared on the broker side: {}&quot; +
+                             &quot;, this could be either &quot; +
+                             &quot;transactional offsets waiting for completion, or &quot; +
+                             &quot;normal offsets waiting for replication after appending to local log&quot;, unstableTxnOffsetTopicPartitions);
+<span class="nc" id="L1594">                future.raise(new UnstableOffsetCommitException(&quot;There are unstable offsets for the requested topic partitions&quot;));</span>
+            } else {
+<span class="nc" id="L1596">                future.complete(offsets);</span>
+            }
+<span class="nc" id="L1598">        }</span>
+    }
+
+    private static class MetadataSnapshot {
+        private final int version;
+        private final Map&lt;String, List&lt;PartitionRackInfo&gt;&gt; partitionsPerTopic;
+
+<span class="nc" id="L1605">        private MetadataSnapshot(Optional&lt;String&gt; clientRack, SubscriptionState subscription, Cluster cluster, int version) {</span>
+<span class="nc" id="L1606">            Map&lt;String, List&lt;PartitionRackInfo&gt;&gt; partitionsPerTopic = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1607" title="All 2 branches missed.">            for (String topic : subscription.metadataTopics()) {</span>
+<span class="nc" id="L1608">                List&lt;PartitionInfo&gt; partitions = cluster.partitionsForTopic(topic);</span>
+<span class="nc bnc" id="L1609" title="All 2 branches missed.">                if (partitions != null) {</span>
+<span class="nc" id="L1610">                    List&lt;PartitionRackInfo&gt; partitionRacks = partitions.stream()</span>
+<span class="nc" id="L1611">                            .map(p -&gt; new PartitionRackInfo(clientRack, p))</span>
+<span class="nc" id="L1612">                            .collect(Collectors.toList());</span>
+<span class="nc" id="L1613">                    partitionsPerTopic.put(topic, partitionRacks);</span>
+                }
+<span class="nc" id="L1615">            }</span>
+<span class="nc" id="L1616">            this.partitionsPerTopic = partitionsPerTopic;</span>
+<span class="nc" id="L1617">            this.version = version;</span>
+<span class="nc" id="L1618">        }</span>
+
+        boolean matches(MetadataSnapshot other) {
+<span class="nc bnc" id="L1621" title="All 2 branches missed.">            if (version == other.version)</span>
+<span class="nc" id="L1622">                return true;</span>
+
+            // A rebalance is only needed if the metadata changed in a way that could change the
+            // assignment: a subscribed topic was added or removed, a topic's partition count
+            // changed, or the racks of a partition's replicas changed. But rack differences that are
+            // only due to a replica broker being temporarily offline (host and rack become unknown)
+            // are tolerated, so that a broker bounce does not trigger unnecessary rebalances.
+            // See PartitionRackInfo#equivalentTo.
+<span class="nc bnc" id="L1630" title="All 2 branches missed.">            if (partitionsPerTopic.size() != other.partitionsPerTopic.size())</span>
+<span class="nc" id="L1631">                return false;</span>
+
+<span class="nc bnc" id="L1633" title="All 2 branches missed.">            for (Map.Entry&lt;String, List&lt;PartitionRackInfo&gt;&gt; entry : partitionsPerTopic.entrySet()) {</span>
+<span class="nc" id="L1634">                List&lt;PartitionRackInfo&gt; partitionRacks = entry.getValue();</span>
+<span class="nc" id="L1635">                List&lt;PartitionRackInfo&gt; otherPartitionRacks = other.partitionsPerTopic.get(entry.getKey());</span>
+<span class="nc bnc" id="L1636" title="All 4 branches missed.">                if (otherPartitionRacks == null || otherPartitionRacks.size() != partitionRacks.size())</span>
+<span class="nc" id="L1637">                    return false;</span>
+<span class="nc bnc" id="L1638" title="All 2 branches missed.">                for (int i = 0; i &lt; partitionRacks.size(); i++) {</span>
+<span class="nc bnc" id="L1639" title="All 2 branches missed.">                    if (!partitionRacks.get(i).equivalentTo(otherPartitionRacks.get(i)))</span>
+<span class="nc" id="L1640">                        return false;</span>
+                }
+<span class="nc" id="L1642">            }</span>
+<span class="nc" id="L1643">            return true;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1648">            return &quot;(version&quot; + version + &quot;: &quot; + partitionsPerTopic + &quot;)&quot;;</span>
+        }
+    }
+
+    private class ConsumerCoordinatorMetrics extends AbstractCoordinatorMetrics {
+        private final Sensor commitSensor;
+
+        private ConsumerCoordinatorMetrics(Metrics metrics, String metricGrpPrefix) {
+<span class="nc" id="L1656">            this(new MetricsLedger(metrics), metricGrpPrefix);</span>
+<span class="nc" id="L1657">        }</span>
+
+<span class="nc" id="L1659">        private ConsumerCoordinatorMetrics(MetricsLedger metrics, String metricGrpPrefix) {</span>
+<span class="nc" id="L1660">            super(metrics);</span>
+<span class="nc" id="L1661">            String metricGrpName = metricGrpPrefix + COORDINATOR_METRICS_SUFFIX;</span>
+
+<span class="nc" id="L1663">            this.commitSensor = metrics.sensor(&quot;commit-latency&quot;);</span>
+<span class="nc" id="L1664">            this.commitSensor.add(metrics.metricName(&quot;commit-latency-avg&quot;,</span>
+                metricGrpName,
+                &quot;The average time taken for a commit request&quot;), new Avg());
+<span class="nc" id="L1667">            this.commitSensor.add(metrics.metricName(&quot;commit-latency-max&quot;,</span>
+                metricGrpName,
+                &quot;The max time taken for a commit request&quot;), new Max());
+<span class="nc" id="L1670">            this.commitSensor.add(createMeter(metricGrpName, &quot;commit&quot;, &quot;commit calls&quot;));</span>
+
+<span class="nc" id="L1672">            Measurable numParts = (config, now) -&gt; subscriptions.numAssignedPartitions();</span>
+<span class="nc" id="L1673">            metrics.addMetric(metrics.metricName(&quot;assigned-partitions&quot;,</span>
+                metricGrpName,
+                &quot;The number of partitions currently assigned to this consumer&quot;), numParts);
+<span class="nc" id="L1676">        }</span>
+    }
+
+    private static class PartitionRackInfo {
+        // Racks of the online replicas, keyed by replica id. Replicas on brokers without a
+        // configured rack are not tracked, since they cannot affect rack-aware assignment.
+        private final Map&lt;Integer, String&gt; onlineRacks;
+        // Ids of the offline replicas, whose broker is not in the current live-broker list (they
+        // resolve to an empty node), so their rack is unknown. Tracked by id so that a broker
+        // that is temporarily offline is not mistaken for a rack change.
+        private final Set&lt;Integer&gt; offlineReplicas;
+
+<span class="nc" id="L1688">        PartitionRackInfo(Optional&lt;String&gt; clientRack, PartitionInfo partition) {</span>
+<span class="nc" id="L1689">            Map&lt;Integer, String&gt; onlineRacks = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1690">            Set&lt;Integer&gt; offlineReplicas = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L1691" title="All 4 branches missed.">            if (clientRack.isPresent() &amp;&amp; partition.replicas() != null) {</span>
+<span class="nc bnc" id="L1692" title="All 2 branches missed.">                for (Node replica : partition.replicas()) {</span>
+<span class="nc bnc" id="L1693" title="All 2 branches missed.">                    if (replica.isEmpty())</span>
+<span class="nc" id="L1694">                        offlineReplicas.add(replica.id());</span>
+<span class="nc bnc" id="L1695" title="All 2 branches missed.">                    else if (replica.rack() != null)</span>
+<span class="nc" id="L1696">                        onlineRacks.put(replica.id(), replica.rack());</span>
+                }
+            }
+<span class="nc" id="L1699">            this.onlineRacks = onlineRacks;</span>
+<span class="nc" id="L1700">            this.offlineReplicas = offlineReplicas;</span>
+<span class="nc" id="L1701">        }</span>
+
+        /**
+         * Returns true if the two snapshots expose the same set of racks for assignment purposes.
+         * Replica changes that leave the set of racks unchanged (e.g. a replica moved to a
+         * different broker on one of the same racks) are not considered a change. A rack that is
+         * present in one snapshot but missing from the other is tolerated only when the replica
+         * it belongs to is offline (same replica id, rack unknown rather than changed),
+         * so a temporarily offline broker is not a rack change, while
+         * a rack that is actually added or removed still is.
+         */
+        boolean equivalentTo(PartitionRackInfo other) {
+<span class="nc bnc" id="L1713" title="All 4 branches missed.">            return racksAccountedForIn(other) &amp;&amp; other.racksAccountedForIn(this);</span>
+        }
+
+        /**
+         * Returns true if every online rack in this PartitionRackInfo snapshot is either still
+         * present in {@code other}, or belongs to a replica that is offline in {@code other}
+         * (its rack is unknown there, rather than changed).
+         */
+        private boolean racksAccountedForIn(PartitionRackInfo other) {
+<span class="nc bnc" id="L1722" title="All 2 branches missed.">            for (Map.Entry&lt;Integer, String&gt; replicaRack : onlineRacks.entrySet()) {</span>
+<span class="nc bnc" id="L1723" title="All 2 branches missed.">                if (!other.onlineRacks.containsValue(replicaRack.getValue()) &amp;&amp;</span>
+<span class="nc bnc" id="L1724" title="All 2 branches missed.">                        !other.offlineReplicas.contains(replicaRack.getKey())) {</span>
+<span class="nc" id="L1725">                    return false;</span>
+                }
+<span class="nc" id="L1727">            }</span>
+<span class="nc" id="L1728">            return true;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc bnc" id="L1733" title="All 2 branches missed.">            String racks = onlineRacks.isEmpty() ? &quot;NO_RACKS&quot; : &quot;racks=&quot; + onlineRacks;</span>
+<span class="nc bnc" id="L1734" title="All 2 branches missed.">            return offlineReplicas.isEmpty() ? racks : racks + &quot;, offlineReplicas=&quot; + offlineReplicas;</span>
+        }
+    }
+
+    private static class OffsetCommitCompletion {
+        private final OffsetCommitCallback callback;
+        private final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets;
+        private final Exception exception;
+
+<span class="nc" id="L1743">        private OffsetCommitCompletion(OffsetCommitCallback callback, Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, Exception exception) {</span>
+<span class="nc" id="L1744">            this.callback = callback;</span>
+<span class="nc" id="L1745">            this.offsets = offsets;</span>
+<span class="nc" id="L1746">            this.exception = exception;</span>
+<span class="nc" id="L1747">        }</span>
+
+        public void invoke() {
+<span class="nc bnc" id="L1750" title="All 2 branches missed.">            if (callback != null)</span>
+<span class="nc" id="L1751">                callback.onComplete(offsets, exception);</span>
+<span class="nc" id="L1752">        }</span>
+    }
+
+    /* test-only classes below */
+    RebalanceProtocol getProtocol() {
+<span class="nc" id="L1757">        return protocol;</span>
+    }
+
+    boolean poll(Timer timer) {
+<span class="nc" id="L1761">        return poll(timer, true);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

@@ -1,0 +1,500 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TestRaftServer.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">kafka.tools</a> &gt; <span class="el_source">TestRaftServer.scala</span></div><h1>TestRaftServer.scala</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.tools
+
+import java.net.InetSocketAddress
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+import java.util.concurrent.{CompletableFuture, CountDownLatch, LinkedBlockingDeque, TimeUnit}
+import joptsimple.{OptionException, OptionSpec}
+import kafka.network.SocketServer
+import kafka.raft.KafkaRaftManager
+import kafka.server.{KafkaConfig, KafkaRequestHandlerPool, KafkaRequestHandlerPoolFactory}
+import kafka.utils.Logging
+import org.apache.kafka.common.message.ApiMessageType.ListenerType
+import org.apache.kafka.common.metrics.Metrics
+import org.apache.kafka.common.metrics.stats.Percentiles.BucketSizing
+import org.apache.kafka.common.metrics.stats.{Meter, Percentile, Percentiles}
+import org.apache.kafka.common.network.ListenerName
+import org.apache.kafka.common.protocol.{ObjectSerializationCache, Writable}
+import org.apache.kafka.common.security.scram.internals.ScramMechanism
+import org.apache.kafka.common.security.token.delegation.internals.DelegationTokenCache
+import org.apache.kafka.common.utils.internals.Exit
+import org.apache.kafka.common.utils.{Time, Utils}
+import org.apache.kafka.common.{TopicPartition, Uuid, protocol}
+import org.apache.kafka.raft.errors.NotLeaderException
+import org.apache.kafka.raft.{Batch, BatchReader, Endpoints, KRaftConfigs, LeaderAndEpoch, QuorumConfig, RaftClient, RaftManager}
+import org.apache.kafka.security.CredentialProvider
+import org.apache.kafka.server.SimpleApiVersionManager
+import org.apache.kafka.server.common.{FinalizedFeatures, MetadataVersion}
+import org.apache.kafka.server.common.serialization.RecordSerde
+import org.apache.kafka.server.fault.ProcessTerminatingFaultHandler
+import org.apache.kafka.server.util.{CommandDefaultOptions, CommandLineUtils, ShutdownableThread}
+import org.apache.kafka.snapshot.SnapshotReader
+
+import scala.jdk.CollectionConverters._
+
+/**
+ * This is an experimental server which is intended for testing the performance
+ * of the Raft implementation. It uses a hard-coded `__raft_performance_test` topic.
+ */
+<span class="nc bnc" id="L55" title="All 4 branches missed.">class TestRaftServer(</span>
+<span class="nc" id="L56">  val config: KafkaConfig,</span>
+<span class="nc" id="L57">  val nodeDirectoryId: Uuid,</span>
+<span class="nc" id="L58">  val throughput: Int,</span>
+<span class="nc" id="L59">  val recordSize: Int</span>
+<span class="nc" id="L60">) extends Logging {</span>
+  import kafka.tools.TestRaftServer._
+
+<span class="nc" id="L63">  private val partition = new TopicPartition(&quot;__raft_performance_test&quot;, 0)</span>
+  // The topic ID must be constant. This value was chosen as to not conflict with the topic ID used for __cluster_metadata.
+<span class="nc" id="L65">  private val topicId = new Uuid(0L, 2L)</span>
+<span class="nc" id="L66">  private val time = Time.SYSTEM</span>
+<span class="nc" id="L67">  private val metrics = new Metrics(time)</span>
+<span class="nc" id="L68">  private val shutdownLatch = new CountDownLatch(1)</span>
+<span class="nc" id="L69">  private val threadNamePrefix = &quot;test-raft&quot;</span>
+<span class="nc" id="L70">  private val requestHandlerPoolFactory = new KafkaRequestHandlerPoolFactory()</span>
+
+<span class="nc" id="L72">  var socketServer: SocketServer = _</span>
+<span class="nc" id="L73">  var credentialProvider: CredentialProvider = _</span>
+<span class="nc" id="L74">  var tokenCache: DelegationTokenCache = _</span>
+<span class="nc" id="L75">  var dataPlaneRequestHandlerPool: KafkaRequestHandlerPool = _</span>
+<span class="nc" id="L76">  private var workloadGenerator: RaftWorkloadGenerator = _</span>
+<span class="nc" id="L77">  var raftManager: KafkaRaftManager[Array[Byte]] = _</span>
+
+  def startup(): Unit = {
+<span class="nc" id="L80">    tokenCache = new DelegationTokenCache(ScramMechanism.mechanismNames)</span>
+<span class="nc" id="L81">    credentialProvider = new CredentialProvider(ScramMechanism.mechanismNames, tokenCache)</span>
+
+<span class="nc" id="L83">    val apiVersionManager = new SimpleApiVersionManager(</span>
+<span class="nc" id="L84">      ListenerType.CONTROLLER,</span>
+<span class="nc" id="L85">      true,</span>
+<span class="nc" id="L86">      () =&gt; FinalizedFeatures.fromMetadataVersion(MetadataVersion.MINIMUM_VERSION))</span>
+<span class="nc" id="L87">    socketServer = new SocketServer(config, metrics, time, credentialProvider, apiVersionManager)</span>
+
+    val endpoints = Endpoints.fromInetSocketAddresses(
+<span class="nc" id="L90">      config.effectiveAdvertisedControllerListeners</span>
+<span class="nc" id="L91">        .map { endpoint =&gt;</span>
+<span class="nc" id="L92">          (ListenerName.normalised(endpoint.listener), InetSocketAddress.createUnresolved(endpoint.host, endpoint.port))</span>
+        }
+<span class="nc" id="L94">        .toMap</span>
+        .asJava
+    )
+
+<span class="nc" id="L98">    raftManager = new KafkaRaftManager[Array[Byte]](</span>
+<span class="nc" id="L99">      Uuid.ZERO_UUID.toString,</span>
+<span class="nc" id="L100">      config,</span>
+<span class="nc" id="L101">      nodeDirectoryId,</span>
+<span class="nc" id="L102">      new ByteArraySerde,</span>
+<span class="nc" id="L103">      partition,</span>
+<span class="nc" id="L104">      topicId,</span>
+<span class="nc" id="L105">      time,</span>
+<span class="nc" id="L106">      metrics,</span>
+<span class="nc" id="L107">      _ =&gt; {},</span>
+<span class="nc" id="L108">      Some(threadNamePrefix),</span>
+<span class="nc" id="L109">      CompletableFuture.completedFuture(QuorumConfig.parseVoterConnections(config.quorumConfig.voters)),</span>
+<span class="nc" id="L110">      QuorumConfig.parseBootstrapServers(config.quorumConfig.bootstrapServers),</span>
+<span class="nc" id="L111">      endpoints,</span>
+<span class="nc" id="L112">      new ProcessTerminatingFaultHandler.Builder().build()</span>
+    )
+
+<span class="nc" id="L115">    workloadGenerator = new RaftWorkloadGenerator(</span>
+<span class="nc" id="L116">      raftManager,</span>
+<span class="nc" id="L117">      time,</span>
+<span class="nc" id="L118">      recordsPerSec = throughput,</span>
+<span class="nc" id="L119">      recordSize = recordSize</span>
+    )
+
+<span class="nc" id="L122">    val requestHandler = new TestRaftRequestHandler(</span>
+<span class="nc" id="L123">      raftManager,</span>
+<span class="nc" id="L124">      socketServer.dataPlaneRequestChannel,</span>
+<span class="nc" id="L125">      time,</span>
+<span class="nc" id="L126">      apiVersionManager</span>
+    )
+
+<span class="nc" id="L129">    dataPlaneRequestHandlerPool = requestHandlerPoolFactory.createPool(</span>
+<span class="nc" id="L130">      config.brokerId,</span>
+<span class="nc" id="L131">      socketServer.dataPlaneRequestChannel,</span>
+<span class="nc" id="L132">      requestHandler,</span>
+<span class="nc" id="L133">      time,</span>
+<span class="nc" id="L134">      config.numIoThreads,</span>
+<span class="nc" id="L135">      &quot;broker&quot;</span>
+    )
+
+<span class="nc" id="L138">    workloadGenerator.start()</span>
+<span class="nc" id="L139">    raftManager.startup()</span>
+<span class="nc" id="L140">    socketServer.enableRequestProcessing(Map.empty)</span>
+  }
+
+  def shutdown(): Unit = {
+<span class="nc bnc" id="L144" title="All 2 branches missed.">    if (raftManager != null)</span>
+<span class="nc" id="L145">      Utils.swallow(this.logger.underlying, () =&gt; raftManager.shutdown())</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">    if (workloadGenerator != null)</span>
+<span class="nc" id="L147">      Utils.swallow(this.logger.underlying, () =&gt; workloadGenerator.shutdown())</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">    if (dataPlaneRequestHandlerPool != null)</span>
+<span class="nc" id="L149">      Utils.swallow(this.logger.underlying, () =&gt; dataPlaneRequestHandlerPool.shutdown())</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">    if (socketServer != null)</span>
+<span class="nc" id="L151">      Utils.swallow(this.logger.underlying, () =&gt; socketServer.shutdown())</span>
+<span class="nc" id="L152">    Utils.closeQuietly(metrics, &quot;metrics&quot;)</span>
+<span class="nc" id="L153">    shutdownLatch.countDown()</span>
+  }
+
+  def awaitShutdown(): Unit = {
+<span class="nc" id="L157">    shutdownLatch.await()</span>
+  }
+
+<span class="nc bnc" id="L160" title="All 2 branches missed.">  private class RaftWorkloadGenerator(</span>
+<span class="nc" id="L161">    raftManager: RaftManager[Array[Byte]],</span>
+<span class="nc" id="L162">    time: Time,</span>
+    recordsPerSec: Int,
+    recordSize: Int
+<span class="nc" id="L165">  ) extends ShutdownableThread(&quot;raft-workload-generator&quot;)</span>
+    with RaftClient.Listener[Array[Byte]] {
+
+    private sealed trait RaftEvent
+<span class="nc bnc" id="L169" title="All 26 branches missed.">    private case class HandleClaim(epoch: Int) extends RaftEvent</span>
+<span class="nc bnc" id="L170" title="All 4 branches missed.">    private case object HandleResign extends RaftEvent</span>
+<span class="nc bnc" id="L171" title="All 30 branches missed.">    private case class HandleCommit(reader: BatchReader[Array[Byte]]) extends RaftEvent</span>
+<span class="nc bnc" id="L172" title="All 30 branches missed.">    private case class HandleSnapshot(reader: SnapshotReader[Array[Byte]]) extends RaftEvent</span>
+<span class="nc bnc" id="L173" title="All 4 branches missed.">    private case object Shutdown extends RaftEvent</span>
+
+<span class="nc" id="L175">    private val eventQueue = new LinkedBlockingDeque[RaftEvent]()</span>
+<span class="nc" id="L176">    private val stats = new WriteStats(metrics, time, printIntervalMs = 5000)</span>
+<span class="nc" id="L177">    private val payload = new Array[Byte](recordSize)</span>
+<span class="nc" id="L178">    private val pendingAppends = new LinkedBlockingDeque[PendingAppend]()</span>
+<span class="nc" id="L179">    private val recordCount = new AtomicInteger(0)</span>
+<span class="nc" id="L180">    private val throttler = new ThroughputThrottler(time, recordsPerSec)</span>
+
+<span class="nc" id="L182">    private var claimedEpoch: Option[Int] = None</span>
+
+<span class="nc" id="L184">    raftManager.client.register(this)</span>
+
+    override def handleLeaderChange(newLeaderAndEpoch: LeaderAndEpoch): Unit = {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">      if (newLeaderAndEpoch.isLeader(config.nodeId)) {</span>
+<span class="nc" id="L188">        eventQueue.offer(HandleClaim(newLeaderAndEpoch.epoch))</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">      } else if (claimedEpoch.isDefined) {</span>
+<span class="nc" id="L190">        eventQueue.offer(HandleResign)</span>
+      }
+    }
+
+    override def handleCommit(reader: BatchReader[Array[Byte]]): Unit = {
+<span class="nc" id="L195">      eventQueue.offer(HandleCommit(reader))</span>
+    }
+
+    override def handleLoadSnapshot(reader: SnapshotReader[Array[Byte]]): Unit = {
+<span class="nc" id="L199">      eventQueue.offer(HandleSnapshot(reader))</span>
+    }
+
+    override def handleLoadBootstrap(reader: SnapshotReader[Array[Byte]]): Unit = {
+      // TestRaftServer does not process bootstrap snapshots.
+<span class="nc" id="L204">      reader.close()</span>
+    }
+
+    override def initiateShutdown(): Boolean = {
+<span class="nc" id="L208">      val initiated = super.initiateShutdown()</span>
+<span class="nc" id="L209">      eventQueue.offer(Shutdown)</span>
+<span class="nc" id="L210">      initiated</span>
+    }
+
+    private def sendNow(
+      leaderEpoch: Int,
+      currentTimeMs: Long
+    ): Unit = {
+<span class="nc" id="L217">      recordCount.incrementAndGet()</span>
+      try {
+<span class="nc" id="L219">        val offset = raftManager.client.prepareAppend(leaderEpoch, List(payload).asJava)</span>
+<span class="nc" id="L220">        raftManager.client.schedulePreparedAppend()</span>
+<span class="nc" id="L221">        pendingAppends.offer(PendingAppend(offset, currentTimeMs))</span>
+      } catch {
+        case e: NotLeaderException =&gt;
+<span class="nc bnc" id="L224" title="All 2 branches missed.">          logger.debug(s&quot;Append failed because this node is no longer leader in epoch $leaderEpoch&quot;, e)</span>
+<span class="nc" id="L225">          time.sleep(10)</span>
+      }
+    }
+
+    override def doWork(): Unit = {
+<span class="nc" id="L230">      val startTimeMs = time.milliseconds()</span>
+<span class="nc" id="L231">      val eventTimeoutMs = claimedEpoch.map { leaderEpoch =&gt;</span>
+<span class="nc" id="L232">        val throttleTimeMs = throttler.maybeThrottle(recordCount.get() + 1, startTimeMs)</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if (throttleTimeMs == 0) {</span>
+<span class="nc" id="L234">          sendNow(leaderEpoch, startTimeMs)</span>
+        }
+<span class="nc" id="L236">        throttleTimeMs</span>
+<span class="nc" id="L237">      }.getOrElse(Long.MaxValue)</span>
+
+<span class="nc" id="L239">      eventQueue.poll(eventTimeoutMs, TimeUnit.MILLISECONDS) match {</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        case HandleClaim(epoch) =&gt;</span>
+<span class="nc" id="L241">          claimedEpoch = Some(epoch)</span>
+<span class="nc" id="L242">          throttler.reset()</span>
+<span class="nc" id="L243">          pendingAppends.clear()</span>
+<span class="nc" id="L244">          recordCount.set(0)</span>
+
+<span class="nc bnc" id="L246" title="All 2 branches missed.">        case HandleResign =&gt;</span>
+<span class="nc" id="L247">          claimedEpoch = None</span>
+<span class="nc" id="L248">          pendingAppends.clear()</span>
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        case HandleCommit(reader) =&gt;</span>
+          try {
+<span class="nc bnc" id="L252" title="All 2 branches missed.">            while (reader.hasNext) {</span>
+<span class="nc" id="L253">              val batch = reader.next()</span>
+<span class="nc" id="L254">              claimedEpoch.foreach { leaderEpoch =&gt;</span>
+<span class="nc" id="L255">                handleLeaderCommit(leaderEpoch, batch)</span>
+              }
+            }
+          } finally {
+<span class="nc" id="L259">            reader.close()</span>
+          }
+
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        case HandleSnapshot(reader) =&gt;</span>
+          // Ignore snapshots; only interested in records appended by this leader
+<span class="nc" id="L264">          reader.close()</span>
+
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        case Shutdown =&gt; // Ignore shutdown command</span>
+
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        case null =&gt; // Ignore null when timeout expires.</span>
+      }
+    }
+
+    private def handleLeaderCommit(
+      leaderEpoch: Int,
+      batch: Batch[Array[Byte]]
+    ): Unit = {
+<span class="nc" id="L276">      val batchEpoch = batch.epoch()</span>
+<span class="nc" id="L277">      var offset = batch.baseOffset</span>
+<span class="nc" id="L278">      val currentTimeMs = time.milliseconds()</span>
+
+      // We are only interested in batches written during the current leader's
+      // epoch since this allows us to rely on the local clock
+<span class="nc bnc" id="L282" title="All 2 branches missed.">      if (batchEpoch != leaderEpoch) {</span>
+<span class="nc" id="L283">        return</span>
+      }
+
+<span class="nc" id="L286">      for (record &lt;- batch.records.asScala) {</span>
+<span class="nc" id="L287">        val pendingAppend = pendingAppends.peek()</span>
+
+<span class="nc bnc" id="L289" title="All 4 branches missed.">        if (pendingAppend == null || pendingAppend.offset != offset) {</span>
+<span class="nc" id="L290">          throw new IllegalStateException(s&quot;Unexpected append at offset $offset. The &quot; +</span>
+<span class="nc" id="L291">            s&quot;next offset we expected was ${pendingAppend.offset}&quot;)</span>
+        }
+
+<span class="nc" id="L294">        pendingAppends.poll()</span>
+<span class="nc" id="L295">        val latencyMs = math.max(0, currentTimeMs - pendingAppend.appendTimeMs).toInt</span>
+<span class="nc" id="L296">        stats.record(latencyMs, record.length, currentTimeMs)</span>
+<span class="nc" id="L297">        offset += 1</span>
+      }
+    }
+
+  }
+
+}
+
+<span class="nc bnc" id="L305" title="All 6 branches missed.">object TestRaftServer extends Logging {</span>
+
+<span class="nc bnc" id="L307" title="All 20 branches missed.">  case class PendingAppend(</span>
+<span class="nc" id="L308">    offset: Long,</span>
+<span class="nc" id="L309">    appendTimeMs: Long</span>
+  ) {
+    override def toString: String = {
+<span class="nc" id="L312">      s&quot;PendingAppend(offset=$offset, appendTimeMs=$appendTimeMs)&quot;</span>
+    }
+  }
+
+<span class="nc" id="L316">  class ByteArraySerde extends RecordSerde[Array[Byte]] {</span>
+    override def recordSize(data: Array[Byte], serializationCache: ObjectSerializationCache): Int = {
+<span class="nc" id="L318">      data.length</span>
+    }
+
+    override def write(data: Array[Byte], serializationCache: ObjectSerializationCache, out: Writable): Unit = {
+<span class="nc" id="L322">      out.writeByteArray(data)</span>
+    }
+
+<span class="nc" id="L325">    override def read(input: protocol.Readable, size: Int): Array[Byte] = input.readArray(size)</span>
+  }
+
+<span class="nc" id="L328">  private class LatencyHistogram(</span>
+    metrics: Metrics,
+    name: String,
+    group: String
+  ) {
+<span class="nc bnc" id="L333" title="All 2 branches missed.">    private val sensor = metrics.sensor(name)</span>
+<span class="nc" id="L334">    private val latencyP75Name = metrics.metricName(s&quot;$name.p75&quot;, group)</span>
+<span class="nc" id="L335">    private val latencyP99Name = metrics.metricName(s&quot;$name.p99&quot;, group)</span>
+<span class="nc" id="L336">    private val latencyP999Name = metrics.metricName(s&quot;$name.p999&quot;, group)</span>
+
+<span class="nc" id="L338">    sensor.add(new Percentiles(</span>
+<span class="nc" id="L339">      1000,</span>
+<span class="nc" id="L340">      250.0,</span>
+<span class="nc" id="L341">      BucketSizing.CONSTANT,</span>
+<span class="nc" id="L342">      new Percentile(latencyP75Name, 75),</span>
+<span class="nc" id="L343">      new Percentile(latencyP99Name, 99),</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">      new Percentile(latencyP999Name, 99.9)</span>
+    ))
+
+<span class="nc" id="L347">    private val p75 = metrics.metric(latencyP75Name)</span>
+<span class="nc" id="L348">    private val p99 = metrics.metric(latencyP99Name)</span>
+<span class="nc" id="L349">    private val p999 = metrics.metric(latencyP999Name)</span>
+
+<span class="nc" id="L351">    def record(latencyMs: Int): Unit = sensor.record(latencyMs)</span>
+<span class="nc" id="L352">    def currentP75: Double = p75.metricValue.asInstanceOf[Double]</span>
+<span class="nc" id="L353">    def currentP99: Double = p99.metricValue.asInstanceOf[Double]</span>
+<span class="nc" id="L354">    def currentP999: Double = p999.metricValue.asInstanceOf[Double]</span>
+  }
+
+<span class="nc" id="L357">  private class ThroughputMeter(</span>
+    metrics: Metrics,
+    name: String,
+    group: String
+  ) {
+<span class="nc bnc" id="L362" title="All 2 branches missed.">    private val sensor = metrics.sensor(name)</span>
+<span class="nc" id="L363">    private val throughputRateName = metrics.metricName(s&quot;$name.rate&quot;, group)</span>
+<span class="nc" id="L364">    private val throughputTotalName = metrics.metricName(s&quot;$name.total&quot;, group)</span>
+
+<span class="nc bnc" id="L366" title="All 2 branches missed.">    sensor.add(new Meter(throughputRateName, throughputTotalName))</span>
+
+<span class="nc" id="L368">    private val rate = metrics.metric(throughputRateName)</span>
+
+<span class="nc" id="L370">    def record(bytes: Int): Unit = sensor.record(bytes)</span>
+<span class="nc" id="L371">    def currentRate: Double = rate.metricValue.asInstanceOf[Double]</span>
+  }
+
+<span class="nc" id="L374">  private class ThroughputThrottler(</span>
+<span class="nc" id="L375">    time: Time,</span>
+<span class="nc" id="L376">    targetRecordsPerSec: Int</span>
+  ) {
+<span class="nc" id="L378">    private val startTimeMs = new AtomicLong(time.milliseconds())</span>
+
+<span class="nc bnc" id="L380" title="All 2 branches missed.">    require(targetRecordsPerSec &gt; 0)</span>
+
+    def reset(): Unit = {
+<span class="nc" id="L383">      this.startTimeMs.set(time.milliseconds())</span>
+    }
+
+    def maybeThrottle(
+      currentCount: Int,
+      currentTimeMs: Long
+    ): Long = {
+<span class="nc" id="L390">      val targetDurationMs = math.round(currentCount / targetRecordsPerSec.toDouble * 1000)</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">      if (targetDurationMs &gt; 0) {</span>
+<span class="nc" id="L392">        val targetDeadlineMs = startTimeMs.get() + targetDurationMs</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (targetDeadlineMs &gt; currentTimeMs) {</span>
+<span class="nc" id="L394">          val throttleDurationMs = targetDeadlineMs - currentTimeMs</span>
+<span class="nc" id="L395">          return throttleDurationMs</span>
+        }
+      }
+<span class="nc" id="L398">      0</span>
+    }
+  }
+
+<span class="nc" id="L402">  private class WriteStats(</span>
+    metrics: Metrics,
+    time: Time,
+<span class="nc" id="L405">    printIntervalMs: Long</span>
+  ) {
+<span class="nc" id="L407">    private var lastReportTimeMs = time.milliseconds()</span>
+<span class="nc" id="L408">    private val latency = new LatencyHistogram(metrics, name = &quot;commit.latency&quot;, group = &quot;kafka.raft&quot;)</span>
+<span class="nc" id="L409">    private val throughput = new ThroughputMeter(metrics, name = &quot;bytes.committed&quot;, group = &quot;kafka.raft&quot;)</span>
+
+    def record(
+      latencyMs: Int,
+      bytes: Int,
+      currentTimeMs: Long
+    ): Unit = {
+<span class="nc" id="L416">      throughput.record(bytes)</span>
+<span class="nc" id="L417">      latency.record(latencyMs)</span>
+
+<span class="nc bnc" id="L419" title="All 2 branches missed.">      if (currentTimeMs - lastReportTimeMs &gt;= printIntervalMs) {</span>
+<span class="nc" id="L420">        printSummary()</span>
+<span class="nc" id="L421">        this.lastReportTimeMs = currentTimeMs</span>
+      }
+    }
+
+    private def printSummary(): Unit = {
+<span class="nc" id="L426">      println(&quot;Throughput (bytes/second): %.2f, Latency (ms): %.1f p75 %.1f p99 %.1f p999&quot;.format(</span>
+<span class="nc" id="L427">        throughput.currentRate,</span>
+<span class="nc" id="L428">        latency.currentP75,</span>
+<span class="nc" id="L429">        latency.currentP99,</span>
+<span class="nc" id="L430">        latency.currentP999</span>
+      ))
+    }
+  }
+
+<span class="nc" id="L435">  private class TestRaftServerOptions(args: Array[String]) extends CommandDefaultOptions(args) {</span>
+<span class="nc" id="L436">    val configOpt: OptionSpec[String] = parser.accepts(&quot;config&quot;, &quot;REQUIRED: The configured file&quot;)</span>
+      .withRequiredArg
+<span class="nc" id="L438">      .describedAs(&quot;filename&quot;)</span>
+<span class="nc" id="L439">      .ofType(classOf[String])</span>
+
+<span class="nc" id="L441">    val throughputOpt: OptionSpec[Int] = parser.accepts(&quot;throughput&quot;,</span>
+<span class="nc" id="L442">      &quot;The number of records per second the leader will write to the metadata topic&quot;)</span>
+      .withRequiredArg
+<span class="nc" id="L444">      .describedAs(&quot;records/sec&quot;)</span>
+<span class="nc" id="L445">      .ofType(classOf[Int])</span>
+<span class="nc" id="L446">      .defaultsTo(5000)</span>
+
+<span class="nc" id="L448">    val recordSizeOpt: OptionSpec[Int] = parser.accepts(&quot;record-size&quot;, &quot;The size of each record&quot;)</span>
+      .withRequiredArg
+<span class="nc" id="L450">      .describedAs(&quot;size in bytes&quot;)</span>
+<span class="nc" id="L451">      .ofType(classOf[Int])</span>
+<span class="nc" id="L452">      .defaultsTo(256)</span>
+
+<span class="nc" id="L454">    val directoryId: OptionSpec[String] = parser.accepts(&quot;replica-directory-id&quot;, &quot;REQUIRED: The directory id of the replica&quot;)</span>
+      .withRequiredArg
+<span class="nc" id="L456">      .describedAs(&quot;directory id&quot;)</span>
+<span class="nc" id="L457">      .ofType(classOf[String])</span>
+
+<span class="nc" id="L459">    options = parser.parse(args : _*)</span>
+
+<span class="nc" id="L461">    def checkArgs(): Unit = CommandLineUtils.checkRequiredArgs(parser, options, configOpt, directoryId)</span>
+  }
+
+  def main(args: Array[String]): Unit = {
+<span class="nc" id="L465">    val opts = new TestRaftServerOptions(args)</span>
+    try {
+<span class="nc" id="L467">      CommandLineUtils.maybePrintHelpOrVersion(opts,</span>
+<span class="nc" id="L468">        &quot;Standalone raft server for performance testing&quot;)</span>
+<span class="nc" id="L469">      opts.checkArgs()</span>
+
+<span class="nc" id="L471">      val configFile = opts.options.valueOf(opts.configOpt)</span>
+<span class="nc" id="L472">      val directoryIdAsString = opts.options.valueOf(opts.directoryId)</span>
+
+<span class="nc" id="L474">      val serverProps = Utils.loadProps(configFile)</span>
+
+      // KafkaConfig requires either `process.roles` or `zookeeper.connect`. Neither are
+      // actually used by the test server, so we fill in `process.roles` with an arbitrary value.
+<span class="nc" id="L478">      serverProps.put(KRaftConfigs.PROCESS_ROLES_CONFIG, &quot;controller&quot;)</span>
+
+<span class="nc" id="L480">      val config = KafkaConfig.fromProps(serverProps, doLog = false)</span>
+<span class="nc" id="L481">      val throughput = opts.options.valueOf(opts.throughputOpt)</span>
+<span class="nc" id="L482">      val recordSize = opts.options.valueOf(opts.recordSizeOpt)</span>
+<span class="nc" id="L483">      val server = new TestRaftServer(config, Uuid.fromString(directoryIdAsString), throughput, recordSize)</span>
+
+<span class="nc" id="L485">      Exit.addShutdownHook(&quot;raft-shutdown-hook&quot;, () =&gt; server.shutdown())</span>
+
+<span class="nc" id="L487">      server.startup()</span>
+<span class="nc" id="L488">      server.awaitShutdown()</span>
+<span class="nc" id="L489">      Exit.exit(0)</span>
+    } catch {
+      case e: OptionException =&gt;
+<span class="nc" id="L492">        CommandLineUtils.printUsageAndExit(opts.parser, e.getMessage)</span>
+      case e: Throwable =&gt;
+<span class="nc" id="L494">        fatal(&quot;Exiting raft server due to fatal exception&quot;, e)</span>
+<span class="nc" id="L495">        Exit.exit(1)</span>
+    }
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

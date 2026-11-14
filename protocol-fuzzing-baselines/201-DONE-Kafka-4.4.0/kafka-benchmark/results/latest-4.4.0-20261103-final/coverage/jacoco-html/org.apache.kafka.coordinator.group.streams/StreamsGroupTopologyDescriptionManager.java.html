@@ -1,0 +1,639 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamsGroupTopologyDescriptionManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.group.streams</a> &gt; <span class="el_source">StreamsGroupTopologyDescriptionManager.java</span></div><h1>StreamsGroupTopologyDescriptionManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.coordinator.group.streams;
+
+import org.apache.kafka.common.errors.CoordinatorLoadInProgressException;
+import org.apache.kafka.common.errors.CoordinatorNotAvailableException;
+import org.apache.kafka.common.errors.GroupIdNotFoundException;
+import org.apache.kafka.common.errors.NotCoordinatorException;
+import org.apache.kafka.common.message.StreamsGroupDescribeResponseData;
+import org.apache.kafka.common.message.StreamsGroupHeartbeatResponseData;
+import org.apache.kafka.common.message.StreamsGroupTopologyDescriptionUpdateResponseData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.ApiError;
+import org.apache.kafka.common.requests.StreamsGroupHeartbeatResponse.Status;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.coordinator.group.api.streams.StreamsGroupTopologyDescription;
+import org.apache.kafka.coordinator.group.api.streams.StreamsGroupTopologyDescriptionPlugin;
+import org.apache.kafka.coordinator.group.api.streams.StreamsTopologyDescriptionPermanentFailureException;
+import org.apache.kafka.coordinator.group.metrics.GroupCoordinatorMetrics;
+import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.server.util.timer.TimerTask;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.common.requests.StreamsGroupDescribeResponse.TOPOLOGY_DESCRIPTION_STATUS_AVAILABLE;
+import static org.apache.kafka.common.requests.StreamsGroupDescribeResponse.TOPOLOGY_DESCRIPTION_STATUS_ERROR;
+import static org.apache.kafka.common.requests.StreamsGroupDescribeResponse.TOPOLOGY_DESCRIPTION_STATUS_NOT_STORED;
+
+/**
+ * Broker-level component that owns the streams-group topology description plugin reference
+ * and the per-group re-solicitation back-off. The push-RPC chain (validate → convert →
+ * plugin → metadata write → back-off mutation) and the periodic cleanup cycle's body live
+ * on {@code GroupCoordinatorService}; this class exposes the building blocks
+ * ({@link #invokeSetTopology}, {@link #completeEpochWrite}, {@link #armBackoff},
+ * {@link #invokeDeleteTopologies}, {@link #clearBackoffGroup}) and one harness method,
+ * {@link #startCleanupCycle}, that wraps a service-supplied cycle body with single-flight
+ * scheduling on the broker timer.
+ *
+ * &lt;p&gt;This class is broker-level (one instance per {@code GroupCoordinatorService}); the
+ * back-off map is keyed by {@code groupId} and shared across all partitions hosted on the
+ * broker. State here is intentionally non-timeline and non-replayed: it is rebuilt from
+ * scratch on broker restart, and the persisted {@code StoredDescriptionTopologyEpoch} /
+ * {@code FailedDescriptionTopologyEpoch} fields on each streams group drive
+ * convergence after a restart.
+ */
+public class StreamsGroupTopologyDescriptionManager implements AutoCloseable {
+    private final Logger log;
+    private final Optional&lt;StreamsGroupTopologyDescriptionPlugin&gt; plugin;
+    private final StreamsGroupTopologyDescriptionBackoff backoff;
+    // Get sensors are recorded here, not in GroupCoordinatorService like set/delete:
+    // the get outcome is only finally classified inside applyGetTopologyOutcome, so the metric lives next to that single source of truth.
+    private final GroupCoordinatorMetrics metrics;
+
+    /**
+     * True between {@link #startCleanupCycle} and {@link #close}. The {@link TimerTask}
+     * checks this on each tick before invoking the cycle supplier, so {@code close} flips
+     * the flag and the next tick refuses to fire even if {@code cancel} on the task races.
+     */
+<span class="nc" id="L86">    private final AtomicBoolean running = new AtomicBoolean(false);</span>
+
+    /**
+     * Single-flight guard for the periodic cleanup cycle: a tick that fires while the
+     * previous cycle is still settling is dropped with a warn-level log. Set true in
+     * {@link #runOnce} before invoking the supplier; released by the terminal
+     * {@code whenComplete} attached to the future the supplier returns.
+     */
+<span class="nc" id="L94">    private final AtomicBoolean cycleInFlight = new AtomicBoolean(false);</span>
+
+    /**
+     * The currently-scheduled cleanup tick on the broker-level {@link Timer}.
+     * Self-rescheduled inside the {@link TimerTask}'s {@code run}; {@link #close} cancels
+     * this snapshot and the task's own re-arm check observes {@code running == false}
+     * so the next tick does not re-schedule itself.
+     */
+    private volatile TimerTask scheduledTask;
+
+    public StreamsGroupTopologyDescriptionManager(
+        LogContext logContext,
+        Optional&lt;StreamsGroupTopologyDescriptionPlugin&gt; plugin,
+        Time time,
+        GroupCoordinatorMetrics metrics
+<span class="nc" id="L109">    ) {</span>
+<span class="nc" id="L110">        this.log = logContext.logger(StreamsGroupTopologyDescriptionManager.class);</span>
+<span class="nc" id="L111">        this.plugin = plugin;</span>
+<span class="nc" id="L112">        this.backoff = new StreamsGroupTopologyDescriptionBackoff(time);</span>
+<span class="nc" id="L113">        this.metrics = metrics;</span>
+<span class="nc" id="L114">    }</span>
+
+    /**
+     * Arm the periodic cleanup cycle. The manager owns the scheduling harness — timer task,
+     * single-flight guard, running flag — and fires the service-supplied {@code cycleSupplier}
+     * on every tick; the cycle body (which operations to schedule on the runtime in what
+     * order) lives entirely on the service side. No-op when no plugin is configured. Must
+     * be called before {@link #close}; a second call while already running logs and is
+     * otherwise a no-op.
+     */
+    public void startCleanupCycle(
+        Timer timer,
+        long cleanupCheckIntervalMs,
+        Supplier&lt;CompletableFuture&lt;?&gt;&gt; cycleSupplier
+    ) {
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (plugin.isEmpty()) return;</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">        if (!running.compareAndSet(false, true)) {</span>
+<span class="nc" id="L131">            log.warn(&quot;Topology-description cleanup cycle is already started.&quot;);</span>
+<span class="nc" id="L132">            return;</span>
+        }
+<span class="nc" id="L134">        scheduleNextTick(timer, cleanupCheckIntervalMs, cycleSupplier);</span>
+<span class="nc" id="L135">    }</span>
+
+    /**
+     * Stop the cleanup cycle and release plugin-side resources. Flips {@code running}
+     * false (so the next timer tick refuses to fire) and cancels the currently-scheduled
+     * tick, then closes the plugin. Called by {@code GroupCoordinatorService.shutdown}
+     * before the runtime is closed, so writes already scheduled by the previous tick
+     * drain through their own futures rather than racing the runtime tear-down.
+     */
+    @Override
+    public void close() throws Exception {
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (running.compareAndSet(true, false)) {</span>
+<span class="nc" id="L147">            TimerTask snapshot = scheduledTask;</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">            if (snapshot != null) {</span>
+<span class="nc" id="L149">                snapshot.cancel();</span>
+            }
+        }
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if (plugin.isPresent()) {</span>
+<span class="nc" id="L153">            plugin.get().close();</span>
+        }
+<span class="nc" id="L155">    }</span>
+
+    private void scheduleNextTick(
+        Timer timer,
+        long cleanupCheckIntervalMs,
+        Supplier&lt;CompletableFuture&lt;?&gt;&gt; cycleSupplier
+    ) {
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        if (!running.get()) return;</span>
+<span class="nc" id="L163">        TimerTask task = new TimerTask(cleanupCheckIntervalMs) {</span>
+            @Override
+            public void run() {
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                if (!running.get()) return;</span>
+                try {
+<span class="nc" id="L168">                    runOnce(cycleSupplier);</span>
+<span class="nc" id="L169">                } catch (Throwable t) {</span>
+<span class="nc" id="L170">                    log.warn(&quot;Unexpected error running topology-description cleanup cycle.&quot;, t);</span>
+<span class="nc" id="L171">                }</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">                if (running.get()) scheduleNextTick(timer, cleanupCheckIntervalMs, cycleSupplier);</span>
+<span class="nc" id="L173">            }</span>
+        };
+<span class="nc" id="L175">        scheduledTask = task;</span>
+<span class="nc" id="L176">        timer.add(task);</span>
+<span class="nc" id="L177">    }</span>
+
+    /**
+     * Invoke {@code cycleSupplier} once under the single-flight guard: a call that fires
+     * while a previous cycle is still settling its returned future is dropped with a
+     * warn-level log. Released in the terminal {@code whenComplete}; a synchronous throw
+     * from the supplier releases the flag before propagating so the next tick can run.
+     */
+    // Visible for testing.
+    public void runOnce(Supplier&lt;CompletableFuture&lt;?&gt;&gt; cycleSupplier) {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (!cycleInFlight.compareAndSet(false, true)) {</span>
+<span class="nc" id="L188">            log.warn(&quot;Topology-description cleanup cycle skipped: previous cycle is still in flight.&quot;);</span>
+<span class="nc" id="L189">            return;</span>
+        }
+        try {
+<span class="nc" id="L192">            CompletableFuture&lt;?&gt; chain = cycleSupplier.get();</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            if (chain == null) {</span>
+<span class="nc" id="L194">                cycleInFlight.set(false);</span>
+<span class="nc" id="L195">                return;</span>
+            }
+<span class="nc" id="L197">            chain.whenComplete((__, throwable) -&gt; {</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">                if (throwable != null) {</span>
+<span class="nc" id="L199">                    log.warn(&quot;Topology-description cleanup cycle failed to complete cleanly.&quot;, throwable);</span>
+                }
+<span class="nc" id="L201">                cycleInFlight.set(false);</span>
+<span class="nc" id="L202">            });</span>
+<span class="nc" id="L203">        } catch (Throwable t) {</span>
+<span class="nc" id="L204">            cycleInFlight.set(false);</span>
+<span class="nc" id="L205">            throw t;</span>
+<span class="nc" id="L206">        }</span>
+<span class="nc" id="L207">    }</span>
+
+    // Visible for testing.
+    TimerTask scheduledCleanupTask() {
+<span class="nc" id="L211">        return scheduledTask;</span>
+    }
+
+    // Visible for testing.
+    boolean isRunning() {
+<span class="nc" id="L216">        return running.get();</span>
+    }
+
+    /**
+     * @return true if a topology description plugin is configured on this broker.
+     */
+    public boolean isPluginConfigured() {
+<span class="nc" id="L223">        return plugin.isPresent();</span>
+    }
+
+    /**
+     * Post-processes a successful streams group heartbeat result by deciding whether the
+     * broker should set {@code TopologyDescriptionRequired=true} on the response, and
+     * arming the per-group back-off when it does.
+     *
+     * &lt;p&gt;The flag is set when the request is at a version that carries the field
+     * ({@code TopologyDescriptionRequired} arrives at v1), the topology description plugin
+     * is configured, the group has resolved to a topology epoch, that epoch is neither
+     * stored nor permanently failed at the plugin, no back-off is in effect for this
+     * epoch, and the response does not carry a {@code STALE_TOPOLOGY} status (the member
+     * would just be told to catch up first). When the response already carries an error
+     * code we leave it alone.
+     *
+     * &lt;p&gt;The version gate is intentional: a v0 client cannot deserialize the flag, so
+     * arming the back-off for it would accumulate entries that grow exponentially while
+     * the flag itself gets dropped at serialization — wasting heap on a per-group basis
+     * for clients that will never push.
+     */
+    public StreamsGroupHeartbeatResult maybeSetTopologyDescriptionRequired(
+        StreamsGroupHeartbeatResult result,
+        String groupId,
+        int apiVersion,
+        int memberEpoch
+    ) {
+        // Do not solicit a push from a departing member (a leave heartbeat carries a negative
+        // member epoch): arming the back-off on its behalf would only delay solicitation for the
+        // rest of the group.
+<span class="nc bnc" id="L253" title="All 6 branches missed.">        if (apiVersion &lt; 1 || plugin.isEmpty() || memberEpoch &lt; 0) {</span>
+<span class="nc" id="L254">            return result;</span>
+        }
+<span class="nc" id="L256">        StreamsGroupHeartbeatResponseData response = result.data();</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        if (response.errorCode() != Errors.NONE.code()) {</span>
+<span class="nc" id="L258">            return result;</span>
+        }
+<span class="nc" id="L260">        int currentEpoch = result.currentTopologyEpoch();</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        if (currentEpoch &lt; 0</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">            || result.storedDescriptionTopologyEpoch() == currentEpoch</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            || result.failedDescriptionTopologyEpoch() == currentEpoch</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">            || responseHasStaleTopology(response)) {</span>
+<span class="nc" id="L265">            return result;</span>
+        }
+        // Atomic check-and-arm: only set the flag if the back-off window is not already
+        // in effect for this epoch, so two concurrent heartbeats for the same group cannot
+        // both arm the back-off and double the window beyond its intended length.
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        if (backoff.armIfNotActive(groupId, currentEpoch)) {</span>
+<span class="nc" id="L271">            response.setTopologyDescriptionRequired(true);</span>
+<span class="nc" id="L272">            log.info(&quot;[GroupId {}] Requested topology description push at topology epoch {}.&quot;,</span>
+<span class="nc" id="L273">                groupId, currentEpoch);</span>
+        }
+<span class="nc" id="L275">        return result;</span>
+    }
+
+    /**
+     * Call {@code plugin.setTopology} and fold the result into a {@link PluginOutcome}.
+     * The returned future never completes exceptionally — the outcome carries the
+     * failure category so the caller can dispatch on it without try/catch on the
+     * future. A synchronous throw from the plugin (which violates the SPI contract) is
+     * mapped to a permanent failure with a generic message rather than forwarding the
+     * raw exception text, and a {@code null} returned future is treated the same way.
+     */
+    public CompletableFuture&lt;PluginOutcome&gt; invokeSetTopology(
+        String groupId,
+        int topologyEpoch,
+        StreamsGroupTopologyDescription description
+    ) {
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (plugin.isEmpty()) {</span>
+<span class="nc" id="L292">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L293">                PluginOutcome.permanent(&quot;Topology description plugin failed.&quot;));</span>
+        }
+        final CompletableFuture&lt;Void&gt; pluginFuture;
+        try {
+<span class="nc" id="L297">            pluginFuture = Objects.requireNonNull(</span>
+<span class="nc" id="L298">                plugin.get().setTopology(groupId, topologyEpoch, description));</span>
+<span class="nc" id="L299">        } catch (Exception e) {</span>
+            // A synchronous throw violates the SPI contract — implementations must signal
+            // failures by completing the future exceptionally. Treat it as a permanent
+            // failure with a stable, generic client-visible message so we don't forward
+            // an unbounded or null exception message that could leak plugin internals.
+<span class="nc" id="L304">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L305">                PluginOutcome.permanent(&quot;Topology description plugin failed.&quot;));</span>
+<span class="nc" id="L306">        }</span>
+<span class="nc" id="L307">        return pluginFuture.handle((unused, throwable) -&gt; {</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">            if (throwable == null) {</span>
+<span class="nc" id="L309">                return PluginOutcome.success();</span>
+            }
+            // CompletionException / ExecutionException can legally carry a null cause; if a
+            // plugin completes its future with one of those (rare but legal),
+            // maybeUnwrapException returns null. Treat that as a transient failure with a
+            // generic message rather than NPE-ing inside this handle and losing the
+            // transient/permanent classification downstream.
+<span class="nc" id="L316">            Throwable cause = Errors.maybeUnwrapException(throwable);</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">            if (cause == null) {</span>
+<span class="nc" id="L318">                return PluginOutcome.transientFailure(&quot;Plugin failure (no cause).&quot;);</span>
+            }
+<span class="nc bnc" id="L320" title="All 2 branches missed.">            if (cause instanceof StreamsTopologyDescriptionPermanentFailureException) {</span>
+<span class="nc" id="L321">                return PluginOutcome.permanent(cause.getMessage());</span>
+            }
+<span class="nc" id="L323">            return PluginOutcome.transientFailure(cause.getMessage());</span>
+        });
+    }
+
+    /**
+     * Arm or extend the back-off window for a group at the given topology epoch.
+     * Delegates to {@link StreamsGroupTopologyDescriptionBackoff#armOrExtend}.
+     */
+    public void armBackoff(String groupId, int topologyEpoch) {
+<span class="nc" id="L332">        backoff.armOrExtend(groupId, topologyEpoch);</span>
+<span class="nc" id="L333">    }</span>
+
+    /**
+     * @return true while the window armed by {@link #throttleConversionDelete} is in effect for
+     *         the group, i.e. a recent classic-join conversion delete failed and the join path
+     *         must not re-invoke the plugin yet.
+     */
+    public boolean isConversionDeleteThrottled(String groupId) {
+<span class="nc" id="L341">        return backoff.isActive(groupId, StreamsGroup.STORED_TOPOLOGY_EPOCH_UNCERTAIN);</span>
+    }
+
+    /**
+     * Arm (or continue) the back-off chain that throttles the classic-join conversion delete
+     * against a failing plugin. On {@code REBALANCE_IN_PROGRESS} the classic client retries the
+     * join immediately (no client-side back-off), so without this window a broken plugin would
+     * be hit with {@code deleteTopology} in a tight loop. Keyed at
+     * {@link StreamsGroup#STORED_TOPOLOGY_EPOCH_UNCERTAIN} — the group's stored epoch after the
+     * barrier write and never a real push epoch — so heartbeat/push windows are not disturbed;
+     * a stale real-epoch entry left from before the group emptied is replaced. The window is
+     * dropped by {@link #clearBackoffGroup} when a conversion or cleanup-cycle delete succeeds.
+     */
+    public void throttleConversionDelete(String groupId) {
+<span class="nc" id="L355">        backoff.armIfNotActive(groupId, StreamsGroup.STORED_TOPOLOGY_EPOCH_UNCERTAIN);</span>
+<span class="nc" id="L356">    }</span>
+
+    /**
+     * Settle the per-group back-off after the bookkeeping write that records a push outcome
+     * (the stored epoch on success, the failed epoch on a permanent failure) completes, and
+     * return the response to send to the client — or rethrow the write failure so the service's
+     * terminal handler maps it.
+     *
+     * &lt;p&gt;On a clean write the back-off is cleared for this epoch (epoch-scoped so a late callback
+     * at an old epoch cannot wipe a window a concurrent heartbeat armed at the advanced epoch);
+     * if the group was deleted underneath the write its whole entry is dropped; a coordinator-moved
+     * error leaves the back-off untouched (the new coordinator owns convergence once the client
+     * retries); any other failure arms it so the next heartbeat re-solicits.
+     */
+    public StreamsGroupTopologyDescriptionUpdateResponseData completeEpochWrite(
+        String groupId,
+        int topologyEpoch,
+        Throwable writeException,
+        StreamsGroupTopologyDescriptionUpdateResponseData responseOnCommit
+    ) {
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        if (writeException == null) {</span>
+<span class="nc" id="L377">            backoff.clear(groupId, topologyEpoch);</span>
+<span class="nc" id="L378">            return responseOnCommit;</span>
+        }
+<span class="nc" id="L380">        Throwable cause = Errors.maybeUnwrapException(writeException);</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (cause instanceof GroupIdNotFoundException) {</span>
+<span class="nc" id="L382">            backoff.clearGroup(groupId);</span>
+<span class="nc bnc" id="L383" title="All 6 branches missed.">        } else if (cause instanceof NotCoordinatorException</span>
+            || cause instanceof CoordinatorLoadInProgressException
+            || cause instanceof CoordinatorNotAvailableException) {
+            // Coordinator moved between the plugin call and the write; the new coordinator owns
+            // convergence after the client retries, so leave the back-off alone.
+        } else {
+<span class="nc" id="L389">            backoff.armOrExtend(groupId, topologyEpoch);</span>
+        }
+<span class="nc" id="L391">        throw new CompletionException(writeException);</span>
+    }
+
+    /**
+     * Drop the back-off entry for a group unconditionally. Currently called when a group is
+     * removed via explicit DeleteGroups and on a post-plugin write failing with
+     * GroupIdNotFoundException. NOTE: groups removed by other lifecycle paths (session expiry,
+     * partition unload, tombstone-via-replay) are not yet wired to this, so their back-off
+     * entries can leak until the group id is reused. Delegates to
+     * {@link StreamsGroupTopologyDescriptionBackoff#clearGroup}.
+     */
+    public void clearBackoffGroup(String groupId) {
+<span class="nc" id="L403">        backoff.clearGroup(groupId);</span>
+<span class="nc" id="L404">    }</span>
+
+    /**
+     * Call {@code plugin.deleteTopology} for every supplied group id. Returns a per-group
+     * map of failures keyed by group id; groups absent from the map either had no plugin
+     * configured or the plugin call succeeded. The returned future never completes
+     * exceptionally — failures are folded into the map so the service-level
+     * {@code DeleteGroups} flow can dispatch on the per-group outcome without try/catch
+     * on the underlying future. A synchronous throw from the plugin (which violates the
+     * SPI contract) is mapped to the same {@code GROUP_DELETION_FAILED} as an
+     * exceptional future.
+     *
+     * &lt;p&gt;Pure plugin invocation: does not read group state, does not touch the back-off
+     * map, and does not record metrics. The service layer pre-filters the input, records
+     * delete-success / delete-error sensors on the returned failure count, and is
+     * responsible for invoking {@link #clearBackoffGroup} for the groups it chose to clear.
+     */
+    public CompletableFuture&lt;Map&lt;String, ApiError&gt;&gt; invokeDeleteTopologies(Set&lt;String&gt; groupIds) {
+<span class="nc bnc" id="L422" title="All 4 branches missed.">        if (plugin.isEmpty() || groupIds.isEmpty()) {</span>
+<span class="nc" id="L423">            return CompletableFuture.completedFuture(Map.of());</span>
+        }
+<span class="nc" id="L425">        final StreamsGroupTopologyDescriptionPlugin p = plugin.get();</span>
+<span class="nc" id="L426">        List&lt;CompletableFuture&lt;Map.Entry&lt;String, ApiError&gt;&gt;&gt; outcomes = new ArrayList&lt;&gt;(groupIds.size());</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        for (String groupId : groupIds) {</span>
+            CompletableFuture&lt;Map.Entry&lt;String, ApiError&gt;&gt; outcome;
+            try {
+<span class="nc" id="L430">                outcome = p.deleteTopology(groupId).handle((unused, throwable) -&gt; toFailureEntry(groupId, throwable));</span>
+<span class="nc" id="L431">            } catch (Exception e) {</span>
+                // Synchronous throw from the plugin violates the SPI contract; treat it as
+                // any other per-group failure so the failures map carries it back to the
+                // caller without dropping the rest of the batch.
+<span class="nc" id="L435">                outcome = CompletableFuture.completedFuture(toFailureEntry(groupId, e));</span>
+<span class="nc" id="L436">            }</span>
+<span class="nc" id="L437">            outcomes.add(outcome);</span>
+<span class="nc" id="L438">        }</span>
+<span class="nc" id="L439">        CompletableFuture&lt;?&gt;[] all = outcomes.toArray(new CompletableFuture&lt;?&gt;[0]);</span>
+<span class="nc" id="L440">        return CompletableFuture.allOf(all).thenApply(unused -&gt; {</span>
+<span class="nc" id="L441">            Map&lt;String, ApiError&gt; failures = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">            for (CompletableFuture&lt;Map.Entry&lt;String, ApiError&gt;&gt; future : outcomes) {</span>
+<span class="nc" id="L443">                Map.Entry&lt;String, ApiError&gt; entry = future.join();</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">                if (entry != null) {</span>
+<span class="nc" id="L445">                    failures.put(entry.getKey(), entry.getValue());</span>
+                }
+<span class="nc" id="L447">            }</span>
+<span class="nc" id="L448">            return failures;</span>
+        });
+    }
+
+    private static Map.Entry&lt;String, ApiError&gt; toFailureEntry(String groupId, Throwable throwable) {
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if (throwable == null) {</span>
+<span class="nc" id="L454">            return null;</span>
+        }
+        // Do not forward the plugin's raw exception message to the client: it can be null and
+        // may leak plugin internals (the ErrorMessage is serialized at DeleteGroups v3+). Use a
+        // fixed generic message, mirroring invokeSetTopology.
+<span class="nc" id="L459">        return Map.entry(groupId, new ApiError(Errors.GROUP_DELETION_FAILED,</span>
+            &quot;Topology description plugin failed to delete the topology.&quot;));
+    }
+
+    /**
+     * Populate {@code TopologyDescription} and {@code TopologyDescriptionStatus} on each
+     * {@code DescribedGroup} carried by {@code result}, calling {@code plugin.getTopology} only
+     * for groups whose persisted {@code StoredDescriptionTopologyEpoch} matches the group's
+     * current topology epoch. Returns a future that completes when every per-group plugin call
+     * has settled; the future never completes exceptionally — per-group errors fold into
+     * {@code TOPOLOGY_DESCRIPTION_STATUS_ERROR} on the corresponding describedGroup.
+     *
+     * &lt;p&gt;Per-group status decisions:
+     * &lt;ul&gt;
+     *   &lt;li&gt;{@code errorCode != NONE} — the group could not be resolved; leave the status
+     *       field at its {@code NOT_REQUESTED} default since the client should consult the
+     *       group's error code first.&lt;/li&gt;
+     *   &lt;li&gt;No plugin configured on this broker — every successful group becomes
+     *       {@code NOT_STORED}: from the client's perspective the broker simply has no
+     *       description to serve.&lt;/li&gt;
+     *   &lt;li&gt;{@code Topology} field is null on the response (group has not yet declared a
+     *       topology), {@code storedEpoch} is missing or {@code -1}, or {@code storedEpoch}
+     *       does not match {@code topology().epoch()} — {@code NOT_STORED}.&lt;/li&gt;
+     *   &lt;li&gt;Plugin call returns null (the plugin no longer has the data, e.g. backend wipe)
+     *       — {@code NOT_STORED}.&lt;/li&gt;
+     *   &lt;li&gt;Plugin call completes exceptionally, throws synchronously, or returns a null
+     *       future (SPI contract violation) — {@code ERROR}. Conversion failures from the
+     *       returned POJO to the wire schema also fold into {@code ERROR} so a single
+     *       malformed plugin response cannot poison the rest of the batch.&lt;/li&gt;
+     *   &lt;li&gt;Plugin call returns a non-null description — {@code AVAILABLE}, with the
+     *       converted topology attached.&lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+    public CompletableFuture&lt;List&lt;StreamsGroupDescribeResponseData.DescribedGroup&gt;&gt; attachTopologyDescriptions(
+        StreamsGroupDescribeResult result
+    ) {
+<span class="nc bnc" id="L495" title="All 2 branches missed.">        if (plugin.isEmpty()) {</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">            for (StreamsGroupDescribeResponseData.DescribedGroup describedGroup : result.describedGroups()) {</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">                if (describedGroup.errorCode() == Errors.NONE.code()) {</span>
+<span class="nc" id="L498">                    describedGroup.setTopologyDescriptionStatus(TOPOLOGY_DESCRIPTION_STATUS_NOT_STORED);</span>
+                }
+<span class="nc" id="L500">            }</span>
+<span class="nc" id="L501">            return CompletableFuture.completedFuture(result.describedGroups());</span>
+        }
+<span class="nc" id="L503">        final StreamsGroupTopologyDescriptionPlugin topologyDescriptionPlugin = plugin.get();</span>
+<span class="nc" id="L504">        List&lt;CompletableFuture&lt;Void&gt;&gt; pluginFutures = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">        for (StreamsGroupDescribeResponseData.DescribedGroup describedGroup : result.describedGroups()) {</span>
+<span class="nc" id="L506">            CompletableFuture&lt;Void&gt; outcome = maybeAttachOne(topologyDescriptionPlugin, describedGroup, result);</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">            if (outcome != null) pluginFutures.add(outcome);</span>
+<span class="nc" id="L508">        }</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">        if (pluginFutures.isEmpty()) {</span>
+<span class="nc" id="L510">            return CompletableFuture.completedFuture(result.describedGroups());</span>
+        }
+<span class="nc" id="L512">        return CompletableFuture.allOf(pluginFutures.toArray(new CompletableFuture&lt;?&gt;[0]))</span>
+<span class="nc" id="L513">            .thenApply(unused -&gt; result.describedGroups());</span>
+    }
+
+    /**
+     * Inspect one describedGroup and, if eligible, fire {@code plugin.getTopology}. Returns
+     * null when no plugin call is needed (status has already been decided synchronously from
+     * the response shape); otherwise returns a future that completes once the plugin call has
+     * been folded into the describedGroup's status / topology fields.
+     */
+    private CompletableFuture&lt;Void&gt; maybeAttachOne(
+        StreamsGroupTopologyDescriptionPlugin p,
+        StreamsGroupDescribeResponseData.DescribedGroup describedGroup,
+        StreamsGroupDescribeResult result
+    ) {
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        if (describedGroup.errorCode() != Errors.NONE.code()) {</span>
+<span class="nc" id="L528">            return null;</span>
+        }
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        if (describedGroup.topology() == null) {</span>
+<span class="nc" id="L531">            describedGroup.setTopologyDescriptionStatus(TOPOLOGY_DESCRIPTION_STATUS_NOT_STORED);</span>
+<span class="nc" id="L532">            return null;</span>
+        }
+<span class="nc" id="L534">        Integer storedEpoch = result.storedDescriptionTopologyEpochs().get(describedGroup.groupId());</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        if (storedEpoch == null</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">            || !StreamsGroup.isReliablyStoredTopologyEpoch(storedEpoch)</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">            || storedEpoch != describedGroup.topology().epoch()) {</span>
+<span class="nc" id="L538">            describedGroup.setTopologyDescriptionStatus(TOPOLOGY_DESCRIPTION_STATUS_NOT_STORED);</span>
+<span class="nc" id="L539">            return null;</span>
+        }
+<span class="nc" id="L541">        int topologyEpoch = describedGroup.topology().epoch();</span>
+        CompletableFuture&lt;StreamsGroupTopologyDescription&gt; pluginFuture;
+        try {
+<span class="nc" id="L544">            pluginFuture = p.getTopology(describedGroup.groupId(), topologyEpoch);</span>
+<span class="nc" id="L545">        } catch (Exception e) {</span>
+            // SPI contract violation: synchronous throw treated as ERROR.
+<span class="nc" id="L547">            recordGetError();</span>
+<span class="nc" id="L548">            describedGroup.setTopologyDescriptionStatus(TOPOLOGY_DESCRIPTION_STATUS_ERROR);</span>
+<span class="nc" id="L549">            return CompletableFuture.completedFuture(null);</span>
+<span class="nc" id="L550">        }</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        if (pluginFuture == null) {</span>
+<span class="nc" id="L552">            recordGetError();</span>
+<span class="nc" id="L553">            describedGroup.setTopologyDescriptionStatus(TOPOLOGY_DESCRIPTION_STATUS_ERROR);</span>
+<span class="nc" id="L554">            return CompletableFuture.completedFuture(null);</span>
+        }
+<span class="nc" id="L556">        return pluginFuture.handle((topology, throwable) -&gt; {</span>
+<span class="nc" id="L557">            applyGetTopologyOutcome(describedGroup, topology, throwable);</span>
+<span class="nc" id="L558">            return null;</span>
+        });
+    }
+
+    private void applyGetTopologyOutcome(
+        StreamsGroupDescribeResponseData.DescribedGroup describedGroup,
+        StreamsGroupTopologyDescription topology,
+        Throwable throwable
+    ) {
+<span class="nc bnc" id="L567" title="All 2 branches missed.">        if (throwable != null) {</span>
+<span class="nc" id="L568">            Throwable cause = Errors.maybeUnwrapException(throwable);</span>
+<span class="nc" id="L569">            log.warn(&quot;Topology description plugin getTopology failed for group {}.&quot;,</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">                describedGroup.groupId(), cause != null ? cause : throwable);</span>
+<span class="nc" id="L571">            recordGetError();</span>
+<span class="nc" id="L572">            describedGroup.setTopologyDescriptionStatus(TOPOLOGY_DESCRIPTION_STATUS_ERROR);</span>
+<span class="nc" id="L573">            return;</span>
+        }
+        // The plugin call itself completed normally. A null return is the documented
+        // &quot;plugin no longer has the data&quot; path and surfaces as NOT_STORED, not an error,
+        // so it still counts as a successful getTopology.
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        if (topology == null) {</span>
+<span class="nc" id="L579">            recordGetSuccess();</span>
+<span class="nc" id="L580">            describedGroup.setTopologyDescriptionStatus(TOPOLOGY_DESCRIPTION_STATUS_NOT_STORED);</span>
+<span class="nc" id="L581">            return;</span>
+        }
+        try {
+<span class="nc" id="L584">            describedGroup.setTopologyDescription(</span>
+<span class="nc" id="L585">                StreamsGroupTopologyDescriptionConverter.toDescribeResponse(topology));</span>
+<span class="nc" id="L586">            describedGroup.setTopologyDescriptionStatus(TOPOLOGY_DESCRIPTION_STATUS_AVAILABLE);</span>
+<span class="nc" id="L587">            recordGetSuccess();</span>
+<span class="nc" id="L588">        } catch (Exception conversionError) {</span>
+            // Defensive catch, should be unreachable in practice. The outcome surfaces as
+            // ERROR to the client, so count it as a failed getTopology to stay consistent.
+<span class="nc" id="L591">            recordGetError();</span>
+<span class="nc" id="L592">            describedGroup.setTopologyDescription(null);</span>
+<span class="nc" id="L593">            describedGroup.setTopologyDescriptionStatus(TOPOLOGY_DESCRIPTION_STATUS_ERROR);</span>
+<span class="nc" id="L594">        }</span>
+<span class="nc" id="L595">    }</span>
+
+    private void recordGetSuccess() {
+<span class="nc" id="L598">        metrics.recordSensor(GroupCoordinatorMetrics.STREAMS_GROUP_TOPOLOGY_DESCRIPTION_GET_SUCCESS_SENSOR_NAME);</span>
+<span class="nc" id="L599">    }</span>
+
+    private void recordGetError() {
+<span class="nc" id="L602">        metrics.recordSensor(GroupCoordinatorMetrics.STREAMS_GROUP_TOPOLOGY_DESCRIPTION_GET_ERROR_SENSOR_NAME);</span>
+<span class="nc" id="L603">    }</span>
+
+    // Visible for testing.
+    StreamsGroupTopologyDescriptionBackoff backoff() {
+<span class="nc" id="L607">        return backoff;</span>
+    }
+
+    private static boolean responseHasStaleTopology(StreamsGroupHeartbeatResponseData response) {
+<span class="nc bnc" id="L611" title="All 2 branches missed.">        if (response.status() == null) {</span>
+<span class="nc" id="L612">            return false;</span>
+        }
+<span class="nc" id="L614">        byte staleCode = Status.STALE_TOPOLOGY.code();</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">        return response.status().stream().anyMatch(s -&gt; s.statusCode() == staleCode);</span>
+    }
+
+    /**
+     * Outcome of a {@code plugin.setTopology} call, folded into a value so the caller can
+     * dispatch on {@link Kind} without try/catch on the underlying future.
+     */
+<span class="nc" id="L622">    public record PluginOutcome(Kind kind, String message) {</span>
+
+<span class="nc" id="L624">        public enum Kind { SUCCESS, PERMANENT, TRANSIENT }</span>
+
+        public static PluginOutcome success() {
+<span class="nc" id="L627">            return new PluginOutcome(Kind.SUCCESS, null);</span>
+        }
+
+        public static PluginOutcome permanent(String message) {
+<span class="nc" id="L631">            return new PluginOutcome(Kind.PERMANENT, message);</span>
+        }
+
+        public static PluginOutcome transientFailure(String message) {
+<span class="nc" id="L635">            return new PluginOutcome(Kind.TRANSIENT, message);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

@@ -1,0 +1,966 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MemoryRecordsBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.record.internal</a> &gt; <span class="el_source">MemoryRecordsBuilder.java</span></div><h1>MemoryRecordsBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.record.internal;
+
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.message.KRaftVersionRecord;
+import org.apache.kafka.common.message.LeaderChangeMessage;
+import org.apache.kafka.common.message.SnapshotFooterRecord;
+import org.apache.kafka.common.message.SnapshotHeaderRecord;
+import org.apache.kafka.common.message.VotersRecord;
+import org.apache.kafka.common.protocol.MessageUtil;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.ByteBufferOutputStream;
+
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+
+import static org.apache.kafka.common.utils.Utils.wrapNullable;
+
+/**
+ * This class is used to write new log data in memory, i.e. this is the write path for {@link MemoryRecords}.
+ * It transparently handles compression and exposes methods for appending new records, possibly with message
+ * format conversion.
+ *
+ * In cases where keeping memory retention low is important and there's a gap between the time that record appends stop
+ * and the builder is closed (e.g. the Producer), it's important to call `closeForRecordAppends` when the former happens.
+ * This will release resources like compression buffers that can be relatively large (64 KB for LZ4).
+ */
+public class MemoryRecordsBuilder implements AutoCloseable {
+    private static final float COMPRESSION_RATE_ESTIMATION_FACTOR = 1.05f;
+<span class="nc" id="L50">    private static final DataOutputStream CLOSED_STREAM = new DataOutputStream(new OutputStream() {</span>
+        @Override
+        public void write(int b) {
+<span class="nc" id="L53">            throw new IllegalStateException(&quot;MemoryRecordsBuilder is closed for record appends&quot;);</span>
+        }
+    });
+
+    private final TimestampType timestampType;
+    private final Compression compression;
+    // Used to hold a reference to the underlying ByteBuffer so that we can write the record batch header and access
+    // the written bytes. ByteBufferOutputStream allocates a new ByteBuffer if the existing one is not large enough,
+    // so it's not safe to hold a direct reference to the underlying ByteBuffer.
+    private final ByteBufferOutputStream bufferStream;
+    private final byte magic;
+    private final int initialPosition;
+    private final long baseOffset;
+    private final long logAppendTime;
+    private final boolean isControlBatch;
+    private final int partitionLeaderEpoch;
+    private final int writeLimit;
+    private final int batchHeaderSizeInBytes;
+    private final long deleteHorizonMs;
+
+    // Use a conservative estimate of the compression ratio. The producer overrides this using statistics
+    // from previous batches before appending any records.
+<span class="nc" id="L75">    private float estimatedCompressionRatio = 1.0F;</span>
+
+    // Used to append records, may compress data on the fly
+    private DataOutputStream appendStream;
+    private boolean isTransactional;
+    private long producerId;
+    private short producerEpoch;
+    private int baseSequence;
+    private int uncompressedRecordsSizeInBytes; // Number of bytes (excluding the header) written before compression
+    private int numRecords;
+    private float actualCompressionRatio;
+    private long maxTimestamp;
+<span class="nc" id="L87">    private long offsetOfMaxTimestamp = -1;</span>
+<span class="nc" id="L88">    private Long lastOffset = null;</span>
+<span class="nc" id="L89">    private Long baseTimestamp = null;</span>
+
+    private MemoryRecords builtRecords;
+<span class="nc" id="L92">    private boolean aborted = false;</span>
+
+    public MemoryRecordsBuilder(ByteBufferOutputStream bufferStream,
+                                byte magic,
+                                Compression compression,
+                                TimestampType timestampType,
+                                long baseOffset,
+                                long logAppendTime,
+                                long producerId,
+                                short producerEpoch,
+                                int baseSequence,
+                                boolean isTransactional,
+                                boolean isControlBatch,
+                                int partitionLeaderEpoch,
+                                int writeLimit,
+<span class="nc" id="L107">                                long deleteHorizonMs) {</span>
+<span class="nc bnc" id="L108" title="All 4 branches missed.">        if (magic &gt; RecordBatch.MAGIC_VALUE_V0 &amp;&amp; timestampType == TimestampType.NO_TIMESTAMP_TYPE)</span>
+<span class="nc" id="L109">            throw new IllegalArgumentException(&quot;TimestampType must be set for magic &gt;= 0&quot;);</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        if (magic &lt; RecordBatch.MAGIC_VALUE_V2) {</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">            if (isTransactional)</span>
+<span class="nc" id="L112">                throw new IllegalArgumentException(&quot;Transactional records are not supported for magic &quot; + magic);</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">            if (isControlBatch)</span>
+<span class="nc" id="L114">                throw new IllegalArgumentException(&quot;Control records are not supported for magic &quot; + magic);</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">            if (compression.type() == CompressionType.ZSTD)</span>
+<span class="nc" id="L116">                throw new IllegalArgumentException(&quot;ZStandard compression is not supported for magic &quot; + magic);</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">            if (deleteHorizonMs != RecordBatch.NO_TIMESTAMP)</span>
+<span class="nc" id="L118">                throw new IllegalArgumentException(&quot;Delete horizon timestamp is not supported for magic &quot; + magic);</span>
+        }
+
+<span class="nc" id="L121">        this.magic = magic;</span>
+<span class="nc" id="L122">        this.timestampType = timestampType;</span>
+<span class="nc" id="L123">        this.compression = compression;</span>
+<span class="nc" id="L124">        this.baseOffset = baseOffset;</span>
+<span class="nc" id="L125">        this.logAppendTime = logAppendTime;</span>
+<span class="nc" id="L126">        this.numRecords = 0;</span>
+<span class="nc" id="L127">        this.uncompressedRecordsSizeInBytes = 0;</span>
+<span class="nc" id="L128">        this.actualCompressionRatio = 1;</span>
+<span class="nc" id="L129">        this.maxTimestamp = RecordBatch.NO_TIMESTAMP;</span>
+<span class="nc" id="L130">        this.producerId = producerId;</span>
+<span class="nc" id="L131">        this.producerEpoch = producerEpoch;</span>
+<span class="nc" id="L132">        this.baseSequence = baseSequence;</span>
+<span class="nc" id="L133">        this.isTransactional = isTransactional;</span>
+<span class="nc" id="L134">        this.isControlBatch = isControlBatch;</span>
+<span class="nc" id="L135">        this.deleteHorizonMs = deleteHorizonMs;</span>
+<span class="nc" id="L136">        this.partitionLeaderEpoch = partitionLeaderEpoch;</span>
+<span class="nc" id="L137">        this.writeLimit = writeLimit;</span>
+<span class="nc" id="L138">        this.initialPosition = bufferStream.position();</span>
+<span class="nc" id="L139">        this.batchHeaderSizeInBytes = AbstractRecords.recordBatchHeaderSizeInBytes(magic, compression.type());</span>
+
+<span class="nc" id="L141">        bufferStream.position(initialPosition + batchHeaderSizeInBytes);</span>
+<span class="nc" id="L142">        this.bufferStream = bufferStream;</span>
+<span class="nc" id="L143">        this.appendStream = new DataOutputStream(compression.wrapForOutput(this.bufferStream, magic));</span>
+
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (hasDeleteHorizonMs()) {</span>
+<span class="nc" id="L146">            this.baseTimestamp = deleteHorizonMs;</span>
+        }
+<span class="nc" id="L148">    }</span>
+
+    public MemoryRecordsBuilder(ByteBufferOutputStream bufferStream,
+                                byte magic,
+                                Compression compression,
+                                TimestampType timestampType,
+                                long baseOffset,
+                                long logAppendTime,
+                                long producerId,
+                                short producerEpoch,
+                                int baseSequence,
+                                boolean isTransactional,
+                                boolean isControlBatch,
+                                int partitionLeaderEpoch,
+                                int writeLimit) {
+<span class="nc" id="L163">        this(bufferStream, magic, compression, timestampType, baseOffset, logAppendTime, producerId,</span>
+             producerEpoch, baseSequence, isTransactional, isControlBatch, partitionLeaderEpoch, writeLimit,
+             RecordBatch.NO_TIMESTAMP);
+<span class="nc" id="L166">    }</span>
+
+    /**
+     * Construct a new builder.
+     *
+     * @param buffer The underlying buffer to use (note that this class will allocate a new buffer if necessary
+     *               to fit the records appended)
+     * @param magic The magic value to use
+     * @param compression The compression codec to use
+     * @param timestampType The desired timestamp type. For magic &gt; 0, this cannot be {@link TimestampType#NO_TIMESTAMP_TYPE}.
+     * @param baseOffset The initial offset to use for
+     * @param logAppendTime The log append time of this record set. Can be set to NO_TIMESTAMP if CREATE_TIME is used.
+     * @param producerId The producer ID associated with the producer writing this record set
+     * @param producerEpoch The epoch of the producer
+     * @param baseSequence The sequence number of the first record in this set
+     * @param isTransactional Whether or not the records are part of a transaction
+     * @param isControlBatch Whether or not this is a control batch (e.g. for transaction markers)
+     * @param partitionLeaderEpoch The epoch of the partition leader appending the record set to the log
+     * @param writeLimit The desired limit on the total bytes for this record set (note that this can be exceeded
+     *                   when compression is used since size estimates are rough, and in the case that the first
+     *                   record added exceeds the size).
+     */
+    public MemoryRecordsBuilder(ByteBuffer buffer,
+                                byte magic,
+                                Compression compression,
+                                TimestampType timestampType,
+                                long baseOffset,
+                                long logAppendTime,
+                                long producerId,
+                                short producerEpoch,
+                                int baseSequence,
+                                boolean isTransactional,
+                                boolean isControlBatch,
+                                int partitionLeaderEpoch,
+                                int writeLimit) {
+<span class="nc" id="L201">        this(new ByteBufferOutputStream(buffer), magic, compression, timestampType, baseOffset, logAppendTime,</span>
+                producerId, producerEpoch, baseSequence, isTransactional, isControlBatch, partitionLeaderEpoch,
+                writeLimit);
+<span class="nc" id="L204">    }</span>
+
+    public ByteBuffer buffer() {
+<span class="nc" id="L207">        return bufferStream.buffer();</span>
+    }
+
+    public int initialCapacity() {
+<span class="nc" id="L211">        return bufferStream.initialCapacity();</span>
+    }
+
+    /**
+     * The underlying output stream, exposed so the incremental strategy can manage its
+     * chunk-backed stream.
+     */
+    public ByteBufferOutputStream bufferStream() {
+<span class="nc" id="L219">        return bufferStream;</span>
+    }
+
+    public double compressionRatio() {
+<span class="nc" id="L223">        return actualCompressionRatio;</span>
+    }
+
+    public Compression compression() {
+<span class="nc" id="L227">        return compression;</span>
+    }
+
+    public boolean isControlBatch() {
+<span class="nc" id="L231">        return isControlBatch;</span>
+    }
+
+    public boolean isTransactional() {
+<span class="nc" id="L235">        return isTransactional;</span>
+    }
+
+    public final boolean hasDeleteHorizonMs() {
+<span class="nc bnc" id="L239" title="All 4 branches missed.">        return magic &gt;= RecordBatch.MAGIC_VALUE_V2 &amp;&amp; deleteHorizonMs &gt;= 0L;</span>
+    }
+
+    /**
+     * Close this builder and return the resulting buffer.
+     * @return The built log buffer
+     */
+    public MemoryRecords build() {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (aborted) {</span>
+<span class="nc" id="L248">            throw new IllegalStateException(&quot;Attempting to build an aborted record batch&quot;);</span>
+        }
+<span class="nc" id="L250">        close();</span>
+<span class="nc" id="L251">        return builtRecords;</span>
+    }
+
+
+    /**
+     * There are three cases of finding max timestamp to return:
+     * 1) version 0: The max timestamp is NO_TIMESTAMP (-1)
+     * 2) LogAppendTime: All records have same timestamp, and so the max timestamp is equal to logAppendTime
+     * 3) CreateTime: The max timestamp of record
+     * &lt;p&gt;
+     * Let's talk about OffsetOfMaxTimestamp. There are some paths that we don't try to find the OffsetOfMaxTimestamp
+     * to avoid expensive records iteration. Those paths include follower append and index recovery. In order to
+     * avoid inconsistent time index, we let all paths find shallowOffsetOfMaxTimestamp instead of OffsetOfMaxTimestamp.
+     * &lt;p&gt;
+     * Let's define the shallowOffsetOfMaxTimestamp: It is last offset of the batch having max timestamp. If there are
+     * many batches having same max timestamp, we pick up the earliest batch.
+     * &lt;p&gt;
+     * There are five cases of finding shallowOffsetOfMaxTimestamp to return:
+     * 1) version 0: It is always the -1
+     * 2) LogAppendTime with single batch: It is the offset of last record
+     * 3) LogAppendTime with many single-record batches: Those single-record batches have same max timestamp, so we return
+     *                                                   the base offset, which is equal to the last offset of earliest batch
+     * 4) CreateTime with single batch: We return offset of last record to follow the spec we mentioned above. Of course,
+     *                                  we do have the OffsetOfMaxTimestamp for this case, but we want to make all paths
+     *                                  find the shallowOffsetOfMaxTimestamp rather than offsetOfMaxTimestamp
+     * 5) CreateTime with many single-record batches: Each batch is composed of single record, and hence offsetOfMaxTimestamp
+     *                                                is equal to the last offset of earliest batch with max timestamp
+     */
+    public RecordsInfo info() {
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        if (timestampType == TimestampType.LOG_APPEND_TIME) {</span>
+<span class="nc bnc" id="L281" title="All 4 branches missed.">            if (compression.type() != CompressionType.NONE || magic &gt;= RecordBatch.MAGIC_VALUE_V2)</span>
+                // maxTimestamp =&gt; case 2
+                // shallowOffsetOfMaxTimestamp =&gt; case 2
+<span class="nc" id="L284">                return new RecordsInfo(logAppendTime, lastOffset);</span>
+            else
+                // maxTimestamp =&gt; case 2
+                // shallowOffsetOfMaxTimestamp =&gt; case 3
+<span class="nc" id="L288">                return new RecordsInfo(logAppendTime, baseOffset);</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        } else if (maxTimestamp == RecordBatch.NO_TIMESTAMP) {</span>
+            // maxTimestamp =&gt; case 1
+            // shallowOffsetOfMaxTimestamp =&gt; case 1
+<span class="nc" id="L292">            return new RecordsInfo(RecordBatch.NO_TIMESTAMP, -1);</span>
+        } else {
+<span class="nc bnc" id="L294" title="All 4 branches missed.">            if (compression.type() != CompressionType.NONE || magic &gt;= RecordBatch.MAGIC_VALUE_V2)</span>
+                // maxTimestamp =&gt; case 3
+                // shallowOffsetOfMaxTimestamp =&gt; case 4
+<span class="nc" id="L297">                return new RecordsInfo(maxTimestamp, lastOffset);</span>
+            else
+                // maxTimestamp =&gt; case 3
+                // shallowOffsetOfMaxTimestamp =&gt; case 5
+<span class="nc" id="L301">                return new RecordsInfo(maxTimestamp, offsetOfMaxTimestamp);</span>
+        }
+    }
+
+    public int numRecords() {
+<span class="nc" id="L306">        return numRecords;</span>
+    }
+
+    /**
+     * Return the sum of the size of the batch header (always uncompressed) and the records (before compression).
+     */
+    public int uncompressedBytesWritten() {
+<span class="nc" id="L313">        return uncompressedRecordsSizeInBytes + batchHeaderSizeInBytes;</span>
+    }
+
+    public void setProducerState(long producerId, short producerEpoch, int baseSequence, boolean isTransactional) {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (isClosed()) {</span>
+            // Sequence numbers are assigned when the batch is closed while the accumulator is being drained.
+            // If the resulting ProduceRequest to the partition leader failed for a retriable error, the batch will
+            // be re queued. In this case, we should not attempt to set the state again, since changing the producerId and sequence
+            // once a batch has been sent to the broker risks introducing duplicates.
+<span class="nc" id="L322">            throw new IllegalStateException(&quot;Trying to set producer state of an already closed batch. This indicates a bug on the client.&quot;);</span>
+        }
+<span class="nc" id="L324">        this.producerId = producerId;</span>
+<span class="nc" id="L325">        this.producerEpoch = producerEpoch;</span>
+<span class="nc" id="L326">        this.baseSequence = baseSequence;</span>
+<span class="nc" id="L327">        this.isTransactional = isTransactional;</span>
+<span class="nc" id="L328">    }</span>
+
+    public void overrideLastOffset(long lastOffset) {
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        if (builtRecords != null)</span>
+<span class="nc" id="L332">            throw new IllegalStateException(&quot;Cannot override the last offset after the records have been built&quot;);</span>
+<span class="nc" id="L333">        this.lastOffset = lastOffset;</span>
+<span class="nc" id="L334">    }</span>
+
+    /**
+     * Release resources required for record appends (e.g. compression buffers). Once this method is called, it's only
+     * possible to update the RecordBatch header.
+     */
+    public void closeForRecordAppends() {
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        if (appendStream != CLOSED_STREAM) {</span>
+            try {
+<span class="nc" id="L343">                appendStream.close();</span>
+<span class="nc" id="L344">            } catch (IOException e) {</span>
+<span class="nc" id="L345">                throw new KafkaException(e);</span>
+            } finally {
+<span class="nc" id="L347">                appendStream = CLOSED_STREAM;</span>
+            }
+        }
+<span class="nc" id="L350">    }</span>
+
+    public void abort() {
+<span class="nc" id="L353">        closeForRecordAppends();</span>
+<span class="nc" id="L354">        buffer().position(initialPosition);</span>
+<span class="nc" id="L355">        aborted = true;</span>
+<span class="nc" id="L356">    }</span>
+
+    public void reopenAndRewriteProducerState(long producerId, short producerEpoch, int baseSequence, boolean isTransactional) {
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        if (aborted)</span>
+<span class="nc" id="L360">            throw new IllegalStateException(&quot;Should not reopen a batch which is already aborted.&quot;);</span>
+<span class="nc" id="L361">        builtRecords = null;</span>
+<span class="nc" id="L362">        this.producerId = producerId;</span>
+<span class="nc" id="L363">        this.producerEpoch = producerEpoch;</span>
+<span class="nc" id="L364">        this.baseSequence = baseSequence;</span>
+<span class="nc" id="L365">        this.isTransactional = isTransactional;</span>
+<span class="nc" id="L366">    }</span>
+
+
+    public void close() {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        if (aborted)</span>
+<span class="nc" id="L371">            throw new IllegalStateException(&quot;Cannot close MemoryRecordsBuilder as it has already been aborted&quot;);</span>
+
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        if (builtRecords != null)</span>
+<span class="nc" id="L374">            return;</span>
+
+<span class="nc" id="L376">        validateProducerState();</span>
+
+<span class="nc" id="L378">        closeForRecordAppends();</span>
+
+<span class="nc bnc" id="L380" title="All 2 branches missed.">        if (numRecords == 0L) {</span>
+<span class="nc" id="L381">            buffer().position(initialPosition);</span>
+<span class="nc" id="L382">            builtRecords = MemoryRecords.EMPTY;</span>
+        } else {
+<span class="nc bnc" id="L384" title="All 2 branches missed.">            if (magic &gt; RecordBatch.MAGIC_VALUE_V1)</span>
+<span class="nc" id="L385">                this.actualCompressionRatio = (float) writeDefaultBatchHeader() / this.uncompressedRecordsSizeInBytes;</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">            else if (compression.type() != CompressionType.NONE)</span>
+<span class="nc" id="L387">                this.actualCompressionRatio = (float) writeLegacyCompressedWrapperHeader() / this.uncompressedRecordsSizeInBytes;</span>
+
+<span class="nc" id="L389">            ByteBuffer buffer = buffer().duplicate();</span>
+<span class="nc" id="L390">            buffer.flip();</span>
+<span class="nc" id="L391">            buffer.position(initialPosition);</span>
+<span class="nc" id="L392">            builtRecords = MemoryRecords.readableRecords(buffer.slice());</span>
+        }
+<span class="nc" id="L394">    }</span>
+
+    private void validateProducerState() {
+<span class="nc bnc" id="L397" title="All 4 branches missed.">        if (isTransactional &amp;&amp; producerId == RecordBatch.NO_PRODUCER_ID)</span>
+<span class="nc" id="L398">            throw new IllegalArgumentException(&quot;Cannot write transactional messages without a valid producer ID&quot;);</span>
+
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (producerId != RecordBatch.NO_PRODUCER_ID) {</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">            if (producerEpoch == RecordBatch.NO_PRODUCER_EPOCH)</span>
+<span class="nc" id="L402">                throw new IllegalArgumentException(&quot;Invalid negative producer epoch&quot;);</span>
+
+<span class="nc bnc" id="L404" title="All 4 branches missed.">            if (baseSequence &lt; 0 &amp;&amp; !isControlBatch)</span>
+<span class="nc" id="L405">                throw new IllegalArgumentException(&quot;Invalid negative sequence number used&quot;);</span>
+
+<span class="nc bnc" id="L407" title="All 2 branches missed.">            if (magic &lt; RecordBatch.MAGIC_VALUE_V2)</span>
+<span class="nc" id="L408">                throw new IllegalArgumentException(&quot;Idempotent messages are not supported for magic &quot; + magic);</span>
+        }
+<span class="nc" id="L410">    }</span>
+
+    /**
+     * Write the header to the default batch.
+     * @return the written compressed bytes.
+     */
+    private int writeDefaultBatchHeader() {
+<span class="nc" id="L417">        ensureOpenForRecordBatchWrite();</span>
+<span class="nc" id="L418">        ByteBuffer buffer = bufferStream.buffer();</span>
+<span class="nc" id="L419">        int pos = buffer.position();</span>
+<span class="nc" id="L420">        buffer.position(initialPosition);</span>
+<span class="nc" id="L421">        int size = pos - initialPosition;</span>
+<span class="nc" id="L422">        int writtenCompressed = size - DefaultRecordBatch.RECORD_BATCH_OVERHEAD;</span>
+<span class="nc" id="L423">        int offsetDelta = (int) (lastOffset - baseOffset);</span>
+
+        final long maxTimestamp;
+<span class="nc bnc" id="L426" title="All 2 branches missed.">        if (timestampType == TimestampType.LOG_APPEND_TIME)</span>
+<span class="nc" id="L427">            maxTimestamp = logAppendTime;</span>
+        else
+<span class="nc" id="L429">            maxTimestamp = this.maxTimestamp;</span>
+
+<span class="nc" id="L431">        DefaultRecordBatch.writeHeader(buffer, baseOffset, offsetDelta, size, magic, compression.type(), timestampType,</span>
+<span class="nc" id="L432">                baseTimestamp, maxTimestamp, producerId, producerEpoch, baseSequence, isTransactional, isControlBatch,</span>
+<span class="nc" id="L433">                hasDeleteHorizonMs(), partitionLeaderEpoch, numRecords);</span>
+
+<span class="nc" id="L435">        buffer.position(pos);</span>
+<span class="nc" id="L436">        return writtenCompressed;</span>
+    }
+
+    /**
+     * Write the header to the legacy batch.
+     * @return the written compressed bytes.
+     */
+    private int writeLegacyCompressedWrapperHeader() {
+<span class="nc" id="L444">        ensureOpenForRecordBatchWrite();</span>
+<span class="nc" id="L445">        ByteBuffer buffer = bufferStream.buffer();</span>
+<span class="nc" id="L446">        int pos = buffer.position();</span>
+<span class="nc" id="L447">        buffer.position(initialPosition);</span>
+
+<span class="nc" id="L449">        int wrapperSize = pos - initialPosition - Records.LOG_OVERHEAD;</span>
+<span class="nc" id="L450">        int writtenCompressed = wrapperSize - LegacyRecord.recordOverhead(magic);</span>
+<span class="nc" id="L451">        AbstractLegacyRecordBatch.writeHeader(buffer, lastOffset, wrapperSize);</span>
+
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        long timestamp = timestampType == TimestampType.LOG_APPEND_TIME ? logAppendTime : maxTimestamp;</span>
+<span class="nc" id="L454">        LegacyRecord.writeCompressedRecordHeader(buffer, magic, wrapperSize, timestamp, compression.type(), timestampType);</span>
+
+<span class="nc" id="L456">        buffer.position(pos);</span>
+<span class="nc" id="L457">        return writtenCompressed;</span>
+    }
+
+    /**
+     * Append a new record at the given offset.
+     */
+    private void appendWithOffset(long offset, boolean isControlRecord, long timestamp, ByteBuffer key,
+                                  ByteBuffer value, Header[] headers) {
+        try {
+<span class="nc bnc" id="L466" title="All 2 branches missed.">            if (isControlRecord != isControlBatch)</span>
+<span class="nc" id="L467">                throw new IllegalArgumentException(&quot;Control records can only be appended to control batches&quot;);</span>
+
+<span class="nc bnc" id="L469" title="All 4 branches missed.">            if (lastOffset != null &amp;&amp; offset &lt;= lastOffset)</span>
+<span class="nc" id="L470">                throw new IllegalArgumentException(String.format(&quot;Illegal offset %d following previous offset %d &quot; +</span>
+<span class="nc" id="L471">                        &quot;(Offsets must increase monotonically).&quot;, offset, lastOffset));</span>
+
+<span class="nc bnc" id="L473" title="All 4 branches missed.">            if (timestamp &lt; 0 &amp;&amp; timestamp != RecordBatch.NO_TIMESTAMP)</span>
+<span class="nc" id="L474">                throw new IllegalArgumentException(&quot;Invalid negative timestamp &quot; + timestamp);</span>
+
+<span class="nc bnc" id="L476" title="All 6 branches missed.">            if (magic &lt; RecordBatch.MAGIC_VALUE_V2 &amp;&amp; headers != null &amp;&amp; headers.length &gt; 0)</span>
+<span class="nc" id="L477">                throw new IllegalArgumentException(&quot;Magic v&quot; + magic + &quot; does not support record headers&quot;);</span>
+
+<span class="nc bnc" id="L479" title="All 2 branches missed.">            if (baseTimestamp == null)</span>
+<span class="nc" id="L480">                baseTimestamp = timestamp;</span>
+
+<span class="nc bnc" id="L482" title="All 2 branches missed.">            if (magic &gt; RecordBatch.MAGIC_VALUE_V1) {</span>
+<span class="nc" id="L483">                appendDefaultRecord(offset, timestamp, key, value, headers);</span>
+            } else {
+<span class="nc" id="L485">                appendLegacyRecord(offset, timestamp, key, value, magic);</span>
+            }
+<span class="nc" id="L487">        } catch (IOException e) {</span>
+<span class="nc" id="L488">            throw new KafkaException(&quot;I/O exception when writing to the append stream, closing&quot;, e);</span>
+<span class="nc" id="L489">        }</span>
+<span class="nc" id="L490">    }</span>
+
+    /**
+     * Append a new record at the given offset.
+     * @param offset The absolute offset of the record in the log buffer
+     * @param timestamp The record timestamp
+     * @param key The record key
+     * @param value The record value
+     * @param headers The record headers if there are any
+     */
+    public void appendWithOffset(long offset, long timestamp, byte[] key, byte[] value, Header[] headers) {
+<span class="nc" id="L501">        appendWithOffset(offset, false, timestamp, wrapNullable(key), wrapNullable(value), headers);</span>
+<span class="nc" id="L502">    }</span>
+
+    /**
+     * Append a new record at the given offset.
+     * @param offset The absolute offset of the record in the log buffer
+     * @param timestamp The record timestamp
+     * @param key The record key
+     * @param value The record value
+     * @param headers The record headers if there are any
+     */
+    public void appendWithOffset(long offset, long timestamp, ByteBuffer key, ByteBuffer value, Header[] headers) {
+<span class="nc" id="L513">        appendWithOffset(offset, false, timestamp, key, value, headers);</span>
+<span class="nc" id="L514">    }</span>
+
+    /**
+     * Append a new record at the given offset.
+     * @param offset The absolute offset of the record in the log buffer
+     * @param timestamp The record timestamp
+     * @param key The record key
+     * @param value The record value
+     */
+    public void appendWithOffset(long offset, long timestamp, byte[] key, byte[] value) {
+<span class="nc" id="L524">        appendWithOffset(offset, timestamp, wrapNullable(key), wrapNullable(value), Record.EMPTY_HEADERS);</span>
+<span class="nc" id="L525">    }</span>
+
+    /**
+     * Append a new record at the given offset.
+     * @param offset The absolute offset of the record in the log buffer
+     * @param timestamp The record timestamp
+     * @param key The record key
+     * @param value The record value
+     */
+    public void appendWithOffset(long offset, long timestamp, ByteBuffer key, ByteBuffer value) {
+<span class="nc" id="L535">        appendWithOffset(offset, timestamp, key, value, Record.EMPTY_HEADERS);</span>
+<span class="nc" id="L536">    }</span>
+
+    /**
+     * Append a new record at the given offset.
+     * @param offset The absolute offset of the record in the log buffer
+     * @param record The record to append
+     */
+    public void appendWithOffset(long offset, SimpleRecord record) {
+<span class="nc" id="L544">        appendWithOffset(offset, record.timestamp(), record.key(), record.value(), record.headers());</span>
+<span class="nc" id="L545">    }</span>
+
+    /**
+     * Append a control record at the given offset. The control record type must be known or
+     * this method will raise an error.
+     *
+     * @param offset The absolute offset of the record in the log buffer
+     * @param record The record to append
+     */
+    public void appendControlRecordWithOffset(long offset, SimpleRecord record) {
+<span class="nc" id="L555">        short typeId = ControlRecordType.parseTypeId(record.key());</span>
+<span class="nc" id="L556">        ControlRecordType type = ControlRecordType.fromTypeId(typeId);</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">        if (type == ControlRecordType.UNKNOWN)</span>
+<span class="nc" id="L558">            throw new IllegalArgumentException(&quot;Cannot append record with unknown control record type &quot; + typeId);</span>
+
+<span class="nc" id="L560">        appendWithOffset(offset, true, record.timestamp(),</span>
+<span class="nc" id="L561">            record.key(), record.value(), record.headers());</span>
+<span class="nc" id="L562">    }</span>
+
+    /**
+     * Append a new record at the next sequential offset.
+     * @param timestamp The record timestamp
+     * @param key The record key
+     * @param value The record value
+     */
+    public void append(long timestamp, ByteBuffer key, ByteBuffer value) {
+<span class="nc" id="L571">        append(timestamp, key, value, Record.EMPTY_HEADERS);</span>
+<span class="nc" id="L572">    }</span>
+
+    /**
+     * Append a new record at the next sequential offset.
+     * @param timestamp The record timestamp
+     * @param key The record key
+     * @param value The record value
+     * @param headers The record headers if there are any
+     */
+    public void append(long timestamp, ByteBuffer key, ByteBuffer value, Header[] headers) {
+<span class="nc" id="L582">        appendWithOffset(nextSequentialOffset(), timestamp, key, value, headers);</span>
+<span class="nc" id="L583">    }</span>
+
+    /**
+     * Append a new record at the next sequential offset.
+     * @param timestamp The record timestamp
+     * @param key The record key
+     * @param value The record value
+     */
+    public void append(long timestamp, byte[] key, byte[] value) {
+<span class="nc" id="L592">        append(timestamp, wrapNullable(key), wrapNullable(value), Record.EMPTY_HEADERS);</span>
+<span class="nc" id="L593">    }</span>
+
+    /**
+     * Append a new record at the next sequential offset.
+     * @param timestamp The record timestamp
+     * @param key The record key
+     * @param value The record value
+     * @param headers The record headers if there are any
+     */
+    public void append(long timestamp, byte[] key, byte[] value, Header[] headers) {
+<span class="nc" id="L603">        append(timestamp, wrapNullable(key), wrapNullable(value), headers);</span>
+<span class="nc" id="L604">    }</span>
+
+    /**
+     * Append a new record at the next sequential offset.
+     * @param record The record to append
+     */
+    public void append(SimpleRecord record) {
+<span class="nc" id="L611">        appendWithOffset(nextSequentialOffset(), record);</span>
+<span class="nc" id="L612">    }</span>
+
+    /**
+     * Append a control record at the next sequential offset.
+     *
+     * @param timestamp The record timestamp
+     * @param type The control record type (cannot be UNKNOWN)
+     * @param value The control record value
+     */
+    public void appendControlRecord(long timestamp, ControlRecordType type, ByteBuffer value) {
+<span class="nc" id="L622">        ByteBuffer key = type.recordKey();</span>
+<span class="nc" id="L623">        appendWithOffset(nextSequentialOffset(), true, timestamp, key, value, Record.EMPTY_HEADERS);</span>
+<span class="nc" id="L624">    }</span>
+
+    public void appendEndTxnMarker(long timestamp, EndTransactionMarker marker) {
+<span class="nc bnc" id="L627" title="All 2 branches missed.">        if (producerId == RecordBatch.NO_PRODUCER_ID)</span>
+<span class="nc" id="L628">            throw new IllegalArgumentException(&quot;End transaction marker requires a valid producerId&quot;);</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">        if (!isTransactional)</span>
+<span class="nc" id="L630">            throw new IllegalArgumentException(&quot;End transaction marker depends on batch transactional flag being enabled&quot;);</span>
+<span class="nc" id="L631">        ByteBuffer value = marker.serializeValue();</span>
+<span class="nc" id="L632">        appendControlRecord(timestamp, marker.controlType(), value);</span>
+<span class="nc" id="L633">    }</span>
+
+    public void appendLeaderChangeMessage(long timestamp, LeaderChangeMessage leaderChangeMessage) {
+<span class="nc bnc" id="L636" title="All 2 branches missed.">        if (partitionLeaderEpoch == RecordBatch.NO_PARTITION_LEADER_EPOCH) {</span>
+<span class="nc" id="L637">            throw new IllegalArgumentException(&quot;Partition leader epoch must be valid, but get &quot; + partitionLeaderEpoch);</span>
+        }
+<span class="nc" id="L639">        appendControlRecord(</span>
+            timestamp,
+            ControlRecordType.LEADER_CHANGE,
+<span class="nc" id="L642">            MessageUtil.toByteBufferAccessor(leaderChangeMessage, ControlRecordUtils.LEADER_CHANGE_CURRENT_VERSION).buffer()</span>
+        );
+<span class="nc" id="L644">    }</span>
+
+    public void appendSnapshotHeaderMessage(long timestamp, SnapshotHeaderRecord snapshotHeaderRecord) {
+<span class="nc" id="L647">        appendControlRecord(</span>
+            timestamp,
+            ControlRecordType.SNAPSHOT_HEADER,
+<span class="nc" id="L650">            MessageUtil.toByteBufferAccessor(snapshotHeaderRecord, ControlRecordUtils.SNAPSHOT_HEADER_CURRENT_VERSION).buffer()</span>
+        );
+<span class="nc" id="L652">    }</span>
+
+    public void appendSnapshotFooterMessage(long timestamp, SnapshotFooterRecord snapshotHeaderRecord) {
+<span class="nc" id="L655">        appendControlRecord(</span>
+            timestamp,
+            ControlRecordType.SNAPSHOT_FOOTER,
+<span class="nc" id="L658">            MessageUtil.toByteBufferAccessor(snapshotHeaderRecord, ControlRecordUtils.SNAPSHOT_FOOTER_CURRENT_VERSION).buffer()</span>
+        );
+<span class="nc" id="L660">    }</span>
+
+    public void appendKRaftVersionMessage(long timestamp, KRaftVersionRecord kraftVersionRecord) {
+<span class="nc" id="L663">        appendControlRecord(</span>
+            timestamp,
+            ControlRecordType.KRAFT_VERSION,
+<span class="nc" id="L666">            MessageUtil.toByteBufferAccessor(kraftVersionRecord, ControlRecordUtils.KRAFT_VERSION_CURRENT_VERSION).buffer()</span>
+        );
+<span class="nc" id="L668">    }</span>
+
+    public void appendVotersMessage(long timestamp, VotersRecord votersRecord) {
+<span class="nc" id="L671">        appendControlRecord(</span>
+            timestamp,
+            ControlRecordType.KRAFT_VOTERS,
+<span class="nc" id="L674">            MessageUtil.toByteBufferAccessor(votersRecord, ControlRecordUtils.KRAFT_VOTERS_CURRENT_VERSION).buffer()</span>
+        );
+<span class="nc" id="L676">    }</span>
+
+    /**
+     * Add a legacy record without doing offset/magic validation (this should only be used in testing).
+     * @param offset The offset of the record
+     * @param record The record to add
+     */
+    public void appendUncheckedWithOffset(long offset, LegacyRecord record) {
+<span class="nc" id="L684">        ensureOpenForRecordAppend();</span>
+        try {
+<span class="nc" id="L686">            int size = record.sizeInBytes();</span>
+<span class="nc" id="L687">            AbstractLegacyRecordBatch.writeHeader(appendStream, toInnerOffset(offset), size);</span>
+
+<span class="nc" id="L689">            ByteBuffer buffer = record.buffer().duplicate();</span>
+<span class="nc" id="L690">            appendStream.write(buffer.array(), buffer.arrayOffset(), buffer.limit());</span>
+
+<span class="nc" id="L692">            recordWritten(offset, record.timestamp(), size + Records.LOG_OVERHEAD);</span>
+<span class="nc" id="L693">        } catch (IOException e) {</span>
+<span class="nc" id="L694">            throw new KafkaException(&quot;I/O exception when writing to the append stream, closing&quot;, e);</span>
+<span class="nc" id="L695">        }</span>
+<span class="nc" id="L696">    }</span>
+
+    /**
+     * Append a record without doing offset/magic validation (this should only be used in testing).
+     *
+     * @param offset The offset of the record
+     * @param record The record to add
+     */
+    public void appendUncheckedWithOffset(long offset, SimpleRecord record) throws IOException {
+<span class="nc bnc" id="L705" title="All 2 branches missed.">        if (magic &gt;= RecordBatch.MAGIC_VALUE_V2) {</span>
+<span class="nc" id="L706">            int offsetDelta = (int) (offset - baseOffset);</span>
+<span class="nc" id="L707">            long timestamp = record.timestamp();</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">            if (baseTimestamp == null)</span>
+<span class="nc" id="L709">                baseTimestamp = timestamp;</span>
+
+<span class="nc" id="L711">            int sizeInBytes = DefaultRecord.writeTo(appendStream,</span>
+                offsetDelta,
+<span class="nc" id="L713">                timestamp - baseTimestamp,</span>
+<span class="nc" id="L714">                record.key(),</span>
+<span class="nc" id="L715">                record.value(),</span>
+<span class="nc" id="L716">                record.headers());</span>
+<span class="nc" id="L717">            recordWritten(offset, timestamp, sizeInBytes);</span>
+<span class="nc" id="L718">        } else {</span>
+<span class="nc" id="L719">            LegacyRecord legacyRecord = LegacyRecord.create(magic,</span>
+<span class="nc" id="L720">                record.timestamp(),</span>
+<span class="nc" id="L721">                Utils.toNullableArray(record.key()),</span>
+<span class="nc" id="L722">                Utils.toNullableArray(record.value()));</span>
+<span class="nc" id="L723">            appendUncheckedWithOffset(offset, legacyRecord);</span>
+        }
+<span class="nc" id="L725">    }</span>
+
+    /**
+     * Append a record at the next sequential offset.
+     * @param record the record to add
+     */
+    public void append(Record record) {
+<span class="nc" id="L732">        appendWithOffset(record.offset(), isControlBatch, record.timestamp(), record.key(), record.value(), record.headers());</span>
+<span class="nc" id="L733">    }</span>
+
+    /**
+     * Append a log record using a different offset
+     * @param offset The offset of the record
+     * @param record The record to add
+     */
+    public void appendWithOffset(long offset, Record record) {
+<span class="nc" id="L741">        appendWithOffset(offset, record.timestamp(), record.key(), record.value(), record.headers());</span>
+<span class="nc" id="L742">    }</span>
+
+    /**
+     * Add a record with a given offset. The record must have a magic which matches the magic use to
+     * construct this builder and the offset must be greater than the last appended record.
+     * @param offset The offset of the record
+     * @param record The record to add
+     */
+    public void appendWithOffset(long offset, LegacyRecord record) {
+<span class="nc" id="L751">        appendWithOffset(offset, record.timestamp(), record.key(), record.value());</span>
+<span class="nc" id="L752">    }</span>
+
+    /**
+     * Append the record at the next consecutive offset. If no records have been appended yet, use the base
+     * offset of this builder.
+     * @param record The record to add
+     */
+    public void append(LegacyRecord record) {
+<span class="nc" id="L760">        appendWithOffset(nextSequentialOffset(), record);</span>
+<span class="nc" id="L761">    }</span>
+
+    private void appendDefaultRecord(long offset, long timestamp, ByteBuffer key, ByteBuffer value,
+                                     Header[] headers) throws IOException {
+<span class="nc" id="L765">        ensureOpenForRecordAppend();</span>
+<span class="nc" id="L766">        int offsetDelta = (int) (offset - baseOffset);</span>
+<span class="nc" id="L767">        long timestampDelta = timestamp - baseTimestamp;</span>
+<span class="nc" id="L768">        int sizeInBytes = DefaultRecord.writeTo(appendStream, offsetDelta, timestampDelta, key, value, headers);</span>
+<span class="nc" id="L769">        recordWritten(offset, timestamp, sizeInBytes);</span>
+<span class="nc" id="L770">    }</span>
+
+    private long appendLegacyRecord(long offset, long timestamp, ByteBuffer key, ByteBuffer value, byte magic) throws IOException {
+<span class="nc" id="L773">        ensureOpenForRecordAppend();</span>
+
+<span class="nc" id="L775">        int size = LegacyRecord.recordSize(magic, key, value);</span>
+<span class="nc" id="L776">        AbstractLegacyRecordBatch.writeHeader(appendStream, toInnerOffset(offset), size);</span>
+
+<span class="nc bnc" id="L778" title="All 2 branches missed.">        if (timestampType == TimestampType.LOG_APPEND_TIME)</span>
+<span class="nc" id="L779">            timestamp = logAppendTime;</span>
+<span class="nc" id="L780">        long crc = LegacyRecord.write(appendStream, magic, timestamp, key, value, CompressionType.NONE, timestampType);</span>
+<span class="nc" id="L781">        recordWritten(offset, timestamp, size + Records.LOG_OVERHEAD);</span>
+<span class="nc" id="L782">        return crc;</span>
+    }
+
+    private long toInnerOffset(long offset) {
+        // use relative offsets for compressed messages with magic v1
+<span class="nc bnc" id="L787" title="All 4 branches missed.">        if (magic &gt; 0 &amp;&amp; compression.type() != CompressionType.NONE)</span>
+<span class="nc" id="L788">            return offset - baseOffset;</span>
+<span class="nc" id="L789">        return offset;</span>
+    }
+
+    private void recordWritten(long offset, long timestamp, int size) {
+<span class="nc bnc" id="L793" title="All 2 branches missed.">        if (numRecords == Integer.MAX_VALUE)</span>
+<span class="nc" id="L794">            throw new IllegalArgumentException(&quot;Maximum number of records per batch exceeded, max records: &quot; + Integer.MAX_VALUE);</span>
+<span class="nc bnc" id="L795" title="All 2 branches missed.">        if (offset - baseOffset &gt; Integer.MAX_VALUE)</span>
+<span class="nc" id="L796">            throw new IllegalArgumentException(&quot;Maximum offset delta exceeded, base offset: &quot; + baseOffset +</span>
+                    &quot;, last offset: &quot; + offset);
+
+<span class="nc" id="L799">        numRecords += 1;</span>
+<span class="nc" id="L800">        uncompressedRecordsSizeInBytes += size;</span>
+<span class="nc" id="L801">        lastOffset = offset;</span>
+
+<span class="nc bnc" id="L803" title="All 4 branches missed.">        if (magic &gt; RecordBatch.MAGIC_VALUE_V0 &amp;&amp; timestamp &gt; maxTimestamp) {</span>
+<span class="nc" id="L804">            maxTimestamp = timestamp;</span>
+<span class="nc" id="L805">            offsetOfMaxTimestamp = offset;</span>
+        }
+<span class="nc" id="L807">    }</span>
+
+    private void ensureOpenForRecordAppend() {
+<span class="nc bnc" id="L810" title="All 2 branches missed.">        if (appendStream == CLOSED_STREAM)</span>
+<span class="nc" id="L811">            throw new IllegalStateException(&quot;Tried to append a record, but MemoryRecordsBuilder is closed for record appends&quot;);</span>
+<span class="nc" id="L812">    }</span>
+
+    private void ensureOpenForRecordBatchWrite() {
+<span class="nc bnc" id="L815" title="All 2 branches missed.">        if (isClosed())</span>
+<span class="nc" id="L816">            throw new IllegalStateException(&quot;Tried to write record batch header, but MemoryRecordsBuilder is closed&quot;);</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">        if (aborted)</span>
+<span class="nc" id="L818">            throw new IllegalStateException(&quot;Tried to write record batch header, but MemoryRecordsBuilder is aborted&quot;);</span>
+<span class="nc" id="L819">    }</span>
+
+    /**
+     * Get an estimate of the number of bytes written (based on the estimation factor hard-coded in {@link CompressionType}).
+     * @return The estimated number of bytes written
+     */
+    private int estimatedBytesWritten() {
+<span class="nc" id="L826">        return estimatedBytesWritten(uncompressedRecordsSizeInBytes);</span>
+    }
+
+    /**
+     * Returns the projected number of bytes the builder would write for the given uncompressed
+     * record bytes: exact for uncompressed, a ratio-aware estimate for compressed.
+     */
+    private int estimatedBytesWritten(int uncompressedSize) {
+<span class="nc bnc" id="L834" title="All 2 branches missed.">        if (compression.type() == CompressionType.NONE) {</span>
+<span class="nc" id="L835">            return batchHeaderSizeInBytes + uncompressedSize;</span>
+        } else {
+<span class="nc" id="L837">            return batchHeaderSizeInBytes + (int) (uncompressedSize * estimatedCompressionRatio * COMPRESSION_RATE_ESTIMATION_FACTOR);</span>
+        }
+    }
+
+    /**
+     * Projected value of {@link #estimatedBytesWritten} after appending one more record with the
+     * given fields, using the record's worst-case (upper-bound) per-record size. Used by the
+     * incremental strategy to size mid-batch chunk extensions.
+     */
+    public int estimatedBytesWrittenAfter(byte[] key, byte[] value, Header[] headers) {
+<span class="nc" id="L847">        ByteBuffer keyBuffer = wrapNullable(key);</span>
+<span class="nc" id="L848">        ByteBuffer valueBuffer = wrapNullable(value);</span>
+        final int recordSize;
+<span class="nc bnc" id="L850" title="All 2 branches missed.">        if (magic &lt; RecordBatch.MAGIC_VALUE_V2) {</span>
+<span class="nc" id="L851">            recordSize = Records.LOG_OVERHEAD + LegacyRecord.recordSize(magic, keyBuffer, valueBuffer);</span>
+        } else {
+<span class="nc" id="L853">            recordSize = DefaultRecord.recordSizeUpperBound(keyBuffer, valueBuffer, headers);</span>
+        }
+<span class="nc" id="L855">        return estimatedBytesWritten(uncompressedRecordsSizeInBytes + recordSize);</span>
+    }
+
+    /**
+     * Set the estimated compression ratio for the memory records builder.
+     */
+    public void setEstimatedCompressionRatio(float estimatedCompressionRatio) {
+<span class="nc" id="L862">        this.estimatedCompressionRatio = estimatedCompressionRatio;</span>
+<span class="nc" id="L863">    }</span>
+
+    /**
+     * Check if we have room for a new record containing the given key/value pair. If no records have been
+     * appended, then this returns true.
+     */
+    public boolean hasRoomFor(long timestamp, byte[] key, byte[] value, Header[] headers) {
+<span class="nc" id="L870">        return hasRoomFor(timestamp, wrapNullable(key), wrapNullable(value), headers);</span>
+    }
+
+    /**
+     * Check if we have room for a new record containing the given key/value pair. If no records have been
+     * appended, then this returns true.
+     *
+     * Note that the return value is based on the estimate of the bytes written to the compressor, which may not be
+     * accurate if compression is used. When this happens, the following append may cause dynamic buffer
+     * re-allocation in the underlying byte buffer stream.
+     */
+    public boolean hasRoomFor(long timestamp, ByteBuffer key, ByteBuffer value, Header[] headers) {
+<span class="nc bnc" id="L882" title="All 2 branches missed.">        if (isFull())</span>
+<span class="nc" id="L883">            return false;</span>
+
+        // We always allow at least one record to be appended (the ByteBufferOutputStream will grow as needed)
+<span class="nc bnc" id="L886" title="All 2 branches missed.">        if (numRecords == 0)</span>
+<span class="nc" id="L887">            return true;</span>
+
+        final int recordSize;
+<span class="nc bnc" id="L890" title="All 2 branches missed.">        if (magic &lt; RecordBatch.MAGIC_VALUE_V2) {</span>
+<span class="nc" id="L891">            recordSize = Records.LOG_OVERHEAD + LegacyRecord.recordSize(magic, key, value);</span>
+        } else {
+<span class="nc bnc" id="L893" title="All 2 branches missed.">            int nextOffsetDelta = lastOffset == null ? 0 : (int) (lastOffset - baseOffset + 1);</span>
+<span class="nc bnc" id="L894" title="All 2 branches missed.">            long timestampDelta = baseTimestamp == null ? 0 : timestamp - baseTimestamp;</span>
+<span class="nc" id="L895">            recordSize = DefaultRecord.sizeInBytes(nextOffsetDelta, timestampDelta, key, value, headers);</span>
+        }
+
+        // Be conservative and not take compression of the new record into consideration.
+<span class="nc bnc" id="L899" title="All 2 branches missed.">        return this.writeLimit &gt;= estimatedBytesWritten() + recordSize;</span>
+    }
+
+    /**
+     * Check if we have room for a given number of bytes.
+     */
+    public boolean hasRoomFor(int estimatedRecordsSize) {
+<span class="nc bnc" id="L906" title="All 2 branches missed.">        if (isFull()) return false;</span>
+<span class="nc bnc" id="L907" title="All 2 branches missed.">        return this.writeLimit &gt;= estimatedBytesWritten() + estimatedRecordsSize;</span>
+    }
+
+    public int maxAllowedBytes() {
+<span class="nc" id="L911">        return this.writeLimit - this.batchHeaderSizeInBytes;</span>
+    }
+
+    public boolean isClosed() {
+<span class="nc bnc" id="L915" title="All 2 branches missed.">        return builtRecords != null;</span>
+    }
+
+    public boolean isFull() {
+        // note that the write limit is respected only after the first record is added which ensures we can always
+        // create non-empty batches (this is used to disable batching when the producer's batch size is set to 0).
+<span class="nc bnc" id="L921" title="All 6 branches missed.">        return appendStream == CLOSED_STREAM || (this.numRecords &gt; 0 &amp;&amp; this.writeLimit &lt;= estimatedBytesWritten());</span>
+    }
+
+    /**
+     * Get an estimate of the number of bytes written to the underlying buffer. The returned value
+     * is exactly correct if the record set is not compressed or if the builder has been closed.
+     */
+    public int estimatedSizeInBytes() {
+<span class="nc bnc" id="L929" title="All 2 branches missed.">        return builtRecords != null ? builtRecords.sizeInBytes() : estimatedBytesWritten();</span>
+    }
+
+    public byte magic() {
+<span class="nc" id="L933">        return magic;</span>
+    }
+
+    private long nextSequentialOffset() {
+<span class="nc bnc" id="L937" title="All 2 branches missed.">        return lastOffset == null ? baseOffset : lastOffset + 1;</span>
+    }
+
+    public static class RecordsInfo {
+        public final long maxTimestamp;
+        public final long shallowOffsetOfMaxTimestamp;
+
+        public RecordsInfo(long maxTimestamp,
+<span class="nc" id="L945">                           long shallowOffsetOfMaxTimestamp) {</span>
+<span class="nc" id="L946">            this.maxTimestamp = maxTimestamp;</span>
+<span class="nc" id="L947">            this.shallowOffsetOfMaxTimestamp = shallowOffsetOfMaxTimestamp;</span>
+<span class="nc" id="L948">        }</span>
+    }
+
+    /**
+     * Return the producer id of the RecordBatches created by this builder.
+     */
+    public long producerId() {
+<span class="nc" id="L955">        return this.producerId;</span>
+    }
+
+    public short producerEpoch() {
+<span class="nc" id="L959">        return this.producerEpoch;</span>
+    }
+
+    public int baseSequence() {
+<span class="nc" id="L963">        return this.baseSequence;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

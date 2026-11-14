@@ -1,0 +1,507 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RackAwareTaskAssignor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals.assignment</a> &gt; <span class="el_source">RackAwareTaskAssignor.java</span></div><h1>RackAwareTaskAssignor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals.assignment;
+
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicPartitionInfo;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.assignment.AssignmentConfigs;
+import org.apache.kafka.streams.processor.assignment.ProcessId;
+import org.apache.kafka.streams.processor.internals.InternalTopicManager;
+import org.apache.kafka.streams.processor.internals.TopologyMetadata.Subtopology;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class RackAwareTaskAssignor {
+
+    @FunctionalInterface
+    public interface MoveStandbyTaskPredicate {
+        boolean canMove(final ClientState source,
+                        final ClientState destination,
+                        final TaskId taskId,
+                        final Map&lt;ProcessId, ClientState&gt; clientStateMap);
+    }
+
+    @FunctionalInterface
+    public interface CostFunction {
+        int getCost(final TaskId taskId,
+                    final ProcessId processId,
+                    final boolean inCurrentAssignment,
+                    final int trafficCost,
+                    final int nonOverlapCost,
+                    final boolean isStandby);
+    }
+
+    // For stateless tasks, it's ok to move them around. So we have 0 non_overlap_cost
+    public static final int STATELESS_TRAFFIC_COST = 1;
+    public static final int STATELESS_NON_OVERLAP_COST = 0;
+
+<span class="nc" id="L78">    private static final Logger log = LoggerFactory.getLogger(RackAwareTaskAssignor.class);</span>
+
+    // This is number is picked based on testing. Usually the optimization for standby assignment
+    // stops after 3 rounds
+    public static final int STANDBY_OPTIMIZER_MAX_ITERATION = 4;
+
+    private final Cluster fullMetadata;
+    private final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask;
+    private final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; changelogPartitionsForTask;
+    private final Map&lt;Subtopology, Set&lt;TaskId&gt;&gt; tasksForTopicGroup;
+    private final AssignmentConfigs assignmentConfigs;
+    private final Map&lt;TopicPartition, Set&lt;String&gt;&gt; racksForPartition;
+    private final Map&lt;ProcessId, String&gt; rackForProcess;
+    private final InternalTopicManager internalTopicManager;
+    private final boolean validClientRack;
+    private final Time time;
+<span class="nc" id="L94">    private Boolean canEnable = null;</span>
+
+    public RackAwareTaskAssignor(final Cluster fullMetadata,
+                                 final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask,
+                                 final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; changelogPartitionsForTask,
+                                 final Map&lt;Subtopology, Set&lt;TaskId&gt;&gt; tasksForTopicGroup,
+                                 final Map&lt;ProcessId, Map&lt;String, Optional&lt;String&gt;&gt;&gt; racksForProcessConsumer,
+                                 final InternalTopicManager internalTopicManager,
+                                 final AssignmentConfigs assignmentConfigs,
+<span class="nc" id="L103">                                 final Time time) {</span>
+<span class="nc" id="L104">        this.fullMetadata = fullMetadata;</span>
+<span class="nc" id="L105">        this.partitionsForTask = partitionsForTask;</span>
+<span class="nc" id="L106">        this.changelogPartitionsForTask = changelogPartitionsForTask;</span>
+<span class="nc" id="L107">        this.tasksForTopicGroup = tasksForTopicGroup;</span>
+<span class="nc" id="L108">        this.internalTopicManager = internalTopicManager;</span>
+<span class="nc" id="L109">        this.assignmentConfigs = assignmentConfigs;</span>
+<span class="nc" id="L110">        this.racksForPartition = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L111">        this.rackForProcess = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L112">        this.time = Objects.requireNonNull(time, &quot;Time was not specified&quot;);</span>
+<span class="nc" id="L113">        validClientRack = validateClientRack(racksForProcessConsumer, assignmentConfigs,</span>
+            rackForProcess
+        );
+<span class="nc" id="L116">    }</span>
+
+    public boolean validClientRack() {
+<span class="nc" id="L119">        return validClientRack;</span>
+    }
+
+    public synchronized boolean canEnableRackAwareAssignor() {
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        if (StreamsConfig.RACK_AWARE_ASSIGNMENT_STRATEGY_NONE.equals(assignmentConfigs.rackAwareAssignmentStrategy())) {</span>
+<span class="nc" id="L124">            return false;</span>
+        }
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        if (canEnable != null) {</span>
+<span class="nc" id="L127">            return canEnable;</span>
+        }
+<span class="nc bnc" id="L129" title="All 4 branches missed.">        canEnable = validClientRack &amp;&amp; validateTopicPartitionRack(false);</span>
+<span class="nc bnc" id="L130" title="All 4 branches missed.">        if (assignmentConfigs.numStandbyReplicas() == 0 || !canEnable) {</span>
+<span class="nc" id="L131">            return canEnable;</span>
+        }
+
+<span class="nc" id="L134">        canEnable = validateTopicPartitionRack(true);</span>
+<span class="nc" id="L135">        return canEnable;</span>
+    }
+
+    // Visible for testing. This method also checks if all TopicPartitions exist in cluster
+    boolean populateTopicsToDescribe(final Set&lt;String&gt; topicsToDescribe, final boolean changelog) {
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (changelog) {</span>
+            // Changelog topics are not in metadata, we need to describe them
+<span class="nc" id="L142">            changelogPartitionsForTask.values().stream().flatMap(Collection::stream).forEach(tp -&gt; topicsToDescribe.add(tp.topic()));</span>
+<span class="nc" id="L143">            return true;</span>
+        }
+
+        // Make sure rackId exist for all TopicPartitions needed
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        for (final Set&lt;TopicPartition&gt; topicPartitions : partitionsForTask.values()) {</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">            for (final TopicPartition topicPartition : topicPartitions) {</span>
+<span class="nc" id="L149">                final PartitionInfo partitionInfo = fullMetadata.partition(topicPartition);</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">                if (partitionInfo == null) {</span>
+<span class="nc" id="L151">                    log.error(&quot;TopicPartition {} doesn't exist in cluster&quot;, topicPartition);</span>
+<span class="nc" id="L152">                    return false;</span>
+                }
+<span class="nc" id="L154">                final Node[] replica = partitionInfo.replicas();</span>
+<span class="nc bnc" id="L155" title="All 4 branches missed.">                if (replica == null || replica.length == 0) {</span>
+<span class="nc" id="L156">                    topicsToDescribe.add(topicPartition.topic());</span>
+<span class="nc" id="L157">                    continue;</span>
+                }
+<span class="nc bnc" id="L159" title="All 2 branches missed.">                for (final Node node : replica) {</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">                    if (node.hasRack()) {</span>
+<span class="nc" id="L161">                        racksForPartition.computeIfAbsent(topicPartition, k -&gt; new HashSet&lt;&gt;()).add(node.rack());</span>
+                    } else {
+<span class="nc" id="L163">                        log.warn(&quot;Node {} for topic partition {} doesn't have rack&quot;, node, topicPartition);</span>
+<span class="nc" id="L164">                        return false;</span>
+                    }
+                }
+<span class="nc" id="L167">            }</span>
+<span class="nc" id="L168">        }</span>
+<span class="nc" id="L169">        return true;</span>
+    }
+
+    /**
+     * This function populates the {@param racksForPartition} parameter passed into the function by using both
+     * the {@code Cluster} metadata as well as the {@param internalTopicManager} for topics that have stale
+     * information.
+     *
+     * @return whether the operation successfully completed and the rack information is valid.
+     */
+    private boolean validateTopicPartitionRack(final boolean changelogTopics) {
+        // Make sure rackId exist for all TopicPartitions needed
+<span class="nc" id="L181">        final Set&lt;String&gt; topicsToDescribe = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (!populateTopicsToDescribe(topicsToDescribe, changelogTopics)) {</span>
+<span class="nc" id="L183">            return false;</span>
+        }
+
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        if (!topicsToDescribe.isEmpty()) {</span>
+<span class="nc" id="L187">            log.info(&quot;Fetching PartitionInfo for topics {}&quot;, topicsToDescribe);</span>
+            try {
+<span class="nc" id="L189">                final Map&lt;String, List&lt;TopicPartitionInfo&gt;&gt; topicPartitionInfo = internalTopicManager.getTopicPartitionInfo(topicsToDescribe);</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">                if (topicsToDescribe.size() &gt; topicPartitionInfo.size()) {</span>
+<span class="nc" id="L191">                    topicsToDescribe.removeAll(topicPartitionInfo.keySet());</span>
+<span class="nc" id="L192">                    log.error(&quot;Failed to describe topic for {}&quot;, topicsToDescribe);</span>
+<span class="nc" id="L193">                    return false;</span>
+                }
+<span class="nc bnc" id="L195" title="All 2 branches missed.">                for (final Map.Entry&lt;String, List&lt;TopicPartitionInfo&gt;&gt; entry : topicPartitionInfo.entrySet()) {</span>
+<span class="nc" id="L196">                    final List&lt;TopicPartitionInfo&gt; partitionInfos = entry.getValue();</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">                    for (final TopicPartitionInfo partitionInfo : partitionInfos) {</span>
+<span class="nc" id="L198">                        final int partition = partitionInfo.partition();</span>
+<span class="nc" id="L199">                        final List&lt;Node&gt; replicas = partitionInfo.replicas();</span>
+<span class="nc bnc" id="L200" title="All 4 branches missed.">                        if (replicas == null || replicas.isEmpty()) {</span>
+<span class="nc" id="L201">                            log.error(&quot;No replicas found for topic partition {}: {}&quot;, entry.getKey(), partition);</span>
+<span class="nc" id="L202">                            return false;</span>
+                        }
+<span class="nc" id="L204">                        final TopicPartition topicPartition = new TopicPartition(entry.getKey(), partition);</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">                        for (final Node node : replicas) {</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">                            if (node.hasRack()) {</span>
+<span class="nc" id="L207">                                racksForPartition.computeIfAbsent(topicPartition, k -&gt; new HashSet&lt;&gt;()).add(node.rack());</span>
+                            } else {
+<span class="nc" id="L209">                                return false;</span>
+                            }
+<span class="nc" id="L211">                        }</span>
+<span class="nc" id="L212">                    }</span>
+<span class="nc" id="L213">                }</span>
+<span class="nc" id="L214">            } catch (final Exception e) {</span>
+<span class="nc" id="L215">                log.error(&quot;Failed to describe topics {}&quot;, topicsToDescribe, e);</span>
+<span class="nc" id="L216">                return false;</span>
+<span class="nc" id="L217">            }</span>
+        }
+<span class="nc" id="L219">        return true;</span>
+    }
+
+    /**
+     * Verifies that within the {@param racksForProcessConsumer}, a single process is only running on a single
+     * rack. This function mutates the parameter {@param racksForProcess} to contain the resulting process
+     * to rack mapping.
+     *
+     * @return true if the validation was successful, and false otherwise.
+     */
+    public static boolean validateClientRack(final Map&lt;ProcessId, Map&lt;String, Optional&lt;String&gt;&gt;&gt; racksForProcessConsumer,
+                                             final AssignmentConfigs assignmentConfigs,
+                                             final Map&lt;ProcessId, String&gt; rackForProcess) {
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        if (racksForProcessConsumer == null) {</span>
+<span class="nc" id="L233">            return false;</span>
+        }
+        /*
+         * Check rack information is populated correctly in clients
+         * 1. RackId exist for all clients
+         * 2. Different consumerId for same process should have same rackId
+         */
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        for (final Map.Entry&lt;ProcessId, Map&lt;String, Optional&lt;String&gt;&gt;&gt; entry : racksForProcessConsumer.entrySet()) {</span>
+<span class="nc" id="L241">            final ProcessId processId = entry.getKey();</span>
+<span class="nc" id="L242">            KeyValue&lt;String, String&gt; previousRackInfo = null;</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">            for (final Map.Entry&lt;String, Optional&lt;String&gt;&gt; rackEntry : entry.getValue().entrySet()) {</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">                if (rackEntry.getValue().isEmpty()) {</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                    if (!StreamsConfig.RACK_AWARE_ASSIGNMENT_STRATEGY_NONE.equals(assignmentConfigs.rackAwareAssignmentStrategy())) {</span>
+<span class="nc" id="L246">                        log.error(</span>
+<span class="nc" id="L247">                            String.format(&quot;RackId doesn't exist for process %s and consumer %s&quot;,</span>
+<span class="nc" id="L248">                                processId, rackEntry.getKey()));</span>
+                    }
+<span class="nc" id="L250">                    return false;</span>
+                }
+<span class="nc bnc" id="L252" title="All 2 branches missed.">                if (previousRackInfo == null) {</span>
+<span class="nc" id="L253">                    previousRackInfo = KeyValue.pair(rackEntry.getKey(), rackEntry.getValue().get());</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">                } else if (!previousRackInfo.value.equals(rackEntry.getValue().get())) {</span>
+<span class="nc" id="L255">                    log.error(</span>
+<span class="nc" id="L256">                        String.format(&quot;Consumers %s and %s for same process %s has different rackId %s and %s. File a ticket for this bug&quot;,</span>
+                            previousRackInfo.key,
+<span class="nc" id="L258">                            rackEntry.getKey(),</span>
+<span class="nc" id="L259">                            entry.getKey(),</span>
+                            previousRackInfo.value,
+<span class="nc" id="L261">                            rackEntry.getValue().get()</span>
+                        )
+                    );
+<span class="nc" id="L264">                    return false;</span>
+                }
+<span class="nc" id="L266">            }</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            if (previousRackInfo == null) {</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">                if (!StreamsConfig.RACK_AWARE_ASSIGNMENT_STRATEGY_NONE.equals(assignmentConfigs.rackAwareAssignmentStrategy())) {</span>
+<span class="nc" id="L269">                    log.error(String.format(&quot;RackId doesn't exist for process %s&quot;, processId));</span>
+                }
+<span class="nc" id="L271">                return false;</span>
+            }
+<span class="nc" id="L273">            rackForProcess.put(entry.getKey(), previousRackInfo.value);</span>
+<span class="nc" id="L274">        }</span>
+
+<span class="nc" id="L276">        return true;</span>
+    }
+
+    public Map&lt;ProcessId, String&gt; racksForProcess() {
+<span class="nc" id="L280">        return Collections.unmodifiableMap(rackForProcess);</span>
+    }
+
+    public Map&lt;TopicPartition, Set&lt;String&gt;&gt; racksForPartition() {
+<span class="nc" id="L284">        return Collections.unmodifiableMap(racksForPartition);</span>
+    }
+
+    private int getCost(final TaskId taskId, final ProcessId processId, final boolean inCurrentAssignment, final int trafficCost, final int nonOverlapCost, final boolean isStandby) {
+<span class="nc" id="L288">        final String clientRack = rackForProcess.get(processId);</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (clientRack == null) {</span>
+<span class="nc" id="L290">            throw new IllegalStateException(&quot;Client &quot; + processId + &quot; doesn't have rack configured. Maybe forgot to call canEnableRackAwareAssignor first&quot;);</span>
+        }
+
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        final Set&lt;TopicPartition&gt; topicPartitions = isStandby ? changelogPartitionsForTask.get(taskId) : partitionsForTask.get(taskId);</span>
+<span class="nc bnc" id="L294" title="All 4 branches missed.">        if (topicPartitions == null || topicPartitions.isEmpty()) {</span>
+<span class="nc" id="L295">            throw new IllegalStateException(&quot;Task &quot; + taskId + &quot; has no TopicPartitions&quot;);</span>
+        }
+
+<span class="nc" id="L298">        int cost = 0;</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        for (final TopicPartition tp : topicPartitions) {</span>
+<span class="nc" id="L300">            final Set&lt;String&gt; tpRacks = racksForPartition.get(tp);</span>
+<span class="nc bnc" id="L301" title="All 4 branches missed.">            if (tpRacks == null || tpRacks.isEmpty()) {</span>
+<span class="nc" id="L302">                throw new IllegalStateException(&quot;TopicPartition &quot; + tp + &quot; has no rack information. Maybe forgot to call canEnableRackAwareAssignor first&quot;);</span>
+            }
+<span class="nc bnc" id="L304" title="All 2 branches missed.">            if (!tpRacks.contains(clientRack)) {</span>
+<span class="nc" id="L305">                cost += trafficCost;</span>
+            }
+<span class="nc" id="L307">        }</span>
+
+<span class="nc bnc" id="L309" title="All 2 branches missed.">        if (!inCurrentAssignment) {</span>
+<span class="nc" id="L310">            cost += nonOverlapCost;</span>
+        }
+
+<span class="nc" id="L313">        return cost;</span>
+    }
+
+    /**
+     * Compute the cost for the provided {@code activeTasks}. The passed in active tasks must be contained in {@code clientState}.
+     */
+    long activeTasksCost(final SortedSet&lt;TaskId&gt; activeTasks,
+                         final SortedMap&lt;ProcessId, ClientState&gt; clientStates,
+                         final int trafficCost,
+                         final int nonOverlapCost) {
+<span class="nc" id="L323">        return tasksCost(activeTasks, clientStates, trafficCost, nonOverlapCost, ClientState::hasActiveTask, false, false);</span>
+    }
+
+    /**
+     * Compute the cost for the provided {@code standbyTasks}. The passed in standby tasks must be contained in {@code clientState}.
+     */
+    long standByTasksCost(final SortedSet&lt;TaskId&gt; standbyTasks,
+                          final SortedMap&lt;ProcessId, ClientState&gt; clientStates,
+                          final int trafficCost,
+                          final int nonOverlapCost) {
+<span class="nc" id="L333">        return tasksCost(standbyTasks, clientStates, trafficCost, nonOverlapCost, ClientState::hasStandbyTask, true, true);</span>
+    }
+
+    private long tasksCost(final SortedSet&lt;TaskId&gt; tasks,
+                           final SortedMap&lt;ProcessId, ClientState&gt; clientStates,
+                           final int trafficCost,
+                           final int nonOverlapCost,
+                           final BiPredicate&lt;ClientState, TaskId&gt; hasAssignedTask,
+                           final boolean hasReplica,
+                           final boolean isStandby) {
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        if (tasks.isEmpty()) {</span>
+<span class="nc" id="L344">            return 0;</span>
+        }
+<span class="nc" id="L346">        final List&lt;ProcessId&gt; clientList = new ArrayList&lt;&gt;(clientStates.keySet());</span>
+<span class="nc" id="L347">        final List&lt;TaskId&gt; taskIdList = new ArrayList&lt;&gt;(tasks);</span>
+<span class="nc" id="L348">        final Graph&lt;Integer&gt; graph = new MinTrafficGraphConstructor&lt;ClientState&gt;()</span>
+<span class="nc" id="L349">            .constructTaskGraph(</span>
+                clientList,
+                taskIdList,
+                clientStates,
+                new HashMap&lt;&gt;(),
+                new HashMap&lt;&gt;(),
+                hasAssignedTask,
+                this::getCost,
+                trafficCost,
+                nonOverlapCost,
+                hasReplica,
+                isStandby
+            );
+<span class="nc" id="L362">        return graph.totalCost();</span>
+    }
+
+    /**
+     * Optimize active task assignment for rack awareness. canEnableRackAwareAssignor must be called first.
+     * {@code trafficCost} and {@code nonOverlapCost} balance cross rack traffic optimization and task movement.
+     * If we set {@code trafficCost} to a larger number, we are more likely to compute an assignment with less
+     * cross rack traffic. However, tasks may be shuffled a lot across clients. If we set {@code nonOverlapCost}
+     * to a larger number, we are more likely to compute an assignment with similar to input assignment. However,
+     * cross rack traffic can be higher. In extreme case, if we set {@code nonOverlapCost} to 0 and @{code trafficCost}
+     * to a positive value, the computed assignment will be minimum for cross rack traffic. If we set {@code trafficCost} to 0,
+     * and {@code nonOverlapCost} to a positive value, the computed assignment should be the same as input
+     * @param activeTasks Tasks to reassign if needed. They must be assigned already in clientStates
+     * @param clientStates Client states
+     * @param trafficCost Cost of cross rack traffic for each TopicPartition
+     * @param nonOverlapCost Cost of assign a task to a different client
+     * @return Total cost after optimization
+     */
+    public long optimizeActiveTasks(final SortedSet&lt;TaskId&gt; activeTasks,
+                                    final SortedMap&lt;ProcessId, ClientState&gt; clientStates,
+                                    final int trafficCost,
+                                    final int nonOverlapCost) {
+<span class="nc bnc" id="L384" title="All 2 branches missed.">        if (activeTasks.isEmpty()) {</span>
+<span class="nc" id="L385">            return 0;</span>
+        }
+
+<span class="nc" id="L388">        log.info(&quot;Assignment before active task optimization is {}\n with cost {}&quot;, clientStates,</span>
+<span class="nc" id="L389">            activeTasksCost(activeTasks, clientStates, trafficCost, nonOverlapCost));</span>
+
+<span class="nc" id="L391">        final long startTime = time.milliseconds();</span>
+<span class="nc" id="L392">        final List&lt;ProcessId&gt; clientList = new ArrayList&lt;&gt;(clientStates.keySet());</span>
+<span class="nc" id="L393">        final List&lt;TaskId&gt; taskIdList = new ArrayList&lt;&gt;(activeTasks);</span>
+<span class="nc" id="L394">        final Map&lt;TaskId, ProcessId&gt; taskClientMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L395">        final Map&lt;ProcessId, Integer&gt; originalAssignedTaskNumber = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L396">        final RackAwareGraphConstructor&lt;ClientState&gt; graphConstructor = RackAwareGraphConstructorFactory.create(assignmentConfigs, tasksForTopicGroup);</span>
+<span class="nc" id="L397">        final Graph&lt;Integer&gt; graph = graphConstructor.constructTaskGraph(</span>
+            clientList,
+            taskIdList,
+            clientStates,
+            taskClientMap,
+            originalAssignedTaskNumber,
+            ClientState::hasActiveTask,
+            this::getCost,
+            trafficCost,
+            nonOverlapCost,
+            false,
+            false
+        );
+
+<span class="nc" id="L411">        graph.solveMinCostFlow();</span>
+<span class="nc" id="L412">        final long cost = graph.totalCost();</span>
+
+<span class="nc" id="L414">        graphConstructor.assignTaskFromMinCostFlow(graph, clientList, taskIdList, clientStates, originalAssignedTaskNumber,</span>
+            taskClientMap, ClientState::assignActive, ClientState::unassignActive, ClientState::hasActiveTask);
+
+<span class="nc" id="L417">        final long duration = time.milliseconds() - startTime;</span>
+<span class="nc" id="L418">        log.info(&quot;Assignment after {} milliseconds for active task optimization is {}\n with cost {}&quot;, duration, clientStates, cost);</span>
+<span class="nc" id="L419">        return cost;</span>
+    }
+
+    public long optimizeStandbyTasks(final SortedMap&lt;ProcessId, ClientState&gt; clientStates,
+                                     final int trafficCost,
+                                     final int nonOverlapCost,
+                                     final MoveStandbyTaskPredicate moveStandbyTask) {
+<span class="nc" id="L426">        final BiFunction&lt;ClientState, ClientState, List&lt;TaskId&gt;&gt; getMovableTasks = (source, destination) -&gt; source.standbyTasks().stream()</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">            .filter(task -&gt; !destination.hasAssignedTask(task))</span>
+<span class="nc" id="L428">            .filter(task -&gt; moveStandbyTask.canMove(source, destination, task, clientStates))</span>
+<span class="nc" id="L429">            .sorted()</span>
+<span class="nc" id="L430">            .collect(Collectors.toList());</span>
+
+<span class="nc" id="L432">        final long startTime = time.milliseconds();</span>
+<span class="nc" id="L433">        final List&lt;ProcessId&gt; clientList = new ArrayList&lt;&gt;(clientStates.keySet());</span>
+<span class="nc" id="L434">        final SortedSet&lt;TaskId&gt; standbyTasks = new TreeSet&lt;&gt;();</span>
+<span class="nc" id="L435">        clientStates.values().forEach(clientState -&gt; standbyTasks.addAll(clientState.standbyTasks()));</span>
+
+<span class="nc" id="L437">        log.info(&quot;Assignment before standby task optimization is {}\n with cost {}&quot;, clientStates,</span>
+<span class="nc" id="L438">            standByTasksCost(standbyTasks, clientStates, trafficCost, nonOverlapCost));</span>
+
+<span class="nc" id="L440">        boolean taskMoved = true;</span>
+<span class="nc" id="L441">        int round = 0;</span>
+<span class="nc" id="L442">        final RackAwareGraphConstructor&lt;ClientState&gt; graphConstructor = new MinTrafficGraphConstructor&lt;&gt;();</span>
+<span class="nc bnc" id="L443" title="All 4 branches missed.">        while (taskMoved &amp;&amp; round &lt; STANDBY_OPTIMIZER_MAX_ITERATION) {</span>
+<span class="nc" id="L444">            taskMoved = false;</span>
+<span class="nc" id="L445">            round++;</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">            for (int i = 0; i &lt; clientList.size(); i++) {</span>
+<span class="nc" id="L447">                final ClientState clientState1 = clientStates.get(clientList.get(i));</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">                for (int j = i + 1; j &lt; clientList.size(); j++) {</span>
+<span class="nc" id="L449">                    final ClientState clientState2 = clientStates.get(clientList.get(j));</span>
+
+<span class="nc" id="L451">                    final String rack1 = rackForProcess.get(clientState1.processId());</span>
+<span class="nc" id="L452">                    final String rack2 = rackForProcess.get(clientState2.processId());</span>
+                    // Cross rack traffic can not be reduced if racks are the same
+<span class="nc bnc" id="L454" title="All 2 branches missed.">                    if (rack1.equals(rack2)) {</span>
+<span class="nc" id="L455">                        continue;</span>
+                    }
+
+<span class="nc" id="L458">                    final List&lt;TaskId&gt; movable1 = getMovableTasks.apply(clientState1, clientState2);</span>
+<span class="nc" id="L459">                    final List&lt;TaskId&gt; movable2 = getMovableTasks.apply(clientState2, clientState1);</span>
+
+                    // There's no needed to optimize if one is empty because the optimization
+                    // can only swap tasks to keep the client's load balanced
+<span class="nc bnc" id="L463" title="All 4 branches missed.">                    if (movable1.isEmpty() || movable2.isEmpty()) {</span>
+<span class="nc" id="L464">                        continue;</span>
+                    }
+
+<span class="nc" id="L467">                    final List&lt;TaskId&gt; taskIdList = Stream.concat(movable1.stream(),</span>
+<span class="nc" id="L468">                            movable2.stream())</span>
+<span class="nc" id="L469">                        .sorted()</span>
+<span class="nc" id="L470">                        .collect(Collectors.toList());</span>
+
+<span class="nc" id="L472">                    final List&lt;ProcessId&gt; clients = Stream.of(clientList.get(i), clientList.get(j))</span>
+<span class="nc" id="L473">                        .sorted().collect(</span>
+<span class="nc" id="L474">                            Collectors.toList());</span>
+
+<span class="nc" id="L476">                    final Map&lt;TaskId, ProcessId&gt; taskClientMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L477">                    final Map&lt;ProcessId, Integer&gt; originalAssignedTaskNumber = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L478">                    final Graph&lt;Integer&gt; graph = graphConstructor.constructTaskGraph(</span>
+                        clients,
+                        taskIdList,
+                        clientStates,
+                        taskClientMap,
+                        originalAssignedTaskNumber,
+                        ClientState::hasStandbyTask,
+                        this::getCost,
+                        trafficCost,
+                        nonOverlapCost,
+                        true,
+                        true
+                    );
+<span class="nc" id="L491">                    graph.solveMinCostFlow();</span>
+
+<span class="nc" id="L493">                    taskMoved |= graphConstructor.assignTaskFromMinCostFlow(graph, clients, taskIdList, clientStates,</span>
+                        originalAssignedTaskNumber,
+                        taskClientMap, ClientState::assignStandby, ClientState::unassignStandby,
+                        ClientState::hasStandbyTask);
+                }
+            }
+        }
+<span class="nc" id="L500">        final long cost = standByTasksCost(standbyTasks, clientStates, trafficCost, nonOverlapCost);</span>
+
+<span class="nc" id="L502">        final long duration = time.milliseconds() - startTime;</span>
+<span class="nc" id="L503">        log.info(&quot;Assignment after {} rounds and {} milliseconds for standby task optimization is {}\n with cost {}&quot;, round, duration, clientStates, cost);</span>
+<span class="nc" id="L504">        return cost;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

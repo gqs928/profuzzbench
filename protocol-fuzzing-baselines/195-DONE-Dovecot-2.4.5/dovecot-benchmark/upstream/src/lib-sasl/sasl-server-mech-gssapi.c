@@ -1,0 +1,731 @@
+/*
+ * GSSAPI Module
+ *
+ * Copyright (c) 2005 Jelmer Vernooij <jelmer@samba.org>
+ *
+ * Related standards:
+ * - draft-ietf-sasl-gssapi-03
+ * - RFC2222
+ *
+ * Some parts inspired by an older patch from Colin Walters
+ *
+ * This software is released under the MIT license.
+ */
+
+#include "lib.h"
+#include "env-util.h"
+#include "str.h"
+#include "str-sanitize.h"
+#include "hex-binary.h"
+#include "safe-memset.h"
+#include "auth-gssapi.h"
+
+#include "sasl-server-protected.h"
+#include "sasl-server-gssapi.h"
+
+#define krb5_boolean2bool(X) ((X) != 0)
+
+/* Non-zero flags defined in RFC 2222 */
+enum sasl_gssapi_qop {
+	SASL_GSSAPI_QOP_UNSPECIFIED = 0x00,
+	SASL_GSSAPI_QOP_AUTH_ONLY   = 0x01,
+	SASL_GSSAPI_QOP_AUTH_INT    = 0x02,
+	SASL_GSSAPI_QOP_AUTH_CONF   = 0x04
+};
+
+struct gssapi_auth_request {
+	struct sasl_server_mech_request auth_request;
+	gss_ctx_id_t gss_ctx;
+	gss_cred_id_t service_cred;
+
+	enum {
+		GSS_STATE_SEC_CONTEXT,
+		GSS_STATE_WRAP,
+		GSS_STATE_UNWRAP
+	} sasl_gssapi_state;
+
+	gss_name_t authn_name;
+	gss_name_t authz_name;
+};
+
+struct gssapi_auth_mech {
+	struct sasl_server_mech mech;
+
+	const char *hostname;
+};
+
+static int
+mech_gssapi_wrap(struct gssapi_auth_request *request, gss_buffer_desc inbuf);
+
+static void
+mech_gssapi_log_error(struct gssapi_auth_request *request,
+		      OM_uint32 status_value, int status_type,
+		      const char *description)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	OM_uint32 message_context = 0;
+	OM_uint32 minor_status;
+	gss_buffer_desc status_string;
+
+	do {
+		(void)gss_display_status(&minor_status, status_value,
+					 status_type, GSS_C_NO_OID,
+					 &message_context, &status_string);
+
+		e_info(auth_request->event, "While %s: %s", description,
+		       str_sanitize(status_string.value, SIZE_MAX));
+
+		(void)gss_release_buffer(&minor_status, &status_string);
+	} while (message_context != 0);
+}
+
+static struct sasl_server_mech_request *
+mech_gssapi_auth_new(const struct sasl_server_mech *mech ATTR_UNUSED,
+		     pool_t pool)
+{
+	struct gssapi_auth_request *request;
+
+	request = p_new(pool, struct gssapi_auth_request, 1);
+
+	request->gss_ctx = GSS_C_NO_CONTEXT;
+
+	return &request->auth_request;
+}
+
+static OM_uint32
+obtain_service_credentials(struct gssapi_auth_request *request,
+			   gss_cred_id_t *ret_r)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	const struct gssapi_auth_mech *gss_mech =
+		container_of(auth_request->mech,
+			     const struct gssapi_auth_mech, mech);
+	OM_uint32 major_status, minor_status;
+	string_t *principal_name;
+	gss_buffer_desc inbuf;
+	gss_name_t gss_principal;
+
+	if (strcmp(gss_mech->hostname, "$ALL") == 0) {
+		e_debug(auth_request->event, "Using all keytab entries");
+		*ret_r = GSS_C_NO_CREDENTIAL;
+		return GSS_S_COMPLETE;
+	}
+
+	principal_name = t_str_new(128);
+	str_append(principal_name, auth_request->protocol);
+	str_append_c(principal_name, '@');
+	str_append(principal_name, gss_mech->hostname);
+
+	e_debug(auth_request->event, "Obtaining credentials for %s",
+		str_c(principal_name));
+
+	inbuf.length = str_len(principal_name);
+	inbuf.value = str_c_modifiable(principal_name);
+
+	major_status = gss_import_name(&minor_status, &inbuf,
+				       GSS_C_NT_HOSTBASED_SERVICE,
+				       &gss_principal);
+	str_free(&principal_name);
+
+	if (GSS_ERROR(major_status) != 0) {
+		mech_gssapi_log_error(request, major_status, GSS_C_GSS_CODE,
+				      "importing principal name");
+		return major_status;
+	}
+
+	major_status = gss_acquire_cred(&minor_status, gss_principal, 0,
+					GSS_C_NULL_OID_SET, GSS_C_ACCEPT,
+					ret_r, NULL, NULL);
+	if (GSS_ERROR(major_status) != 0) {
+		mech_gssapi_log_error(request, major_status, GSS_C_GSS_CODE,
+				      "acquiring service credentials");
+		mech_gssapi_log_error(request, minor_status, GSS_C_MECH_CODE,
+				      "acquiring service credentials");
+		return major_status;
+	}
+
+	gss_release_name(&minor_status, &gss_principal);
+	return major_status;
+}
+
+static gss_name_t
+import_name(struct gssapi_auth_request *request, void *str, size_t len)
+{
+	OM_uint32 major_status, minor_status;
+	gss_buffer_desc name_buf;
+	gss_name_t name;
+
+	name_buf.value = str;
+	name_buf.length = len;
+	major_status = gss_import_name(&minor_status, &name_buf,
+				       GSS_C_NO_OID, &name);
+	if (GSS_ERROR(major_status) != 0) {
+		mech_gssapi_log_error(request, major_status, GSS_C_GSS_CODE,
+				      "gss_import_name");
+		return GSS_C_NO_NAME;
+	}
+	return name;
+}
+
+static gss_name_t
+duplicate_name(struct gssapi_auth_request *request, gss_name_t old)
+{
+	OM_uint32 major_status, minor_status;
+	gss_name_t new;
+
+	major_status = gss_duplicate_name(&minor_status, old, &new);
+	if (GSS_ERROR(major_status) != 0) {
+		mech_gssapi_log_error(request, major_status, GSS_C_GSS_CODE,
+				      "gss_duplicate_name");
+		return GSS_C_NO_NAME;
+	}
+	return new;
+}
+
+static bool data_has_nuls(const void *data, size_t len)
+{
+	const unsigned char *c = data;
+	size_t i;
+
+	/* apparently all names end with NUL? */
+	if (len > 0 && c[len-1] == '\0')
+		len--;
+
+	for (i = 0; i < len; i++) {
+		if (c[i] == '\0')
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static int
+get_display_name(struct gssapi_auth_request *request, gss_name_t name,
+		 gss_OID *name_type_r, const char **display_name_r)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	OM_uint32 major_status, minor_status;
+	gss_buffer_desc buf;
+
+	major_status = gss_display_name(&minor_status, name,
+					&buf, name_type_r);
+	if (major_status != GSS_S_COMPLETE) {
+		mech_gssapi_log_error(request, major_status, GSS_C_GSS_CODE,
+				      "gss_display_name");
+		return -1;
+	}
+	if (data_has_nuls(buf.value, buf.length)) {
+		e_info(auth_request->event, "authn_name has NULs");
+		(void)gss_release_buffer(&minor_status, &buf);
+		return -1;
+	}
+	*display_name_r = t_strndup(buf.value, buf.length);
+	(void)gss_release_buffer(&minor_status, &buf);
+	return 0;
+}
+
+static int
+mech_gssapi_sec_context(struct gssapi_auth_request *request,
+			gss_buffer_desc inbuf)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	OM_uint32 major_status, minor_status;
+	gss_buffer_desc output_token;
+	gss_OID name_type;
+	gss_OID mech_type;
+	const char *username;
+	int ret = 0;
+
+	major_status = gss_accept_sec_context (
+		&minor_status,
+		&request->gss_ctx,
+		request->service_cred,
+		&inbuf,
+		GSS_C_NO_CHANNEL_BINDINGS,
+		&request->authn_name,
+		&mech_type,
+		&output_token,
+		NULL, /* ret_flags */
+		NULL, /* time_rec */
+		NULL  /* delegated_cred_handle */
+	);
+
+	if (GSS_ERROR(major_status) != 0) {
+		mech_gssapi_log_error(request, major_status, GSS_C_GSS_CODE,
+				      "processing incoming data");
+		mech_gssapi_log_error(request, minor_status, GSS_C_MECH_CODE,
+				      "processing incoming data");
+		return -1;
+	}
+
+	switch (major_status) {
+	case GSS_S_COMPLETE:
+		if (!auth_gssapi_oid_equal(mech_type,
+					   auth_gssapi_mech_krb5_oid)) {
+			e_info(auth_request->event,
+			       "GSSAPI mechanism not Kerberos5");
+			ret = -1;
+		} else if (get_display_name(request, request->authn_name,
+					    &name_type, &username) < 0)
+			ret = -1;
+		else if (!sasl_server_request_set_authid(
+				auth_request, SASL_SERVER_AUTHID_TYPE_USERNAME,
+				username)) {
+			ret = -1;
+		} else {
+			request->sasl_gssapi_state = GSS_STATE_WRAP;
+			e_debug(auth_request->event,
+				"security context state completed.");
+		}
+		break;
+	case GSS_S_CONTINUE_NEEDED:
+		e_debug(auth_request->event,
+			"Processed incoming packet correctly, "
+			"waiting for another.");
+		break;
+	default:
+		e_error(auth_request->event,
+			"Received unexpected major status %d", major_status);
+		break;
+	}
+
+	if (ret == 0) {
+		if (output_token.length > 0) {
+			sasl_server_request_output(auth_request,
+						   output_token.value,
+						   output_token.length);
+		} else {
+			/* If there is no output token, go straight to wrap,
+			   which is expecting an empty input token. */
+			ret = mech_gssapi_wrap(request, output_token);
+		}
+	}
+	(void)gss_release_buffer(&minor_status, &output_token);
+	return ret;
+}
+
+static int
+mech_gssapi_wrap(struct gssapi_auth_request *request, gss_buffer_desc inbuf)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	OM_uint32 major_status, minor_status;
+	gss_buffer_desc outbuf;
+	unsigned char ret[4];
+
+	/* The client's return data should be empty here */
+
+	/* Only authentication, no integrity or confidentiality protection
+	   (yet?) */
+	ret[0] = (SASL_GSSAPI_QOP_UNSPECIFIED |
+                  SASL_GSSAPI_QOP_AUTH_ONLY);
+	ret[1] = 0xFF;
+	ret[2] = 0xFF;
+	ret[3] = 0xFF;
+
+	inbuf.length = 4;
+	inbuf.value = ret;
+
+	major_status = gss_wrap(&minor_status, request->gss_ctx, 0,
+				GSS_C_QOP_DEFAULT, &inbuf, NULL, &outbuf);
+
+	if (GSS_ERROR(major_status) != 0) {
+		mech_gssapi_log_error(request, major_status, GSS_C_GSS_CODE,
+				      "sending security layer negotiation");
+		mech_gssapi_log_error(request, minor_status, GSS_C_MECH_CODE,
+				      "sending security layer negotiation");
+		return -1;
+	}
+
+	e_debug(auth_request->event, "Negotiated security layer");
+
+	sasl_server_request_output(auth_request, outbuf.value, outbuf.length);
+
+	(void)gss_release_buffer(&minor_status, &outbuf);
+	request->sasl_gssapi_state = GSS_STATE_UNWRAP;
+	return 0;
+}
+
+static bool
+k5_principal_is_authorized(struct gssapi_auth_request *request, const char *name)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	const char *value, *const *authorized_names, *const *tmp;
+
+	if (!sasl_server_request_get_extra_field(auth_request, "k5principals",
+						 &value))
+		return FALSE;
+
+	authorized_names = t_strsplit_spaces(value, ",");
+	for (tmp = authorized_names; *tmp != NULL; tmp++) {
+		if (strcmp(*tmp, name) == 0) {
+			e_debug(auth_request->event,
+				"authorized by k5principals field: %s", name);
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static bool
+mech_gssapi_krb5_userok(struct gssapi_auth_request *request,
+			gss_name_t name, const char *login_user,
+			bool check_name_type)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	krb5_context ctx;
+	krb5_principal princ;
+	krb5_error_code krb5_err;
+	gss_OID name_type;
+	const char *princ_display_name;
+	bool authorized = FALSE;
+
+	/* Parse out the principal's username */
+	if (get_display_name(request, name, &name_type,
+			     &princ_display_name) < 0)
+		return FALSE;
+
+	if (!auth_gssapi_oid_equal(name_type, GSS_KRB5_NT_PRINCIPAL_NAME) &&
+	    check_name_type) {
+		e_info(auth_request->event, "OID not kerberos principal name");
+		return FALSE;
+	}
+
+	/* Init a krb5 context and parse the principal username */
+	krb5_err = krb5_init_context(&ctx);
+	if (krb5_err != 0) {
+		e_error(auth_request->event, "krb5_init_context() failed: %d",
+			(int)krb5_err);
+		return FALSE;
+	}
+	krb5_err = krb5_parse_name(ctx, princ_display_name, &princ);
+	if (krb5_err != 0) {
+		/* writing the error string would be better, but we probably
+		   rarely get here and there doesn't seem to be a standard
+		   way of getting it */
+		e_info(auth_request->event, "krb5_parse_name() failed: %d",
+		       (int)krb5_err);
+	} else {
+		/* See if the principal is in the list of authorized principals
+		   for the user */
+		authorized = k5_principal_is_authorized(request,
+							princ_display_name);
+
+		/* See if the principal is authorized to act as the specified
+		   (UNIX) user */
+		if (!authorized) {
+			authorized = krb5_boolean2bool(
+				krb5_kuserok(ctx, princ, login_user));
+		}
+
+		krb5_free_principal(ctx, princ);
+	}
+	krb5_free_context(ctx);
+	return authorized;
+}
+
+static int
+mech_gssapi_userok(struct gssapi_auth_request *request, const char *login_user)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	OM_uint32 major_status, minor_status;
+	int equal_authn_authz;
+
+	/* If authn and authz names equal, don't bother checking further. */
+	major_status = gss_compare_name(&minor_status,
+					request->authn_name,
+					request->authz_name,
+					&equal_authn_authz);
+	if (GSS_ERROR(major_status) != 0) {
+		mech_gssapi_log_error(request, major_status, GSS_C_GSS_CODE,
+				      "gss_compare_name failed");
+		return -1;
+	}
+
+	if (equal_authn_authz != 0)
+		return 0;
+
+	if (!mech_gssapi_krb5_userok(request, request->authn_name,
+				     login_user, TRUE)) {
+		e_info(auth_request->event,
+		       "User not authorized to log in as %s", login_user);
+		return -1;
+	}
+
+	return 0;
+}
+
+static void
+gssapi_credentials_callback(struct sasl_server_mech_request *auth_request,
+			    const struct sasl_passdb_result *result)
+{
+	struct gssapi_auth_request *request =
+		container_of(auth_request, struct gssapi_auth_request,
+			     auth_request);
+
+	/* We don't care much whether the lookup succeeded or not because GSSAPI
+	   does not strictly require a passdb. But if a passdb is configured,
+	   now the k5principals field will have been filled in. */
+	switch (result->status) {
+	case SASL_PASSDB_RESULT_INTERNAL_FAILURE:
+		sasl_server_request_internal_failure(auth_request);
+		return;
+	case SASL_PASSDB_RESULT_USER_DISABLED:
+	case SASL_PASSDB_RESULT_PASS_EXPIRED:
+		/* User is explicitly disabled, don't allow it to log in */
+		sasl_server_request_failure(auth_request);
+		return;
+	case SASL_PASSDB_RESULT_SCHEME_NOT_AVAILABLE:
+	case SASL_PASSDB_RESULT_USER_UNKNOWN:
+	case SASL_PASSDB_RESULT_PASSWORD_MISMATCH:
+	case SASL_PASSDB_RESULT_OK:
+		break;
+	}
+
+	if (mech_gssapi_userok(request, auth_request->authid) == 0)
+		sasl_server_request_success(auth_request, NULL, 0);
+	else
+		sasl_server_request_failure(auth_request);
+}
+
+static int
+mech_gssapi_unwrap(struct gssapi_auth_request *request, gss_buffer_desc inbuf)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	OM_uint32 major_status, minor_status;
+	gss_buffer_desc outbuf;
+	const char *login_user;
+	unsigned char *name;
+	size_t name_len;
+
+	major_status = gss_unwrap(&minor_status, request->gss_ctx,
+				  &inbuf, &outbuf, NULL, NULL);
+
+	if (GSS_ERROR(major_status) != 0) {
+		mech_gssapi_log_error(request, major_status, GSS_C_GSS_CODE,
+				      "final negotiation: gss_unwrap");
+		return -1;
+	}
+
+	/* outbuf[0] contains bitmask for selected security layer,
+	   outbuf[1..3] contains maximum output_message size */
+	if (outbuf.length < 4) {
+		e_error(auth_request->event, "Invalid response length");
+		(void)gss_release_buffer(&minor_status, &outbuf);
+		return -1;
+	}
+
+	if (outbuf.length > 4) {
+		name = (unsigned char *)outbuf.value + 4;
+		name_len = outbuf.length - 4;
+
+		if (data_has_nuls(name, name_len)) {
+			e_info(auth_request->event, "authz_name has NULs");
+			(void)gss_release_buffer(&minor_status, &outbuf);
+			return -1;
+		}
+
+		login_user = p_strndup(auth_request->pool, name, name_len);
+		request->authz_name = import_name(request, name, name_len);
+	} else {
+		request->authz_name = duplicate_name(request,
+						     request->authn_name);
+		if (get_display_name(request, request->authz_name,
+				     NULL, &login_user) < 0) {
+			(void)gss_release_buffer(&minor_status, &outbuf);
+			return -1;
+		}
+	}
+
+	if (request->authz_name == GSS_C_NO_NAME) {
+		e_info(auth_request->event, "no authz_name");
+		(void)gss_release_buffer(&minor_status, &outbuf);
+		return -1;
+	}
+
+	/* Set username early, so that the credential lookup is for the
+	   authorizing user. This means the username in subsequent log messages
+	   will be the authorization name, not the authentication name, which
+	   may mean that future log messages should be adjusted to log the right
+	   thing. */
+	if (!sasl_server_request_set_authid(auth_request,
+					    SASL_SERVER_AUTHID_TYPE_USERNAME,
+					    login_user)) {
+		(void)gss_release_buffer(&minor_status, &outbuf);
+		return -1;
+	}
+
+	/* Continue in callback once auth_request is populated with passdb
+	   information. */
+	sasl_server_request_lookup_credentials(auth_request, "",
+					       gssapi_credentials_callback);
+	(void)gss_release_buffer(&minor_status, &outbuf);
+	return 0;
+}
+
+static void
+mech_gssapi_auth_continue(struct sasl_server_mech_request *auth_request,
+			  const unsigned char *data, size_t data_size)
+{
+	struct gssapi_auth_request *request =
+		container_of(auth_request, struct gssapi_auth_request,
+			     auth_request);
+	gss_buffer_desc inbuf;
+	int ret = -1;
+
+	inbuf.value = (void *)data;
+	inbuf.length = data_size;
+
+	switch (request->sasl_gssapi_state) {
+	case GSS_STATE_SEC_CONTEXT:
+		ret = mech_gssapi_sec_context(request, inbuf);
+		break;
+	case GSS_STATE_WRAP:
+		ret = mech_gssapi_wrap(request, inbuf);
+		break;
+	case GSS_STATE_UNWRAP:
+		ret = mech_gssapi_unwrap(request, inbuf);
+		break;
+	default:
+		i_unreached();
+	}
+	if (ret < 0)
+		sasl_server_request_failure(auth_request);
+}
+
+static void
+mech_gssapi_auth_initial(struct sasl_server_mech_request *auth_request,
+			 const unsigned char *data, size_t data_size)
+{
+	struct gssapi_auth_request *request =
+		container_of(auth_request, struct gssapi_auth_request,
+			     auth_request);
+	OM_uint32 major_status;
+
+	major_status =
+		obtain_service_credentials(request, &request->service_cred);
+
+	if (GSS_ERROR(major_status) != 0) {
+		sasl_server_request_internal_failure(auth_request);
+		return;
+	}
+	request->authn_name = GSS_C_NO_NAME;
+	request->authz_name = GSS_C_NO_NAME;
+
+	request->sasl_gssapi_state = GSS_STATE_SEC_CONTEXT;
+
+	if (data == NULL) {
+		/* The client should go first */
+		sasl_server_request_output(auth_request, uchar_empty_ptr, 0);
+	} else {
+		mech_gssapi_auth_continue(auth_request, data, data_size);
+	}
+}
+
+static void
+mech_gssapi_auth_free(struct sasl_server_mech_request *auth_request)
+{
+	struct gssapi_auth_request *request =
+		container_of(auth_request, struct gssapi_auth_request,
+			     auth_request);
+	OM_uint32 minor_status;
+
+	if (request->gss_ctx != GSS_C_NO_CONTEXT) {
+		(void)gss_delete_sec_context(&minor_status, &request->gss_ctx,
+					     GSS_C_NO_BUFFER);
+	}
+
+	if (request->service_cred != GSS_C_NO_CREDENTIAL)
+		(void)gss_release_cred(&minor_status, &request->service_cred);
+	if (request->authn_name != GSS_C_NO_NAME)
+		(void)gss_release_name(&minor_status, &request->authn_name);
+	if (request->authz_name != GSS_C_NO_NAME)
+		(void)gss_release_name(&minor_status, &request->authz_name);
+}
+
+static struct sasl_server_mech *mech_gssapi_mech_new(pool_t pool)
+{
+	struct gssapi_auth_mech *gss_mech;
+
+	gss_mech = p_new(pool, struct gssapi_auth_mech, 1);
+
+	return &gss_mech->mech;
+}
+
+static const struct sasl_server_mech_funcs mech_gssapi_funcs = {
+	.auth_new = mech_gssapi_auth_new,
+	.auth_initial = mech_gssapi_auth_initial,
+	.auth_continue = mech_gssapi_auth_continue,
+	.auth_free = mech_gssapi_auth_free,
+
+	.mech_new = mech_gssapi_mech_new,
+};
+
+static const struct sasl_server_mech_def mech_gssapi = {
+	.name = SASL_MECH_NAME_GSSAPI,
+
+	.flags = SASL_MECH_SEC_ALLOW_NULS,
+	.passdb_need = SASL_MECH_PASSDB_NEED_NOTHING,
+
+	.funcs = &mech_gssapi_funcs,
+};
+
+/* MIT Kerberos v1.5+ and Heimdal v0.7+ support SPNEGO for Kerberos tickets
+   internally. Nothing else needs to be done here. Note, however, that this does
+   not support SPNEGO when the only available credential is NTLM. */
+static const struct sasl_server_mech_def mech_gss_spnego = {
+	.name = SASL_MECH_NAME_GSS_SPNEGO,
+
+	.flags = SASL_MECH_SEC_ALLOW_NULS,
+	.passdb_need = SASL_MECH_PASSDB_NEED_NOTHING,
+
+	.funcs = &mech_gssapi_funcs,
+};
+
+static void
+mech_gssapi_register(struct sasl_server_instance *sinst,
+		     const struct sasl_server_mech_def *mech_def,
+		     const struct sasl_server_gssapi_settings *set)
+{
+	struct sasl_server_mech *mech;
+	struct gssapi_auth_mech *gss_mech;
+
+	mech = sasl_server_mech_register(sinst, mech_def, NULL);
+
+	gss_mech = container_of(mech, struct gssapi_auth_mech, mech);
+	gss_mech->hostname = p_strdup(mech->pool, set->hostname);
+
+	const char *path = set->krb5_keytab;
+
+	if (path != NULL && *path != '\0') {
+		/* Environment may be used by Kerberos 5 library directly */
+		env_put("KRB5_KTNAME", path);
+#ifdef HAVE_GSSKRB5_REGISTER_ACCEPTOR_IDENTITY
+		gsskrb5_register_acceptor_identity(path);
+#elif defined (HAVE_KRB5_GSS_REGISTER_ACCEPTOR_IDENTITY)
+		krb5_gss_register_acceptor_identity(path);
+#endif
+	}
+}
+
+void sasl_server_mech_register_gssapi(
+	struct sasl_server_instance *sinst,
+	const struct sasl_server_gssapi_settings *set)
+{
+	mech_gssapi_register(sinst, &mech_gssapi, set);
+}
+
+void sasl_server_mech_unregister_gssapi(struct sasl_server_instance *sinst)
+{
+	sasl_server_mech_unregister(sinst, &mech_gssapi);
+}
+
+void sasl_server_mech_register_gss_spnego(
+	struct sasl_server_instance *sinst,
+	const struct sasl_server_gssapi_settings *set)
+{
+	mech_gssapi_register(sinst, &mech_gss_spnego, set);
+}
+
+void sasl_server_mech_unregister_gss_spnego(struct sasl_server_instance *sinst)
+{
+	sasl_server_mech_unregister(sinst, &mech_gss_spnego);
+}

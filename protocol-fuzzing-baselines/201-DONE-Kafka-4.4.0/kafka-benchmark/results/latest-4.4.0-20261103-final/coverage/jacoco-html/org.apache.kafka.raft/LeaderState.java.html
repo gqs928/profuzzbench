@@ -1,0 +1,1086 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LeaderState.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.raft</a> &gt; <span class="el_source">LeaderState.java</span></div><h1>LeaderState.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.raft;
+
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.errors.InvalidUpdateVersionException;
+import org.apache.kafka.common.message.KRaftVersionRecord;
+import org.apache.kafka.common.message.LeaderChangeMessage;
+import org.apache.kafka.common.message.LeaderChangeMessage.Voter;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.record.internal.ControlRecordUtils;
+import org.apache.kafka.common.record.internal.MemoryRecordsBuilder;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.raft.errors.NotLeaderException;
+import org.apache.kafka.raft.internals.BatchAccumulator;
+import org.apache.kafka.raft.internals.ChangeVoterHandlerState;
+import org.apache.kafka.raft.internals.KRaftVersionUpgrade;
+import org.apache.kafka.raft.internals.KafkaRaftMetrics;
+import org.apache.kafka.server.common.KRaftVersion;
+
+import org.slf4j.Logger;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+/**
+ * In the context of LeaderState, an acknowledged voter means one who has acknowledged the current leader by either
+ * responding to a `BeginQuorumEpoch` request from the leader or by beginning to send `Fetch` requests.
+ * More specifically, the set of unacknowledged voters are targets for BeginQuorumEpoch requests from the leader until
+ * they acknowledge the leader.
+ */
+public final class LeaderState&lt;T&gt; implements EpochState {
+    static final long OBSERVER_SESSION_TIMEOUT_MS = 300_000L;
+    static final double CHECK_QUORUM_TIMEOUT_FACTOR = 1.5;
+
+    private final VoterSet.VoterNode localVoterNode;
+    private final int epoch;
+    private final long epochStartOffset;
+    private final Set&lt;Integer&gt; grantingVoters;
+    private final VoterSet voterSetAtEpochStart;
+    // This field is non-empty if the voter set at epoch start came from a snapshot or log segment
+    private final OptionalLong offsetOfVotersAtEpochStart;
+    private final KRaftVersion kraftVersionAtEpochStart;
+    private final ChangeVoterHandlerState changeVoterState;
+
+<span class="nc" id="L77">    private Optional&lt;LogOffsetMetadata&gt; highWatermark = Optional.empty();</span>
+<span class="nc" id="L78">    private Map&lt;Integer, ReplicaState&gt; voterStates = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L80">    private final Map&lt;ReplicaKey, ReplicaState&gt; observerStates = new HashMap&lt;&gt;();</span>
+    private final Logger log;
+    private final BatchAccumulator&lt;T&gt; accumulator;
+    // The set includes all the followers voters that FETCH or FETCH_SNAPSHOT during the current checkQuorumTimer interval.
+<span class="nc" id="L84">    private final Set&lt;Integer&gt; fetchedVoters = new HashSet&lt;&gt;();</span>
+    private final Timer checkQuorumTimer;
+    private final int checkQuorumTimeoutMs;
+    private final Timer beginQuorumEpochTimer;
+    private final int beginQuorumEpochTimeoutMs;
+    private final KafkaRaftMetrics kafkaRaftMetrics;
+
+    // This is volatile because resignation can be requested from an external thread.
+<span class="nc" id="L92">    private volatile boolean resignRequested = false;</span>
+
+    /* Used to coordinate the upgrade of the kraft.version from 0 to 1. The upgrade is triggered by
+     * the clients to RaftClient.
+     *  1. if the kraft version is 0, the starting state is the Voters type. The voter set is the voters in
+     *     the static voter set with the leader updated. See KRaftVersionUpgrade for details on the
+     *     Voters type.
+     *  2. as the leader receives UpdateRaftVoter requests, it updates the associated Voters type. Only
+     *     after all of the voters have been updated will an upgrade successfully complete.
+     *  3. a client of RaftClient triggers the upgrade and transition this state to the Version
+     *     type. See KRaftVersionUpgrade for details on the Version type.
+     *
+     * All transition are coordinated using optimistic locking by always calling AtomicReference#compareAndSet
+     */
+<span class="nc" id="L106">    private final AtomicReference&lt;KRaftVersionUpgrade&gt; kraftVersionUpgradeState = new AtomicReference&lt;&gt;(</span>
+<span class="nc" id="L107">        KRaftVersionUpgrade.empty()</span>
+    );
+
+    protected LeaderState(
+        Time time,
+        VoterSet.VoterNode localVoterNode,
+        int epoch,
+        long epochStartOffset,
+        VoterSet voterSetAtEpochStart,
+        OptionalLong offsetOfVotersAtEpochStart,
+        KRaftVersion kraftVersionAtEpochStart,
+        Set&lt;Integer&gt; grantingVoters,
+        BatchAccumulator&lt;T&gt; accumulator,
+        int fetchTimeoutMs,
+        LogContext logContext,
+        KafkaRaftMetrics kafkaRaftMetrics
+<span class="nc" id="L123">    ) {</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        if (localVoterNode.voterKey().directoryId().isEmpty()) {</span>
+<span class="nc" id="L125">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L126">                String.format(&quot;Unknown local replica directory id: %s&quot;, localVoterNode)</span>
+            );
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        } else if (!voterSetAtEpochStart.isVoter(localVoterNode.voterKey())) {</span>
+<span class="nc" id="L129">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L130">                String.format(</span>
+                    &quot;Local replica %s is not a voter in %s&quot;,
+                    localVoterNode,
+                    voterSetAtEpochStart
+                )
+            );
+        }
+
+<span class="nc" id="L138">        this.localVoterNode = localVoterNode;</span>
+<span class="nc" id="L139">        this.epoch = epoch;</span>
+<span class="nc" id="L140">        this.epochStartOffset = epochStartOffset;</span>
+
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        for (VoterSet.VoterNode voterNode: voterSetAtEpochStart.voterNodes()) {</span>
+<span class="nc" id="L143">            boolean hasAcknowledgedLeader = voterNode.isVoter(localVoterNode.voterKey());</span>
+<span class="nc" id="L144">            this.voterStates.put(</span>
+<span class="nc" id="L145">                voterNode.voterKey().id(),</span>
+<span class="nc" id="L146">                new ReplicaState(voterNode.voterKey(), hasAcknowledgedLeader, voterNode.listeners())</span>
+            );
+<span class="nc" id="L148">        }</span>
+<span class="nc" id="L149">        this.grantingVoters = Set.copyOf(grantingVoters);</span>
+<span class="nc" id="L150">        this.log = logContext.logger(LeaderState.class);</span>
+<span class="nc" id="L151">        this.accumulator = Objects.requireNonNull(accumulator, &quot;accumulator must be non-null&quot;);</span>
+        // use the 1.5x of fetch timeout to tolerate some network transition time or other IO time.
+<span class="nc" id="L153">        this.checkQuorumTimeoutMs = (int) (fetchTimeoutMs * CHECK_QUORUM_TIMEOUT_FACTOR);</span>
+<span class="nc" id="L154">        this.checkQuorumTimer = time.timer(checkQuorumTimeoutMs);</span>
+<span class="nc" id="L155">        this.beginQuorumEpochTimeoutMs = fetchTimeoutMs / 2;</span>
+<span class="nc" id="L156">        this.beginQuorumEpochTimer = time.timer(0);</span>
+<span class="nc" id="L157">        this.voterSetAtEpochStart =  voterSetAtEpochStart;</span>
+<span class="nc" id="L158">        this.offsetOfVotersAtEpochStart = offsetOfVotersAtEpochStart;</span>
+<span class="nc" id="L159">        this.kraftVersionAtEpochStart = kraftVersionAtEpochStart;</span>
+<span class="nc" id="L160">        this.changeVoterState = new ChangeVoterHandlerState(kafkaRaftMetrics);</span>
+
+<span class="nc" id="L162">        kafkaRaftMetrics.addLeaderMetrics();</span>
+<span class="nc" id="L163">        this.kafkaRaftMetrics = kafkaRaftMetrics;</span>
+
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        if (!kraftVersionAtEpochStart.isReconfigSupported()) {</span>
+<span class="nc" id="L166">            var updatedVoters = voterSetAtEpochStart</span>
+<span class="nc" id="L167">                .updateVoterIgnoringDirectoryId(localVoterNode)</span>
+<span class="nc" id="L168">                .orElseThrow(</span>
+<span class="nc" id="L169">                    () -&gt; new IllegalStateException(</span>
+<span class="nc" id="L170">                        String.format(</span>
+                            &quot;Unable to update voter set %s with the latest leader information %s&quot;,
+                            voterSetAtEpochStart,
+                            localVoterNode
+                        )
+                    )
+                );
+<span class="nc" id="L177">            kraftVersionUpgradeState.set(new KRaftVersionUpgrade.Voters(updatedVoters));</span>
+        }
+<span class="nc" id="L179">    }</span>
+
+    public long timeUntilBeginQuorumEpochTimerExpires(long currentTimeMs) {
+<span class="nc" id="L182">        beginQuorumEpochTimer.update(currentTimeMs);</span>
+<span class="nc" id="L183">        return beginQuorumEpochTimer.remainingMs();</span>
+    }
+
+    public void resetBeginQuorumEpochTimer(long currentTimeMs) {
+<span class="nc" id="L187">        beginQuorumEpochTimer.update(currentTimeMs);</span>
+<span class="nc" id="L188">        beginQuorumEpochTimer.reset(beginQuorumEpochTimeoutMs);</span>
+<span class="nc" id="L189">    }</span>
+
+    /**
+     * Determines the set of replicas that should receive a {@code BeginQuorumEpoch} request
+     * based on the elapsed time since their last fetch.
+     * &lt;p&gt;
+     * For each remote voter (excluding the local node), if the time since the last
+     * fetch exceeds the configured {@code beginQuorumEpochTimeoutMs}, the replica
+     * is considered to need a new quorum epoch request.
+     *
+     * @param currentTimeMs the current system time in milliseconds
+     * @return an unmodifiable set of {@link ReplicaKey} objects representing replicas
+     *         that need to receive a {@code BeginQuorumEpoch} request
+     */
+    public Set&lt;ReplicaKey&gt; needToSendBeginQuorumRequests(long currentTimeMs) {
+<span class="nc" id="L204">        return voterStates.values()</span>
+<span class="nc" id="L205">            .stream()</span>
+<span class="nc" id="L206">            .filter(</span>
+<span class="nc bnc" id="L207" title="All 4 branches missed.">                state -&gt; state.replicaKey.id() != localVoterNode.voterKey().id() &amp;&amp;</span>
+                currentTimeMs - state.lastFetchTimestamp &gt;= beginQuorumEpochTimeoutMs
+            )
+<span class="nc" id="L210">            .map(ReplicaState::replicaKey)</span>
+<span class="nc" id="L211">            .collect(Collectors.toUnmodifiableSet());</span>
+    }
+
+    /**
+     * Get the remaining time in milliseconds until the checkQuorumTimer expires.
+     *
+     * This will happen if we didn't receive a valid fetch/fetchSnapshot request from the majority
+     * of the voters within checkQuorumTimeoutMs.
+     *
+     * @param currentTimeMs the current timestamp in millisecond
+     * @return the remainingMs before the checkQuorumTimer expired
+     */
+    public long timeUntilCheckQuorumExpires(long currentTimeMs) {
+        // if there's only 1 voter, it should never get expired.
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (voterStates.size() == 1) {</span>
+<span class="nc" id="L226">            return Long.MAX_VALUE;</span>
+        }
+<span class="nc" id="L228">        checkQuorumTimer.update(currentTimeMs);</span>
+<span class="nc" id="L229">        long remainingMs = checkQuorumTimer.remainingMs();</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        if (remainingMs == 0) {</span>
+<span class="nc" id="L231">            log.info(</span>
+                &quot;Did not receive fetch request from the majority of the voters within {}ms. &quot; +
+                &quot;Current fetched voters are {}, and voters are {}&quot;,
+<span class="nc" id="L234">                checkQuorumTimeoutMs,</span>
+                fetchedVoters,
+<span class="nc" id="L236">                voterStates.values()</span>
+<span class="nc" id="L237">                    .stream()</span>
+<span class="nc" id="L238">                    .map(voter -&gt; voter.replicaKey)</span>
+<span class="nc" id="L239">                    .collect(Collectors.toUnmodifiableSet())</span>
+            );
+        }
+<span class="nc" id="L242">        return remainingMs;</span>
+    }
+
+    /**
+     * Reset the checkQuorumTimer if we've received fetch/fetchSnapshot request from the majority of the voter
+     *
+     * @param replicaKey the replica key of the voter
+     * @param currentTimeMs the current timestamp in millisecond
+     */
+    public void updateCheckQuorumForFollowingVoter(ReplicaKey replicaKey, long currentTimeMs) {
+<span class="nc" id="L252">        updateFetchedVoters(replicaKey);</span>
+        // The majority number of the voters. Ex: 2 for 3 voters, 3 for 4 voters... etc.
+<span class="nc" id="L254">        int majority = (voterStates.size() / 2) + 1;</span>
+        // If the leader is in the voter set, it should be implicitly counted as part of the
+        // majority, but the leader will never be a member of the fetchedVoters.
+        // If the leader is not in the voter set, it is not in the majority. Then, the
+        // majority can only be composed of fetched voters.
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        if (voterStates.containsKey(localVoterNode.voterKey().id())) {</span>
+<span class="nc" id="L260">            majority = majority - 1;</span>
+        }
+
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (fetchedVoters.size() &gt;= majority) {</span>
+<span class="nc" id="L264">            fetchedVoters.clear();</span>
+<span class="nc" id="L265">            checkQuorumTimer.update(currentTimeMs);</span>
+<span class="nc" id="L266">            checkQuorumTimer.reset(checkQuorumTimeoutMs);</span>
+        }
+<span class="nc" id="L268">    }</span>
+
+    private void updateFetchedVoters(ReplicaKey replicaKey) {
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        if (replicaKey.id() == localVoterNode.voterKey().id()) {</span>
+<span class="nc" id="L272">            throw new IllegalArgumentException(&quot;Received a FETCH/FETCH_SNAPSHOT request from the leader itself.&quot;);</span>
+        }
+
+<span class="nc" id="L275">        ReplicaState state = voterStates.get(replicaKey.id());</span>
+<span class="nc bnc" id="L276" title="All 4 branches missed.">        if (state != null &amp;&amp; state.matchesKey(replicaKey)) {</span>
+<span class="nc" id="L277">            fetchedVoters.add(replicaKey.id());</span>
+        }
+<span class="nc" id="L279">    }</span>
+
+    public BatchAccumulator&lt;T&gt; accumulator() {
+<span class="nc" id="L282">        return accumulator;</span>
+    }
+
+    public ChangeVoterHandlerState changeVoterState() {
+<span class="nc" id="L286">        return changeVoterState;</span>
+    }
+
+    private static List&lt;Voter&gt; convertToVoters(Set&lt;Integer&gt; voterIds) {
+<span class="nc" id="L290">        return voterIds.stream()</span>
+<span class="nc" id="L291">            .map(follower -&gt; new Voter().setVoterId(follower))</span>
+<span class="nc" id="L292">            .collect(Collectors.toList());</span>
+    }
+
+    private static MemoryRecordsBuilder createControlRecordsBuilder(
+        long baseOffset,
+        int epoch,
+        Compression compression,
+        ByteBuffer buffer,
+        long currentTimeMs
+    ) {
+<span class="nc" id="L302">        return new MemoryRecordsBuilder(</span>
+            buffer,
+            RecordBatch.CURRENT_MAGIC_VALUE,
+            compression,
+            TimestampType.CREATE_TIME,
+            baseOffset,
+            currentTimeMs,
+            RecordBatch.NO_PRODUCER_ID,
+            RecordBatch.NO_PRODUCER_EPOCH,
+            RecordBatch.NO_SEQUENCE,
+            false, // isTransactional
+            true,  // isControlBatch
+            epoch,
+<span class="nc" id="L315">            buffer.capacity()</span>
+        );
+    }
+
+
+    public void appendStartOfEpochControlRecords(long currentTimeMs) {
+<span class="nc" id="L321">        List&lt;Voter&gt; voters = convertToVoters(voterStates.keySet());</span>
+<span class="nc" id="L322">        List&lt;Voter&gt; grantingVoters = convertToVoters(this.grantingVoters());</span>
+
+<span class="nc" id="L324">        LeaderChangeMessage leaderChangeMessage = new LeaderChangeMessage()</span>
+<span class="nc" id="L325">            .setVersion(ControlRecordUtils.LEADER_CHANGE_CURRENT_VERSION)</span>
+<span class="nc" id="L326">            .setLeaderId(this.election().leaderId())</span>
+<span class="nc" id="L327">            .setVoters(voters)</span>
+<span class="nc" id="L328">            .setGrantingVoters(grantingVoters);</span>
+
+<span class="nc" id="L330">        accumulator.appendControlMessages((baseOffset, epoch, compression, buffer) -&gt; {</span>
+<span class="nc" id="L331">            try (MemoryRecordsBuilder builder = createControlRecordsBuilder(</span>
+                    baseOffset,
+                    epoch,
+                    compression,
+                    buffer,
+                    currentTimeMs
+                )
+            ) {
+<span class="nc" id="L339">                builder.appendLeaderChangeMessage(currentTimeMs, leaderChangeMessage);</span>
+
+<span class="nc bnc" id="L341" title="All 2 branches missed.">                if (kraftVersionAtEpochStart.isReconfigSupported()) {</span>
+<span class="nc" id="L342">                    long offset = offsetOfVotersAtEpochStart.orElseThrow(</span>
+<span class="nc" id="L343">                        () -&gt; new IllegalStateException(</span>
+<span class="nc" id="L344">                            String.format(</span>
+                                &quot;The %s is %s but there is no voter set in the log or &quot; +
+                                &quot;checkpoint %s&quot;,
+                                KRaftVersion.FEATURE_NAME,
+                                kraftVersionAtEpochStart,
+                                voterSetAtEpochStart
+                            )
+                        )
+                    );
+
+                    // The leader should write the latest voters record if its local listeners are different
+                    // or it has never written a voters record to the log before.
+<span class="nc bnc" id="L356" title="All 4 branches missed.">                    if (offset == -1 || voterSetAtEpochStart.voterNodeNeedsUpdate(localVoterNode)) {</span>
+<span class="nc" id="L357">                        VoterSet updatedVoterSet = voterSetAtEpochStart</span>
+<span class="nc" id="L358">                            .updateVoter(localVoterNode)</span>
+<span class="nc" id="L359">                            .orElseThrow(</span>
+<span class="nc" id="L360">                                () -&gt; new IllegalStateException(</span>
+<span class="nc" id="L361">                                    String.format(</span>
+                                        &quot;Update expected for leader node %s and voter set %s&quot;,
+                                        localVoterNode,
+                                        voterSetAtEpochStart
+                                    )
+                                )
+                            );
+
+<span class="nc" id="L369">                        builder.appendKRaftVersionMessage(</span>
+                            currentTimeMs,
+                            new KRaftVersionRecord()
+<span class="nc" id="L372">                                .setVersion(kraftVersionAtEpochStart.kraftVersionRecordVersion())</span>
+<span class="nc" id="L373">                                .setKRaftVersion(kraftVersionAtEpochStart.featureLevel())</span>
+                        );
+<span class="nc" id="L375">                        builder.appendVotersMessage(</span>
+                            currentTimeMs,
+<span class="nc" id="L377">                            updatedVoterSet.toVotersRecord(</span>
+<span class="nc" id="L378">                                kraftVersionAtEpochStart.votersRecordVersion()</span>
+                            )
+                        );
+                    }
+                }
+
+<span class="nc" id="L384">                return builder.build();</span>
+            }
+        });
+<span class="nc" id="L387">    }</span>
+
+    public long appendVotersRecord(VoterSet voters, long currentTimeMs) {
+<span class="nc" id="L390">        return accumulator.appendVotersRecord(</span>
+<span class="nc" id="L391">            voters.toVotersRecord(ControlRecordUtils.KRAFT_VOTERS_CURRENT_VERSION),</span>
+            currentTimeMs
+        );
+    }
+
+    public boolean compareAndSetVolatileVoters(
+        KRaftVersionUpgrade.Voters oldVoters,
+        KRaftVersionUpgrade.Voters newVoters
+    ) {
+<span class="nc" id="L400">        return kraftVersionUpgradeState.compareAndSet(oldVoters, newVoters);</span>
+    }
+
+    public Optional&lt;KRaftVersionUpgrade.Voters&gt; volatileVoters() {
+<span class="nc" id="L404">        return kraftVersionUpgradeState.get().toVoters();</span>
+    }
+
+    public Optional&lt;KRaftVersionUpgrade.Version&gt; requestedKRaftVersion() {
+<span class="nc" id="L408">        return kraftVersionUpgradeState.get().toVersion();</span>
+    }
+
+    public boolean isResignRequested() {
+<span class="nc" id="L412">        return resignRequested;</span>
+    }
+
+    public boolean isReplicaCaughtUp(ReplicaKey replicaKey, long currentTimeMs) {
+        // In summary, let's consider a replica caught up for add voter, if they
+        // have fetched within the last hour
+<span class="nc" id="L418">        long anHourInMs = TimeUnit.HOURS.toMillis(1);</span>
+<span class="nc" id="L419">        return Optional.ofNullable(observerStates.get(replicaKey))</span>
+<span class="nc" id="L420">            .map(state -&gt;</span>
+<span class="nc bnc" id="L421" title="All 6 branches missed.">                state.lastCaughtUpTimestamp &gt; 0 &amp;&amp;</span>
+                state.lastFetchTimestamp &gt; 0 &amp;&amp;
+                state.lastFetchTimestamp &gt; currentTimeMs - anHourInMs
+            )
+<span class="nc" id="L425">            .orElse(false);</span>
+    }
+
+    public void requestResign() {
+<span class="nc" id="L429">        this.resignRequested = true;</span>
+<span class="nc" id="L430">    }</span>
+
+    /**
+     * Upgrade the kraft version.
+     *
+     * This methods upgrades the kraft version to {@code newVersion}. If the version is already
+     * {@code newVersion}, this is a noop operation.
+     *
+     * KRaft only supports upgrades, so {@code newVersion} must be greater than or equal to current
+     * kraft version {@code persistedVersion}.
+     *
+     * For the upgrade to succeed all of the voters in the voter set must support the new kraft
+     * version. The upgrade from kraft version 0 to kraft version 1 generate one control batch
+     * with one control record setting the kraft version to 1 and one voters record setting the
+     * updated voter set.
+     *
+     * When {@code validateOnly} is true only the validation is perform and the control records are
+     * not generated.
+     *
+     * @param currentEpoch the current epoch
+     * @param newVersion the new kraft version
+     * @param persistedVersion the kraft version persisted to disk
+     * @param persistedVoters the set of voters persisted to disk
+     * @param validateOnly determine if only validation should be performed
+     * @param currentTimeMs the current time
+     */
+    public boolean maybeAppendUpgradedKRaftVersion(
+        int currentEpoch,
+        KRaftVersion newVersion,
+        KRaftVersion persistedVersion,
+        VoterSet persistedVoters,
+        boolean validateOnly,
+        long currentTimeMs
+    ) {
+<span class="nc" id="L464">        validateEpoch(currentEpoch);</span>
+
+<span class="nc" id="L466">        var pendingVersion = kraftVersionUpgradeState.get().toVersion();</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">        if (pendingVersion.isPresent()) {</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">            if (pendingVersion.get().kraftVersion().equals(newVersion)) {</span>
+                // The version match; upgrade is a noop
+<span class="nc" id="L470">                return false;</span>
+            } else {
+<span class="nc" id="L472">                throw new InvalidUpdateVersionException(</span>
+<span class="nc" id="L473">                    String.format(</span>
+                        &quot;Invalid concurrent upgrade of %s from version %s to %s&quot;,
+                        KRaftVersion.FEATURE_NAME,
+<span class="nc" id="L476">                        pendingVersion.get(),</span>
+                        newVersion
+                    )
+                );
+            }
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        } else if (persistedVersion.equals(newVersion)) {</span>
+<span class="nc" id="L482">            return false;</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">        } else if (persistedVersion.isMoreThan(newVersion)) {</span>
+<span class="nc" id="L484">            throw new InvalidUpdateVersionException(</span>
+<span class="nc" id="L485">                String.format(</span>
+                    &quot;Invalid upgrade of %s from version %s to %s because the new version is a downgrade&quot;,
+                    KRaftVersion.FEATURE_NAME,
+                    persistedVersion,
+                    newVersion
+                )
+            );
+        }
+
+        // Upgrade to kraft.version 1 is only supported; this needs to change when kraft.version 2 is added
+<span class="nc" id="L495">        var inMemoryVoters = kraftVersionUpgradeState.get().toVoters().orElseThrow(() -&gt;</span>
+<span class="nc" id="L496">            new InvalidUpdateVersionException(</span>
+<span class="nc" id="L497">                String.format(</span>
+                    &quot;Invalid upgrade of %s from version %s to %s&quot;,
+                    KRaftVersion.FEATURE_NAME,
+                    persistedVersion,
+                    newVersion
+                )
+            )
+        );
+<span class="nc bnc" id="L505" title="All 2 branches missed.">        if (!inMemoryVoters.voters().voterIds().equals(persistedVoters.voterIds())) {</span>
+<span class="nc" id="L506">            throw new IllegalStateException(</span>
+<span class="nc" id="L507">                String.format(</span>
+                    &quot;Unable to update %s to %s due to missing voters %s compared to %s&quot;,
+                    KRaftVersion.FEATURE_NAME,
+                    newVersion,
+<span class="nc" id="L511">                    inMemoryVoters.voters().voterIds(),</span>
+<span class="nc" id="L512">                    persistedVoters.voterIds()</span>
+                )
+            );
+<span class="nc bnc" id="L515" title="All 2 branches missed.">        } else if (!inMemoryVoters.voters().supportsVersion(newVersion)) {</span>
+<span class="nc" id="L516">            log.info(&quot;Not all voters support kraft version {}: {}&quot;, newVersion, inMemoryVoters.voters());</span>
+<span class="nc" id="L517">            throw new InvalidUpdateVersionException(</span>
+<span class="nc" id="L518">                String.format(</span>
+                    &quot;Invalid upgrade of %s to %s because not all of the voters support it&quot;,
+                    KRaftVersion.FEATURE_NAME,
+                    newVersion
+                )
+            );
+<span class="nc" id="L524">        } else if (</span>
+            inMemoryVoters
+<span class="nc" id="L526">                .voters()</span>
+<span class="nc" id="L527">                .voterKeys()</span>
+<span class="nc" id="L528">                .stream()</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">                .anyMatch(voterKey -&gt; voterKey.directoryId().isEmpty())</span>
+        ) {
+<span class="nc" id="L531">            throw new IllegalStateException(</span>
+<span class="nc" id="L532">                String.format(</span>
+                    &quot;Directory id must be known for all of the voters: %s&quot;,
+<span class="nc" id="L534">                    inMemoryVoters.voters()</span>
+                )
+            );
+        }
+
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        if (!validateOnly) {</span>
+            /* Note that this only supports upgrades from kraft.version 0 to kraft.version 1. When
+             * kraft.version 2 is added, this logic needs to be revisited
+             */
+<span class="nc" id="L543">            var successful = kraftVersionUpgradeState.compareAndSet(</span>
+                inMemoryVoters,
+                new KRaftVersionUpgrade.Version(newVersion)
+            );
+<span class="nc bnc" id="L547" title="All 2 branches missed.">            if (!successful) {</span>
+<span class="nc" id="L548">                throw new InvalidUpdateVersionException(</span>
+<span class="nc" id="L549">                    String.format(</span>
+                        &quot;Unable to upgrade version for %s to %s due to changing voters&quot;,
+                        KRaftVersion.FEATURE_NAME,
+                        newVersion
+                    )
+                );
+            }
+
+            // All of the validations succeeded; create control records for the upgrade
+<span class="nc" id="L558">            accumulator.appendControlMessages((baseOffset, batchEpoch, compression, buffer) -&gt; {</span>
+<span class="nc" id="L559">                try (MemoryRecordsBuilder builder = createControlRecordsBuilder(</span>
+                        baseOffset,
+                        batchEpoch,
+                        compression,
+                        buffer,
+                        currentTimeMs
+                    )
+                ) {
+<span class="nc" id="L567">                    log.info(&quot;Appended kraft.version {} to the batch accumulator&quot;, newVersion);</span>
+<span class="nc" id="L568">                    builder.appendKRaftVersionMessage(</span>
+                        currentTimeMs,
+                        new KRaftVersionRecord()
+<span class="nc" id="L571">                            .setVersion(newVersion.kraftVersionRecordVersion())</span>
+<span class="nc" id="L572">                            .setKRaftVersion(newVersion.featureLevel())</span>
+                    );
+
+<span class="nc bnc" id="L575" title="All 2 branches missed.">                    if (!inMemoryVoters.voters().equals(persistedVoters)) {</span>
+<span class="nc" id="L576">                        log.info(&quot;Appended voter set {} to the batch accumulator&quot;, inMemoryVoters.voters());</span>
+<span class="nc" id="L577">                        builder.appendVotersMessage(</span>
+                            currentTimeMs,
+<span class="nc" id="L579">                            inMemoryVoters.voters().toVotersRecord(newVersion.votersRecordVersion())</span>
+                        );
+                    }
+
+<span class="nc" id="L583">                    return builder.build();</span>
+                }
+            });
+        }
+
+<span class="nc" id="L588">        return true;</span>
+    }
+
+    private void validateEpoch(int currentEpoch) {
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        if (currentEpoch &lt; epoch()) {</span>
+<span class="nc" id="L593">            throw new NotLeaderException(</span>
+<span class="nc" id="L594">                String.format(</span>
+                    &quot;Upgrade kraft version failed because the given epoch %s is stale. Current leader epoch is %s&quot;,
+<span class="nc" id="L596">                    currentEpoch,</span>
+<span class="nc" id="L597">                    epoch()</span>
+                )
+            );
+<span class="nc bnc" id="L600" title="All 2 branches missed.">        } else if (currentEpoch &gt; epoch()) {</span>
+<span class="nc" id="L601">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L602">                String.format(</span>
+                    &quot;Attempt to append from epoch %s which is larger than the current epoch of %s&quot;,
+<span class="nc" id="L604">                    currentEpoch,</span>
+<span class="nc" id="L605">                    epoch()</span>
+                )
+            );
+        }
+<span class="nc" id="L609">    }</span>
+
+    @Override
+    public Optional&lt;LogOffsetMetadata&gt; highWatermark() {
+<span class="nc" id="L613">        return highWatermark;</span>
+    }
+
+    @Override
+    public ElectionState election() {
+<span class="nc" id="L618">        return ElectionState.withElectedLeader(epoch, localVoterNode.voterKey().id(), Optional.empty(), voterStates.keySet());</span>
+    }
+
+    @Override
+    public int epoch() {
+<span class="nc" id="L623">        return epoch;</span>
+    }
+
+    @Override
+    public LeaderAndEpoch leaderAndEpoch() {
+<span class="nc" id="L628">        return new LeaderAndEpoch(OptionalInt.of(localVoterNode.voterKey().id()), epoch);</span>
+    }
+
+    @Override
+    public Endpoints leaderEndpoints() {
+<span class="nc" id="L633">        return localVoterNode.listeners();</span>
+    }
+
+    Map&lt;Integer, ReplicaState&gt; voterStates() {
+<span class="nc" id="L637">        return voterStates;</span>
+    }
+
+    Map&lt;ReplicaKey, ReplicaState&gt; observerStates(final long currentTimeMs) {
+<span class="nc" id="L641">        clearInactiveObservers(currentTimeMs);</span>
+<span class="nc" id="L642">        return observerStates;</span>
+    }
+
+    public Set&lt;Integer&gt; grantingVoters() {
+<span class="nc" id="L646">        return this.grantingVoters;</span>
+    }
+
+    // visible for testing
+    Set&lt;ReplicaKey&gt; nonAcknowledgingVoters() {
+<span class="nc" id="L651">        Set&lt;ReplicaKey&gt; nonAcknowledging = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L652" title="All 2 branches missed.">        for (ReplicaState state : voterStates.values()) {</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">            if (!state.hasAcknowledgedLeader) {</span>
+<span class="nc" id="L654">                nonAcknowledging.add(state.replicaKey);</span>
+            }
+<span class="nc" id="L656">        }</span>
+<span class="nc" id="L657">        return nonAcknowledging;</span>
+    }
+
+    private boolean maybeUpdateHighWatermark() {
+        // Find the largest offset which is replicated to a majority of replicas (the leader counts)
+<span class="nc" id="L662">        ArrayList&lt;ReplicaState&gt; followersByDescendingFetchOffset = followersByDescendingFetchOffset()</span>
+<span class="nc" id="L663">            .collect(Collectors.toCollection(ArrayList::new));</span>
+
+<span class="nc" id="L665">        int indexOfHw = voterStates.size() / 2;</span>
+<span class="nc" id="L666">        Optional&lt;LogOffsetMetadata&gt; highWatermarkUpdateOpt = followersByDescendingFetchOffset.get(indexOfHw).endOffset;</span>
+
+<span class="nc bnc" id="L668" title="All 2 branches missed.">        if (highWatermarkUpdateOpt.isPresent()) {</span>
+
+            // The KRaft protocol requires an extra condition on commitment after a leader
+            // election. The leader must commit one record from its own epoch before it is
+            // allowed to expose records from any previous epoch. This guarantees that its
+            // log will contain the largest record (in terms of epoch/offset) in any log
+            // which ensures that any future leader will have replicated this record as well
+            // as all records from previous epochs that the current leader has committed.
+
+<span class="nc" id="L677">            LogOffsetMetadata highWatermarkUpdateMetadata = highWatermarkUpdateOpt.get();</span>
+<span class="nc" id="L678">            long highWatermarkUpdateOffset = highWatermarkUpdateMetadata.offset();</span>
+
+<span class="nc bnc" id="L680" title="All 2 branches missed.">            if (highWatermarkUpdateOffset &gt; epochStartOffset) {</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">                if (highWatermark.isPresent()) {</span>
+<span class="nc" id="L682">                    LogOffsetMetadata currentHighWatermarkMetadata = highWatermark.get();</span>
+<span class="nc bnc" id="L683" title="All 2 branches missed.">                    if (highWatermarkUpdateOffset &gt; currentHighWatermarkMetadata.offset()</span>
+<span class="nc bnc" id="L684" title="All 2 branches missed.">                        || (highWatermarkUpdateOffset == currentHighWatermarkMetadata.offset() &amp;&amp;</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">                            !highWatermarkUpdateMetadata.metadata().equals(currentHighWatermarkMetadata.metadata()))) {</span>
+<span class="nc" id="L686">                        Optional&lt;LogOffsetMetadata&gt; oldHighWatermark = highWatermark;</span>
+<span class="nc" id="L687">                        highWatermark = highWatermarkUpdateOpt;</span>
+<span class="nc" id="L688">                        logHighWatermarkUpdate(</span>
+                            oldHighWatermark,
+                            highWatermarkUpdateMetadata,
+                            indexOfHw,
+                            followersByDescendingFetchOffset
+                        );
+<span class="nc" id="L694">                        return true;</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">                    } else if (highWatermarkUpdateOffset &lt; currentHighWatermarkMetadata.offset()) {</span>
+<span class="nc" id="L696">                        log.info(&quot;The latest computed high watermark {} is smaller than the current &quot; +</span>
+                                &quot;value {}, which should only happen when voter set membership changes. If the voter &quot; +
+                                &quot;set has not changed this suggests that one of the voters has lost committed data. &quot; +
+<span class="nc" id="L699">                                &quot;Full voter replication state: {}&quot;, highWatermarkUpdateOffset,</span>
+<span class="nc" id="L700">                            currentHighWatermarkMetadata.offset(), voterStates.values());</span>
+<span class="nc" id="L701">                        return false;</span>
+                    } else {
+<span class="nc" id="L703">                        return false;</span>
+                    }
+                } else {
+<span class="nc" id="L706">                    Optional&lt;LogOffsetMetadata&gt; oldHighWatermark = highWatermark;</span>
+<span class="nc" id="L707">                    highWatermark = highWatermarkUpdateOpt;</span>
+<span class="nc" id="L708">                    logHighWatermarkUpdate(</span>
+                        oldHighWatermark,
+                        highWatermarkUpdateMetadata,
+                        indexOfHw,
+                        followersByDescendingFetchOffset
+                    );
+<span class="nc" id="L714">                    return true;</span>
+                }
+            }
+        }
+<span class="nc" id="L718">        return false;</span>
+    }
+
+    private void logHighWatermarkUpdate(
+        Optional&lt;LogOffsetMetadata&gt; oldHighWatermark,
+        LogOffsetMetadata newHighWatermark,
+        int indexOfHw,
+        List&lt;ReplicaState&gt; followersByDescendingFetchOffset
+    ) {
+<span class="nc bnc" id="L727" title="All 2 branches missed.">        if (oldHighWatermark.isPresent()) {</span>
+<span class="nc" id="L728">            log.debug(</span>
+                &quot;High watermark set to {} from {} based on indexOfHw {} and voters {}&quot;,
+                newHighWatermark,
+<span class="nc" id="L731">                oldHighWatermark.get(),</span>
+<span class="nc" id="L732">                indexOfHw,</span>
+                followersByDescendingFetchOffset
+            );
+        } else {
+<span class="nc" id="L736">            log.info(</span>
+                &quot;High watermark set to {} for the first time for epoch {} based on indexOfHw {} and voters {}&quot;,
+                newHighWatermark,
+<span class="nc" id="L739">                epoch,</span>
+<span class="nc" id="L740">                indexOfHw,</span>
+                followersByDescendingFetchOffset
+            );
+        }
+<span class="nc" id="L744">    }</span>
+
+    /**
+     * Update the local replica state.
+     *
+     * @param endOffsetMetadata updated log end offset of local replica
+     * @param lastVoterSet the up-to-date voter set
+     * @return true if the high watermark is updated as a result of this call
+     */
+    public boolean updateLocalState(
+        LogOffsetMetadata endOffsetMetadata,
+        VoterSet lastVoterSet
+    ) {
+<span class="nc" id="L757">        ReplicaState state = getOrCreateReplicaState(localVoterNode.voterKey());</span>
+<span class="nc" id="L758">        state.endOffset.ifPresent(currentEndOffset -&gt; {</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">            if (currentEndOffset.offset() &gt; endOffsetMetadata.offset()) {</span>
+<span class="nc" id="L760">                throw new IllegalStateException(&quot;Detected non-monotonic update of local &quot; +</span>
+<span class="nc" id="L761">                    &quot;end offset: &quot; + currentEndOffset.offset() + &quot; -&gt; &quot; + endOffsetMetadata.offset());</span>
+            }
+<span class="nc" id="L763">        });</span>
+
+<span class="nc" id="L765">        state.updateLeaderEndOffset(endOffsetMetadata);</span>
+<span class="nc" id="L766">        updateVoterAndObserverStates(lastVoterSet);</span>
+
+<span class="nc" id="L768">        return maybeUpdateHighWatermark();</span>
+    }
+
+    /**
+     * Update the replica state in terms of fetch time and log end offsets.
+     *
+     * @param replicaKey replica key
+     * @param currentTimeMs current time in milliseconds
+     * @param fetchOffsetMetadata new log offset and metadata
+     * @return true if the high watermark is updated as a result of this call
+     */
+    public boolean updateReplicaState(
+        ReplicaKey replicaKey,
+        long currentTimeMs,
+        LogOffsetMetadata fetchOffsetMetadata
+    ) {
+        // Ignore fetches from negative replica id, as it indicates
+        // the fetch is from non-replica. For example, a consumer.
+<span class="nc bnc" id="L786" title="All 2 branches missed.">        if (replicaKey.id() &lt; 0) {</span>
+<span class="nc" id="L787">            return false;</span>
+<span class="nc bnc" id="L788" title="All 2 branches missed.">        } else if (replicaKey.id() == localVoterNode.voterKey().id()) {</span>
+<span class="nc" id="L789">            throw new IllegalStateException(</span>
+<span class="nc" id="L790">                String.format(&quot;Remote replica ID %s matches the local leader ID&quot;, replicaKey)</span>
+            );
+        }
+
+<span class="nc" id="L794">        ReplicaState state = getOrCreateReplicaState(replicaKey);</span>
+
+<span class="nc" id="L796">        state.endOffset.ifPresent(currentEndOffset -&gt; {</span>
+<span class="nc bnc" id="L797" title="All 2 branches missed.">            if (currentEndOffset.offset() &gt; fetchOffsetMetadata.offset()) {</span>
+<span class="nc" id="L798">                log.warn(&quot;Detected non-monotonic update of fetch offset from nodeId {}: {} -&gt; {}&quot;,</span>
+<span class="nc" id="L799">                    state.replicaKey, currentEndOffset.offset(), fetchOffsetMetadata.offset());</span>
+            }
+<span class="nc" id="L801">        });</span>
+
+<span class="nc" id="L803">        Optional&lt;LogOffsetMetadata&gt; leaderEndOffsetOpt = getOrCreateReplicaState(localVoterNode.voterKey()).endOffset;</span>
+
+<span class="nc" id="L805">        state.updateFollowerState(</span>
+            currentTimeMs,
+            fetchOffsetMetadata,
+            leaderEndOffsetOpt
+        );
+<span class="nc" id="L810">        updateCheckQuorumForFollowingVoter(replicaKey, currentTimeMs);</span>
+
+<span class="nc bnc" id="L812" title="All 4 branches missed.">        return isVoter(state.replicaKey) &amp;&amp; maybeUpdateHighWatermark();</span>
+    }
+
+    public List&lt;ReplicaKey&gt; nonLeaderVotersByDescendingFetchOffset() {
+<span class="nc" id="L816">        return followersByDescendingFetchOffset()</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">            .filter(state -&gt; !state.matchesKey(localVoterNode.voterKey()))</span>
+<span class="nc" id="L818">            .map(state -&gt; state.replicaKey)</span>
+<span class="nc" id="L819">            .collect(Collectors.toList());</span>
+    }
+
+    private Stream&lt;ReplicaState&gt; followersByDescendingFetchOffset() {
+<span class="nc" id="L823">        return voterStates</span>
+<span class="nc" id="L824">            .values()</span>
+<span class="nc" id="L825">            .stream()</span>
+<span class="nc" id="L826">            .sorted();</span>
+    }
+
+    public void addAcknowledgementFrom(int remoteNodeId) {
+<span class="nc" id="L830">        ReplicaState voterState = ensureValidVoter(remoteNodeId);</span>
+<span class="nc" id="L831">        voterState.hasAcknowledgedLeader = true;</span>
+<span class="nc" id="L832">    }</span>
+
+    private ReplicaState ensureValidVoter(int remoteNodeId) {
+<span class="nc" id="L835">        ReplicaState state = voterStates.get(remoteNodeId);</span>
+<span class="nc bnc" id="L836" title="All 2 branches missed.">        if (state == null) {</span>
+<span class="nc" id="L837">            throw new IllegalArgumentException(&quot;Unexpected acknowledgement from non-voter &quot; + remoteNodeId);</span>
+        }
+<span class="nc" id="L839">        return state;</span>
+    }
+
+    public long epochStartOffset() {
+<span class="nc" id="L843">        return epochStartOffset;</span>
+    }
+
+    private ReplicaState getOrCreateReplicaState(ReplicaKey replicaKey) {
+<span class="nc" id="L847">        ReplicaState state = voterStates.get(replicaKey.id());</span>
+<span class="nc bnc" id="L848" title="All 4 branches missed.">        if (state == null || !state.matchesKey(replicaKey)) {</span>
+<span class="nc" id="L849">            observerStates.putIfAbsent(replicaKey, new ReplicaState(replicaKey, false, Endpoints.empty()));</span>
+<span class="nc" id="L850">            kafkaRaftMetrics.updateNumObservers(observerStates.size());</span>
+<span class="nc" id="L851">            return observerStates.get(replicaKey);</span>
+        }
+<span class="nc" id="L853">        return state;</span>
+    }
+
+    public Optional&lt;ReplicaState&gt; getReplicaState(ReplicaKey replicaKey) {
+<span class="nc" id="L857">        ReplicaState state = voterStates.get(replicaKey.id());</span>
+<span class="nc bnc" id="L858" title="All 4 branches missed.">        if (state == null || !state.matchesKey(replicaKey)) {</span>
+<span class="nc" id="L859">            state = observerStates.get(replicaKey);</span>
+        }
+
+<span class="nc" id="L862">        return Optional.ofNullable(state);</span>
+    }
+
+    /**
+     * Clear observer states that have not been active for a while and are not the leader.
+     */
+    private void clearInactiveObservers(final long currentTimeMs) {
+<span class="nc" id="L869">        observerStates.entrySet().removeIf(integerReplicaStateEntry -&gt;</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">            currentTimeMs - integerReplicaStateEntry.getValue().lastFetchTimestamp &gt;= OBSERVER_SESSION_TIMEOUT_MS &amp;&amp;</span>
+<span class="nc bnc" id="L871" title="All 2 branches missed.">            !integerReplicaStateEntry.getKey().equals(localVoterNode.voterKey())</span>
+        );
+<span class="nc" id="L873">        kafkaRaftMetrics.updateNumObservers(observerStates.size());</span>
+<span class="nc" id="L874">    }</span>
+
+    private boolean isVoter(ReplicaKey remoteReplicaKey) {
+<span class="nc" id="L877">        ReplicaState state = voterStates.get(remoteReplicaKey.id());</span>
+<span class="nc bnc" id="L878" title="All 4 branches missed.">        return state != null &amp;&amp; state.matchesKey(remoteReplicaKey);</span>
+    }
+
+    private void updateVoterAndObserverStates(VoterSet lastVoterSet) {
+<span class="nc" id="L882">        Map&lt;Integer, ReplicaState&gt; newVoterStates = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L883">        Map&lt;Integer, ReplicaState&gt; oldVoterStates = new HashMap&lt;&gt;(voterStates);</span>
+
+        // Compute the new voter states map
+<span class="nc bnc" id="L886" title="All 2 branches missed.">        for (VoterSet.VoterNode voterNode : lastVoterSet.voterNodes()) {</span>
+<span class="nc" id="L887">            ReplicaState state = getReplicaState(voterNode.voterKey())</span>
+<span class="nc" id="L888">                .orElse(new ReplicaState(voterNode.voterKey(), false, voterNode.listeners()));</span>
+
+            // Remove the voter from the previous data structures
+<span class="nc" id="L891">            oldVoterStates.remove(voterNode.voterKey().id());</span>
+<span class="nc" id="L892">            observerStates.remove(voterNode.voterKey());</span>
+
+            // Make sure that the replica key in the replica state matches the voter's
+<span class="nc" id="L895">            state.setReplicaKey(voterNode.voterKey());</span>
+
+            // Make sure that the listeners are updated
+<span class="nc" id="L898">            state.updateListeners(voterNode.listeners());</span>
+<span class="nc" id="L899">            newVoterStates.put(state.replicaKey.id(), state);</span>
+<span class="nc" id="L900">        }</span>
+<span class="nc" id="L901">        voterStates = newVoterStates;</span>
+
+        // Move any of the remaining old voters to observerStates
+<span class="nc bnc" id="L904" title="All 2 branches missed.">        for (ReplicaState replicaStateEntry : oldVoterStates.values()) {</span>
+<span class="nc" id="L905">            replicaStateEntry.clearListeners();</span>
+<span class="nc" id="L906">            observerStates.putIfAbsent(replicaStateEntry.replicaKey, replicaStateEntry);</span>
+<span class="nc" id="L907">        }</span>
+<span class="nc" id="L908">        kafkaRaftMetrics.updateNumObservers(observerStates.size());</span>
+<span class="nc" id="L909">    }</span>
+
+    public static class ReplicaState implements Comparable&lt;ReplicaState&gt; {
+        private ReplicaKey replicaKey;
+        private Endpoints listeners;
+        private Optional&lt;LogOffsetMetadata&gt; endOffset;
+        private long lastFetchTimestamp;
+        private long lastFetchLeaderLogEndOffset;
+        private long lastCaughtUpTimestamp;
+        private boolean hasAcknowledgedLeader;
+
+<span class="nc" id="L920">        public ReplicaState(ReplicaKey replicaKey, boolean hasAcknowledgedLeader, Endpoints listeners) {</span>
+<span class="nc" id="L921">            this.replicaKey = replicaKey;</span>
+<span class="nc" id="L922">            this.listeners = listeners;</span>
+<span class="nc" id="L923">            this.endOffset = Optional.empty();</span>
+<span class="nc" id="L924">            this.lastFetchTimestamp = -1;</span>
+<span class="nc" id="L925">            this.lastFetchLeaderLogEndOffset = -1;</span>
+<span class="nc" id="L926">            this.lastCaughtUpTimestamp = -1;</span>
+<span class="nc" id="L927">            this.hasAcknowledgedLeader = hasAcknowledgedLeader;</span>
+<span class="nc" id="L928">        }</span>
+
+        public ReplicaKey replicaKey() {
+<span class="nc" id="L931">            return replicaKey;</span>
+        }
+
+        public Endpoints listeners() {
+<span class="nc" id="L935">            return listeners;</span>
+        }
+
+        public Optional&lt;LogOffsetMetadata&gt; endOffset() {
+<span class="nc" id="L939">            return endOffset;</span>
+        }
+
+        public long lastFetchTimestamp() {
+<span class="nc" id="L943">            return lastFetchTimestamp;</span>
+        }
+
+        public long lastCaughtUpTimestamp() {
+<span class="nc" id="L947">            return lastCaughtUpTimestamp;</span>
+        }
+
+        void setReplicaKey(ReplicaKey replicaKey) {
+<span class="nc bnc" id="L951" title="All 2 branches missed.">            if (this.replicaKey.id() != replicaKey.id()) {</span>
+<span class="nc" id="L952">                throw new IllegalArgumentException(</span>
+<span class="nc" id="L953">                    String.format(</span>
+                        &quot;Attempting to update the replica key %s with a different replica id %s&quot;,
+                        this.replicaKey,
+                        replicaKey
+                    )
+                );
+<span class="nc bnc" id="L959" title="All 2 branches missed.">            } else if (this.replicaKey.directoryId().isPresent() &amp;&amp;</span>
+<span class="nc bnc" id="L960" title="All 2 branches missed.">                !this.replicaKey.equals(replicaKey)</span>
+            ) {
+<span class="nc" id="L962">                throw new IllegalArgumentException(</span>
+<span class="nc" id="L963">                    String.format(</span>
+                        &quot;Attempting to update an already set directory id %s with a different directory id %s&quot;,
+                        this.replicaKey,
+                        replicaKey
+                    )
+                );
+            }
+
+<span class="nc" id="L971">            this.replicaKey = replicaKey;</span>
+<span class="nc" id="L972">        }</span>
+
+        void updateListeners(Endpoints listeners) {
+<span class="nc" id="L975">            this.listeners = listeners;</span>
+<span class="nc" id="L976">        }</span>
+
+        void clearListeners() {
+<span class="nc" id="L979">            updateListeners(Endpoints.empty());</span>
+<span class="nc" id="L980">        }</span>
+
+        boolean matchesKey(ReplicaKey replicaKey) {
+<span class="nc bnc" id="L983" title="All 2 branches missed.">            if (this.replicaKey.id() != replicaKey.id()) return false;</span>
+
+<span class="nc bnc" id="L985" title="All 2 branches missed.">            if (this.replicaKey.directoryId().isPresent()) {</span>
+<span class="nc" id="L986">                return this.replicaKey.directoryId().equals(replicaKey.directoryId());</span>
+            } else {
+                // it doesn't include a directory id so it matches as long as the ids match
+<span class="nc" id="L989">                return true;</span>
+            }
+        }
+
+        void updateLeaderEndOffset(
+            LogOffsetMetadata endOffsetMetadata
+        ) {
+            // For the leader, we only update the end offset. The remaining fields
+            // (such as the caught up time) are determined implicitly.
+<span class="nc" id="L998">            this.endOffset = Optional.of(endOffsetMetadata);</span>
+<span class="nc" id="L999">        }</span>
+
+        void updateFollowerState(
+            long currentTimeMs,
+            LogOffsetMetadata fetchOffsetMetadata,
+            Optional&lt;LogOffsetMetadata&gt; leaderEndOffsetOpt
+        ) {
+            // Update the `lastCaughtUpTimestamp` before we update the `lastFetchTimestamp`.
+            // This allows us to use the previous value for `lastFetchTimestamp` if the
+            // follower was able to catch up to `lastFetchLeaderLogEndOffset` on this fetch.
+<span class="nc" id="L1009">            leaderEndOffsetOpt.ifPresent(leaderEndOffset -&gt; {</span>
+<span class="nc bnc" id="L1010" title="All 2 branches missed.">                if (fetchOffsetMetadata.offset() &gt;= leaderEndOffset.offset()) {</span>
+<span class="nc" id="L1011">                    lastCaughtUpTimestamp = Math.max(lastCaughtUpTimestamp, currentTimeMs);</span>
+<span class="nc bnc" id="L1012" title="All 2 branches missed.">                } else if (lastFetchLeaderLogEndOffset &gt; 0</span>
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">                    &amp;&amp; fetchOffsetMetadata.offset() &gt;= lastFetchLeaderLogEndOffset) {</span>
+<span class="nc" id="L1014">                    lastCaughtUpTimestamp = Math.max(lastCaughtUpTimestamp, lastFetchTimestamp);</span>
+                }
+<span class="nc" id="L1016">                lastFetchLeaderLogEndOffset = leaderEndOffset.offset();</span>
+<span class="nc" id="L1017">            });</span>
+
+<span class="nc" id="L1019">            lastFetchTimestamp = Math.max(lastFetchTimestamp, currentTimeMs);</span>
+<span class="nc" id="L1020">            endOffset = Optional.of(fetchOffsetMetadata);</span>
+<span class="nc" id="L1021">            hasAcknowledgedLeader = true;</span>
+<span class="nc" id="L1022">        }</span>
+
+        @Override
+        public int compareTo(ReplicaState that) {
+<span class="nc bnc" id="L1026" title="All 2 branches missed.">            if (this.endOffset.equals(that.endOffset))</span>
+<span class="nc" id="L1027">                return this.replicaKey.compareTo(that.replicaKey);</span>
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">            else if (this.endOffset.isEmpty())</span>
+<span class="nc" id="L1029">                return 1;</span>
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">            else if (that.endOffset.isEmpty())</span>
+<span class="nc" id="L1031">                return -1;</span>
+            else
+<span class="nc" id="L1033">                return Long.compare(that.endOffset.get().offset(), this.endOffset.get().offset());</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1038">            return String.format(</span>
+                &quot;ReplicaState(replicaKey=%s, endOffset=%s, lastFetchTimestamp=%s, &quot; +
+                &quot;lastCaughtUpTimestamp=%s, hasAcknowledgedLeader=%s)&quot;,
+                replicaKey,
+                endOffset,
+<span class="nc" id="L1043">                lastFetchTimestamp,</span>
+<span class="nc" id="L1044">                lastCaughtUpTimestamp,</span>
+<span class="nc" id="L1045">                hasAcknowledgedLeader</span>
+            );
+        }
+    }
+
+    @Override
+    public boolean canGrantVote(ReplicaKey replicaKey, boolean isLogUpToDate, boolean isPreVote) {
+<span class="nc" id="L1052">        log.debug(</span>
+            &quot;Rejecting Vote request (preVote={}) from replica ({}) since we are already leader in epoch {}&quot;,
+<span class="nc" id="L1054">            isPreVote,</span>
+            replicaKey,
+<span class="nc" id="L1056">            epoch</span>
+        );
+<span class="nc" id="L1058">        return false;</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L1063">        return String.format(</span>
+            &quot;Leader(localVoterNode=%s, epoch=%d, epochStartOffset=%d, highWatermark=%s, voterStates=%s)&quot;,
+            localVoterNode,
+<span class="nc" id="L1066">            epoch,</span>
+<span class="nc" id="L1067">            epochStartOffset,</span>
+            highWatermark,
+            voterStates
+        );
+    }
+
+    @Override
+    public String name() {
+<span class="nc" id="L1075">        return &quot;Leader&quot;;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L1080">        changeVoterState.maybeResetPendingVoterHandlerState(Errors.NOT_LEADER_OR_FOLLOWER);</span>
+<span class="nc" id="L1081">        kafkaRaftMetrics.removeLeaderMetrics();</span>
+
+<span class="nc" id="L1083">        accumulator.close();</span>
+<span class="nc" id="L1084">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

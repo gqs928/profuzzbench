@@ -1,0 +1,433 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RocksDBTransactionBuffer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">RocksDBTransactionBuffer.java</span></div><h1>RocksDBTransactionBuffer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.query.Position;
+
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.RocksIterator;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.NoSuchElementException;
+import java.util.Optional;
+import java.util.TreeMap;
+
+/**
+ * A {@link TransactionBuffer} implementation for RocksDB-backed stores.
+ * Uses a {@link WriteBatch} (without index) to accumulate writes for atomic commit.
+ * Reads are handled entirely by the shared staging map in
+ * {@link AbstractTransactionBuffer}, so a {@code WriteBatchWithIndex} is not needed.
+ * &lt;p&gt;
+ * Follows the base class locking discipline: structural mutations of the staging map
+ * ({@link #stage}, {@link #stageDeleteRange}) hold the {@code snapshotLock} write lock; owner
+ * reads/scan-copies are lock-free; non-owner (IQ) reads hold the read lock.
+ * &lt;p&gt;
+ * Range deletions ({@link #stageDeleteRange}) are only supported by RocksDB-backed stores
+ * and are owned entirely by this class; {@link AbstractTransactionBuffer} carries no
+ * tombstone state.
+ */
+class RocksDBTransactionBuffer extends AbstractTransactionBuffer&lt;Bytes&gt; {
+
+    private final RocksDB db;
+    private final ColumnFamilyHandle cfHandle;
+    private final WriteOptions wOptions;
+    private final String storeName;
+    private WriteBatch writeBatch;
+<span class="nc" id="L62">    private volatile NavigableMap&lt;Bytes, List&lt;Bytes&gt;&gt; rangeTombstones = Collections.emptyNavigableMap();</span>
+    // Position deltas for writes staged in the current (uncommitted) transaction. Merged into the
+    // store's committed Position and cleared on commit; discarded on rollback. Guarded by
+    // snapshotLock (the same lock that guards the staging map), so reads from IQ threads and
+    // owner mutations stay consistent with the staged writes they correspond to.
+<span class="nc" id="L67">    private Position pendingPosition = Position.emptyPosition();</span>
+
+    RocksDBTransactionBuffer(final RocksDB db,
+                             final ColumnFamilyHandle cfHandle,
+                             final WriteOptions wOptions,
+<span class="nc" id="L72">                             final String storeName) {</span>
+<span class="nc" id="L73">        this.db = db;</span>
+<span class="nc" id="L74">        this.cfHandle = cfHandle;</span>
+<span class="nc" id="L75">        this.wOptions = wOptions;</span>
+<span class="nc" id="L76">        this.storeName = storeName;</span>
+<span class="nc" id="L77">        this.writeBatch = new WriteBatch();</span>
+<span class="nc" id="L78">    }</span>
+
+    @Override
+    int estimateKeySize(final Bytes key) {
+<span class="nc" id="L82">        return key.get().length;</span>
+    }
+
+    @Override
+    void stageToBackend(final Bytes key, final byte[] value) {
+<span class="nc" id="L87">        stage(cfHandle, key, value);</span>
+<span class="nc" id="L88">    }</span>
+
+    /**
+     * Stages a write for an explicit column family. Updates the shared read buffer
+     * ({@code pendingWrites}) and appends the write to the shared {@link WriteBatch}
+     * under {@code cf}, so every staged CF is committed atomically on {@link #commit()}.
+     */
+    void stage(final ColumnFamilyHandle cf, final Bytes key, final byte[] value) {
+<span class="nc" id="L96">        snapshotLock.writeLock().lock();</span>
+        try {
+<span class="nc bnc" id="L98" title="All 2 branches missed.">            if (cf == cfHandle) {</span>
+<span class="nc" id="L99">                pendingWrites.put(key, Optional.ofNullable(value));</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">                pendingWritesBytes += estimateKeySize(key) + (value != null ? value.length : 0);</span>
+            }
+            try {
+<span class="nc bnc" id="L103" title="All 2 branches missed.">                if (value != null) {</span>
+<span class="nc" id="L104">                    writeBatch.put(cf, key.get(), value);</span>
+                } else {
+<span class="nc" id="L106">                    writeBatch.delete(cf, key.get());</span>
+                }
+<span class="nc" id="L108">            } catch (final RocksDBException e) {</span>
+<span class="nc" id="L109">                throw new ProcessorStateException(&quot;Error staging write in transaction buffer for store &quot; + storeName, e);</span>
+<span class="nc" id="L110">            }</span>
+        } finally {
+<span class="nc" id="L112">            snapshotLock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L114">    }</span>
+
+    /**
+     * Runs a sequence of {@link #stage} calls as one batch, holding the {@code snapshotLock} write
+     * lock for the whole batch so a non-owner (IQ) read observes either none or all of it. Without
+     * this, a multi-write operation would stage entry-by-entry and a reader could interleave with a
+     * half-staged batch, which the equivalent non-transactional {@code WriteBatch} write never
+     * exposes. The lock is reentrant, so the per-write acquisitions nested inside are uncontended.
+     *
+     * @param stagingOperations the batch to stage; must only call {@code stage}/{@code stageDeleteRange}
+     *                          on this buffer, and must not block
+     */
+    void stageAll(final Runnable stagingOperations) {
+<span class="nc" id="L127">        snapshotLock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L129">            stagingOperations.run();</span>
+        } finally {
+<span class="nc" id="L131">            snapshotLock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L133">    }</span>
+
+    /**
+     * Stages a range deletion for an explicit column family. Updates the shared
+     * {@code pendingWrites} and {@code rangeTombstones} so iterators opened before
+     * commit hide the deleted range, and appends the range delete to the shared
+     * {@link WriteBatch} under {@code cf}.
+     */
+    void stageDeleteRange(final ColumnFamilyHandle cf, final Bytes from, final Bytes to) {
+<span class="nc" id="L142">        snapshotLock.writeLock().lock();</span>
+        try {
+            // Multi-node subMap().clear() on the (non-thread-safe) TreeMap staging buffer must hold
+            // the write lock; doing it together with the rangeTombstones swap also makes the two
+            // updates atomic with respect to a non-owner snapshot scan.
+<span class="nc" id="L147">            pendingWrites.subMap(from, true, to, false).clear();</span>
+            // Copy-on-write: clone the map AND the affected key's list, so a non-owner iterator
+            // holding the previous rangeTombstones map (and its lists) is never mutated underneath
+            // it. A shallow map copy alone would share the List&lt;Bytes&gt; values and corrupt in-flight
+            // iterators when the same `from` is deleted twice.
+<span class="nc" id="L152">            final TreeMap&lt;Bytes, List&lt;Bytes&gt;&gt; copy = new TreeMap&lt;&gt;(rangeTombstones);</span>
+<span class="nc" id="L153">            final List&lt;Bytes&gt; existing = copy.get(from);</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">            final List&lt;Bytes&gt; updated = existing == null ? new ArrayList&lt;&gt;() : new ArrayList&lt;&gt;(existing);</span>
+<span class="nc" id="L155">            updated.add(to);</span>
+<span class="nc" id="L156">            copy.put(from, updated);</span>
+<span class="nc" id="L157">            rangeTombstones = copy;</span>
+<span class="nc" id="L158">            pendingWritesBytes += estimateKeySize(from) + estimateKeySize(to);</span>
+            try {
+<span class="nc" id="L160">                writeBatch.deleteRange(cf, from.get(), to.get());</span>
+<span class="nc" id="L161">            } catch (final RocksDBException e) {</span>
+<span class="nc" id="L162">                throw new ProcessorStateException(&quot;Error staging delete range in transaction buffer for store &quot; + storeName, e);</span>
+<span class="nc" id="L163">            }</span>
+        } finally {
+<span class="nc" id="L165">            snapshotLock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L167">    }</span>
+
+    @Override
+    public Optional&lt;byte[]&gt; get(final Bytes key) {
+        // Owner reads lock-free (sole, single-threaded mutator); non-owner (IQ) reads take the read
+        // lock to exclude a concurrent owner write on the TreeMap. The volatile rangeTombstones
+        // reference is read lock-free either way.
+        final Optional&lt;byte[]&gt; staged;
+<span class="nc bnc" id="L175" title="All 2 branches missed.">        if (Thread.currentThread() == ownerThread) {</span>
+<span class="nc" id="L176">            staged = pendingWrites.get(key);</span>
+        } else {
+<span class="nc" id="L178">            snapshotLock.readLock().lock();</span>
+            try {
+<span class="nc" id="L180">                staged = pendingWrites.get(key);</span>
+            } finally {
+<span class="nc" id="L182">                snapshotLock.readLock().unlock();</span>
+            }
+        }
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        if (staged != null) {</span>
+<span class="nc" id="L186">            return staged;</span>
+        }
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        if (isCoveredByRangeTombstone(key, rangeTombstones)) {</span>
+<span class="nc" id="L189">            return Optional.empty();</span>
+        }
+<span class="nc" id="L191">        return null;</span>
+    }
+
+    @Override
+    public boolean isEmpty() {
+<span class="nc bnc" id="L196" title="All 4 branches missed.">        return super.isEmpty() &amp;&amp; rangeTombstones.isEmpty();</span>
+    }
+
+    ManagedKeyValueIterator&lt;Bytes, byte[]&gt; all(final ColumnFamilyHandle cf, final boolean forward) {
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (Thread.currentThread() == ownerThread) {</span>
+            // Eager copy of the staging layer (lock-free for the sole mutator) so a later owner
+            // stage cannot invalidate this iterator; the base store is iterated live.
+<span class="nc" id="L203">            final NavigableMap&lt;Bytes, Optional&lt;byte[]&gt;&gt; stagingSnapshot = new TreeMap&lt;&gt;(pendingWrites);</span>
+<span class="nc" id="L204">            final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; baseIter = newBaseIterator(cf, null, null, forward, true);</span>
+<span class="nc" id="L205">            return new StagedMergeIterator&lt;&gt;(stagingSnapshot, baseIter, forward);</span>
+        }
+<span class="nc" id="L207">        return snapshotScan(cf, null, null, forward, true);</span>
+    }
+
+    ManagedKeyValueIterator&lt;Bytes, byte[]&gt; range(final ColumnFamilyHandle cf,
+                                                 final Bytes from, final Bytes to,
+                                                 final boolean forward, final boolean toInclusive) {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        if (Thread.currentThread() == ownerThread) {</span>
+<span class="nc" id="L214">            final NavigableMap&lt;Bytes, Optional&lt;byte[]&gt;&gt; stagingSnapshot = new TreeMap&lt;&gt;(boundStaging(from, to, toInclusive));</span>
+<span class="nc" id="L215">            final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; baseIter = newBaseIterator(cf, from, to, forward, toInclusive);</span>
+<span class="nc" id="L216">            return new StagedMergeIterator&lt;&gt;(stagingSnapshot, baseIter, forward);</span>
+        }
+<span class="nc" id="L218">        return snapshotScan(cf, from, to, forward, toInclusive);</span>
+    }
+
+    private ManagedKeyValueIterator&lt;Bytes, byte[]&gt; snapshotScan(final ColumnFamilyHandle cf,
+                                                                final Bytes from, final Bytes to,
+                                                                final boolean forward, final boolean toInclusive) {
+<span class="nc" id="L224">        snapshotLock.readLock().lock();</span>
+        try {
+<span class="nc" id="L226">            final NavigableMap&lt;Bytes, Optional&lt;byte[]&gt;&gt; stagingSnapshot =</span>
+<span class="nc" id="L227">                new TreeMap&lt;&gt;(boundStaging(from, to, toInclusive));</span>
+<span class="nc" id="L228">            final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; baseIter = newBaseIterator(cf, from, to, forward, toInclusive);</span>
+<span class="nc" id="L229">            return new StagedMergeIterator&lt;&gt;(stagingSnapshot, baseIter, forward);</span>
+        } finally {
+<span class="nc" id="L231">            snapshotLock.readLock().unlock();</span>
+        }
+    }
+
+    @Override
+    ManagedKeyValueIterator&lt;Bytes, byte[]&gt; newBaseIterator(final Bytes from, final Bytes to) {
+<span class="nc" id="L237">        return newBaseIterator(cfHandle, from, to, true, true);</span>
+    }
+
+    @Override
+    ManagedKeyValueIterator&lt;Bytes, byte[]&gt; newBaseIterator(final Bytes from, final Bytes to,
+                                                           final boolean forward, final boolean toInclusive) {
+<span class="nc" id="L243">        return newBaseIterator(cfHandle, from, to, forward, toInclusive);</span>
+    }
+
+    @Override
+    ManagedKeyValueIterator&lt;Bytes, byte[]&gt; newBaseSnapshotIterator(
+        final Bytes from,
+        final Bytes to,
+        final boolean forward,
+        final boolean toInclusive
+    ) {
+        // A RocksDB iterator already exposes a point-in-time consistent view of the base store
+        // as of its creation, so no extra snapshotting is required beyond the live base iterator.
+<span class="nc" id="L255">        return newBaseIterator(cfHandle, from, to, forward, toInclusive);</span>
+    }
+
+    private ManagedKeyValueIterator&lt;Bytes, byte[]&gt; newBaseIterator(final ColumnFamilyHandle cf,
+                                                                   final Bytes from, final Bytes to,
+                                                                   final boolean forward, final boolean toInclusive) {
+<span class="nc" id="L261">        final RocksIterator rocksIterator = db.newIterator(cf);</span>
+        final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; iter;
+<span class="nc bnc" id="L263" title="All 4 branches missed.">        if (from != null &amp;&amp; to != null) {</span>
+<span class="nc" id="L264">            iter = new RocksDBRangeIterator(storeName, rocksIterator, from, to, forward, toInclusive);</span>
+<span class="nc bnc" id="L265" title="All 4 branches missed.">        } else if (from != null &amp;&amp; forward) {</span>
+<span class="nc" id="L266">            rocksIterator.seek(from.get());</span>
+<span class="nc" id="L267">            iter = new RocksDbIterator(storeName, rocksIterator, true);</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        } else if (!forward) {</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            if (to != null) {</span>
+<span class="nc" id="L270">                rocksIterator.seekForPrev(to.get());</span>
+            } else {
+<span class="nc" id="L272">                rocksIterator.seekToLast();</span>
+            }
+<span class="nc" id="L274">            iter = new RocksDbIterator(storeName, rocksIterator, false);</span>
+        } else {
+<span class="nc" id="L276">            rocksIterator.seekToFirst();</span>
+<span class="nc" id="L277">            iter = new RocksDbIterator(storeName, rocksIterator, true);</span>
+        }
+        // RocksDbIterator requires onClose to be set before close() is called.
+        // Since this iterator is used internally by StagedMergeIterator (not
+        // tracked by RocksDBStore's open-iterator set), use a no-op callback.
+<span class="nc" id="L282">        iter.onClose(() -&gt; { });</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if (rangeTombstones.isEmpty()) {</span>
+<span class="nc" id="L284">            return iter;</span>
+        }
+<span class="nc" id="L286">        return new RangeTombstoneFilterIterator(iter, rangeTombstones);</span>
+    }
+
+    @Override
+    void flushToBase() {
+        try {
+<span class="nc" id="L292">            db.write(wOptions, writeBatch);</span>
+<span class="nc" id="L293">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L294">            throw new ProcessorStateException(&quot;Error committing transaction buffer for store &quot; + storeName, e);</span>
+<span class="nc" id="L295">        }</span>
+<span class="nc" id="L296">        writeBatch.close();</span>
+<span class="nc" id="L297">        writeBatch = new WriteBatch();</span>
+<span class="nc" id="L298">        rangeTombstones = Collections.emptyNavigableMap();</span>
+<span class="nc" id="L299">    }</span>
+
+    @Override
+    void discardPendingBatch() {
+<span class="nc" id="L303">        writeBatch.clear();</span>
+<span class="nc" id="L304">        rangeTombstones = Collections.emptyNavigableMap();</span>
+<span class="nc" id="L305">        pendingPosition = Position.emptyPosition();</span>
+<span class="nc" id="L306">    }</span>
+
+    void updatePosition(final StateStoreContext stateStoreContext) {
+<span class="nc" id="L309">        snapshotLock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L311">            StoreQueryUtils.updatePosition(pendingPosition, stateStoreContext);</span>
+        } finally {
+<span class="nc" id="L313">            snapshotLock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L315">    }</span>
+
+    Position pendingPosition() {
+<span class="nc" id="L318">        snapshotLock.readLock().lock();</span>
+        try {
+<span class="nc" id="L320">            return pendingPosition.copy();</span>
+        } finally {
+<span class="nc" id="L322">            snapshotLock.readLock().unlock();</span>
+        }
+    }
+
+    void mergePendingPositionInto(final Position committed) {
+<span class="nc" id="L327">        snapshotLock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L329">            committed.merge(pendingPosition);</span>
+<span class="nc" id="L330">            pendingPosition = Position.emptyPosition();</span>
+        } finally {
+<span class="nc" id="L332">            snapshotLock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L334">    }</span>
+
+    @Override
+    public long approximateNumUncommittedBytes() {
+<span class="nc" id="L338">        return super.approximateNumUncommittedBytes() + writeBatch.getDataSize();</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L343">        writeBatch.close();</span>
+<span class="nc" id="L344">    }</span>
+
+    static boolean isCoveredByRangeTombstone(final Bytes key,
+                                              final NavigableMap&lt;Bytes, List&lt;Bytes&gt;&gt; tombstones) {
+<span class="nc bnc" id="L348" title="All 2 branches missed.">        if (tombstones.isEmpty()) {</span>
+<span class="nc" id="L349">            return false;</span>
+        }
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        for (final Map.Entry&lt;Bytes, List&lt;Bytes&gt;&gt; entry : tombstones.headMap(key, true).entrySet()) {</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            for (final Bytes to : entry.getValue()) {</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">                if (key.compareTo(to) &lt; 0) {</span>
+<span class="nc" id="L354">                    return true;</span>
+                }
+<span class="nc" id="L356">            }</span>
+<span class="nc" id="L357">        }</span>
+<span class="nc" id="L358">        return false;</span>
+    }
+
+    private static class RangeTombstoneFilterIterator implements ManagedKeyValueIterator&lt;Bytes, byte[]&gt; {
+
+        private final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; wrapped;
+        private final NavigableMap&lt;Bytes, List&lt;Bytes&gt;&gt; tombstones;
+        private KeyValue&lt;Bytes, byte[]&gt; prefetched;
+<span class="nc" id="L366">        private boolean closed = false;</span>
+        private Runnable closeCallback;
+
+        RangeTombstoneFilterIterator(final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; wrapped,
+<span class="nc" id="L370">                                      final NavigableMap&lt;Bytes, List&lt;Bytes&gt;&gt; tombstones) {</span>
+<span class="nc" id="L371">            this.wrapped = wrapped;</span>
+<span class="nc" id="L372">            this.tombstones = tombstones;</span>
+<span class="nc" id="L373">        }</span>
+
+        @Override
+        public void onClose(final Runnable closeCallback) {
+<span class="nc" id="L377">            this.closeCallback = closeCallback;</span>
+<span class="nc" id="L378">        }</span>
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L382" title="All 2 branches missed.">            if (closed) {</span>
+<span class="nc" id="L383">                throw new IllegalStateException(&quot;Iterator has already been closed.&quot;);</span>
+            }
+<span class="nc bnc" id="L385" title="All 2 branches missed.">            if (prefetched != null) {</span>
+<span class="nc" id="L386">                return true;</span>
+            }
+<span class="nc" id="L388">            prefetched = computeNext();</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            return prefetched != null;</span>
+        }
+
+        @Override
+        public KeyValue&lt;Bytes, byte[]&gt; next() {
+<span class="nc bnc" id="L394" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L395">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L397">            final KeyValue&lt;Bytes, byte[]&gt; result = prefetched;</span>
+<span class="nc" id="L398">            prefetched = null;</span>
+<span class="nc" id="L399">            return result;</span>
+        }
+
+        @Override
+        public Bytes peekNextKey() {
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L405">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L407">            return prefetched.key;</span>
+        }
+
+        @Override
+        public void close() {
+<span class="nc" id="L412">            closed = true;</span>
+            try {
+<span class="nc" id="L414">                wrapped.close();</span>
+            } finally {
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                if (closeCallback != null) {</span>
+<span class="nc" id="L417">                    closeCallback.run();</span>
+                }
+            }
+<span class="nc" id="L420">        }</span>
+
+        private KeyValue&lt;Bytes, byte[]&gt; computeNext() {
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            while (wrapped.hasNext()) {</span>
+<span class="nc" id="L424">                final KeyValue&lt;Bytes, byte[]&gt; entry = wrapped.next();</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                if (!isCoveredByRangeTombstone(entry.key, tombstones)) {</span>
+<span class="nc" id="L426">                    return entry;</span>
+                }
+<span class="nc" id="L428">            }</span>
+<span class="nc" id="L429">            return null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

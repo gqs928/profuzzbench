@@ -1,0 +1,641 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CachingWindowStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">CachingWindowStore.java</span></div><h1>CachingWindowStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.kstream.internals.Change;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.api.Record;
+import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
+import org.apache.kafka.streams.processor.internals.ProcessorContextUtils;
+import org.apache.kafka.streams.processor.internals.ProcessorRecordContext;
+import org.apache.kafka.streams.processor.internals.RecordQueue;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.ReadOnlyWindowStore;
+import org.apache.kafka.streams.state.StateSerdes;
+import org.apache.kafka.streams.state.WindowStore;
+import org.apache.kafka.streams.state.WindowStoreIterator;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Instant;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static org.apache.kafka.streams.processor.internals.ProcessorContextUtils.asInternalProcessorContext;
+import static org.apache.kafka.streams.state.internals.ExceptionUtils.executeAll;
+import static org.apache.kafka.streams.state.internals.ExceptionUtils.throwSuppressed;
+
+public class CachingWindowStore
+    extends WrappedStateStore&lt;WindowStore&lt;Bytes, byte[]&gt;, byte[], byte[]&gt;
+    implements WindowStore&lt;Bytes, byte[]&gt;, CachedStateStore&lt;byte[], byte[]&gt; {
+
+<span class="nc" id="L57">    private static final Logger LOG = LoggerFactory.getLogger(CachingWindowStore.class);</span>
+
+    private final long windowSize;
+    private final SegmentedCacheFunction cacheFunction;
+<span class="nc" id="L61">    private final SegmentedBytesStore.KeySchema keySchema = new WindowKeySchema();</span>
+
+    private String cacheName;
+    private boolean sendOldValues;
+    private InternalProcessorContext&lt;?, ?&gt; internalContext;
+    private StateSerdes&lt;Bytes, byte[]&gt; bytesSerdes;
+    private CacheFlushListener&lt;byte[], byte[]&gt; flushListener;
+
+    private final AtomicLong maxObservedTimestamp;
+
+    CachingWindowStore(final WindowStore&lt;Bytes, byte[]&gt; underlying,
+                       final long windowSize,
+                       final long segmentInterval) {
+<span class="nc" id="L74">        super(underlying);</span>
+<span class="nc" id="L75">        this.windowSize = windowSize;</span>
+<span class="nc" id="L76">        this.cacheFunction = new SegmentedCacheFunction(keySchema, segmentInterval);</span>
+<span class="nc" id="L77">        this.maxObservedTimestamp = new AtomicLong(RecordQueue.UNKNOWN);</span>
+<span class="nc" id="L78">    }</span>
+
+    @Override
+    public void init(final StateStoreContext stateStoreContext, final StateStore root) {
+<span class="nc" id="L82">        final String changelogTopic = ProcessorContextUtils.changelogFor(stateStoreContext, name(), Boolean.TRUE);</span>
+<span class="nc" id="L83">        internalContext = asInternalProcessorContext(stateStoreContext);</span>
+<span class="nc" id="L84">        bytesSerdes = new StateSerdes&lt;&gt;(</span>
+            changelogTopic,
+<span class="nc" id="L86">            Serdes.Bytes(),</span>
+<span class="nc" id="L87">            Serdes.ByteArray());</span>
+<span class="nc" id="L88">        cacheName = internalContext.taskId() + &quot;-&quot; + name();</span>
+
+<span class="nc" id="L90">        internalContext.registerCacheFlushListener(cacheName, entries -&gt; {</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">            for (final ThreadCache.DirtyEntry entry : entries) {</span>
+<span class="nc" id="L92">                putAndMaybeForward(entry, internalContext);</span>
+<span class="nc" id="L93">            }</span>
+<span class="nc" id="L94">        });</span>
+
+<span class="nc" id="L96">        super.init(stateStoreContext, root);</span>
+<span class="nc" id="L97">    }</span>
+
+    private void putAndMaybeForward(final ThreadCache.DirtyEntry entry,
+                                    final InternalProcessorContext&lt;?, ?&gt; context) {
+<span class="nc" id="L101">        final byte[] binaryWindowKey = cacheFunction.key(entry.key()).get();</span>
+<span class="nc" id="L102">        final Windowed&lt;Bytes&gt; windowedKeyBytes = WindowKeySchema.fromStoreBytesKey(binaryWindowKey, windowSize);</span>
+<span class="nc" id="L103">        final long windowStartTimestamp = windowedKeyBytes.window().start();</span>
+<span class="nc" id="L104">        final Bytes binaryKey = windowedKeyBytes.key();</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">        if (flushListener != null) {</span>
+<span class="nc" id="L106">            final byte[] rawNewValue = entry.newValue();</span>
+<span class="nc bnc" id="L107" title="All 4 branches missed.">            final byte[] rawOldValue = rawNewValue == null || sendOldValues ?</span>
+<span class="nc" id="L108">                wrapped().fetch(binaryKey, windowStartTimestamp) : null;</span>
+
+            // this is an optimization: if this key did not exist in underlying store and also not in the cache,
+            // we can skip flushing to downstream as well as writing to underlying store
+<span class="nc bnc" id="L112" title="All 4 branches missed.">            if (rawNewValue != null || rawOldValue != null) {</span>
+                // we need to get the old values if needed, and then put to store, and then flush
+
+<span class="nc" id="L115">                final ProcessorRecordContext current = context.recordContext();</span>
+                try {
+<span class="nc" id="L117">                    context.setRecordContext(entry.entry().context());</span>
+<span class="nc" id="L118">                    wrapped().put(binaryKey, entry.newValue(), windowStartTimestamp);</span>
+<span class="nc" id="L119">                    flushListener.apply(</span>
+                        new Record&lt;&gt;(
+                            binaryWindowKey,
+<span class="nc bnc" id="L122" title="All 2 branches missed.">                            new Change&lt;&gt;(rawNewValue, sendOldValues ? rawOldValue : null),</span>
+<span class="nc" id="L123">                            entry.entry().context().timestamp(),</span>
+<span class="nc" id="L124">                            entry.entry().context().headers()));</span>
+                } finally {
+<span class="nc" id="L126">                    context.setRecordContext(current);</span>
+                }
+            }
+<span class="nc" id="L129">        } else {</span>
+<span class="nc" id="L130">            final ProcessorRecordContext current = context.recordContext();</span>
+            try {
+<span class="nc" id="L132">                context.setRecordContext(entry.entry().context());</span>
+<span class="nc" id="L133">                wrapped().put(binaryKey, entry.newValue(), windowStartTimestamp);</span>
+            } finally {
+<span class="nc" id="L135">                context.setRecordContext(current);</span>
+            }
+        }
+<span class="nc" id="L138">    }</span>
+
+    @Override
+    public boolean setFlushListener(final CacheFlushListener&lt;byte[], byte[]&gt; flushListener,
+                                    final boolean sendOldValues) {
+<span class="nc" id="L143">        this.flushListener = flushListener;</span>
+<span class="nc" id="L144">        this.sendOldValues = sendOldValues;</span>
+
+<span class="nc" id="L146">        return true;</span>
+    }
+
+
+    @Override
+    public synchronized void put(final Bytes key,
+                                 final byte[] value,
+                                 final long windowStartTimestamp) {
+        // since this function may not access the underlying inner store, we need to validate
+        // if store is open outside as well.
+<span class="nc" id="L156">        validateStoreOpen();</span>
+
+<span class="nc" id="L158">        final Bytes keyBytes = WindowKeySchema.toStoreKeyBinary(key, windowStartTimestamp, 0);</span>
+<span class="nc" id="L159">        final LRUCacheEntry entry =</span>
+            new LRUCacheEntry(
+                value,
+<span class="nc" id="L162">                internalContext.recordContext().headers(),</span>
+                true,
+<span class="nc" id="L164">                internalContext.recordContext().offset(),</span>
+<span class="nc" id="L165">                internalContext.recordContext().timestamp(),</span>
+<span class="nc" id="L166">                internalContext.recordContext().partition(),</span>
+<span class="nc" id="L167">                internalContext.recordContext().topic(),</span>
+<span class="nc" id="L168">                internalContext.recordContext().sourceRawKey(),</span>
+<span class="nc" id="L169">                internalContext.recordContext().sourceRawValue()</span>
+            );
+<span class="nc" id="L171">        internalContext.cache().put(cacheName, cacheFunction.cacheKey(keyBytes), entry);</span>
+
+<span class="nc" id="L173">        maxObservedTimestamp.set(Math.max(keySchema.segmentTimestamp(keyBytes), maxObservedTimestamp.get()));</span>
+<span class="nc" id="L174">    }</span>
+
+    @Override
+    public byte[] fetch(final Bytes key, final long timestamp) {
+<span class="nc" id="L178">        return fetchPointInternal(key, timestamp, wrapped());</span>
+    }
+
+    private byte[] fetchPointInternal(final Bytes key,
+                                      final long timestamp,
+                                      final ReadOnlyWindowStore&lt;Bytes, byte[]&gt; source) {
+<span class="nc" id="L184">        validateStoreOpen();</span>
+<span class="nc" id="L185">        final Bytes bytesKey = WindowKeySchema.toStoreKeyBinary(key, timestamp, 0);</span>
+<span class="nc" id="L186">        final Bytes cacheKey = cacheFunction.cacheKey(bytesKey);</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (internalContext.cache() == null) {</span>
+<span class="nc" id="L188">            return source.fetch(key, timestamp);</span>
+        }
+<span class="nc" id="L190">        final LRUCacheEntry entry = internalContext.cache().get(cacheName, cacheKey);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (entry == null) {</span>
+<span class="nc" id="L192">            return source.fetch(key, timestamp);</span>
+        } else {
+<span class="nc" id="L194">            return entry.value();</span>
+        }
+    }
+
+
+    @Override
+    public synchronized WindowStoreIterator&lt;byte[]&gt; fetch(final Bytes key,
+                                                          final long timeFrom,
+                                                          final long timeTo) {
+<span class="nc" id="L203">        validateStoreOpen();</span>
+<span class="nc" id="L204">        return fetchInternal(wrapped().fetch(key, timeFrom, timeTo), key, timeFrom, timeTo, true);</span>
+    }
+
+    @Override
+    public synchronized WindowStoreIterator&lt;byte[]&gt; backwardFetch(final Bytes key,
+                                                                  final long timeFrom,
+                                                                  final long timeTo) {
+<span class="nc" id="L211">        validateStoreOpen();</span>
+<span class="nc" id="L212">        return fetchInternal(wrapped().backwardFetch(key, timeFrom, timeTo), key, timeFrom, timeTo, false);</span>
+    }
+
+    private synchronized WindowStoreIterator&lt;byte[]&gt; fetchInternal(final WindowStoreIterator&lt;byte[]&gt; underlyingIterator,
+                                                                   final Bytes key,
+                                                                   final long timeFrom,
+                                                                   final long timeTo,
+                                                                   final boolean forward) {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (internalContext.cache() == null) {</span>
+<span class="nc" id="L221">            return underlyingIterator;</span>
+        }
+
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; cacheIterator = wrapped().persistent() ?</span>
+<span class="nc" id="L225">            new CacheIteratorWrapper(key, timeFrom, timeTo, forward) :</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            (forward ?</span>
+<span class="nc" id="L227">                internalContext.cache().range(</span>
+                    cacheName,
+<span class="nc" id="L229">                    cacheFunction.cacheKey(keySchema.lowerRangeFixedSize(key, timeFrom)),</span>
+<span class="nc" id="L230">                    cacheFunction.cacheKey(keySchema.upperRangeFixedSize(key, timeTo))</span>
+                ) :
+<span class="nc" id="L232">                internalContext.cache().reverseRange(</span>
+                    cacheName,
+<span class="nc" id="L234">                    cacheFunction.cacheKey(keySchema.lowerRangeFixedSize(key, timeFrom)),</span>
+<span class="nc" id="L235">                    cacheFunction.cacheKey(keySchema.upperRangeFixedSize(key, timeTo))</span>
+                )
+            );
+<span class="nc" id="L238">        final HasNextCondition hasNextCondition = keySchema.hasNextCondition(key, key, timeFrom, timeTo, forward);</span>
+<span class="nc" id="L239">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; filteredCacheIterator =</span>
+            new FilteredCacheIterator(cacheIterator, hasNextCondition, cacheFunction);
+<span class="nc" id="L241">        return new MergedSortedCacheWindowStoreIterator(filteredCacheIterator, underlyingIterator, forward);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetch(final Bytes keyFrom,
+                                                           final Bytes keyTo,
+                                                           final long timeFrom,
+                                                           final long timeTo) {
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        if (isInvalidKeyRange(keyFrom, keyTo)) {</span>
+<span class="nc" id="L250">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+        // since this function may not access the underlying inner store, we need to validate
+        // if store is open outside as well.
+<span class="nc" id="L255">        validateStoreOpen();</span>
+<span class="nc" id="L256">        return fetchKeyRangeInternal(wrapped().fetch(keyFrom, keyTo, timeFrom, timeTo), keyFrom, keyTo, timeFrom, timeTo, true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetch(final Bytes keyFrom,
+                                                                   final Bytes keyTo,
+                                                                   final long timeFrom,
+                                                                   final long timeTo) {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        if (isInvalidKeyRange(keyFrom, keyTo)) {</span>
+<span class="nc" id="L265">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+        // since this function may not access the underlying inner store, we need to validate
+        // if store is open outside as well.
+<span class="nc" id="L270">        validateStoreOpen();</span>
+<span class="nc" id="L271">        return fetchKeyRangeInternal(wrapped().backwardFetch(keyFrom, keyTo, timeFrom, timeTo), keyFrom, keyTo, timeFrom, timeTo, false);</span>
+    }
+
+    private boolean isInvalidKeyRange(final Bytes keyFrom, final Bytes keyTo) {
+<span class="nc bnc" id="L275" title="All 6 branches missed.">        if (keyFrom != null &amp;&amp; keyTo != null &amp;&amp; keyFrom.compareTo(keyTo) &gt; 0) {</span>
+<span class="nc" id="L276">            LOG.warn(&quot;Returning empty iterator for fetch with invalid key range: from &gt; to. &quot; +</span>
+                    &quot;This may be due to range arguments set in the wrong order, &quot; +
+                    &quot;or serdes that don't preserve ordering when lexicographically comparing the serialized bytes. &quot; +
+                    &quot;Note that the built-in numerical serdes do not follow this for negative numbers&quot;);
+<span class="nc" id="L280">            return true;</span>
+        }
+<span class="nc" id="L282">        return false;</span>
+    }
+
+    private synchronized KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetchKeyRangeInternal(final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; underlyingIterator,
+                                                                                         final Bytes keyFrom,
+                                                                                         final Bytes keyTo,
+                                                                                         final long timeFrom,
+                                                                                         final long timeTo,
+                                                                                         final boolean forward) {
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (internalContext.cache() == null) {</span>
+<span class="nc" id="L292">            return underlyingIterator;</span>
+        }
+
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; cacheIterator = wrapped().persistent() ?</span>
+<span class="nc" id="L296">            new CacheIteratorWrapper(keyFrom, keyTo, timeFrom, timeTo, forward) :</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">            (forward ?</span>
+<span class="nc" id="L298">                internalContext.cache().range(</span>
+                    cacheName,
+<span class="nc bnc" id="L300" title="All 2 branches missed.">                    keyFrom == null ? null : cacheFunction.cacheKey(keySchema.lowerRange(keyFrom, timeFrom)),</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">                    keyTo == null ? null : cacheFunction.cacheKey(keySchema.upperRange(keyTo, timeTo))</span>
+                ) :
+<span class="nc" id="L303">                internalContext.cache().reverseRange(</span>
+                    cacheName,
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                    keyFrom == null ? null : cacheFunction.cacheKey(keySchema.lowerRange(keyFrom, timeFrom)),</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">                    keyTo == null ? null : cacheFunction.cacheKey(keySchema.upperRange(keyTo, timeTo))</span>
+                )
+            );
+<span class="nc" id="L309">        final HasNextCondition hasNextCondition = keySchema.hasNextCondition(keyFrom, keyTo, timeFrom, timeTo, forward);</span>
+<span class="nc" id="L310">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; filteredCacheIterator =</span>
+            new FilteredCacheIterator(cacheIterator, hasNextCondition, cacheFunction);
+
+<span class="nc" id="L313">        return new MergedSortedCacheWindowStoreKeyValueIterator(</span>
+            filteredCacheIterator, underlyingIterator, bytesSerdes, windowSize, cacheFunction, forward);
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetchAll(final long timeFrom, final long timeTo) {
+<span class="nc" id="L319">        validateStoreOpen();</span>
+<span class="nc" id="L320">        return fetchAllInternal(wrapped().fetchAll(timeFrom, timeTo), timeFrom, timeTo, true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetchAll(final long timeFrom, final long timeTo) {
+<span class="nc" id="L325">        validateStoreOpen();</span>
+<span class="nc" id="L326">        return fetchAllInternal(wrapped().backwardFetchAll(timeFrom, timeTo), timeFrom, timeTo, false);</span>
+    }
+
+    private KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetchAllInternal(final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; underlyingIterator,
+                                                                       final long timeFrom,
+                                                                       final long timeTo,
+                                                                       final boolean forward) {
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        final ThreadCache.MemoryLRUCacheBytesIterator cacheIterator = forward ?</span>
+<span class="nc" id="L334">            internalContext.cache().all(cacheName) :</span>
+<span class="nc" id="L335">            internalContext.cache().reverseAll(cacheName);</span>
+<span class="nc" id="L336">        final HasNextCondition hasNextCondition = keySchema.hasNextCondition(null, null, timeFrom, timeTo, forward);</span>
+<span class="nc" id="L337">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; filteredCacheIterator =</span>
+            new FilteredCacheIterator(cacheIterator, hasNextCondition, cacheFunction);
+<span class="nc" id="L339">        return new MergedSortedCacheWindowStoreKeyValueIterator(</span>
+            filteredCacheIterator, underlyingIterator, bytesSerdes, windowSize, cacheFunction, forward);
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; all() {
+<span class="nc" id="L345">        validateStoreOpen();</span>
+<span class="nc" id="L346">        return allInternal(wrapped().all(), true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardAll() {
+<span class="nc" id="L351">        validateStoreOpen();</span>
+<span class="nc" id="L352">        return allInternal(wrapped().backwardAll(), false);</span>
+    }
+
+    private KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; allInternal(final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; underlyingIterator,
+                                                                  final boolean forward) {
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        final ThreadCache.MemoryLRUCacheBytesIterator cacheIterator = forward ?</span>
+<span class="nc" id="L358">            internalContext.cache().all(cacheName) :</span>
+<span class="nc" id="L359">            internalContext.cache().reverseAll(cacheName);</span>
+<span class="nc" id="L360">        return new MergedSortedCacheWindowStoreKeyValueIterator(</span>
+            cacheIterator, underlyingIterator, bytesSerdes, windowSize, cacheFunction, forward);
+    }
+
+    @Override
+    public ReadOnlyWindowStore&lt;Bytes, byte[]&gt; readOnly(final IsolationLevel isolationLevel) {
+<span class="nc" id="L366">        Objects.requireNonNull(isolationLevel, &quot;isolationLevel cannot be null&quot;);</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        if (isolationLevel == IsolationLevel.READ_COMMITTED) {</span>
+<span class="nc" id="L368">            return wrapped().readOnly(isolationLevel);</span>
+        }
+<span class="nc" id="L370">        return new ReadOnlyView(wrapped().readOnly(isolationLevel));</span>
+    }
+
+    @Override
+    public synchronized void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc" id="L375">        internalContext.cache().flush(cacheName);</span>
+<span class="nc" id="L376">        wrapped().commit(changelogOffsets);</span>
+<span class="nc" id="L377">    }</span>
+
+    @Override
+    public void flushCache() {
+<span class="nc" id="L381">        internalContext.cache().flush(cacheName);</span>
+<span class="nc" id="L382">    }</span>
+
+    @Override
+    public void clearCache() {
+<span class="nc" id="L386">        internalContext.cache().clear(cacheName);</span>
+<span class="nc" id="L387">    }</span>
+
+    @Override
+    public synchronized void close() {
+<span class="nc" id="L391">        final LinkedList&lt;RuntimeException&gt; suppressed = executeAll(</span>
+<span class="nc" id="L392">            () -&gt; internalContext.cache().flush(cacheName),</span>
+<span class="nc" id="L393">            () -&gt; internalContext.cache().close(cacheName),</span>
+<span class="nc" id="L394">            wrapped()::close</span>
+        );
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        if (!suppressed.isEmpty()) {</span>
+<span class="nc" id="L397">            throwSuppressed(&quot;Caught an exception while closing caching window store for store &quot; + name(),</span>
+                suppressed);
+        }
+<span class="nc" id="L400">    }</span>
+
+    private final class ReadOnlyView implements ReadOnlyWindowStore&lt;Bytes, byte[]&gt; {
+
+        private final ReadOnlyWindowStore&lt;Bytes, byte[]&gt; underlying;
+
+<span class="nc" id="L406">        ReadOnlyView(final ReadOnlyWindowStore&lt;Bytes, byte[]&gt; underlying) {</span>
+<span class="nc" id="L407">            this.underlying = underlying;</span>
+<span class="nc" id="L408">        }</span>
+
+        @Override
+        public byte[] fetch(final Bytes key, final long timestamp) {
+<span class="nc" id="L412">            return fetchPointInternal(key, timestamp, underlying);</span>
+        }
+
+        @Override
+        public WindowStoreIterator&lt;byte[]&gt; fetch(final Bytes key, final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L417">            validateStoreOpen();</span>
+<span class="nc" id="L418">            final long timeFromMs = timeFrom.toEpochMilli();</span>
+<span class="nc" id="L419">            final long timeToMs = timeTo.toEpochMilli();</span>
+<span class="nc" id="L420">            return fetchInternal(underlying.fetch(key, timeFrom, timeTo), key, timeFromMs, timeToMs, true);</span>
+        }
+
+        @Override
+        public WindowStoreIterator&lt;byte[]&gt; backwardFetch(final Bytes key, final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L425">            validateStoreOpen();</span>
+<span class="nc" id="L426">            final long timeFromMs = timeFrom.toEpochMilli();</span>
+<span class="nc" id="L427">            final long timeToMs = timeTo.toEpochMilli();</span>
+<span class="nc" id="L428">            return fetchInternal(underlying.backwardFetch(key, timeFrom, timeTo), key, timeFromMs, timeToMs, false);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetch(final Bytes keyFrom, final Bytes keyTo, final Instant timeFrom, final Instant timeTo) {
+<span class="nc bnc" id="L433" title="All 2 branches missed.">            if (isInvalidKeyRange(keyFrom, keyTo)) {</span>
+<span class="nc" id="L434">                return KeyValueIterators.emptyIterator();</span>
+            }
+<span class="nc" id="L436">            validateStoreOpen();</span>
+<span class="nc" id="L437">            final long timeFromMs = timeFrom.toEpochMilli();</span>
+<span class="nc" id="L438">            final long timeToMs = timeTo.toEpochMilli();</span>
+<span class="nc" id="L439">            return fetchKeyRangeInternal(underlying.fetch(keyFrom, keyTo, timeFrom, timeTo), keyFrom, keyTo, timeFromMs, timeToMs, true);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetch(final Bytes keyFrom, final Bytes keyTo, final Instant timeFrom, final Instant timeTo) {
+<span class="nc bnc" id="L444" title="All 2 branches missed.">            if (isInvalidKeyRange(keyFrom, keyTo)) {</span>
+<span class="nc" id="L445">                return KeyValueIterators.emptyIterator();</span>
+            }
+<span class="nc" id="L447">            validateStoreOpen();</span>
+<span class="nc" id="L448">            final long timeFromMs = timeFrom.toEpochMilli();</span>
+<span class="nc" id="L449">            final long timeToMs = timeTo.toEpochMilli();</span>
+<span class="nc" id="L450">            return fetchKeyRangeInternal(underlying.backwardFetch(keyFrom, keyTo, timeFrom, timeTo), keyFrom, keyTo, timeFromMs, timeToMs, false);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetchAll(final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L455">            validateStoreOpen();</span>
+<span class="nc" id="L456">            return fetchAllInternal(underlying.fetchAll(timeFrom, timeTo), timeFrom.toEpochMilli(), timeTo.toEpochMilli(), true);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetchAll(final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L461">            validateStoreOpen();</span>
+<span class="nc" id="L462">            return fetchAllInternal(underlying.backwardFetchAll(timeFrom, timeTo), timeFrom.toEpochMilli(), timeTo.toEpochMilli(), false);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; all() {
+<span class="nc" id="L467">            validateStoreOpen();</span>
+<span class="nc" id="L468">            return allInternal(underlying.all(), true);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardAll() {
+<span class="nc" id="L473">            validateStoreOpen();</span>
+<span class="nc" id="L474">            return allInternal(underlying.backwardAll(), false);</span>
+        }
+    }
+
+    private class CacheIteratorWrapper implements PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; {
+
+        private final long segmentInterval;
+        private final Bytes keyFrom;
+        private final Bytes keyTo;
+        private final long timeTo;
+        private final boolean forward;
+
+        private long lastSegmentId;
+        private long currentSegmentId;
+        private Bytes cacheKeyFrom;
+        private Bytes cacheKeyTo;
+
+        private ThreadCache.MemoryLRUCacheBytesIterator current;
+
+        private CacheIteratorWrapper(final Bytes key,
+                                     final long timeFrom,
+                                     final long timeTo,
+                                     final boolean forward) {
+<span class="nc" id="L497">            this(key, key, timeFrom, timeTo, forward);</span>
+<span class="nc" id="L498">        }</span>
+
+        private CacheIteratorWrapper(final Bytes keyFrom,
+                                     final Bytes keyTo,
+                                     final long timeFrom,
+                                     final long timeTo,
+<span class="nc" id="L504">                                     final boolean forward) {</span>
+<span class="nc" id="L505">            this.keyFrom = keyFrom;</span>
+<span class="nc" id="L506">            this.keyTo = keyTo;</span>
+<span class="nc" id="L507">            this.timeTo = timeTo;</span>
+<span class="nc" id="L508">            this.forward = forward;</span>
+
+<span class="nc" id="L510">            this.segmentInterval = cacheFunction.getSegmentInterval();</span>
+
+<span class="nc bnc" id="L512" title="All 2 branches missed.">            if (forward) {</span>
+<span class="nc" id="L513">                this.lastSegmentId = cacheFunction.segmentId(Math.min(timeTo, maxObservedTimestamp.get()));</span>
+<span class="nc" id="L514">                this.currentSegmentId = cacheFunction.segmentId(timeFrom);</span>
+
+<span class="nc" id="L516">                setCacheKeyRange(timeFrom, currentSegmentLastTime());</span>
+<span class="nc" id="L517">                this.current = internalContext.cache().range(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+            } else {
+<span class="nc" id="L519">                this.currentSegmentId = cacheFunction.segmentId(Math.min(timeTo, maxObservedTimestamp.get()));</span>
+<span class="nc" id="L520">                this.lastSegmentId = cacheFunction.segmentId(timeFrom);</span>
+
+<span class="nc" id="L522">                setCacheKeyRange(currentSegmentBeginTime(), Math.min(timeTo, maxObservedTimestamp.get()));</span>
+<span class="nc" id="L523">                this.current = internalContext.cache().reverseRange(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+            }
+<span class="nc" id="L525">        }</span>
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L529" title="All 2 branches missed.">            if (current == null) {</span>
+<span class="nc" id="L530">                return false;</span>
+            }
+
+<span class="nc bnc" id="L533" title="All 2 branches missed.">            if (current.hasNext()) {</span>
+<span class="nc" id="L534">                return true;</span>
+            }
+
+<span class="nc bnc" id="L537" title="All 2 branches missed.">            while (!current.hasNext()) {</span>
+<span class="nc" id="L538">                getNextSegmentIterator();</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">                if (current == null) {</span>
+<span class="nc" id="L540">                    return false;</span>
+                }
+            }
+<span class="nc" id="L543">            return true;</span>
+        }
+
+        @Override
+        public Bytes peekNextKey() {
+<span class="nc bnc" id="L548" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L549">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L551">            return current.peekNextKey();</span>
+        }
+
+        @Override
+        public KeyValue&lt;Bytes, LRUCacheEntry&gt; peekNext() {
+<span class="nc bnc" id="L556" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L557">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L559">            return current.peekNext();</span>
+        }
+
+        @Override
+        public KeyValue&lt;Bytes, LRUCacheEntry&gt; next() {
+<span class="nc bnc" id="L564" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L565">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L567">            return current.next();</span>
+        }
+
+        @Override
+        public void close() {
+<span class="nc" id="L572">            current.close();</span>
+<span class="nc" id="L573">        }</span>
+
+        private long currentSegmentBeginTime() {
+<span class="nc" id="L576">            return currentSegmentId * segmentInterval;</span>
+        }
+
+        private long currentSegmentLastTime() {
+<span class="nc" id="L580">            return Math.min(timeTo, currentSegmentBeginTime() + segmentInterval - 1);</span>
+        }
+
+        private void getNextSegmentIterator() {
+<span class="nc bnc" id="L584" title="All 2 branches missed.">            if (forward) {</span>
+<span class="nc" id="L585">                ++currentSegmentId;</span>
+                // updating as maxObservedTimestamp can change while iterating
+<span class="nc" id="L587">                lastSegmentId = cacheFunction.segmentId(Math.min(timeTo, maxObservedTimestamp.get()));</span>
+
+<span class="nc bnc" id="L589" title="All 2 branches missed.">                if (currentSegmentId &gt; lastSegmentId) {</span>
+<span class="nc" id="L590">                    current = null;</span>
+<span class="nc" id="L591">                    return;</span>
+                }
+
+<span class="nc" id="L594">                setCacheKeyRange(currentSegmentBeginTime(), currentSegmentLastTime());</span>
+
+<span class="nc" id="L596">                current.close();</span>
+
+<span class="nc" id="L598">                current = internalContext.cache().range(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+            } else {
+<span class="nc" id="L600">                --currentSegmentId;</span>
+
+                // last segment id is stable when iterating backward, therefore no need to update
+<span class="nc bnc" id="L603" title="All 2 branches missed.">                if (currentSegmentId &lt; lastSegmentId) {</span>
+<span class="nc" id="L604">                    current = null;</span>
+<span class="nc" id="L605">                    return;</span>
+                }
+
+<span class="nc" id="L608">                setCacheKeyRange(currentSegmentBeginTime(), currentSegmentLastTime());</span>
+
+<span class="nc" id="L610">                current.close();</span>
+
+<span class="nc" id="L612">                current = internalContext.cache().reverseRange(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+            }
+<span class="nc" id="L614">        }</span>
+
+        private void setCacheKeyRange(final long lowerRangeEndTime, final long upperRangeEndTime) {
+<span class="nc bnc" id="L617" title="All 2 branches missed.">            if (cacheFunction.segmentId(lowerRangeEndTime) != cacheFunction.segmentId(upperRangeEndTime)) {</span>
+<span class="nc" id="L618">                throw new IllegalStateException(&quot;Error iterating over segments: segment interval has changed&quot;);</span>
+            }
+
+<span class="nc bnc" id="L621" title="All 4 branches missed.">            if (keyFrom != null &amp;&amp; keyFrom.equals(keyTo)) {</span>
+<span class="nc" id="L622">                cacheKeyFrom = cacheFunction.cacheKey(segmentLowerRangeFixedSize(keyFrom, lowerRangeEndTime));</span>
+<span class="nc" id="L623">                cacheKeyTo = cacheFunction.cacheKey(segmentUpperRangeFixedSize(keyTo, upperRangeEndTime));</span>
+            } else {
+<span class="nc bnc" id="L625" title="All 2 branches missed.">                cacheKeyFrom = keyFrom == null ? null :</span>
+<span class="nc" id="L626">                    cacheFunction.cacheKey(keySchema.lowerRange(keyFrom, lowerRangeEndTime), currentSegmentId);</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">                cacheKeyTo = keyTo == null ? null :</span>
+<span class="nc" id="L628">                    cacheFunction.cacheKey(keySchema.upperRange(keyTo, timeTo), currentSegmentId);</span>
+            }
+<span class="nc" id="L630">        }</span>
+
+        private Bytes segmentLowerRangeFixedSize(final Bytes key, final long segmentBeginTime) {
+<span class="nc" id="L633">            return WindowKeySchema.toStoreKeyBinary(key, Math.max(0, segmentBeginTime), 0);</span>
+        }
+
+        private Bytes segmentUpperRangeFixedSize(final Bytes key, final long segmentEndTime) {
+<span class="nc" id="L637">            return WindowKeySchema.toStoreKeyBinary(key, segmentEndTime, Integer.MAX_VALUE);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

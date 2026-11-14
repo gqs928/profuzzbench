@@ -1,0 +1,908 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>UniformHeterogeneousAssignmentBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.group.assignor</a> &gt; <span class="el_source">UniformHeterogeneousAssignmentBuilder.java</span></div><h1>UniformHeterogeneousAssignmentBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.coordinator.group.assignor;
+
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.coordinator.group.api.assignor.GroupAssignment;
+import org.apache.kafka.coordinator.group.api.assignor.GroupSpec;
+import org.apache.kafka.coordinator.group.api.assignor.MemberAssignment;
+import org.apache.kafka.coordinator.group.api.assignor.PartitionAssignorException;
+import org.apache.kafka.coordinator.group.api.assignor.SubscribedTopicDescriber;
+import org.apache.kafka.coordinator.group.modern.MemberAssignmentImpl;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * The heterogeneous uniform assignment builder is used to generate the target assignment for a consumer group with
+ * at least one of its members subscribed to a different set of topics.
+ * &lt;p/&gt;
+ * Assignments are done according to the following principles:
+ * &lt;ol&gt;
+ *   &lt;li&gt;Balance:          Ensure partitions are distributed equally among all members.
+ *                         The difference in assignments sizes between any two members
+ *                         should not exceed one partition.&lt;/li&gt;
+ *   &lt;li&gt;Stickiness:       Minimize partition movements among members by retaining
+ *                         as much of the existing assignment as possible.&lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ * This assignment builder prioritizes the above properties in the following order:
+ *      Balance &gt; Stickiness.
+ */
+public class UniformHeterogeneousAssignmentBuilder {
+
+    /**
+     * The maximum number of iterations to perform in the final iterative balancing phase.
+     * &lt;p/&gt;
+     * When all subscribers to a topic have the same subscriptions, the final balancing phase
+     * converges in a single iteration and takes another iteration to detect that no further
+     * balancing is possible. This describes most subscription patterns.
+     * &lt;p/&gt;
+     * When subscribers have overlapping, non-identical subscriptions, the final balancing phase can
+     * take a lot longer to converge. We assume that each iteration roughly halves the imbalance and
+     * choose a limit that allows for a reasonable balance to be achieved without taking too long.
+     */
+    private static final int MAX_ITERATION_COUNT = 16;
+
+    /**
+     * The group metadata specification.
+     */
+    private final GroupSpec groupSpec;
+
+    /**
+     * The topic and partition metadata describer.
+     */
+    private final SubscribedTopicDescriber subscribedTopicDescriber;
+
+    /**
+     * The list of all the topic Ids that the consumer group is subscribed to.
+     */
+    private final Set&lt;Uuid&gt; subscribedTopicIds;
+
+    /**
+     * The list of members in the consumer group.
+     */
+    private final List&lt;String&gt; memberIds;
+
+    /**
+     * Maps member ids to their indices in the memberIds list.
+     */
+    private final Map&lt;String, Integer&gt; memberIndices;
+
+    /**
+     * List of subscribed members for each topic, in ascending order.
+     * &lt;p/&gt;
+     * Members are stored as integer indices into the memberIds array.
+     */
+    private final Map&lt;Uuid, List&lt;Integer&gt;&gt; topicSubscribers;
+
+    /**
+     * The new assignment that will be returned.
+     */
+    private final Map&lt;String, MemberAssignment&gt; targetAssignment;
+
+    /**
+     * The number of partitions each member is assigned in the new assignment.
+     * &lt;p/&gt;
+     * The indices are the same as the memberIds array. memberTargetAssignmentSizes[i] contains the
+     * number of partitions assigned to memberIds[i].
+     * &lt;p/&gt;
+     * We use a plain int[] array here for performance reasons. Looking up the number of partitions
+     * assigned to a given member is a very common operation. By using a plain int[] array, we can
+     * avoid:
+     * &lt;ul&gt;
+     *   &lt;li&gt;the overhead of boxing and unboxing integers.&lt;/li&gt;
+     *   &lt;li&gt;the cost of HashMap lookups.&lt;/li&gt;
+     *   &lt;li&gt;the cost of checking member ids for equality when there are HashMap collisions.&lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+    private final int[] memberTargetAssignmentSizes;
+
+    /**
+     * Orders topics by partitions per subscriber, descending.
+     * &lt;p/&gt;
+     * Ties are broken by subscriber count, ascending.
+     * &lt;p/&gt;
+     * Remaining ties are broken by topic id, ascending.
+     */
+    private final Comparator&lt;Uuid&gt; topicComparator;
+
+    /**
+     * Orders members by their number of assigned partitions, ascending.
+     * &lt;p/&gt;
+     * Ties are broken by member index, ascending.
+     */
+    private final Comparator&lt;Integer&gt; memberComparator;
+
+    /**
+     * Tracks the owner of each partition in the target assignment.
+     * &lt;p/&gt;
+     * Owners are represented as indices into the memberIds array.
+     * -1 indicates an unassigned partition.
+     */
+    private final Map&lt;Uuid, int[]&gt; targetAssignmentPartitionOwners;
+
+<span class="nc" id="L146">    public UniformHeterogeneousAssignmentBuilder(GroupSpec groupSpec, SubscribedTopicDescriber subscribedTopicDescriber) {</span>
+<span class="nc" id="L147">        this.groupSpec = groupSpec;</span>
+<span class="nc" id="L148">        this.subscribedTopicDescriber = subscribedTopicDescriber;</span>
+<span class="nc" id="L149">        this.subscribedTopicIds = new HashSet&lt;&gt;();</span>
+
+        // Number the members 0 to M - 1.
+<span class="nc" id="L152">        this.memberIds = new ArrayList&lt;&gt;(groupSpec.memberIds());</span>
+<span class="nc" id="L153">        this.memberIndices = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        for (int memberIndex = 0; memberIndex &lt; this.memberIds.size(); memberIndex++) {</span>
+<span class="nc" id="L155">            memberIndices.put(memberIds.get(memberIndex), memberIndex);</span>
+        }
+
+<span class="nc" id="L158">        this.topicSubscribers = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L160">        this.targetAssignment = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L161">        this.memberTargetAssignmentSizes = new int[this.memberIds.size()];</span>
+
+        // Build set of all subscribed topics and sets of subscribers per topic.
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        for (int memberIndex = 0; memberIndex &lt; this.memberIds.size(); memberIndex++) {</span>
+<span class="nc" id="L165">            String memberId = this.memberIds.get(memberIndex);</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">            for (Uuid topicId : groupSpec.memberSubscription(memberId).subscribedTopicIds()) {</span>
+                // Check if the subscribed topic exists.
+<span class="nc" id="L168">                int numPartitions = subscribedTopicDescriber.numPartitions(topicId);</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">                if (numPartitions == -1) {</span>
+<span class="nc" id="L170">                    throw new PartitionAssignorException(</span>
+                        &quot;Members are subscribed to topic &quot; + topicId + &quot; which doesn't exist in the topic metadata.&quot;
+                    );
+                }
+<span class="nc" id="L174">                subscribedTopicIds.add(topicId);</span>
+<span class="nc" id="L175">                topicSubscribers.computeIfAbsent(topicId, k -&gt; new ArrayList&lt;&gt;()).add(memberIndex);</span>
+<span class="nc" id="L176">            }</span>
+        }
+
+<span class="nc" id="L179">        this.topicComparator = (topic1Id, topic2Id) -&gt; {</span>
+<span class="nc" id="L180">            int topic1PartitionCount = subscribedTopicDescriber.numPartitions(topic1Id);</span>
+<span class="nc" id="L181">            int topic2PartitionCount = subscribedTopicDescriber.numPartitions(topic2Id);</span>
+<span class="nc" id="L182">            int topic1SubscriberCount = topicSubscribers.get(topic1Id).size();</span>
+<span class="nc" id="L183">            int topic2SubscriberCount = topicSubscribers.get(topic2Id).size();</span>
+
+            // Order by partitions per subscriber, descending.
+<span class="nc" id="L186">            int order = Double.compare(</span>
+                (double) topic2PartitionCount / topic2SubscriberCount,
+                (double) topic1PartitionCount / topic1SubscriberCount
+            );
+
+            // Then order by subscriber count, ascending.
+<span class="nc bnc" id="L192" title="All 2 branches missed.">            if (order == 0) {</span>
+<span class="nc" id="L193">                order = Integer.compare(topic1SubscriberCount, topic2SubscriberCount);</span>
+            }
+
+            // Then order by topic id, ascending.
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (order == 0) {</span>
+<span class="nc" id="L198">                order = topic1Id.compareTo(topic2Id);</span>
+            }
+
+<span class="nc" id="L201">            return order;</span>
+        };
+
+<span class="nc" id="L204">        this.memberComparator = (memberIndex1, memberIndex2) -&gt; {</span>
+            // Order by number of assigned partitions, ascending.
+<span class="nc" id="L206">            int order = Integer.compare(</span>
+<span class="nc" id="L207">                memberTargetAssignmentSizes[memberIndex1],</span>
+<span class="nc" id="L208">                memberTargetAssignmentSizes[memberIndex2]</span>
+            );
+
+            // Then order by member index, ascending.
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            if (order == 0) {</span>
+<span class="nc" id="L213">                order = memberIndex1.compareTo(memberIndex2);</span>
+            }
+
+<span class="nc" id="L216">            return order;</span>
+        };
+
+        // Initialize partition owners for the target assignments.
+<span class="nc" id="L220">        this.targetAssignmentPartitionOwners = new HashMap&lt;&gt;((int) ((this.subscribedTopicIds.size() / 0.75f) + 1));</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        for (Uuid topicId : this.subscribedTopicIds) {</span>
+<span class="nc" id="L222">            int numPartitions = subscribedTopicDescriber.numPartitions(topicId);</span>
+<span class="nc" id="L223">            int[] partitionOwners = new int[numPartitions];</span>
+<span class="nc" id="L224">            Arrays.fill(partitionOwners, -1);</span>
+<span class="nc" id="L225">            this.targetAssignmentPartitionOwners.put(topicId, partitionOwners);</span>
+<span class="nc" id="L226">        }</span>
+<span class="nc" id="L227">    }</span>
+
+    /**
+     * Here's the step-by-step breakdown of the assignment process:
+     * &lt;ol&gt;
+     *   &lt;li&gt;Revoke partitions from the existing assignment that are no longer part of each member's
+     *     subscriptions.&lt;/li&gt;
+     *   &lt;li&gt;Allocate all the remaining unassigned partitions to the members in a balanced manner.&lt;/li&gt;
+     *   &lt;li&gt;Iterate through the assignment until it is balanced.&lt;/li&gt;
+     * &lt;/ol&gt;
+     */
+    public GroupAssignment build() {
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if (subscribedTopicIds.isEmpty()) {</span>
+<span class="nc" id="L240">            return new GroupAssignment(Map.of());</span>
+        }
+
+<span class="nc" id="L243">        maybeRevokePartitions();</span>
+
+<span class="nc" id="L245">        Map&lt;Uuid, List&lt;Integer&gt;&gt; unassignedPartitions = computeUnassignedPartitions();</span>
+<span class="nc" id="L246">        assignRemainingPartitions(unassignedPartitions);</span>
+
+<span class="nc" id="L248">        balance();</span>
+
+<span class="nc" id="L250">        return new GroupAssignment(targetAssignment);</span>
+    }
+
+    /**
+     * Sorts topics based on the following criteria:
+     * &lt;ol&gt;
+     *   &lt;li&gt;Topics are sorted in descending order of totalPartitions / number of subscribers
+     *       (partitions per subscriber).&lt;/li&gt;
+     *   &lt;li&gt;Ties are broken by sorting in ascending order of number of subscribers.&lt;/li&gt;
+     *   &lt;li&gt;Any remaining ties are broken by sorting in ascending order of topic id.&lt;/li&gt;
+     * &lt;/ol&gt;
+     *
+     * The last criteria is for predictability of assignments.
+     *
+     * @param topicIds          The topic ids that need to be sorted.
+     * @return A list of sorted topic ids.
+     */
+    private List&lt;Uuid&gt; sortTopicIds(Collection&lt;Uuid&gt; topicIds) {
+<span class="nc" id="L268">        List&lt;Uuid&gt; sortedTopicIds = new ArrayList&lt;&gt;(topicIds);</span>
+<span class="nc" id="L269">        sortedTopicIds.sort(topicComparator);</span>
+<span class="nc" id="L270">        return sortedTopicIds;</span>
+    }
+
+    /**
+     * Revoke the partitions that are not part of each member's subscriptions.
+     *
+     * This method ensures that the original assignment is not copied if it is not altered.
+     */
+    private void maybeRevokePartitions() {
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        for (String memberId : groupSpec.memberIds()) {</span>
+<span class="nc" id="L280">            int memberIndex = memberIndices.get(memberId);</span>
+
+<span class="nc" id="L282">            Map&lt;Uuid, Set&lt;Integer&gt;&gt; oldAssignment = groupSpec.memberAssignment(memberId).partitions();</span>
+<span class="nc" id="L283">            Map&lt;Uuid, Set&lt;Integer&gt;&gt; newAssignment = null;</span>
+
+            // The assignor expects to receive the assignment as an immutable map. It leverages
+            // this knowledge in order to avoid having to copy all assignments.
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (!AssignorHelpers.isImmutableMap(oldAssignment)) {</span>
+<span class="nc" id="L288">                throw new IllegalStateException(&quot;The assignor expect an immutable map.&quot;);</span>
+            }
+
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            for (Map.Entry&lt;Uuid, Set&lt;Integer&gt;&gt; topicPartitions : oldAssignment.entrySet()) {</span>
+<span class="nc" id="L292">                Uuid topicId = topicPartitions.getKey();</span>
+<span class="nc" id="L293">                Set&lt;Integer&gt; partitions = topicPartitions.getValue();</span>
+
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                if (groupSpec.memberSubscription(memberId).subscribedTopicIds().contains(topicId)) {</span>
+<span class="nc" id="L296">                    memberTargetAssignmentSizes[memberIndex] += partitions.size();</span>
+
+<span class="nc bnc" id="L298" title="All 2 branches missed.">                    for (int partition : partitions) {</span>
+<span class="nc" id="L299">                        targetAssignmentPartitionOwners.get(topicId)[partition] = memberIndex;</span>
+<span class="nc" id="L300">                    }</span>
+                } else {
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                    if (newAssignment == null) {</span>
+                        // If the new assignment is null, we create a deep copy of the
+                        // original assignment so that we can alter it.
+<span class="nc" id="L305">                        newAssignment = AssignorHelpers.deepCopyAssignment(oldAssignment);</span>
+                    }
+                    // Remove the entire topic.
+<span class="nc" id="L308">                    newAssignment.remove(topicId);</span>
+                }
+<span class="nc" id="L310">            }</span>
+
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            if (newAssignment == null) {</span>
+<span class="nc" id="L313">                newAssignment = oldAssignment;</span>
+            }
+<span class="nc" id="L315">            targetAssignment.put(memberId, new MemberAssignmentImpl(newAssignment));</span>
+<span class="nc" id="L316">        }</span>
+<span class="nc" id="L317">    }</span>
+
+    /**
+     * A class that holds the state for the balancing process.
+     * &lt;p/&gt;
+     * Keeps track of two ranges of members: the members with the least number of assigned
+     * partitions and the members with the most number of assigned partitions. Within each range,
+     * all members start with the same number of assigned partitions.
+     */
+    private final class MemberAssignmentBalancer {
+        private final int[] memberTargetAssignmentSizes;
+
+        /**
+         * The members to balance, sorted by number of assigned partitions.
+         * &lt;p/&gt;
+         * Can be visualized like so:
+         * &lt;pre&gt;
+         *           ^
+         *           |          #
+         * partition |        ###
+         * count     |        ###
+         *           | ##########
+         *           +-----------&gt;
+         *             members
+         * &lt;/pre&gt;
+         */
+        private final List&lt;Integer&gt; sortedMembers;
+
+        /**
+         * [0, leastLoadedRangeEnd) represents the range of members with the smallest partition
+         * count.
+         */
+<span class="nc" id="L349">        private int leastLoadedRangeEnd = 0; // exclusive</span>
+
+        /**
+         * The partition count of each member in the least loaded range before we start assigning
+         * partitions to them.
+         */
+<span class="nc" id="L355">        private int leastLoadedRangePartitionCount = -1;</span>
+
+        /**
+         * The index of the next element in sortedMembers to which to assign the next partition.
+         */
+<span class="nc" id="L360">        private int nextLeastLoadedMember = 0;</span>
+
+        /**
+         * [mostLoadedRangeStart, mostLoadedRangeEnd) is the range of members with the largest
+         * partition count.
+         */
+<span class="nc" id="L366">        private int mostLoadedRangeStart = 0; // inclusive</span>
+
+        /**
+         * [mostLoadedRangeStart, mostLoadedRangeEnd) is the range of members with the largest
+         * partition count.
+         * &lt;p/&gt;
+         * mostLoadedRangeEnd is not simply the end of the member list, since we need to be able to
+         * exclude heavily loaded members which do not have any partitions to give up.
+         */
+<span class="nc" id="L375">        private int mostLoadedRangeEnd = 0; // inclusive</span>
+
+        /**
+         * The partition count of each member in the most loaded range before we start unassigning
+         * partitions from them.
+         */
+<span class="nc" id="L381">        private int mostLoadedRangePartitionCount = 1;</span>
+
+        /**
+         * The index of the next element in sortedMembers from which to unassign the next partition.
+         */
+<span class="nc" id="L386">        private int nextMostLoadedMember = -1;</span>
+
+        // The ranges can be visualized like so:
+        //
+        //                         most
+        //                         loaded
+        //           ^ least       range
+        //           | loaded               #
+        //           | range      [##&lt;-   ]##
+        // partition |          ##[#######]##
+        // count     | [...-&gt;  ]##[#######]##
+        //           | [#######]##[#######]##
+        //           +-----------------------&gt;
+        //             members
+        //                                 ^^
+        //                                 These members have no partitions to give up.
+        //
+        // The least loaded range expands rightwards and the most loaded range expands leftwards.
+        // Note that we are not done once the ranges touch, but rather when the partition counts in
+        // the ranges differ by one or less.
+
+<span class="nc" id="L407">        public MemberAssignmentBalancer() {</span>
+<span class="nc" id="L408">            this.memberTargetAssignmentSizes = UniformHeterogeneousAssignmentBuilder.this.memberTargetAssignmentSizes;</span>
+<span class="nc" id="L409">            this.sortedMembers = new ArrayList&lt;&gt;(memberTargetAssignmentSizes.length);</span>
+<span class="nc" id="L410">        }</span>
+
+        /**
+         * Resets the state of the balancer for a new set of members.
+         *
+         * @param members The members to balance.
+         * @return The difference in partition counts between the most and least loaded members.
+         */
+        public int initialize(List&lt;Integer&gt; members) {
+<span class="nc bnc" id="L419" title="All 2 branches missed.">            if (members.isEmpty()) {</span>
+                // nextLeastLoadedMember needs at least one member.
+<span class="nc" id="L421">                throw new IllegalArgumentException(&quot;Cannot balance an empty subscriber list.&quot;);</span>
+            }
+
+            // Build a sorted list of subscribers, where members with the smallest partition count
+            // appear first.
+<span class="nc" id="L426">            sortedMembers.clear();</span>
+<span class="nc" id="L427">            sortedMembers.addAll(members);</span>
+<span class="nc" id="L428">            sortedMembers.sort(memberComparator);</span>
+
+<span class="nc" id="L430">            leastLoadedRangeEnd = 0; // exclusive</span>
+<span class="nc" id="L431">            leastLoadedRangePartitionCount = memberTargetAssignmentSizes[sortedMembers.get(0)] - 1;</span>
+<span class="nc" id="L432">            nextLeastLoadedMember = 0;</span>
+
+<span class="nc" id="L434">            mostLoadedRangeStart = sortedMembers.size(); // inclusive</span>
+<span class="nc" id="L435">            mostLoadedRangeEnd = sortedMembers.size(); // exclusive</span>
+<span class="nc" id="L436">            mostLoadedRangePartitionCount = memberTargetAssignmentSizes[sortedMembers.get(sortedMembers.size() - 1)] + 1;</span>
+<span class="nc" id="L437">            nextMostLoadedMember = sortedMembers.size() - 1;</span>
+
+<span class="nc" id="L439">            return memberTargetAssignmentSizes[sortedMembers.get(sortedMembers.size() - 1)] -</span>
+<span class="nc" id="L440">                   memberTargetAssignmentSizes[sortedMembers.get(0)];</span>
+        }
+
+        /**
+         * Gets the least loaded member to which to assign a partition.
+         * &lt;p/&gt;
+         * Advances the state of the balancer by assuming that an additional partition has been
+         * assigned to the returned member.
+         * &lt;p/&gt;
+         * Assumes that there is at least one member.
+         *
+         * @return The least loaded member to which to assign a partition
+         */
+        public int nextLeastLoadedMember() {
+            // To generate a balanced assignment, we assign partitions to members in the
+            // [0, leastLoadedRangeEnd) range first. Once each member in the range has received a
+            // partition, the partition count of the range rises by one and we can try to expand it.
+            //                                     Range full,             Range full,
+            //                                     bump level by one       bump level by one,
+            //                                     can't expand range.     expand range.
+            //           ^                       ^                       ^
+            //           |            #          |            #          | [..-&gt;     ]#
+            // partition |          ###    -&gt;    | [..-&gt;   ]###    -&gt;    | [.......##]#
+            // count     | [..-&gt;   ]###          | [.......]###          | [.......##]#
+            //           | [#######]###          | [#######]###          | [#########]#
+            //           +-------------&gt;         +-------------&gt;         +------------&gt;
+            //             members                members                members
+
+<span class="nc bnc" id="L468" title="All 2 branches missed.">            if (nextLeastLoadedMember &gt;= leastLoadedRangeEnd) {</span>
+                // We've hit the end of the range. Bump its level and try to expand it.
+<span class="nc" id="L470">                leastLoadedRangePartitionCount++;</span>
+
+                // Expand the range.
+<span class="nc bnc" id="L473" title="All 2 branches missed.">                while (leastLoadedRangeEnd &lt; sortedMembers.size() &amp;&amp;</span>
+<span class="nc bnc" id="L474" title="All 2 branches missed.">                    memberTargetAssignmentSizes[sortedMembers.get(leastLoadedRangeEnd)] == leastLoadedRangePartitionCount) {</span>
+<span class="nc" id="L475">                    leastLoadedRangeEnd++;</span>
+                }
+
+                // Reset the pointer to the start of the range of members with identical
+                // partition counts.
+<span class="nc" id="L480">                nextLeastLoadedMember = 0;</span>
+            }
+
+<span class="nc" id="L483">            int leastLoadedMemberIndex = sortedMembers.get(nextLeastLoadedMember);</span>
+<span class="nc" id="L484">            nextLeastLoadedMember++;</span>
+
+<span class="nc" id="L486">            return leastLoadedMemberIndex;</span>
+        }
+
+        /**
+         * Gets the most loaded member from which to reassign a partition.
+         * &lt;p/&gt;
+         * Advances the state of the balancer by assuming that a partition has been unassigned from
+         * the returned member.
+         *
+         * @return The most loaded member from which to reassign a partition, or -1 if no such
+         *         member exists.
+         */
+        public int nextMostLoadedMember() {
+<span class="nc bnc" id="L499" title="All 2 branches missed.">            if (nextMostLoadedMember &lt; mostLoadedRangeStart) {</span>
+<span class="nc bnc" id="L500" title="All 4 branches missed.">                if (mostLoadedRangeEnd &lt;= mostLoadedRangeStart &amp;&amp;</span>
+                    mostLoadedRangeStart &gt; 0) {
+                    // The range is empty due to calls to excludeMostLoadedMember(). We risk not
+                    // expanding the range below and returning a member outside the range. Ensure
+                    // that we always expand the range below by resetting the partition count.
+<span class="nc" id="L505">                    mostLoadedRangePartitionCount = memberTargetAssignmentSizes[sortedMembers.get(mostLoadedRangeStart - 1)];</span>
+                } else {
+<span class="nc" id="L507">                    mostLoadedRangePartitionCount--;</span>
+                }
+
+                // Expand the range.
+<span class="nc bnc" id="L511" title="All 2 branches missed.">                while (mostLoadedRangeStart &gt; 0 &amp;&amp;</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                    memberTargetAssignmentSizes[sortedMembers.get(mostLoadedRangeStart - 1)] == mostLoadedRangePartitionCount) {</span>
+<span class="nc" id="L513">                    mostLoadedRangeStart--;</span>
+                }
+
+                // Reset the pointer to the end of the range of members with identical partition
+                // counts.
+<span class="nc" id="L518">                nextMostLoadedMember = mostLoadedRangeEnd - 1;</span>
+            }
+
+<span class="nc bnc" id="L521" title="All 2 branches missed.">            if (nextMostLoadedMember &lt; 0) {</span>
+                // The range is empty due to excludeMostLoadedMember() calls and there are no more
+                // members that can give up partitions.
+<span class="nc" id="L524">                return -1;</span>
+            }
+
+<span class="nc" id="L527">            int mostLoadedMemberIndex = sortedMembers.get(nextMostLoadedMember);</span>
+<span class="nc" id="L528">            nextMostLoadedMember--;</span>
+
+<span class="nc" id="L530">            return mostLoadedMemberIndex;</span>
+        }
+
+        /**
+         * Excludes the last member returned from nextMostLoadedMember from the most loaded range.
+         *
+         * Must not be called if nextMostLoadedMember has not been called yet or returned -1.
+         */
+        public void excludeMostLoadedMember() {
+            // Kick the member out of the most loaded range by swapping with the member at the end
+            // of the range and contracting the end of the range.
+<span class="nc" id="L541">            int mostLoadedMemberIndex = sortedMembers.get(nextMostLoadedMember + 1);</span>
+<span class="nc" id="L542">            sortedMembers.set(nextMostLoadedMember + 1, sortedMembers.get(mostLoadedRangeEnd - 1));</span>
+<span class="nc" id="L543">            sortedMembers.set(mostLoadedRangeEnd - 1, mostLoadedMemberIndex);</span>
+<span class="nc" id="L544">            mostLoadedRangeEnd--;</span>
+<span class="nc" id="L545">        }</span>
+
+        /**
+         * Checks whether the members are balanced based on the partition counts of the least and
+         * most loaded ranges.
+         */
+        public boolean isBalanced() {
+<span class="nc bnc" id="L552" title="All 2 branches missed.">            return mostLoadedRangePartitionCount - leastLoadedRangePartitionCount &lt;= 1;</span>
+        }
+    }
+
+    /**
+     * Allocates the remaining unassigned partitions to members in a balanced manner.
+     * &lt;ol&gt;
+     *   &lt;li&gt;Topics are sorted to maximize the probability of a balanced assignment.&lt;/li&gt;
+     *   &lt;li&gt;Unassigned partitions within each topic are distributed to the least loaded
+     *       subscribers, repeatedly.&lt;/li&gt;
+     * &lt;/ol&gt;
+     *
+     * @param partitions        The partitions to be assigned.
+     */
+    private void assignRemainingPartitions(Map&lt;Uuid, List&lt;Integer&gt;&gt; partitions) {
+<span class="nc" id="L567">        List&lt;Uuid&gt; sortedTopicIds = sortTopicIds(partitions.keySet());</span>
+
+<span class="nc" id="L569">        MemberAssignmentBalancer memberAssignmentBalancer = new MemberAssignmentBalancer();</span>
+
+<span class="nc bnc" id="L571" title="All 2 branches missed.">        for (Uuid topicId : sortedTopicIds) {</span>
+<span class="nc" id="L572">            memberAssignmentBalancer.initialize(topicSubscribers.get(topicId));</span>
+
+<span class="nc bnc" id="L574" title="All 2 branches missed.">            for (int partition : partitions.get(topicId)) {</span>
+<span class="nc" id="L575">                int leastLoadedMemberIndex = memberAssignmentBalancer.nextLeastLoadedMember();</span>
+<span class="nc" id="L576">                assignPartition(topicId, partition, leastLoadedMemberIndex);</span>
+<span class="nc" id="L577">            }</span>
+<span class="nc" id="L578">        }</span>
+<span class="nc" id="L579">    }</span>
+
+    /**
+     * If a topic has two or more potential members it is subject to reassignment.
+     *
+     * @return true if the topic can participate in reassignment, false otherwise.
+     */
+    private boolean canTopicParticipateInReassignment(Uuid topicId) {
+<span class="nc bnc" id="L587" title="All 2 branches missed.">        return topicSubscribers.get(topicId).size() &gt;= 2;</span>
+    }
+
+    /**
+     * Balance the current assignment after the initial round of assignments have completed.
+     */
+    private void balance() {
+<span class="nc" id="L594">        Set&lt;Uuid&gt; topicIds = new HashSet&lt;&gt;(subscribedTopicIds);</span>
+
+        // Narrow down the reassignment scope to only those topics that can actually be reassigned.
+<span class="nc bnc" id="L597" title="All 2 branches missed.">        for (Uuid topicId : subscribedTopicIds) {</span>
+<span class="nc bnc" id="L598" title="All 2 branches missed.">            if (!canTopicParticipateInReassignment(topicId)) {</span>
+<span class="nc" id="L599">                topicIds.remove(topicId);</span>
+            }
+<span class="nc" id="L601">        }</span>
+
+        // If all the partitions are fixed i.e. unassigned partitions is empty there is no point of re-balancing.
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        if (!topicIds.isEmpty()) balanceTopics(topicIds);</span>
+<span class="nc" id="L605">    }</span>
+
+    /**
+     * Performs reassignments of partitions to balance the load across members.
+     * This method iteratively reassigns partitions until no further moves can improve the balance.
+     * &lt;p/&gt;
+     * The method loops over the topics repeatedly until an entire loop around the topics has
+     * completed without any reassignments, or we hit an iteration limit.
+     * &lt;p/&gt;
+     * This method produces perfectly balanced assignments when all subscribers of a topic have the
+     * same subscriptions. However, when subscribers have overlapping, non-identical subscriptions,
+     * the method produces almost-balanced assignments, assuming the iteration limit is not hit.
+     * eg. if there are three members and two topics and members 1 and 2 are subscribed to the first
+     *     topic and members 2 and 3 are subscribed to the second topic, we can end up with an
+     *     assignment like:
+     * &lt;ul&gt;
+     *   &lt;li&gt;Member 1: 9 partitions&lt;/li&gt;
+     *   &lt;li&gt;Member 2: 10 partitions&lt;/li&gt;
+     *   &lt;li&gt;Member 3: 11 partitions&lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * In this assignment, the subscribers of the first topic have a difference in partitions of 1,
+     * so the topic is considered balanced. The same applies to the second topic. However, balance
+     * can be improved by moving a partition from the second topic from member 3 to member 2 and a
+     * partition from the first topic from member 2 to member 1.
+     *
+     * @param topicIds          The topics to consider for reassignment. These topics must have at
+     *                          least two subscribers.
+     */
+    private void balanceTopics(Collection&lt;Uuid&gt; topicIds) {
+<span class="nc" id="L635">        List&lt;Uuid&gt; sortedTopicIds = sortTopicIds(topicIds);</span>
+        // The index of the last topic in sortedTopicIds that was rebalanced.
+        // Used to decide when to exit early.
+<span class="nc" id="L638">        int lastRebalanceTopicIndex = -1;</span>
+
+<span class="nc" id="L640">        MemberAssignmentBalancer memberAssignmentBalancer = new MemberAssignmentBalancer();</span>
+
+        // An array of partitions, with partitions owned by the same member grouped together.
+<span class="nc" id="L643">        List&lt;Integer&gt; partitions = new ArrayList&lt;&gt;();</span>
+
+        // The ranges in the partitions list assigned to members.
+        // Maintaining these ranges allows for constant time, deterministic picking of partitions
+        // owned by a given member.
+<span class="nc" id="L648">        Map&lt;Integer, Integer&gt; startPartitionIndices = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L649">        Map&lt;Integer, Integer&gt; endPartitionIndices = new HashMap&lt;&gt;(); // exclusive</span>
+
+        // Repeat reassignment until no partition can be moved to improve the balance or we hit an
+        // iteration limit.
+<span class="nc bnc" id="L653" title="All 2 branches missed.">        for (int i = 0; i &lt; MAX_ITERATION_COUNT; i++) {</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">            for (int topicIndex = 0; topicIndex &lt; sortedTopicIds.size(); topicIndex++) {</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">                if (topicIndex == lastRebalanceTopicIndex) {</span>
+                    // The last rebalanced topic was this one, which means we've gone through all
+                    // the topics and didn't perform any additional rebalancing. Don't bother trying
+                    // to rebalance this topic again and exit.
+<span class="nc" id="L659">                    return;</span>
+                }
+
+<span class="nc" id="L662">                Uuid topicId = sortedTopicIds.get(topicIndex);</span>
+
+<span class="nc" id="L664">                int reassignedPartitionCount = balanceTopic(</span>
+                    topicId,
+                    memberAssignmentBalancer,
+                    partitions,
+                    startPartitionIndices,
+                    endPartitionIndices
+                );
+
+<span class="nc bnc" id="L672" title="All 4 branches missed.">                if (reassignedPartitionCount &gt; 0 ||</span>
+                    lastRebalanceTopicIndex == -1) {
+<span class="nc" id="L674">                    lastRebalanceTopicIndex = topicIndex;</span>
+                }
+            }
+        }
+<span class="nc" id="L678">    }</span>
+
+    /**
+     * Performs reassignments of a topic's partitions to balance the load across its subscribers.
+     *
+     * @param topicId                  The topic to consider for reassignment. The topic must have
+     *                                 at least two subscribers.
+     * @param memberAssignmentBalancer A MemberAssignmentBalancer to hold the state of the balancing
+     *                                 algorithm.
+     *                                 subscribers in ascending order of total assigned partitions.
+     * @param partitions               A list for the balancing algorithm to store the topic's
+     *                                 partitions, with partitions owned by the same member grouped
+     *                                 together.
+     * @param startPartitionIndices    A map for the balancing algorithm to store the ranges in the
+     *                                 partitions list assigned to members. These ranges allows for
+     *                                 constant time, deterministic picking of partitions owned by a
+     *                                 given member.
+     * @param endPartitionIndices      A map for the balancing algorithm to store the ranges in the
+     *                                 partitions list assigned to members. These ranges allows for
+     *                                 constant time, deterministic picking of partitions owned by a
+     *                                 given member.
+     * @return the number of partitions reassigned.
+     */
+    private int balanceTopic(
+        Uuid topicId,
+        MemberAssignmentBalancer memberAssignmentBalancer,
+        List&lt;Integer&gt; partitions,
+        Map&lt;Integer, Integer&gt; startPartitionIndices,
+        Map&lt;Integer, Integer&gt; endPartitionIndices // exclusive
+    ) {
+<span class="nc" id="L708">        int reassignedPartitionCount = 0;</span>
+
+<span class="nc" id="L710">        int numPartitions = subscribedTopicDescriber.numPartitions(topicId);</span>
+
+<span class="nc" id="L712">        int[] partitionOwners = targetAssignmentPartitionOwners.get(topicId);</span>
+
+        // Next, try to reassign partitions from the most loaded subscribers to the least loaded
+        // subscribers. We use a similar approach to assignRemainingPartitions, except instead
+        // we are reassigning partitions from the most loaded subscribers to the least loaded
+        // subscribers. Once the difference in partition counts between the ranges is one or less,
+        // we are done, since reassigning partitions would not improve balance.
+<span class="nc" id="L719">        int imbalance = memberAssignmentBalancer.initialize(topicSubscribers.get(topicId));</span>
+<span class="nc bnc" id="L720" title="All 2 branches missed.">        if (imbalance &lt;= 1) {</span>
+            // The topic is already balanced.
+<span class="nc" id="L722">            return reassignedPartitionCount;</span>
+        }
+
+        // Initialize the array of partitions, with partitions owned by the same member grouped
+        // together.
+<span class="nc" id="L727">        partitions.clear();</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">        for (int partition = 0; partition &lt; numPartitions; partition++) {</span>
+<span class="nc" id="L729">            partitions.add(partition);</span>
+        }
+<span class="nc" id="L731">        partitions.sort(</span>
+            Comparator
+<span class="nc" id="L733">                .comparingInt((Integer partition) -&gt; partitionOwners[partition])</span>
+<span class="nc" id="L734">                .thenComparingInt(partition -&gt; partition)</span>
+        );
+
+        // Initialize the ranges in the partitions list owned by members.
+<span class="nc" id="L738">        startPartitionIndices.clear();</span>
+<span class="nc" id="L739">        endPartitionIndices.clear();</span>
+
+<span class="nc bnc" id="L741" title="All 2 branches missed.">        for (int i = 0; i &lt; numPartitions; i++) {</span>
+<span class="nc" id="L742">            int partition = partitions.get(i);</span>
+<span class="nc" id="L743">            int ownerIndex = partitionOwners[partition];</span>
+<span class="nc" id="L744">            startPartitionIndices.putIfAbsent(ownerIndex, i);</span>
+<span class="nc" id="L745">            endPartitionIndices.put(ownerIndex, i + 1); // endPartitionIndices is exclusive</span>
+        }
+
+        // Redistribute partitions from the most loaded subscriber to the least loaded subscriber
+        // until the topic's subscribers are balanced.
+<span class="nc bnc" id="L750" title="All 2 branches missed.">        while (!memberAssignmentBalancer.isBalanced()) {</span>
+            // NB: The condition above does not do much. This loop will terminate due to the checks
+            //     inside instead.
+
+            // First, choose a member from the most loaded range to reassign a partition from.
+
+            // Loop until we find a member that has partitions to give up.
+            int mostLoadedMemberIndex;
+            while (true) {
+<span class="nc" id="L759">                mostLoadedMemberIndex = memberAssignmentBalancer.nextMostLoadedMember();</span>
+
+<span class="nc bnc" id="L761" title="All 2 branches missed.">                if (mostLoadedMemberIndex == -1) {</span>
+                    // There are no more members with partitions to give up.
+                    // We need to break out of two loops here.
+<span class="nc" id="L764">                    break;</span>
+                }
+
+<span class="nc bnc" id="L767" title="All 2 branches missed.">                if (!endPartitionIndices.containsKey(mostLoadedMemberIndex) ||</span>
+<span class="nc bnc" id="L768" title="All 2 branches missed.">                    endPartitionIndices.get(mostLoadedMemberIndex) - startPartitionIndices.get(mostLoadedMemberIndex) &lt;= 0) {</span>
+<span class="nc" id="L769">                    memberAssignmentBalancer.excludeMostLoadedMember();</span>
+<span class="nc" id="L770">                    continue;</span>
+                }
+
+                break;
+            }
+
+<span class="nc bnc" id="L776" title="All 2 branches missed.">            if (mostLoadedMemberIndex == -1) {</span>
+                // There are no more members with partitions to give up.
+<span class="nc" id="L778">                break;</span>
+            }
+
+            // We've picked a member. Now pick its last partition to reassign.
+<span class="nc" id="L782">            int partition = partitions.get(endPartitionIndices.get(mostLoadedMemberIndex) - 1);</span>
+<span class="nc" id="L783">            endPartitionIndices.put(mostLoadedMemberIndex, endPartitionIndices.get(mostLoadedMemberIndex) - 1);</span>
+
+            // Find the least loaded subscriber.
+<span class="nc" id="L786">            int leastLoadedMemberIndex = memberAssignmentBalancer.nextLeastLoadedMember();</span>
+
+            // If the most and least loaded subscribers came from member ranges with partition
+            // counts that differ by one or less, then the members are balanced and we are done.
+<span class="nc bnc" id="L790" title="All 2 branches missed.">            if (memberAssignmentBalancer.isBalanced()) {</span>
+                // The topic is balanced.
+<span class="nc" id="L792">                break;</span>
+            }
+
+            // Reassign the partition.
+<span class="nc" id="L796">            assignPartition(topicId, partition, leastLoadedMemberIndex);</span>
+<span class="nc" id="L797">            reassignedPartitionCount++;</span>
+<span class="nc" id="L798">        }</span>
+
+<span class="nc" id="L800">        return reassignedPartitionCount;</span>
+    }
+
+    /**
+     * Computes the set of unassigned partitions, based on targetAssignmentPartitionOwners.
+     */
+    private Map&lt;Uuid, List&lt;Integer&gt;&gt; computeUnassignedPartitions() {
+<span class="nc" id="L807">        Map&lt;Uuid, List&lt;Integer&gt;&gt; unassignedPartitions = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L809" title="All 2 branches missed.">        for (Uuid topicId : subscribedTopicIds) {</span>
+<span class="nc" id="L810">            List&lt;Integer&gt; topicUnassignedPartitions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L811">            int numPartitions = subscribedTopicDescriber.numPartitions(topicId);</span>
+<span class="nc bnc" id="L812" title="All 2 branches missed.">            for (int partition = 0; partition &lt; numPartitions; partition++) {</span>
+<span class="nc bnc" id="L813" title="All 2 branches missed.">                if (targetAssignmentPartitionOwners.get(topicId)[partition] == -1) {</span>
+<span class="nc" id="L814">                    topicUnassignedPartitions.add(partition);</span>
+                }
+            }
+
+<span class="nc bnc" id="L818" title="All 2 branches missed.">            if (!topicUnassignedPartitions.isEmpty()) {</span>
+<span class="nc" id="L819">                unassignedPartitions.put(topicId, topicUnassignedPartitions);</span>
+            }
+<span class="nc" id="L821">        }</span>
+
+<span class="nc" id="L823">        return unassignedPartitions;</span>
+    }
+
+    /**
+     * Assigns or reassigns the given partition to a member.
+     *
+     * @param topicId           The topic containing the partition to be assigned or reassigned.
+     * @param partition         The partition to be assigned or reassigned.
+     * @param memberIndex       The index of the member to which the partition should be assigned.
+     */
+    private void assignPartition(Uuid topicId, int partition, int memberIndex) {
+<span class="nc" id="L834">        int oldMemberIndex = targetAssignmentPartitionOwners.get(topicId)[partition];</span>
+
+<span class="nc bnc" id="L836" title="All 2 branches missed.">        if (oldMemberIndex != -1) {</span>
+<span class="nc" id="L837">            removePartitionFromTargetAssignment(topicId, partition, oldMemberIndex);</span>
+        }
+
+<span class="nc" id="L840">        addPartitionToTargetAssignment(topicId, partition, memberIndex);</span>
+<span class="nc" id="L841">    }</span>
+
+    /**
+     * Assigns a partition to a member and updates the current assignment size.
+     *
+     * @param topicId               The topic containing the partition to be assigned.
+     * @param partition             The partition to be assigned.
+     * @param memberIndex           Member that the partition needs to be added to.
+     */
+    private void addPartitionToTargetAssignment(
+        Uuid topicId,
+        int partition,
+        int memberIndex
+    ) {
+<span class="nc" id="L855">        String memberId = memberIds.get(memberIndex);</span>
+<span class="nc" id="L856">        Map&lt;Uuid, Set&lt;Integer&gt;&gt; assignment = targetAssignment.get(memberId).partitions();</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">        if (AssignorHelpers.isImmutableMap(assignment)) {</span>
+<span class="nc" id="L858">            assignment = AssignorHelpers.deepCopyAssignment(assignment);</span>
+<span class="nc" id="L859">            targetAssignment.put(memberId, new MemberAssignmentImpl(assignment));</span>
+        }
+<span class="nc" id="L861">        assignment</span>
+<span class="nc" id="L862">            .computeIfAbsent(topicId, __ -&gt; {</span>
+<span class="nc" id="L863">                int numPartitions = subscribedTopicDescriber.numPartitions(topicId);</span>
+<span class="nc" id="L864">                int numSubscribers = topicSubscribers.get(topicId).size();</span>
+<span class="nc" id="L865">                int estimatedPartitionsPerSubscriber = (numPartitions + numSubscribers - 1) / numSubscribers;</span>
+<span class="nc" id="L866">                return new HashSet&lt;&gt;((int) ((estimatedPartitionsPerSubscriber / 0.75f) + 1));</span>
+            })
+<span class="nc" id="L868">            .add(partition);</span>
+
+<span class="nc" id="L870">        targetAssignmentPartitionOwners.get(topicId)[partition] = memberIndex;</span>
+
+<span class="nc" id="L872">        memberTargetAssignmentSizes[memberIndex]++;</span>
+<span class="nc" id="L873">    }</span>
+
+    /**
+     * Revokes the partition from a member and updates the current target assignment size.
+     *
+     * @param topicId               The topic containing the partition to be revoked.
+     * @param partition             The partition to be revoked.
+     * @param memberIndex           Member that the partition needs to be revoked from.
+     */
+    private void removePartitionFromTargetAssignment(
+        Uuid topicId,
+        int partition,
+        int memberIndex
+    ) {
+<span class="nc" id="L887">        String memberId = memberIds.get(memberIndex);</span>
+<span class="nc" id="L888">        Map&lt;Uuid, Set&lt;Integer&gt;&gt; assignment = targetAssignment.get(memberId).partitions();</span>
+<span class="nc bnc" id="L889" title="All 2 branches missed.">        if (AssignorHelpers.isImmutableMap(assignment)) {</span>
+<span class="nc" id="L890">            assignment = AssignorHelpers.deepCopyAssignment(assignment);</span>
+<span class="nc" id="L891">            targetAssignment.put(memberId, new MemberAssignmentImpl(assignment));</span>
+        }
+<span class="nc" id="L893">        Set&lt;Integer&gt; partitionsSet = assignment.get(topicId);</span>
+        // Remove the partition from the assignment, if there are no more partitions from a particular topic,
+        // remove the topic from the assignment as well.
+<span class="nc bnc" id="L896" title="All 2 branches missed.">        if (partitionsSet != null) {</span>
+<span class="nc" id="L897">            partitionsSet.remove(partition);</span>
+<span class="nc bnc" id="L898" title="All 2 branches missed.">            if (partitionsSet.isEmpty()) {</span>
+<span class="nc" id="L899">                assignment.remove(topicId);</span>
+            }
+        }
+
+<span class="nc" id="L903">        targetAssignmentPartitionOwners.get(topicId)[partition] = -1;</span>
+
+<span class="nc" id="L905">        memberTargetAssignmentSizes[memberIndex]--;</span>
+<span class="nc" id="L906">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

@@ -1,0 +1,267 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractTransactionBuffer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">AbstractTransactionBuffer.java</span></div><h1>AbstractTransactionBuffer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.IsolationLevel;
+
+import java.util.NavigableMap;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+/**
+ * Base class for {@link TransactionBuffer} implementations. Provides the shared two-layer
+ * staging design: a {@link TreeMap} staging buffer for uncommitted writes plus backend-specific
+ * write accumulation for atomic commit.
+ * &lt;p&gt;
+ * Exactly one thread — the {@link #ownerThread} that constructs the buffer (the StreamThread) —
+ * ever mutates {@code pendingWrites}; Interactive Query (IQ) threads are read-only. The staging
+ * map is therefore a plain (non-thread-safe) {@link TreeMap} guarded by {@link #snapshotLock}:
+ * &lt;ul&gt;
+ *   &lt;li&gt;Owner structural mutations ({@code stage}/{@code commit}/{@code rollback}) hold the
+ *       &lt;b&gt;write&lt;/b&gt; lock.&lt;/li&gt;
+ *   &lt;li&gt;The owner reads ({@code get}) and scan-copies &lt;b&gt;lock-free&lt;/b&gt;: because it is the sole
+ *       mutator and is single-threaded, a read is never concurrent with a structural change, and
+ *       IQ threads never mutate — so the tree is quiescent for the read.&lt;/li&gt;
+ *   &lt;li&gt;Non-owner (IQ) reads/snapshots hold the &lt;b&gt;read&lt;/b&gt; lock; owner writes become visible to
+ *       them via the write-unlock → read-lock happens-before edge.&lt;/li&gt;
+ *   &lt;li&gt;Owner scans eagerly copy the bounded staging range into a private {@link TreeMap} so a
+ *       subsequent owner {@code stage} cannot invalidate an open iterator with a
+ *       {@link java.util.ConcurrentModificationException}.&lt;/li&gt;
+ * &lt;/ul&gt;
+ * {@code isEmpty()} and {@code approximateNumUncommittedBytes()} read owner-thread-only state and
+ * are not synchronized.
+ *
+ * @param &lt;K&gt; the key type, must be {@link Comparable}
+ */
+abstract class AbstractTransactionBuffer&lt;K extends Comparable&lt;K&gt;&gt; implements TransactionBuffer&lt;K&gt; {
+
+<span class="nc" id="L53">    final NavigableMap&lt;K, Optional&lt;byte[]&gt;&gt; pendingWrites = new TreeMap&lt;&gt;();</span>
+<span class="nc" id="L54">    final ReentrantReadWriteLock snapshotLock = new ReentrantReadWriteLock();</span>
+    final Thread ownerThread;
+    long pendingWritesBytes;
+
+<span class="nc" id="L58">    AbstractTransactionBuffer() {</span>
+<span class="nc" id="L59">        this.ownerThread = Thread.currentThread();</span>
+<span class="nc" id="L60">    }</span>
+
+    // -- Abstract methods to be implemented by backend-specific subclasses --
+
+    /** Append the write to the backend-specific batch (e.g. WriteBatch for RocksDB). */
+    abstract void stageToBackend(K key, byte[] value);
+
+    /** Create a base store iterator for the given range. Upper bound is inclusive. Forward direction. */
+    abstract ManagedKeyValueIterator&lt;K, byte[]&gt; newBaseIterator(K from, K to);
+
+    /** Create a base store iterator with configurable direction and upper bound inclusiveness. */
+    ManagedKeyValueIterator&lt;K, byte[]&gt; newBaseIterator(final K from, final K to,
+                                                       final boolean forward, final boolean toInclusive) {
+<span class="nc" id="L73">        return newBaseIterator(from, to);</span>
+    }
+
+    /**
+     * Create a base iterator that is isolated from concurrent base-store mutation.
+     * &lt;p&gt;
+     * Called only from the non-owner ({@link #snapshotScan}) path while the {@link #snapshotLock}
+     * read-lock is held. Subclasses must provide mutation isolation appropriate to their backend
+     * (e.g. an eager range copy for in-memory, a native snapshot for RocksDB).
+     * &lt;p&gt;
+     * The owner fast path uses the live {@link #newBaseIterator} and must not use this method.
+     */
+    abstract ManagedKeyValueIterator&lt;K, byte[]&gt; newBaseSnapshotIterator(K from, K to,
+                                                                        boolean forward, boolean toInclusive);
+
+    /** Atomically apply the accumulated writes to the base store. */
+    abstract void flushToBase();
+
+    /** Discard the backend-specific pending batch without applying it. */
+    abstract void discardPendingBatch();
+
+    /** Estimate the byte size of a key, for uncommitted bytes tracking. */
+    abstract int estimateKeySize(K key);
+
+    // -- TransactionBuffer implementation --
+
+    @Override
+    public void stage(final K key, final byte[] value) {
+<span class="nc" id="L101">        snapshotLock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L103">            pendingWrites.put(key, Optional.ofNullable(value));</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">            pendingWritesBytes += estimateKeySize(key) + (value != null ? value.length : 0);</span>
+<span class="nc" id="L105">            stageToBackend(key, value);</span>
+        } finally {
+<span class="nc" id="L107">            snapshotLock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L109">    }</span>
+
+    @Override
+    public Optional&lt;byte[]&gt; get(final K key) {
+        // Owner reads lock-free: it is the sole mutator and single-threaded, so this read is never
+        // concurrent with a structural change. Non-owner (IQ) reads take the read lock to exclude a
+        // concurrent owner write on the non-thread-safe TreeMap.
+<span class="nc bnc" id="L116" title="All 2 branches missed.">        if (Thread.currentThread() == ownerThread) {</span>
+<span class="nc" id="L117">            return pendingWrites.get(key);</span>
+        }
+<span class="nc" id="L119">        snapshotLock.readLock().lock();</span>
+        try {
+<span class="nc" id="L121">            return pendingWrites.get(key);</span>
+        } finally {
+<span class="nc" id="L123">            snapshotLock.readLock().unlock();</span>
+        }
+    }
+
+    @Override
+    public ManagedKeyValueIterator&lt;K, byte[]&gt; all(final boolean forward) {
+<span class="nc" id="L129">        return all(forward, IsolationLevel.READ_UNCOMMITTED);</span>
+    }
+
+    /**
+     * As {@link #all(boolean)}, but under {@link IsolationLevel#READ_COMMITTED} the staging layer is
+     * excluded and only the committed base store is iterated.
+     */
+    ManagedKeyValueIterator&lt;K, byte[]&gt; all(final boolean forward, final IsolationLevel isolationLevel) {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        if (Thread.currentThread() == ownerThread) {</span>
+            // Eager copy of the staging layer (lock-free for the sole mutator) so a later owner
+            // stage cannot invalidate this iterator; the base store is iterated live.
+<span class="nc" id="L140">            final NavigableMap&lt;K, Optional&lt;byte[]&gt;&gt; stagingSnapshot = stagingSnapshot(null, null, true, isolationLevel);</span>
+<span class="nc" id="L141">            final ManagedKeyValueIterator&lt;K, byte[]&gt; baseIter = newBaseIterator(null, null, forward, true);</span>
+<span class="nc" id="L142">            return new StagedMergeIterator&lt;&gt;(stagingSnapshot, baseIter, forward);</span>
+        }
+<span class="nc" id="L144">        return snapshotScan(null, null, forward, true, isolationLevel);</span>
+    }
+
+    /**
+     * @throws IllegalArgumentException if {@code from &gt; to} and {@code forward == true}; or {@code from &lt; to} and {@code forward == false}.
+     */
+    @Override
+    public ManagedKeyValueIterator&lt;K, byte[]&gt; range(final K from, final K to, final boolean forward, final boolean toInclusive) {
+<span class="nc" id="L152">        return range(from, to, forward, toInclusive, IsolationLevel.READ_UNCOMMITTED);</span>
+    }
+
+    /**
+     * As {@link #range(Object, Object, boolean, boolean)}, but under {@link IsolationLevel#READ_COMMITTED}
+     * the staging layer is excluded and only the committed base store is iterated.
+     */
+    ManagedKeyValueIterator&lt;K, byte[]&gt; range(final K from, final K to, final boolean forward, final boolean toInclusive,
+                                             final IsolationLevel isolationLevel) {
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (Thread.currentThread() == ownerThread) {</span>
+<span class="nc" id="L162">            final NavigableMap&lt;K, Optional&lt;byte[]&gt;&gt; stagingSnapshot = stagingSnapshot(from, to, toInclusive, isolationLevel);</span>
+<span class="nc" id="L163">            final ManagedKeyValueIterator&lt;K, byte[]&gt; baseIter = newBaseIterator(from, to, forward, toInclusive);</span>
+<span class="nc" id="L164">            return new StagedMergeIterator&lt;&gt;(stagingSnapshot, baseIter, forward);</span>
+        }
+<span class="nc" id="L166">        return snapshotScan(from, to, forward, toInclusive, isolationLevel);</span>
+    }
+
+    @Override
+    public void commit() {
+<span class="nc" id="L171">        snapshotLock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L173">            flushToBase();</span>
+<span class="nc" id="L174">            pendingWrites.clear();</span>
+<span class="nc" id="L175">            pendingWritesBytes = 0;</span>
+        } finally {
+<span class="nc" id="L177">            snapshotLock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L179">    }</span>
+
+    @Override
+    public void rollback() {
+<span class="nc" id="L183">        snapshotLock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L185">            pendingWrites.clear();</span>
+<span class="nc" id="L186">            pendingWritesBytes = 0;</span>
+<span class="nc" id="L187">            discardPendingBatch();</span>
+        } finally {
+<span class="nc" id="L189">            snapshotLock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L191">    }</span>
+
+    @Override
+    public boolean isEmpty() {
+<span class="nc" id="L195">        return pendingWrites.isEmpty();</span>
+    }
+
+    @Override
+    public long approximateNumUncommittedBytes() {
+<span class="nc" id="L200">        return pendingWritesBytes;</span>
+    }
+
+    @Override
+    public void close() {
+        // Subclasses can override to release resources
+<span class="nc" id="L206">    }</span>
+
+    // -- Internal helpers (package-private for subclass use) --
+
+    /**
+     * Constructs an iteratator over a *snapshot* of the current transaction buffer state.
+     * This ensures snapshot-isolation for interactive queries, and prevents iterators suddenly becoming invalid when
+     * the stream thread clears the transaction buffer state on commit/rollback.
+     */
+    ManagedKeyValueIterator&lt;K, byte[]&gt; snapshotScan(final K from, final K to,
+                                                    final boolean forward, final boolean toInclusive) {
+<span class="nc" id="L217">        return snapshotScan(from, to, forward, toInclusive, IsolationLevel.READ_UNCOMMITTED);</span>
+    }
+
+    /**
+     * As {@link #snapshotScan(Object, Object, boolean, boolean)}, but under
+     * {@link IsolationLevel#READ_COMMITTED} only the committed base store is snapshotted, excluding the
+     * staging layer.
+     */
+    ManagedKeyValueIterator&lt;K, byte[]&gt; snapshotScan(final K from, final K to,
+                                                    final boolean forward, final boolean toInclusive,
+                                                    final IsolationLevel isolationLevel) {
+<span class="nc" id="L228">        snapshotLock.readLock().lock();</span>
+        try {
+<span class="nc" id="L230">            final NavigableMap&lt;K, Optional&lt;byte[]&gt;&gt; stagingSnapshot = stagingSnapshot(from, to, toInclusive, isolationLevel);</span>
+<span class="nc" id="L231">            final ManagedKeyValueIterator&lt;K, byte[]&gt; baseIter = newBaseSnapshotIterator(from, to, forward, toInclusive);</span>
+<span class="nc" id="L232">            return new StagedMergeIterator&lt;&gt;(stagingSnapshot, baseIter, forward);</span>
+        } finally {
+<span class="nc" id="L234">            snapshotLock.readLock().unlock();</span>
+        }
+    }
+
+    /**
+     * An eager copy of the bounded staging range, so a later owner {@code stage} cannot invalidate an
+     * open iterator. Under {@link IsolationLevel#READ_COMMITTED} the copy is empty, which makes the
+     * {@link StagedMergeIterator} degenerate to a committed-only (base) view.
+     */
+    private NavigableMap&lt;K, Optional&lt;byte[]&gt;&gt; stagingSnapshot(final K from, final K to, final boolean toInclusive,
+                                                              final IsolationLevel isolationLevel) {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        return isolationLevel == IsolationLevel.READ_UNCOMMITTED</span>
+<span class="nc" id="L246">            ? new TreeMap&lt;&gt;(boundStaging(from, to, toInclusive))</span>
+<span class="nc" id="L247">            : new TreeMap&lt;&gt;();</span>
+    }
+
+    /**
+     * Constructs a view over the transaction buffer's read buffer consisting of only the keys in the given range.
+     * If {@code from} or {@code to} are {@code null}, the range will be open-ended; if they are both {@code null}, the
+     * range will include all keys (it will just return the original read buffer directly).
+     */
+    NavigableMap&lt;K, Optional&lt;byte[]&gt;&gt; boundStaging(final K from, final K to, final boolean toInclusive) {
+<span class="nc bnc" id="L256" title="All 4 branches missed.">        if (from != null &amp;&amp; to != null) {</span>
+<span class="nc" id="L257">            return pendingWrites.subMap(from, true, to, toInclusive);</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">        } else if (from != null) {</span>
+<span class="nc" id="L259">            return pendingWrites.tailMap(from, true);</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        } else if (to != null) {</span>
+<span class="nc" id="L261">            return pendingWrites.headMap(to, toInclusive);</span>
+        } else {
+<span class="nc" id="L263">            return pendingWrites;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

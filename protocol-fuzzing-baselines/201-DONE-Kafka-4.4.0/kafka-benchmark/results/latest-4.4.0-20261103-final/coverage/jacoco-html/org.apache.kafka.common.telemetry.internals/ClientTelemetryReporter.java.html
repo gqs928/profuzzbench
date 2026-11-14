@@ -1,0 +1,1020 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClientTelemetryReporter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.telemetry.internals</a> &gt; <span class="el_source">ClientTelemetryReporter.java</span></div><h1>ClientTelemetryReporter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.telemetry.internals;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.InterruptException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.message.GetTelemetrySubscriptionsRequestData;
+import org.apache.kafka.common.message.GetTelemetrySubscriptionsResponseData;
+import org.apache.kafka.common.message.PushTelemetryRequestData;
+import org.apache.kafka.common.message.PushTelemetryResponseData;
+import org.apache.kafka.common.metrics.KafkaMetric;
+import org.apache.kafka.common.metrics.MetricsContext;
+import org.apache.kafka.common.metrics.MetricsReporter;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.record.internal.CompressionType;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.requests.AbstractRequest.Builder;
+import org.apache.kafka.common.requests.GetTelemetrySubscriptionsRequest;
+import org.apache.kafka.common.requests.GetTelemetrySubscriptionsResponse;
+import org.apache.kafka.common.requests.PushTelemetryRequest;
+import org.apache.kafka.common.requests.PushTelemetryResponse;
+import org.apache.kafka.common.telemetry.ClientTelemetryState;
+import org.apache.kafka.common.utils.Time;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.StringJoiner;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Predicate;
+
+import io.opentelemetry.proto.metrics.v1.Metric;
+import io.opentelemetry.proto.metrics.v1.MetricsData;
+import io.opentelemetry.proto.metrics.v1.ResourceMetrics;
+import io.opentelemetry.proto.metrics.v1.ScopeMetrics;
+
+/**
+ * The implementation of the {@link MetricsReporter} for client telemetry which manages the life-cycle
+ * of the client telemetry collection process. The client telemetry reporter is responsible for
+ * collecting the client telemetry data and sending it to the broker.
+ * &lt;p&gt;
+ *
+ * The client telemetry reporter is configured with a {@link ClientTelemetrySender} which is
+ * responsible for sending the client telemetry data to the broker. The client telemetry reporter
+ * will attempt to fetch the telemetry subscription information from the broker and send the
+ * telemetry data to the broker based on the subscription information i.e. push interval, temporality,
+ * compression type, etc.
+ * &lt;p&gt;
+ *
+ * The full life-cycle of the metric collection process is defined by a state machine in
+ * {@link ClientTelemetryState}. Each state is associated with a different set of operations.
+ * For example, the client telemetry reporter will attempt to fetch the telemetry subscription
+ * from the broker when in the {@link ClientTelemetryState#SUBSCRIPTION_NEEDED} state.
+ * If the push operation fails, the client telemetry reporter will attempt to re-fetch the
+ * subscription information by setting the state back to {@link ClientTelemetryState#SUBSCRIPTION_NEEDED}.
+ * &lt;p&gt;
+ *
+ * In an unlikely scenario, if a bad state transition is detected, an
+ * {@link IllegalStateException} will be thrown.
+ * &lt;p&gt;
+ *
+ * The state transition follows the following steps in order:
+ * &lt;ol&gt;
+ *     &lt;li&gt;{@link ClientTelemetryState#SUBSCRIPTION_NEEDED}&lt;/li&gt;
+ *     &lt;li&gt;{@link ClientTelemetryState#SUBSCRIPTION_IN_PROGRESS}&lt;/li&gt;
+ *     &lt;li&gt;{@link ClientTelemetryState#PUSH_NEEDED}&lt;/li&gt;
+ *     &lt;li&gt;{@link ClientTelemetryState#PUSH_IN_PROGRESS}&lt;/li&gt;
+ *     &lt;li&gt;{@link ClientTelemetryState#TERMINATING_PUSH_NEEDED}&lt;/li&gt;
+ *     &lt;li&gt;{@link ClientTelemetryState#TERMINATING_PUSH_IN_PROGRESS}&lt;/li&gt;
+ *     &lt;li&gt;{@link ClientTelemetryState#TERMINATED}&lt;/li&gt;
+ * &lt;/ol&gt;
+ * &lt;p&gt;
+ *
+ * For more detail in state transition, see {@link ClientTelemetryState#validateTransition}.
+ */
+public class ClientTelemetryReporter implements MetricsReporter {
+
+<span class="nc" id="L108">    private static final Logger log = LoggerFactory.getLogger(ClientTelemetryReporter.class);</span>
+    /*
+     Exclude client_id from the labels as the broker already knows the client_id from the request
+     context. These additional labels from the request context should be added by broker prior
+     exporting the metrics to the telemetry backend.
+    */
+<span class="nc" id="L114">    private static final Set&lt;String&gt; EXCLUDE_LABELS = Set.of(&quot;client_id&quot;);</span>
+
+    public static final int DEFAULT_PUSH_INTERVAL_MS = 5 * 60 * 1000;
+
+    private final ClientTelemetryProvider telemetryProvider;
+    private final ClientTelemetrySender clientTelemetrySender;
+    private final Time time;
+
+    private Map&lt;String, Object&gt; rawOriginalConfig;
+    private KafkaMetricsCollector kafkaMetricsCollector;
+
+<span class="nc" id="L125">    public ClientTelemetryReporter(Time time) {</span>
+<span class="nc" id="L126">        this.time = time;</span>
+<span class="nc" id="L127">        telemetryProvider = new ClientTelemetryProvider();</span>
+<span class="nc" id="L128">        clientTelemetrySender = new DefaultClientTelemetrySender();</span>
+<span class="nc" id="L129">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public synchronized void configure(Map&lt;String, ?&gt; configs) {
+<span class="nc" id="L134">        rawOriginalConfig = (Map&lt;String, Object&gt;) Objects.requireNonNull(configs);</span>
+<span class="nc" id="L135">    }</span>
+
+    @Override
+    public synchronized void contextChange(MetricsContext metricsContext) {
+        /*
+         If validation succeeds: initialize the provider, start the metric collection task,
+         set metrics labels for services/libraries that expose metrics.
+        */
+<span class="nc" id="L143">        Objects.requireNonNull(rawOriginalConfig, &quot;configure() was not called before contextChange()&quot;);</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        if (kafkaMetricsCollector != null) {</span>
+<span class="nc" id="L145">            kafkaMetricsCollector.stop();</span>
+        }
+
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (!telemetryProvider.validate(metricsContext)) {</span>
+<span class="nc" id="L149">            log.warn(&quot;Validation failed for {} context {}, skip starting collectors. Metrics collection is disabled&quot;,</span>
+<span class="nc" id="L150">                    telemetryProvider.getClass(), metricsContext.contextLabels());</span>
+<span class="nc" id="L151">            return;</span>
+        }
+
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (kafkaMetricsCollector == null) {</span>
+            /*
+             Initialize the provider only once. contextChange(..) can be called more than once,
+             but once it's been initialized and all necessary labels are present then we don't
+             re-initialize.
+            */
+<span class="nc" id="L160">            telemetryProvider.configure(rawOriginalConfig);</span>
+        }
+
+<span class="nc" id="L163">        telemetryProvider.contextChange(metricsContext);</span>
+
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        if (kafkaMetricsCollector == null) {</span>
+<span class="nc" id="L166">            initCollectors();</span>
+        }
+<span class="nc" id="L168">    }</span>
+
+    @Override
+    public void init(List&lt;KafkaMetric&gt; metrics) {
+        /*
+         metrics collector may not have been initialized (e.g. invalid context labels)
+         in which case metrics collection is disabled
+        */
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        if (kafkaMetricsCollector != null) {</span>
+<span class="nc" id="L177">            kafkaMetricsCollector.init(metrics);</span>
+        }
+<span class="nc" id="L179">    }</span>
+
+    /**
+     * Method is invoked whenever a metric is added/registered
+     */
+    @Override
+    public void metricChange(KafkaMetric metric) {
+        /*
+         metrics collector may not have been initialized (e.g. invalid context labels)
+         in which case metrics collection is disabled
+        */
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (kafkaMetricsCollector != null) {</span>
+<span class="nc" id="L191">            kafkaMetricsCollector.metricChange(metric);</span>
+        }
+<span class="nc" id="L193">    }</span>
+
+    /**
+     * Method is invoked whenever a metric is removed
+     */
+    @Override
+    public void metricRemoval(KafkaMetric metric) {
+        /*
+         metrics collector may not have been initialized (e.g. invalid context labels)
+         in which case metrics collection is disabled
+        */
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        if (kafkaMetricsCollector != null) {</span>
+<span class="nc" id="L205">            kafkaMetricsCollector.metricRemoval(metric);</span>
+        }
+<span class="nc" id="L207">    }</span>
+
+    @Override
+    public void close() {
+<span class="nc" id="L211">        log.debug(&quot;Stopping ClientTelemetryReporter&quot;);</span>
+        try {
+<span class="nc" id="L213">            clientTelemetrySender.close();</span>
+<span class="nc" id="L214">        } catch (Exception exception) {</span>
+<span class="nc" id="L215">            log.error(&quot;Failed to close client telemetry reporter&quot;, exception);</span>
+<span class="nc" id="L216">        }</span>
+<span class="nc" id="L217">    }</span>
+
+    public synchronized void updateMetricsLabels(Map&lt;String, String&gt; labels) {
+<span class="nc" id="L220">        telemetryProvider.updateLabels(labels);</span>
+<span class="nc" id="L221">    }</span>
+
+    public void initiateClose() {
+<span class="nc" id="L224">        log.debug(&quot;Initiate close of ClientTelemetryReporter&quot;);</span>
+        try {
+<span class="nc" id="L226">            clientTelemetrySender.initiateClose();</span>
+<span class="nc" id="L227">        } catch (Exception exception) {</span>
+<span class="nc" id="L228">            log.error(&quot;Failed to initiate close of client telemetry reporter&quot;, exception);</span>
+<span class="nc" id="L229">        }</span>
+<span class="nc" id="L230">    }</span>
+
+    public ClientTelemetrySender telemetrySender() {
+<span class="nc" id="L233">        return clientTelemetrySender;</span>
+    }
+
+    private void initCollectors() {
+<span class="nc" id="L237">        kafkaMetricsCollector = new KafkaMetricsCollector(</span>
+<span class="nc" id="L238">            TelemetryMetricNamingConvention.getClientTelemetryMetricNamingStrategy(</span>
+<span class="nc" id="L239">                telemetryProvider.domain()), EXCLUDE_LABELS);</span>
+<span class="nc" id="L240">    }</span>
+
+    private ResourceMetrics buildMetric(Metric metric) {
+<span class="nc" id="L243">        return ResourceMetrics.newBuilder()</span>
+<span class="nc" id="L244">            .setResource(telemetryProvider.resource())</span>
+<span class="nc" id="L245">            .addScopeMetrics(ScopeMetrics.newBuilder()</span>
+<span class="nc" id="L246">                .addMetrics(metric)</span>
+<span class="nc" id="L247">                .build()).build();</span>
+    }
+
+    // Visible for testing, only for unit tests
+    void metricsCollector(KafkaMetricsCollector metricsCollector) {
+<span class="nc" id="L252">        kafkaMetricsCollector = metricsCollector;</span>
+<span class="nc" id="L253">    }</span>
+
+    // Visible for testing, only for unit tests
+    MetricsCollector metricsCollector() {
+<span class="nc" id="L257">        return kafkaMetricsCollector;</span>
+    }
+
+    // Visible for testing, only for unit tests
+    ClientTelemetryProvider telemetryProvider() {
+<span class="nc" id="L262">        return telemetryProvider;</span>
+    }
+
+    class DefaultClientTelemetrySender implements ClientTelemetrySender {
+
+        /*
+         These are the lower and upper bounds of the jitter that we apply to the initial push
+         telemetry API call. This helps to avoid a flood of requests all coming at the same time.
+        */
+        private static final double INITIAL_PUSH_JITTER_LOWER = 0.5;
+        private static final double INITIAL_PUSH_JITTER_UPPER = 1.5;
+
+<span class="nc" id="L274">        private final Set&lt;CompressionType&gt; unsupportedCompressionTypes = ConcurrentHashMap.newKeySet();</span>
+<span class="nc" id="L275">        private final ReadWriteLock lock = new ReentrantReadWriteLock();</span>
+<span class="nc" id="L276">        private final Condition subscriptionLoaded = lock.writeLock().newCondition();</span>
+        /*
+         Initial state should be subscription needed which should allow issuing first telemetry
+         request of get telemetry subscription.
+        */
+<span class="nc" id="L281">        private ClientTelemetryState state = ClientTelemetryState.SUBSCRIPTION_NEEDED;</span>
+
+        private ClientTelemetrySubscription subscription;
+
+        /*
+         Last time a telemetry request was made. Initialized to 0 to indicate that no request has
+         been made yet. Telemetry requests, get or post, should always be made after the push interval
+         time has elapsed.
+        */
+        private long lastRequestMs;
+        /*
+         Interval between telemetry requests in milliseconds. Initialized to 0 to indicate that the
+         interval has not yet been computed. The first get request will be immediately triggered as
+         soon as the client is ready.
+        */
+        private int intervalMs;
+        /*
+         Whether the client telemetry sender is enabled or not. Initialized to true to indicate that
+         the client telemetry sender is enabled. This is used to disable the client telemetry sender
+         when the client receives unrecoverable error from broker.
+        */
+        private boolean enabled;
+
+<span class="nc" id="L304">        private DefaultClientTelemetrySender() {</span>
+<span class="nc" id="L305">            enabled = true;</span>
+<span class="nc" id="L306">        }</span>
+
+        @Override
+        public long timeToNextUpdate(long requestTimeoutMs) {
+<span class="nc" id="L310">            final long nowMs = time.milliseconds();</span>
+            final ClientTelemetryState localState;
+            final long localLastRequestMs;
+            final int localIntervalMs;
+
+<span class="nc" id="L315">            lock.readLock().lock();</span>
+            try {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">                if (!enabled) {</span>
+<span class="nc" id="L318">                    return Integer.MAX_VALUE;</span>
+                }
+
+<span class="nc" id="L321">                localState = state;</span>
+<span class="nc" id="L322">                localLastRequestMs = lastRequestMs;</span>
+<span class="nc" id="L323">                localIntervalMs = intervalMs;</span>
+            } finally {
+<span class="nc" id="L325">                lock.readLock().unlock();</span>
+            }
+
+            final long timeMs;
+            final String apiName;
+
+<span class="nc bnc" id="L331" title="All 6 branches missed.">            switch (localState) {</span>
+                case SUBSCRIPTION_IN_PROGRESS:
+                case PUSH_IN_PROGRESS:
+                    /*
+                     We have a network request in progress. We record the time of the request
+                     submission, so wait that amount of the time PLUS the requestTimeout that
+                     is provided.
+                    */
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                    apiName = (localState == ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS) ? ApiKeys.GET_TELEMETRY_SUBSCRIPTIONS.name : ApiKeys.PUSH_TELEMETRY.name;</span>
+<span class="nc" id="L340">                    timeMs = requestTimeoutMs;</span>
+<span class="nc" id="L341">                    log.trace(&quot;For telemetry state {}, returning the value {} ms; the remaining wait time for the {} network API request, as specified by {}&quot;, localState, timeMs, apiName, CommonClientConfigs.REQUEST_TIMEOUT_MS_CONFIG);</span>
+<span class="nc" id="L342">                    break;</span>
+                case TERMINATING_PUSH_IN_PROGRESS:
+<span class="nc" id="L344">                    timeMs = Long.MAX_VALUE;</span>
+<span class="nc" id="L345">                    log.trace(&quot;For telemetry state {}, returning the value {} ms; the terminating push is in progress, disabling telemetry for further requests&quot;, localState, timeMs);</span>
+<span class="nc" id="L346">                    break;</span>
+                case TERMINATED:
+<span class="nc" id="L348">                    timeMs = Long.MAX_VALUE;</span>
+<span class="nc" id="L349">                    log.trace(&quot;For telemetry state {}, returning the value {} ms; telemetry is terminated, no further requests will be made&quot;, localState, timeMs);</span>
+<span class="nc" id="L350">                    break;</span>
+                case TERMINATING_PUSH_NEEDED:
+<span class="nc" id="L352">                    timeMs = 0;</span>
+<span class="nc" id="L353">                    log.trace(&quot;For telemetry state {}, returning the value {} ms; the client should try to submit the final {} network API request ASAP before closing&quot;, localState, timeMs, ApiKeys.PUSH_TELEMETRY.name);</span>
+<span class="nc" id="L354">                    break;</span>
+                case SUBSCRIPTION_NEEDED:
+                case PUSH_NEEDED:
+<span class="nc bnc" id="L357" title="All 2 branches missed.">                    apiName = (localState == ClientTelemetryState.SUBSCRIPTION_NEEDED) ? ApiKeys.GET_TELEMETRY_SUBSCRIPTIONS.name : ApiKeys.PUSH_TELEMETRY.name;</span>
+<span class="nc" id="L358">                    long timeRemainingBeforeRequest = localLastRequestMs + localIntervalMs - nowMs;</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">                    if (timeRemainingBeforeRequest &lt;= 0) {</span>
+<span class="nc" id="L360">                        timeMs = 0;</span>
+<span class="nc" id="L361">                        log.trace(&quot;For telemetry state {}, returning the value {} ms; the wait time before submitting the next {} network API request has elapsed&quot;, localState, timeMs, apiName);</span>
+                    } else {
+<span class="nc" id="L363">                        timeMs = timeRemainingBeforeRequest;</span>
+<span class="nc" id="L364">                        log.trace(&quot;For telemetry state {}, returning the value {} ms; the client will wait before submitting the next {} network API request&quot;, localState, timeMs, apiName);</span>
+                    }
+<span class="nc" id="L366">                    break;</span>
+                default:
+<span class="nc" id="L368">                    throw new IllegalStateException(&quot;Unknown telemetry state: &quot; + localState);</span>
+            }
+<span class="nc" id="L370">            return timeMs;</span>
+        }
+
+        @Override
+        public Optional&lt;AbstractRequest.Builder&lt;?&gt;&gt; createRequest() {
+            final ClientTelemetryState localState;
+            final ClientTelemetrySubscription localSubscription;
+
+<span class="nc" id="L378">            lock.readLock().lock();</span>
+            try {
+<span class="nc" id="L380">                localState = state;</span>
+<span class="nc" id="L381">                localSubscription = subscription;</span>
+            } finally {
+<span class="nc" id="L383">                lock.readLock().unlock();</span>
+            }
+
+<span class="nc bnc" id="L386" title="All 2 branches missed.">            if (localState == ClientTelemetryState.SUBSCRIPTION_NEEDED) {</span>
+<span class="nc" id="L387">                return createSubscriptionRequest(localSubscription);</span>
+<span class="nc bnc" id="L388" title="All 4 branches missed.">            } else if (localState == ClientTelemetryState.PUSH_NEEDED || localState == ClientTelemetryState.TERMINATING_PUSH_NEEDED) {</span>
+<span class="nc" id="L389">                return createPushRequest(localSubscription);</span>
+            }
+
+<span class="nc" id="L392">            log.warn(&quot;Cannot make telemetry request as telemetry is in state: {}&quot;, localState);</span>
+<span class="nc" id="L393">            return Optional.empty();</span>
+        }
+
+        @Override
+        public void handleResponse(GetTelemetrySubscriptionsResponse response) {
+<span class="nc" id="L398">            final long nowMs = time.milliseconds();</span>
+<span class="nc" id="L399">            final GetTelemetrySubscriptionsResponseData data = response.data();</span>
+
+            final ClientTelemetryState oldState;
+            final ClientTelemetrySubscription oldSubscription;
+<span class="nc" id="L403">            lock.readLock().lock();</span>
+            try {
+<span class="nc" id="L405">                oldState = state;</span>
+<span class="nc" id="L406">                oldSubscription = subscription;</span>
+            } finally {
+<span class="nc" id="L408">                lock.readLock().unlock();</span>
+            }
+
+<span class="nc" id="L411">            Optional&lt;Integer&gt; errorIntervalMsOpt = ClientTelemetryUtils.maybeFetchErrorIntervalMs(data.errorCode(),</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">                oldSubscription != null ? oldSubscription.pushIntervalMs() : -1);</span>
+            /*
+             If the error code indicates that the interval ms needs to be updated as per the error
+             code then update the interval ms and state so that the subscription can be retried.
+            */
+<span class="nc bnc" id="L417" title="All 2 branches missed.">            if (errorIntervalMsOpt.isPresent()) {</span>
+                /*
+                 Update the state from SUBSCRIPTION_INR_PROGRESS to SUBSCRIPTION_NEEDED as the error
+                 response indicates that the subscription is not valid.
+                */
+<span class="nc bnc" id="L422" title="All 2 branches missed.">                if (!maybeSetState(ClientTelemetryState.SUBSCRIPTION_NEEDED)) {</span>
+<span class="nc" id="L423">                    log.warn(&quot;Unable to transition state after failed get telemetry subscriptions from state {}&quot;, oldState);</span>
+                }
+<span class="nc" id="L425">                updateErrorResult(errorIntervalMsOpt.get(), nowMs);</span>
+<span class="nc" id="L426">                return;</span>
+            }
+
+<span class="nc" id="L429">            Uuid clientInstanceId = ClientTelemetryUtils.validateClientInstanceId(data.clientInstanceId());</span>
+<span class="nc" id="L430">            int intervalMs = ClientTelemetryUtils.validateIntervalMs(data.pushIntervalMs());</span>
+<span class="nc" id="L431">            Predicate&lt;? super MetricKeyable&gt; selector = ClientTelemetryUtils.getSelectorFromRequestedMetrics(</span>
+<span class="nc" id="L432">                data.requestedMetrics());</span>
+<span class="nc" id="L433">            List&lt;CompressionType&gt; acceptedCompressionTypes = ClientTelemetryUtils.getCompressionTypesFromAcceptedList(</span>
+<span class="nc" id="L434">                data.acceptedCompressionTypes());</span>
+
+            /*
+             Check if the delta temporality has changed, if so, we need to reset the ledger tracking
+             the last value sent for each metric.
+            */
+<span class="nc bnc" id="L440" title="All 4 branches missed.">            if (oldSubscription != null &amp;&amp; oldSubscription.deltaTemporality() != data.deltaTemporality()) {</span>
+<span class="nc" id="L441">                log.info(&quot;Delta temporality has changed from {} to {}, resetting metric values&quot;,</span>
+<span class="nc" id="L442">                    oldSubscription.deltaTemporality(), data.deltaTemporality());</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">                if (kafkaMetricsCollector != null) {</span>
+<span class="nc" id="L444">                    kafkaMetricsCollector.metricsReset();</span>
+                }
+            }
+
+<span class="nc" id="L448">            ClientTelemetrySubscription clientTelemetrySubscription = new ClientTelemetrySubscription(</span>
+                clientInstanceId,
+<span class="nc" id="L450">                data.subscriptionId(),</span>
+                intervalMs,
+                acceptedCompressionTypes,
+<span class="nc" id="L453">                data.deltaTemporality(),</span>
+                selector);
+
+<span class="nc" id="L456">            lock.writeLock().lock();</span>
+            try {
+                /*
+                 This is the case if we began termination sometime after the subscription request
+                 was issued. We're just now getting our callback, but we need to ignore it.
+                */
+<span class="nc bnc" id="L462" title="All 2 branches missed.">                if (isTerminatingState()) {</span>
+<span class="nc" id="L463">                    return;</span>
+                }
+
+                ClientTelemetryState newState;
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                if (selector == ClientTelemetryUtils.SELECTOR_NO_METRICS) {</span>
+                    /*
+                     This is the case where no metrics are requested and/or match the filters. We need
+                     to wait intervalMs then retry.
+                    */
+<span class="nc" id="L472">                    newState = ClientTelemetryState.SUBSCRIPTION_NEEDED;</span>
+                } else {
+<span class="nc" id="L474">                    newState = ClientTelemetryState.PUSH_NEEDED;</span>
+                }
+
+                // If we're terminating, don't update state or set the subscription.
+<span class="nc bnc" id="L478" title="All 2 branches missed.">                if (!maybeSetState(newState)) {</span>
+<span class="nc" id="L479">                    return;</span>
+                }
+
+<span class="nc" id="L482">                updateSubscriptionResult(clientTelemetrySubscription, nowMs);</span>
+<span class="nc" id="L483">                log.info(&quot;Client telemetry registered with client instance id: {}&quot;, subscription.clientInstanceId());</span>
+            } finally {
+<span class="nc" id="L485">                lock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L487">        }</span>
+
+        @Override
+        public void handleResponse(PushTelemetryResponse response) {
+<span class="nc" id="L491">            final long nowMs = time.milliseconds();</span>
+<span class="nc" id="L492">            final PushTelemetryResponseData data = response.data();</span>
+
+<span class="nc" id="L494">            lock.writeLock().lock();</span>
+            try {
+                /*
+                 This is the case when client began termination sometime after the last push request
+                 was issued. Just getting the callback, hence need to ignore it.
+                */
+<span class="nc bnc" id="L500" title="All 2 branches missed.">                if (isTerminatingState()) {</span>
+<span class="nc" id="L501">                    return;</span>
+                }
+
+<span class="nc" id="L504">                Optional&lt;Integer&gt; errorIntervalMsOpt = ClientTelemetryUtils.maybeFetchErrorIntervalMs(data.errorCode(),</span>
+<span class="nc" id="L505">                    subscription.pushIntervalMs());</span>
+                /*
+                 If the error code indicates that the interval ms needs to be updated as per the error
+                 code then update the interval ms and state so that the subscription can be re-fetched,
+                 and the push retried.
+                */
+<span class="nc bnc" id="L511" title="All 2 branches missed.">                if (errorIntervalMsOpt.isPresent()) {</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                    if (!maybeSetState(ClientTelemetryState.SUBSCRIPTION_NEEDED)) {</span>
+<span class="nc" id="L513">                        log.warn(&quot;Unable to transition state after failed push telemetry from state {}&quot;, state);</span>
+                    }
+<span class="nc" id="L515">                    updateErrorResult(errorIntervalMsOpt.get(), nowMs);</span>
+<span class="nc" id="L516">                    return;</span>
+                }
+
+<span class="nc" id="L519">                lastRequestMs = nowMs;</span>
+<span class="nc" id="L520">                intervalMs = subscription.pushIntervalMs();</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">                if (!maybeSetState(ClientTelemetryState.PUSH_NEEDED)) {</span>
+<span class="nc" id="L522">                    log.warn(&quot;Unable to transition state after successful push telemetry from state {}&quot;, state);</span>
+                }
+            } finally {
+<span class="nc" id="L525">                lock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L527">        }</span>
+
+        @Override
+        public void handleFailedGetTelemetrySubscriptionsRequest(KafkaException maybeFatalException) {
+<span class="nc" id="L531">            log.debug(&quot;The broker generated an error for the get telemetry network API request&quot;, maybeFatalException);</span>
+<span class="nc" id="L532">            handleFailedRequest(maybeFatalException);</span>
+<span class="nc" id="L533">        }</span>
+
+        @Override
+        public void handleFailedPushTelemetryRequest(KafkaException maybeFatalException) {
+<span class="nc" id="L537">            log.debug(&quot;The broker generated an error for the push telemetry network API request&quot;, maybeFatalException);</span>
+<span class="nc" id="L538">            handleFailedRequest(maybeFatalException);</span>
+<span class="nc" id="L539">        }</span>
+
+        @Override
+        public Optional&lt;Uuid&gt; clientInstanceId(Duration timeout) {
+<span class="nc" id="L543">            final long timeoutMs = timeout.toMillis();</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">            if (timeoutMs &lt; 0) {</span>
+<span class="nc" id="L545">                throw new IllegalArgumentException(&quot;The timeout cannot be negative for fetching client instance id.&quot;);</span>
+            }
+
+<span class="nc" id="L548">            lock.writeLock().lock();</span>
+            try {
+<span class="nc bnc" id="L550" title="All 2 branches missed.">                if (subscription == null) {</span>
+                    // If we have a non-negative timeout and no-subscription, let's wait for one to be retrieved.
+<span class="nc" id="L552">                    log.debug(&quot;Waiting for telemetry subscription containing the client instance ID with timeoutMillis = {} ms.&quot;, timeoutMs);</span>
+                    try {
+<span class="nc bnc" id="L554" title="All 2 branches missed.">                        if (!subscriptionLoaded.await(timeoutMs, TimeUnit.MILLISECONDS)) {</span>
+<span class="nc" id="L555">                            log.debug(&quot;Wait for telemetry subscription elapsed; may not have actually loaded it&quot;);</span>
+                        }
+<span class="nc" id="L557">                    } catch (InterruptedException e) {</span>
+<span class="nc" id="L558">                        throw new InterruptException(e);</span>
+<span class="nc" id="L559">                    }</span>
+                }
+
+<span class="nc bnc" id="L562" title="All 2 branches missed.">                if (subscription == null) {</span>
+<span class="nc" id="L563">                    log.debug(&quot;Client instance ID could not be retrieved with timeout {}&quot;, timeout);</span>
+<span class="nc" id="L564">                    return Optional.empty();</span>
+                }
+
+<span class="nc" id="L567">                Uuid clientInstanceId = subscription.clientInstanceId();</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">                if (clientInstanceId == null) {</span>
+<span class="nc" id="L569">                    log.info(&quot;Client instance ID was null in telemetry subscription while in state {}&quot;, state);</span>
+<span class="nc" id="L570">                    return Optional.empty();</span>
+                }
+
+<span class="nc" id="L573">                return Optional.of(clientInstanceId);</span>
+            } finally {
+<span class="nc" id="L575">                lock.writeLock().unlock();</span>
+            }
+        }
+
+        @Override
+        public void close() {
+<span class="nc" id="L581">            log.debug(&quot;close telemetry sender for client telemetry reporter instance&quot;);</span>
+
+<span class="nc" id="L583">            boolean shouldClose = false;</span>
+<span class="nc" id="L584">            lock.writeLock().lock();</span>
+            try {
+<span class="nc bnc" id="L586" title="All 2 branches missed.">                if (state != ClientTelemetryState.TERMINATED) {</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">                    if (maybeSetState(ClientTelemetryState.TERMINATED)) {</span>
+<span class="nc" id="L588">                        shouldClose = true;</span>
+                    }
+                } else {
+<span class="nc" id="L591">                    log.debug(&quot;Ignoring subsequent close&quot;);</span>
+                }
+            } finally {
+<span class="nc" id="L594">                lock.writeLock().unlock();</span>
+            }
+
+<span class="nc bnc" id="L597" title="All 2 branches missed.">            if (shouldClose) {</span>
+<span class="nc bnc" id="L598" title="All 2 branches missed.">                if (kafkaMetricsCollector != null) {</span>
+<span class="nc" id="L599">                    kafkaMetricsCollector.stop();</span>
+                }
+            }
+<span class="nc" id="L602">        }</span>
+
+        @Override
+        public void initiateClose() {
+<span class="nc" id="L606">            log.debug(&quot;initiate close for client telemetry, check if terminal push required.&quot;);</span>
+
+<span class="nc" id="L608">            lock.writeLock().lock();</span>
+            try {
+                // If we never fetched a subscription, we can't really push anything.
+<span class="nc bnc" id="L611" title="All 2 branches missed.">                if (lastRequestMs == 0) {</span>
+<span class="nc" id="L612">                    log.debug(&quot;Telemetry subscription not loaded, not attempting terminating push&quot;);</span>
+<span class="nc" id="L613">                    return;</span>
+                }
+
+<span class="nc bnc" id="L616" title="All 2 branches missed.">                if (state == ClientTelemetryState.SUBSCRIPTION_NEEDED) {</span>
+<span class="nc" id="L617">                    log.debug(&quot;Subscription not yet loaded, ignoring terminal push&quot;);</span>
+<span class="nc" id="L618">                    return;</span>
+                }
+
+<span class="nc bnc" id="L621" title="All 4 branches missed.">                if (isTerminatingState() || !maybeSetState(ClientTelemetryState.TERMINATING_PUSH_NEEDED)) {</span>
+<span class="nc" id="L622">                    log.debug(&quot;Ignoring subsequent initiateClose&quot;);</span>
+<span class="nc" id="L623">                    return;</span>
+                }
+
+<span class="nc" id="L626">                log.debug(&quot;Updated state to send terminal telemetry push request&quot;);</span>
+            } finally {
+<span class="nc" id="L628">                lock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L630">        }</span>
+
+        private boolean isRetryable(final KafkaException maybeFatalException) {
+<span class="nc bnc" id="L633" title="All 4 branches missed.">            return maybeFatalException == null ||</span>
+                (maybeFatalException instanceof RetriableException) ||
+<span class="nc bnc" id="L635" title="All 4 branches missed.">                (maybeFatalException.getCause() != null &amp;&amp; maybeFatalException.getCause() instanceof RetriableException);</span>
+        }
+
+        private Optional&lt;Builder&lt;?&gt;&gt; createSubscriptionRequest(ClientTelemetrySubscription localSubscription) {
+            /*
+             If we've previously retrieved a subscription, it will contain the client instance ID
+             that the broker assigned. Otherwise, per KIP-714, we send a special &quot;null&quot; UUID to
+             signal to the broker that we need to have a client instance ID assigned.
+            */
+<span class="nc bnc" id="L644" title="All 2 branches missed.">            Uuid clientInstanceId = (localSubscription != null) ? localSubscription.clientInstanceId() : Uuid.ZERO_UUID;</span>
+<span class="nc" id="L645">            log.debug(&quot;Creating telemetry subscription request with client instance id {}&quot;, clientInstanceId);</span>
+
+<span class="nc" id="L647">            lock.writeLock().lock();</span>
+            try {
+<span class="nc bnc" id="L649" title="All 2 branches missed.">                if (isTerminatingState()) {</span>
+<span class="nc" id="L650">                    return Optional.empty();</span>
+                }
+
+<span class="nc bnc" id="L653" title="All 2 branches missed.">                if (!maybeSetState(ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS)) {</span>
+<span class="nc" id="L654">                    return Optional.empty();</span>
+                }
+            } finally {
+<span class="nc" id="L657">                lock.writeLock().unlock();</span>
+            }
+
+<span class="nc" id="L660">            AbstractRequest.Builder&lt;?&gt; requestBuilder = new GetTelemetrySubscriptionsRequest.Builder(</span>
+<span class="nc" id="L661">                new GetTelemetrySubscriptionsRequestData().setClientInstanceId(clientInstanceId), true);</span>
+<span class="nc" id="L662">            return Optional.of(requestBuilder);</span>
+        }
+
+        private Optional&lt;Builder&lt;?&gt;&gt; createPushRequest(ClientTelemetrySubscription localSubscription) {
+<span class="nc bnc" id="L666" title="All 2 branches missed.">            if (localSubscription == null) {</span>
+<span class="nc" id="L667">                log.warn(&quot;Telemetry state is {} but subscription is null; not sending telemetry&quot;, state);</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">                if (!maybeSetState(ClientTelemetryState.SUBSCRIPTION_NEEDED)) {</span>
+<span class="nc" id="L669">                    log.warn(&quot;Unable to transition state after failed create push telemetry from state {}&quot;, state);</span>
+                }
+<span class="nc" id="L671">                return Optional.empty();</span>
+            }
+
+<span class="nc" id="L674">            log.debug(&quot;Creating telemetry push request with client instance id {}&quot;, localSubscription.clientInstanceId());</span>
+            /*
+             Don't send a push request if we don't have the collector initialized. Re-attempt
+             the push on the next interval.
+            */
+<span class="nc bnc" id="L679" title="All 2 branches missed.">            if (kafkaMetricsCollector == null) {</span>
+<span class="nc" id="L680">                log.warn(&quot;Cannot make telemetry request as collector is not initialized&quot;);</span>
+                // Update last accessed time for push request to be retried on next interval.
+<span class="nc" id="L682">                updateErrorResult(localSubscription.pushIntervalMs, time.milliseconds());</span>
+<span class="nc" id="L683">                return Optional.empty();</span>
+            }
+
+            boolean terminating;
+<span class="nc" id="L687">            lock.writeLock().lock();</span>
+            try {
+                /*
+                 We've already been terminated, or we've already issued our last push, so we
+                 should just exit now.
+                */
+<span class="nc bnc" id="L693" title="All 4 branches missed.">                if (state == ClientTelemetryState.TERMINATED || state == ClientTelemetryState.TERMINATING_PUSH_IN_PROGRESS) {</span>
+<span class="nc" id="L694">                    return Optional.empty();</span>
+                }
+
+                /*
+                 Check the *actual* state (while locked) to make sure we're still in the state
+                 we expect to be in.
+                */
+<span class="nc bnc" id="L701" title="All 2 branches missed.">                terminating = state == ClientTelemetryState.TERMINATING_PUSH_NEEDED;</span>
+<span class="nc bnc" id="L702" title="All 4 branches missed.">                if (!maybeSetState(terminating ? ClientTelemetryState.TERMINATING_PUSH_IN_PROGRESS : ClientTelemetryState.PUSH_IN_PROGRESS)) {</span>
+<span class="nc" id="L703">                    return Optional.empty();</span>
+                }
+            } finally {
+<span class="nc" id="L706">                lock.writeLock().unlock();</span>
+            }
+
+<span class="nc" id="L709">            return createPushRequest(localSubscription, terminating);</span>
+        }
+
+        private Optional&lt;Builder&lt;?&gt;&gt; createPushRequest(ClientTelemetrySubscription localSubscription, boolean terminating) {
+            MetricsData payload;
+<span class="nc" id="L714">            try (MetricsEmitter emitter = new ClientTelemetryEmitter(localSubscription.selector(), localSubscription.deltaTemporality())) {</span>
+<span class="nc" id="L715">                emitter.init();</span>
+<span class="nc" id="L716">                kafkaMetricsCollector.collect(emitter);</span>
+<span class="nc" id="L717">                payload = createPayload(emitter.emittedMetrics());</span>
+<span class="nc" id="L718">            } catch (Exception e) {</span>
+<span class="nc" id="L719">                log.warn(&quot;Error constructing client telemetry payload: &quot;, e);</span>
+                // Update last accessed time for push request to be retried on next interval.
+<span class="nc" id="L721">                updateErrorResult(localSubscription.pushIntervalMs, time.milliseconds());</span>
+<span class="nc" id="L722">                return Optional.empty();</span>
+<span class="nc" id="L723">            }</span>
+
+<span class="nc" id="L725">            CompressionType compressionType = ClientTelemetryUtils.preferredCompressionType(localSubscription.acceptedCompressionTypes(), unsupportedCompressionTypes);</span>
+            ByteBuffer compressedPayload;
+            try {
+<span class="nc" id="L728">                compressedPayload = ClientTelemetryUtils.compress(payload, compressionType);</span>
+<span class="nc" id="L729">            } catch (Throwable e) {</span>
+                // Distinguish between recoverable errors (NoClassDefFoundError for missing compression libs) 
+                // and fatal errors (OutOfMemoryError, etc.) that should terminate telemetry.
+<span class="nc bnc" id="L732" title="All 6 branches missed.">                if (e instanceof Error &amp;&amp; !(e instanceof NoClassDefFoundError) &amp;&amp; !(e.getCause() instanceof NoClassDefFoundError)) {</span>
+<span class="nc" id="L733">                    lock.writeLock().lock();</span>
+                    try {
+<span class="nc" id="L735">                        state = ClientTelemetryState.TERMINATED;</span>
+                    } finally {
+<span class="nc" id="L737">                        lock.writeLock().unlock();</span>
+                    }
+<span class="nc" id="L739">                    log.error(&quot;Unexpected error occurred while compressing telemetry payload for compression: {}, stopping client telemetry&quot;, compressionType, e);</span>
+<span class="nc" id="L740">                    throw new KafkaException(&quot;Unexpected compression error&quot;, e);</span>
+                }
+
+<span class="nc" id="L743">                log.debug(&quot;Failed to compress telemetry payload for compression: {}, sending uncompressed data&quot;, compressionType, e);</span>
+<span class="nc" id="L744">                unsupportedCompressionTypes.add(compressionType);</span>
+<span class="nc" id="L745">                compressedPayload = ByteBuffer.wrap(payload.toByteArray());</span>
+<span class="nc" id="L746">                compressionType = CompressionType.NONE;</span>
+<span class="nc" id="L747">            }</span>
+
+<span class="nc" id="L749">            AbstractRequest.Builder&lt;?&gt; requestBuilder = new PushTelemetryRequest.Builder(</span>
+                new PushTelemetryRequestData()
+<span class="nc" id="L751">                    .setClientInstanceId(localSubscription.clientInstanceId())</span>
+<span class="nc" id="L752">                    .setSubscriptionId(localSubscription.subscriptionId())</span>
+<span class="nc" id="L753">                    .setTerminating(terminating)</span>
+<span class="nc" id="L754">                    .setCompressionType(compressionType.id)</span>
+<span class="nc" id="L755">                    .setMetrics(compressedPayload), true);</span>
+
+<span class="nc" id="L757">            return Optional.of(requestBuilder);</span>
+        }
+
+        /**
+         * Updates the {@link ClientTelemetrySubscription}, {@link #intervalMs}, and
+         * {@link #lastRequestMs}.
+         * &lt;p&gt;
+         * After the update, the {@link #subscriptionLoaded} condition is signaled so any threads
+         * waiting on the subscription can be unblocked.
+         *
+         * @param subscription Updated subscription that will replace any current subscription
+         * @param timeMs       Time in milliseconds representing the current time
+         */
+        // Visible for testing
+        void updateSubscriptionResult(ClientTelemetrySubscription subscription, long timeMs) {
+<span class="nc" id="L772">            lock.writeLock().lock();</span>
+            try {
+<span class="nc" id="L774">                this.subscription = Objects.requireNonNull(subscription);</span>
+                /*
+                 If the subscription is updated for the client, we want to attempt to spread out the push
+                 requests between 50% and 150% of the push interval value from the broker. This helps us
+                 to avoid the case where multiple clients are started at the same time and end up sending
+                 all their data at the same time.
+                */
+<span class="nc bnc" id="L781" title="All 2 branches missed.">                if (state == ClientTelemetryState.PUSH_NEEDED) {</span>
+<span class="nc" id="L782">                    intervalMs = computeStaggeredIntervalMs(subscription.pushIntervalMs(), INITIAL_PUSH_JITTER_LOWER, INITIAL_PUSH_JITTER_UPPER);</span>
+                } else {
+<span class="nc" id="L784">                    intervalMs = subscription.pushIntervalMs();</span>
+                }
+<span class="nc" id="L786">                lastRequestMs = timeMs;</span>
+
+<span class="nc" id="L788">                log.debug(&quot;Updating subscription - subscription: {}; intervalMs: {}, lastRequestMs: {}&quot;,</span>
+<span class="nc" id="L789">                    subscription, intervalMs, lastRequestMs);</span>
+<span class="nc" id="L790">                subscriptionLoaded.signalAll();</span>
+            } finally {
+<span class="nc" id="L792">                lock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L794">        }</span>
+
+        /**
+         * Updates the {@link #intervalMs}, {@link #lastRequestMs} and {@link #enabled}.
+         * &lt;p&gt;
+         * The contents of the method are guarded by the {@link #lock}.
+         */
+        private void updateErrorResult(int intervalMs, long timeMs) {
+<span class="nc" id="L802">            lock.writeLock().lock();</span>
+            try {
+<span class="nc" id="L804">                this.intervalMs = intervalMs;</span>
+<span class="nc" id="L805">                lastRequestMs = timeMs;</span>
+                /*
+                 If the interval time is set to Integer.MAX_VALUE, then it means that the telemetry sender
+                 should not send any more telemetry requests. This is used when the client received
+                 unrecoverable error from broker.
+                */
+<span class="nc bnc" id="L811" title="All 2 branches missed.">                if (intervalMs == Integer.MAX_VALUE) {</span>
+<span class="nc" id="L812">                    enabled = false;</span>
+                }
+
+<span class="nc" id="L815">                log.debug(&quot;Updating intervalMs: {}, lastRequestMs: {}&quot;, intervalMs, lastRequestMs);</span>
+            } finally {
+<span class="nc" id="L817">                lock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L819">        }</span>
+
+        // Visible for testing
+        int computeStaggeredIntervalMs(int intervalMs, double lowerBound, double upperBound) {
+<span class="nc" id="L823">            double rand = ThreadLocalRandom.current().nextDouble(lowerBound, upperBound);</span>
+<span class="nc" id="L824">            int firstPushIntervalMs = (int) Math.round(rand * intervalMs);</span>
+
+<span class="nc" id="L826">            log.debug(&quot;Telemetry subscription push interval value from broker was {}; to stagger requests the first push&quot;</span>
+<span class="nc" id="L827">                + &quot; interval is being adjusted to {}&quot;, intervalMs, firstPushIntervalMs);</span>
+<span class="nc" id="L828">            return firstPushIntervalMs;</span>
+        }
+
+        private boolean isTerminatingState() {
+<span class="nc bnc" id="L832" title="All 6 branches missed.">            return state == ClientTelemetryState.TERMINATED || state == ClientTelemetryState.TERMINATING_PUSH_NEEDED</span>
+                || state == ClientTelemetryState.TERMINATING_PUSH_IN_PROGRESS;
+        }
+
+        // Visible for testing
+        boolean maybeSetState(ClientTelemetryState newState) {
+<span class="nc" id="L838">            lock.writeLock().lock();</span>
+            try {
+<span class="nc" id="L840">                ClientTelemetryState oldState = state;</span>
+<span class="nc" id="L841">                state = oldState.validateTransition(newState);</span>
+<span class="nc" id="L842">                log.debug(&quot;Setting telemetry state from {} to {}&quot;, oldState, newState);</span>
+<span class="nc" id="L843">                return true;</span>
+<span class="nc" id="L844">            } catch (IllegalStateException e) {</span>
+<span class="nc" id="L845">                log.warn(&quot;Error updating client telemetry state, disabled telemetry&quot;);</span>
+<span class="nc" id="L846">                enabled = false;</span>
+<span class="nc" id="L847">                return false;</span>
+            } finally {
+<span class="nc" id="L849">                lock.writeLock().unlock();</span>
+            }
+        }
+
+        private void handleFailedRequest(KafkaException maybeFatalException) {
+<span class="nc" id="L854">            final long nowMs = time.milliseconds();</span>
+<span class="nc" id="L855">            lock.writeLock().lock();</span>
+            try {
+<span class="nc bnc" id="L857" title="All 2 branches missed.">                if (isTerminatingState()) {</span>
+<span class="nc" id="L858">                    return;</span>
+                }
+<span class="nc bnc" id="L860" title="All 4 branches missed.">                if (state != ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS &amp;&amp; state != ClientTelemetryState.PUSH_IN_PROGRESS) {</span>
+<span class="nc" id="L861">                    log.warn(&quot;Could not transition state after failed telemetry from state {}, disabling telemetry&quot;, state);</span>
+<span class="nc" id="L862">                    updateErrorResult(Integer.MAX_VALUE, nowMs);</span>
+<span class="nc" id="L863">                    return;</span>
+                }
+
+                /*
+                 The broker might not support telemetry. Let's sleep for a while before trying request
+                 again. We may disconnect from the broker and connect to a broker that supports client
+                 telemetry.
+                */
+<span class="nc bnc" id="L871" title="All 2 branches missed.">                if (isRetryable(maybeFatalException)) {</span>
+<span class="nc" id="L872">                    updateErrorResult(DEFAULT_PUSH_INTERVAL_MS, nowMs);</span>
+                } else {
+<span class="nc bnc" id="L874" title="All 2 branches missed.">                    if (!(maybeFatalException instanceof UnsupportedVersionException)) {</span>
+<span class="nc" id="L875">                        log.warn(&quot;Received unrecoverable error from broker, disabling telemetry&quot;);</span>
+                    }
+<span class="nc" id="L877">                    updateErrorResult(Integer.MAX_VALUE, nowMs);</span>
+                }
+
+<span class="nc bnc" id="L880" title="All 2 branches missed.">                if (!maybeSetState(ClientTelemetryState.SUBSCRIPTION_NEEDED)) {</span>
+<span class="nc" id="L881">                    log.warn(&quot;Could not transition state after failed telemetry from state {}&quot;, state);</span>
+                }
+            } finally {
+<span class="nc" id="L884">                lock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L886">        }</span>
+
+        private MetricsData createPayload(List&lt;SinglePointMetric&gt; emittedMetrics) {
+<span class="nc" id="L889">            MetricsData.Builder builder = MetricsData.newBuilder();</span>
+<span class="nc" id="L890">            emittedMetrics.forEach(metric -&gt; {</span>
+<span class="nc" id="L891">                Metric m = metric.builder().build();</span>
+<span class="nc" id="L892">                ResourceMetrics rm = buildMetric(m);</span>
+<span class="nc" id="L893">                builder.addResourceMetrics(rm);</span>
+<span class="nc" id="L894">            });</span>
+<span class="nc" id="L895">            return builder.build();</span>
+        }
+
+        // Visible for testing
+        ClientTelemetrySubscription subscription() {
+<span class="nc" id="L900">            lock.readLock().lock();</span>
+            try {
+<span class="nc" id="L902">                return subscription;</span>
+            } finally {
+<span class="nc" id="L904">                lock.readLock().unlock();</span>
+            }
+        }
+
+        // Visible for testing
+        ClientTelemetryState state() {
+<span class="nc" id="L910">            lock.readLock().lock();</span>
+            try {
+<span class="nc" id="L912">                return state;</span>
+            } finally {
+<span class="nc" id="L914">                lock.readLock().unlock();</span>
+            }
+        }
+
+        // Visible for testing
+        long intervalMs() {
+<span class="nc" id="L920">            lock.readLock().lock();</span>
+            try {
+<span class="nc" id="L922">                return intervalMs;</span>
+            } finally {
+<span class="nc" id="L924">                lock.readLock().unlock();</span>
+            }
+        }
+
+        // Visible for testing
+        long lastRequestMs() {
+<span class="nc" id="L930">            lock.readLock().lock();</span>
+            try {
+<span class="nc" id="L932">                return lastRequestMs;</span>
+            } finally {
+<span class="nc" id="L934">                lock.readLock().unlock();</span>
+            }
+        }
+
+        // Visible for testing
+        void enabled(boolean enabled) {
+<span class="nc" id="L940">            lock.writeLock().lock();</span>
+            try {
+<span class="nc" id="L942">                this.enabled = enabled;</span>
+            } finally {
+<span class="nc" id="L944">                lock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L946">        }</span>
+
+        // Visible for testing
+        boolean enabled() {
+<span class="nc" id="L950">            lock.readLock().lock();</span>
+            try {
+<span class="nc" id="L952">                return enabled;</span>
+            } finally {
+<span class="nc" id="L954">                lock.readLock().unlock();</span>
+            }
+        }
+    }
+
+    /**
+     * Representation of the telemetry subscription that is retrieved from the cluster at startup and
+     * then periodically afterward, following the telemetry push.
+     */
+    static class ClientTelemetrySubscription {
+
+        private final Uuid clientInstanceId;
+        private final int subscriptionId;
+        private final int pushIntervalMs;
+        private final List&lt;CompressionType&gt; acceptedCompressionTypes;
+        private final boolean deltaTemporality;
+        private final Predicate&lt;? super MetricKeyable&gt; selector;
+
+        ClientTelemetrySubscription(Uuid clientInstanceId, int subscriptionId, int pushIntervalMs,
+                List&lt;CompressionType&gt; acceptedCompressionTypes, boolean deltaTemporality,
+<span class="nc" id="L974">                Predicate&lt;? super MetricKeyable&gt; selector) {</span>
+<span class="nc" id="L975">            this.clientInstanceId = clientInstanceId;</span>
+<span class="nc" id="L976">            this.subscriptionId = subscriptionId;</span>
+<span class="nc" id="L977">            this.pushIntervalMs = pushIntervalMs;</span>
+<span class="nc" id="L978">            this.acceptedCompressionTypes = List.copyOf(acceptedCompressionTypes);</span>
+<span class="nc" id="L979">            this.deltaTemporality = deltaTemporality;</span>
+<span class="nc" id="L980">            this.selector = selector;</span>
+<span class="nc" id="L981">        }</span>
+
+        public Uuid clientInstanceId() {
+<span class="nc" id="L984">            return clientInstanceId;</span>
+        }
+
+        public int subscriptionId() {
+<span class="nc" id="L988">            return subscriptionId;</span>
+        }
+
+        public int pushIntervalMs() {
+<span class="nc" id="L992">            return pushIntervalMs;</span>
+        }
+
+        public List&lt;CompressionType&gt; acceptedCompressionTypes() {
+<span class="nc" id="L996">            return acceptedCompressionTypes;</span>
+        }
+
+        public boolean deltaTemporality() {
+<span class="nc" id="L1000">            return deltaTemporality;</span>
+        }
+
+        public Predicate&lt;? super MetricKeyable&gt; selector() {
+<span class="nc" id="L1004">            return selector;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1009">            return new StringJoiner(&quot;, &quot;, &quot;ClientTelemetrySubscription{&quot;, &quot;}&quot;)</span>
+<span class="nc" id="L1010">                .add(&quot;clientInstanceId=&quot; + clientInstanceId)</span>
+<span class="nc" id="L1011">                .add(&quot;subscriptionId=&quot; + subscriptionId)</span>
+<span class="nc" id="L1012">                .add(&quot;pushIntervalMs=&quot; + pushIntervalMs)</span>
+<span class="nc" id="L1013">                .add(&quot;acceptedCompressionTypes=&quot; + acceptedCompressionTypes)</span>
+<span class="nc" id="L1014">                .add(&quot;deltaTemporality=&quot; + deltaTemporality)</span>
+<span class="nc" id="L1015">                .add(&quot;selector=&quot; + selector)</span>
+<span class="nc" id="L1016">                .toString();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

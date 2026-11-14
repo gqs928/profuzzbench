@@ -1,0 +1,877 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Metadata.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients</a> &gt; <span class="el_source">Metadata.java</span></div><h1>Metadata.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients;
+
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.ClusterResourceListener;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.InvalidMetadataException;
+import org.apache.kafka.common.errors.InvalidTopicException;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
+import org.apache.kafka.common.internals.ClusterResourceListeners;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.MetadataRequest;
+import org.apache.kafka.common.requests.MetadataResponse;
+import org.apache.kafka.common.requests.MetadataResponse.PartitionMetadata;
+import org.apache.kafka.common.utils.internals.ExponentialBackoff;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.io.Closeable;
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.common.record.internal.RecordBatch.NO_PARTITION_LEADER_EPOCH;
+
+/**
+ * A class encapsulating some of the logic around metadata.
+ * &lt;p&gt;
+ * This class is shared by the client thread (for partitioning) and the background sender thread.
+ *
+ * Metadata is maintained for only a subset of topics, which can be added to over time. When we request metadata for a
+ * topic we don't have any metadata for it will trigger a metadata update.
+ * &lt;p&gt;
+ * If topic expiry is enabled for the metadata, any topic that has not been used within the expiry interval
+ * is removed from the metadata refresh set after an update. Consumers disable topic expiry since they explicitly
+ * manage topics while producers rely on topic expiry to limit the refresh set.
+ */
+public class Metadata implements Closeable {
+    private final Logger log;
+    private final ExponentialBackoff refreshBackoff;
+    private final long metadataExpireMs;
+    private int updateVersion;  // bumped on every metadata response
+    private int requestVersion; // bumped on every new topic addition
+    private long lastRefreshMs;
+    private long lastSuccessfulRefreshMs;
+    private long attempts;
+    private KafkaException fatalException;
+    private KafkaException bootstrapFatalException;
+    private Set&lt;String&gt; invalidTopics;
+    private Set&lt;String&gt; unauthorizedTopics;
+<span class="nc" id="L80">    private volatile MetadataSnapshot metadataSnapshot = MetadataSnapshot.empty();</span>
+    private boolean needFullUpdate;
+    private boolean needPartialUpdate;
+    private long equivalentResponseCount;
+    private final ClusterResourceListeners clusterResourceListeners;
+    private boolean isClosed;
+    private final Map&lt;TopicPartition, Integer&gt; lastSeenLeaderEpochs;
+    /** Addresses with which the metadata was originally bootstrapped. */
+    private List&lt;InetSocketAddress&gt; bootstrapAddresses;
+
+    /**
+     * Create a new Metadata instance
+     *
+     * @param refreshBackoffMs         The minimum amount of time that must expire between metadata refreshes to avoid busy
+     *                                 polling
+     * @param refreshBackoffMaxMs      The maximum amount of time to wait between metadata refreshes
+     * @param metadataExpireMs         The maximum amount of time that metadata can be retained without refresh
+     * @param logContext               Log context corresponding to the containing client
+     * @param clusterResourceListeners List of ClusterResourceListeners which will receive metadata updates.
+     */
+    public Metadata(long refreshBackoffMs,
+                    long refreshBackoffMaxMs,
+                    long metadataExpireMs,
+                    LogContext logContext,
+<span class="nc" id="L104">                    ClusterResourceListeners clusterResourceListeners) {</span>
+<span class="nc" id="L105">        this.log = logContext.logger(Metadata.class);</span>
+<span class="nc" id="L106">        this.refreshBackoff = new ExponentialBackoff(</span>
+            refreshBackoffMs,
+            CommonClientConfigs.RETRY_BACKOFF_EXP_BASE,
+            refreshBackoffMaxMs,
+            CommonClientConfigs.RETRY_BACKOFF_JITTER);
+<span class="nc" id="L111">        this.metadataExpireMs = metadataExpireMs;</span>
+<span class="nc" id="L112">        this.lastRefreshMs = 0L;</span>
+<span class="nc" id="L113">        this.lastSuccessfulRefreshMs = 0L;</span>
+<span class="nc" id="L114">        this.attempts = 0L;</span>
+<span class="nc" id="L115">        this.requestVersion = 0;</span>
+<span class="nc" id="L116">        this.updateVersion = 0;</span>
+<span class="nc" id="L117">        this.needFullUpdate = false;</span>
+<span class="nc" id="L118">        this.needPartialUpdate = false;</span>
+<span class="nc" id="L119">        this.equivalentResponseCount = 0;</span>
+<span class="nc" id="L120">        this.clusterResourceListeners = clusterResourceListeners;</span>
+<span class="nc" id="L121">        this.isClosed = false;</span>
+<span class="nc" id="L122">        this.lastSeenLeaderEpochs = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L123">        this.invalidTopics = Collections.emptySet();</span>
+<span class="nc" id="L124">        this.unauthorizedTopics = Collections.emptySet();</span>
+<span class="nc" id="L125">    }</span>
+
+    /**
+     * Get the current cluster info without blocking
+     */
+    public Cluster fetch() {
+<span class="nc" id="L131">        return metadataSnapshot.cluster();</span>
+    }
+
+    /**
+     * Get the current metadata cache.
+     */
+    public MetadataSnapshot fetchMetadataSnapshot() {
+<span class="nc" id="L138">        return metadataSnapshot;</span>
+    }
+
+    /**
+     * Return the next time when the current cluster info can be updated (i.e., backoff time has elapsed).
+     * There are two calculations for backing off based on how many attempts to retrieve metadata have been made
+     * since the last successful response, and how many equivalent metadata responses have been received.
+     * The second of these allows backing off when there are errors to do with stale metadata, even though the
+     * metadata responses are clean.
+     * &lt;p&gt;
+     * This can be used to check whether it's worth requesting an update in the knowledge that it will
+     * not be delayed if this method returns 0.
+     *
+     * @param nowMs current time in ms
+     * @return remaining time in ms till the cluster info can be updated again
+     */
+    public synchronized long timeToAllowUpdate(long nowMs) {
+        // Calculate the backoff for attempts which acts when metadata responses fail
+<span class="nc" id="L156">        long backoffForAttempts = Math.max(this.lastRefreshMs +</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">                this.refreshBackoff.backoff(this.attempts &gt; 0 ? this.attempts - 1 : 0) - nowMs, 0);</span>
+
+        // Periodic updates based on expiration resets the equivalent response count so exponential backoff is not used
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (Math.max(this.lastSuccessfulRefreshMs + this.metadataExpireMs - nowMs, 0) == 0) {</span>
+<span class="nc" id="L161">            this.equivalentResponseCount = 0;</span>
+        }
+
+        // Calculate the backoff for equivalent responses which acts when metadata responses are not making progress
+<span class="nc" id="L165">        long backoffForEquivalentResponseCount = Math.max(this.lastRefreshMs +</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                (this.equivalentResponseCount &gt; 0 ? this.refreshBackoff.backoff(this.equivalentResponseCount - 1) : 0) - nowMs, 0);</span>
+
+<span class="nc" id="L168">        return Math.max(backoffForAttempts, backoffForEquivalentResponseCount);</span>
+    }
+
+    /**
+     * The next time to update the cluster info is the maximum of the time the current info will expire and the time the
+     * current info can be updated (i.e. backoff time has elapsed). If an update has been requested, the metadata
+     * expiry time is now.
+     *
+     * @param nowMs current time in ms
+     * @return remaining time in ms till updating the cluster info
+     */
+    public synchronized long timeToNextUpdate(long nowMs) {
+<span class="nc bnc" id="L180" title="All 2 branches missed.">        long timeToExpire = updateRequested() ? 0 : Math.max(this.lastSuccessfulRefreshMs + this.metadataExpireMs - nowMs, 0);</span>
+<span class="nc" id="L181">        return Math.max(timeToExpire, timeToAllowUpdate(nowMs));</span>
+    }
+
+    public long metadataExpireMs() {
+<span class="nc" id="L185">        return this.metadataExpireMs;</span>
+    }
+
+    /**
+     * Request an update of the current cluster metadata info, permitting backoff based on the number of
+     * equivalent metadata responses, which indicates that responses did not make progress and may be stale.
+     * 
+     * @param resetEquivalentResponseBackoff Whether to reset backing off based on consecutive equivalent responses.
+     *                                       This should be set to &lt;i&gt;false&lt;/i&gt; in situations where the update is
+     *                                       being requested to retry an operation, such as when the leader has
+     *                                       changed. It should be set to &lt;i&gt;true&lt;/i&gt; in situations where new
+     *                                       metadata is being requested, such as adding a topic to a subscription.
+     *                                       In situations where it's not clear, it's best to use &lt;i&gt;true&lt;/i&gt;.
+     * 
+     * @return The current updateVersion before the update
+     */
+    public synchronized int requestUpdate(final boolean resetEquivalentResponseBackoff) {
+<span class="nc" id="L202">        this.needFullUpdate = true;</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        if (resetEquivalentResponseBackoff) {</span>
+<span class="nc" id="L204">            this.equivalentResponseCount = 0;</span>
+        }
+<span class="nc" id="L206">        return this.updateVersion;</span>
+    }
+
+    /**
+     * Request an immediate update of the current cluster metadata info, because the caller is interested in
+     * metadata that is being newly requested.
+     * @return The current updateVersion before the update
+     */
+    public synchronized int requestUpdateForNewTopics() {
+        // Override the timestamp of last refresh to let immediate update.
+<span class="nc" id="L216">        this.lastRefreshMs = 0;</span>
+<span class="nc" id="L217">        this.needPartialUpdate = true;</span>
+<span class="nc" id="L218">        this.equivalentResponseCount = 0;</span>
+<span class="nc" id="L219">        this.requestVersion++;</span>
+<span class="nc" id="L220">        return this.updateVersion;</span>
+    }
+
+    /**
+     * Request an update for the partition metadata if and only if we have seen a newer leader epoch. This is called by the client
+     * any time it handles a response from the broker that includes leader epoch, except for update via Metadata RPC which
+     * follows a different code path ({@link #update}).
+     *
+     * @param topicPartition The partition for which to update the last seen leader epoch.
+     * @param leaderEpoch    The leader epoch received from the broker.
+     * @return {@code true} if we updated the last seen epoch, {@code false} otherwise.
+     */
+    public synchronized boolean updateLastSeenEpochIfNewer(TopicPartition topicPartition, int leaderEpoch) {
+<span class="nc" id="L233">        Objects.requireNonNull(topicPartition, &quot;TopicPartition cannot be null&quot;);</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        if (leaderEpoch &lt; 0)</span>
+<span class="nc" id="L235">            throw new IllegalArgumentException(&quot;Invalid leader epoch &quot; + leaderEpoch + &quot; (must be non-negative)&quot;);</span>
+
+<span class="nc" id="L237">        Integer oldEpoch = lastSeenLeaderEpochs.get(topicPartition);</span>
+<span class="nc" id="L238">        log.trace(&quot;Determining if we should replace existing epoch {} with new epoch {} for partition {}&quot;, oldEpoch, leaderEpoch, topicPartition);</span>
+
+        final boolean updated;
+<span class="nc bnc" id="L241" title="All 2 branches missed.">        if (oldEpoch == null) {</span>
+<span class="nc" id="L242">            log.debug(&quot;Not replacing null epoch with new epoch {} for partition {}&quot;, leaderEpoch, topicPartition);</span>
+<span class="nc" id="L243">            updated = false;</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">        } else if (leaderEpoch &gt; oldEpoch) {</span>
+<span class="nc" id="L245">            log.debug(&quot;Updating last seen epoch from {} to {} for partition {}&quot;, oldEpoch, leaderEpoch, topicPartition);</span>
+<span class="nc" id="L246">            lastSeenLeaderEpochs.put(topicPartition, leaderEpoch);</span>
+<span class="nc" id="L247">            updated = true;</span>
+        } else {
+<span class="nc" id="L249">            log.debug(&quot;Not replacing existing epoch {} with new epoch {} for partition {}&quot;, oldEpoch, leaderEpoch, topicPartition);</span>
+<span class="nc" id="L250">            updated = false;</span>
+        }
+
+<span class="nc bnc" id="L253" title="All 4 branches missed.">        this.needFullUpdate = this.needFullUpdate || updated;</span>
+<span class="nc" id="L254">        return updated;</span>
+    }
+
+    public Optional&lt;Integer&gt; lastSeenLeaderEpoch(TopicPartition topicPartition) {
+<span class="nc" id="L258">        return Optional.ofNullable(lastSeenLeaderEpochs.get(topicPartition));</span>
+    }
+
+    /**
+     * Check whether an update has been explicitly requested.
+     *
+     * @return true if an update was requested, false otherwise
+     */
+    public synchronized boolean updateRequested() {
+<span class="nc bnc" id="L267" title="All 4 branches missed.">        return this.needFullUpdate || this.needPartialUpdate;</span>
+    }
+
+    public synchronized void addClusterUpdateListener(ClusterResourceListener listener) {
+<span class="nc" id="L271">        this.clusterResourceListeners.maybeAdd(listener);</span>
+<span class="nc" id="L272">    }</span>
+
+    /**
+     * Return the cached partition info if it exists and a newer leader epoch isn't known about.
+     */
+    public synchronized Optional&lt;MetadataResponse.PartitionMetadata&gt; partitionMetadataIfCurrent(TopicPartition topicPartition) {
+<span class="nc" id="L278">        Integer epoch = lastSeenLeaderEpochs.get(topicPartition);</span>
+<span class="nc" id="L279">        Optional&lt;MetadataResponse.PartitionMetadata&gt; partitionMetadata = metadataSnapshot.partitionMetadata(topicPartition);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        if (epoch == null) {</span>
+            // old cluster format (no epochs)
+<span class="nc" id="L282">            return partitionMetadata;</span>
+        } else {
+<span class="nc" id="L284">            return partitionMetadata.filter(metadata -&gt;</span>
+<span class="nc" id="L285">                    metadata.leaderEpoch.orElse(NO_PARTITION_LEADER_EPOCH).equals(epoch));</span>
+        }
+    }
+
+    /**
+     * @return a mapping from topic names to topic IDs for all topics with valid IDs in the cache
+     */
+    public Map&lt;String, Uuid&gt; topicIds() {
+<span class="nc" id="L293">        return metadataSnapshot.topicIds();</span>
+    }
+
+    public synchronized LeaderAndEpoch currentLeader(TopicPartition topicPartition) {
+<span class="nc" id="L297">        Optional&lt;MetadataResponse.PartitionMetadata&gt; maybeMetadata = partitionMetadataIfCurrent(topicPartition);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        if (maybeMetadata.isEmpty())</span>
+<span class="nc" id="L299">            return new LeaderAndEpoch(Optional.empty(), Optional.ofNullable(lastSeenLeaderEpochs.get(topicPartition)));</span>
+
+<span class="nc" id="L301">        MetadataResponse.PartitionMetadata partitionMetadata = maybeMetadata.get();</span>
+<span class="nc" id="L302">        Optional&lt;Integer&gt; leaderEpochOpt = partitionMetadata.leaderEpoch;</span>
+<span class="nc" id="L303">        Optional&lt;Node&gt; leaderNodeOpt = partitionMetadata.leaderId.flatMap(metadataSnapshot::nodeById);</span>
+<span class="nc" id="L304">        return new LeaderAndEpoch(leaderNodeOpt, leaderEpochOpt);</span>
+    }
+
+    public synchronized void bootstrap(List&lt;InetSocketAddress&gt; addresses) {
+<span class="nc" id="L308">        this.needFullUpdate = true;</span>
+<span class="nc" id="L309">        this.updateVersion += 1;</span>
+<span class="nc" id="L310">        this.metadataSnapshot = MetadataSnapshot.bootstrap(addresses);</span>
+<span class="nc" id="L311">        this.bootstrapAddresses = addresses;</span>
+<span class="nc" id="L312">    }</span>
+
+    public synchronized void rebootstrap() {
+<span class="nc" id="L315">        log.info(&quot;Rebootstrapping with {}&quot;, this.bootstrapAddresses);</span>
+<span class="nc" id="L316">        this.bootstrap(this.bootstrapAddresses);</span>
+<span class="nc" id="L317">    }</span>
+
+    /**
+     * Update metadata assuming the current request version.
+     *
+     * For testing only.
+     */
+    public synchronized void updateWithCurrentRequestVersion(MetadataResponse response, boolean isPartialUpdate, long nowMs) {
+<span class="nc" id="L325">        this.update(this.requestVersion, response, isPartialUpdate, nowMs);</span>
+<span class="nc" id="L326">    }</span>
+
+    /**
+     * Updates the cluster metadata. If topic expiry is enabled, expiry time
+     * is set for topics if required and expired topics are removed from the metadata.
+     *
+     * @param requestVersion The request version corresponding to the update response, as provided by
+     *     {@link #newMetadataRequestAndVersion(long)}.
+     * @param response metadata response received from the broker
+     * @param isPartialUpdate whether the metadata request was for a subset of the active topics
+     * @param nowMs current time in milliseconds
+     */
+    public synchronized void update(int requestVersion, MetadataResponse response, boolean isPartialUpdate, long nowMs) {
+<span class="nc" id="L339">        Objects.requireNonNull(response, &quot;Metadata response cannot be null&quot;);</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        if (isClosed())</span>
+<span class="nc" id="L341">            throw new IllegalStateException(&quot;Update requested after metadata close&quot;);</span>
+
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        this.needPartialUpdate = requestVersion &lt; this.requestVersion;</span>
+<span class="nc" id="L344">        this.lastRefreshMs = nowMs;</span>
+<span class="nc" id="L345">        this.attempts = 0;</span>
+<span class="nc" id="L346">        this.updateVersion += 1;</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        if (!isPartialUpdate) {</span>
+<span class="nc" id="L348">            this.needFullUpdate = false;</span>
+<span class="nc" id="L349">            this.lastSuccessfulRefreshMs = nowMs;</span>
+        }
+        // If we subsequently find that the metadata response is not equivalent to the metadata already known,
+        // this count is reset to 0 in updateLatestMetadata()
+<span class="nc" id="L353">        this.equivalentResponseCount++;</span>
+
+<span class="nc" id="L355">        String previousClusterId = metadataSnapshot.clusterResource().clusterId();</span>
+
+<span class="nc" id="L357">        this.metadataSnapshot = handleMetadataResponse(response, isPartialUpdate, nowMs);</span>
+
+<span class="nc" id="L359">        Cluster cluster = metadataSnapshot.cluster();</span>
+<span class="nc" id="L360">        maybeSetMetadataError(cluster);</span>
+
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        this.lastSeenLeaderEpochs.keySet().removeIf(tp -&gt; !retainTopic(tp.topic(), false, nowMs));</span>
+
+<span class="nc" id="L364">        String newClusterId = metadataSnapshot.clusterResource().clusterId();</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        if (!Objects.equals(previousClusterId, newClusterId)) {</span>
+<span class="nc" id="L366">            log.info(&quot;Cluster ID: {}&quot;, newClusterId);</span>
+        }
+<span class="nc" id="L368">        clusterResourceListeners.onUpdate(metadataSnapshot.clusterResource());</span>
+
+<span class="nc" id="L370">        log.debug(&quot;Updated cluster metadata updateVersion {} to {}&quot;, this.updateVersion, this.metadataSnapshot);</span>
+<span class="nc" id="L371">    }</span>
+
+    /**
+     * Updates the partition-leadership info in the metadata. Update is done by merging existing metadata with the input leader information and nodes.
+     * This is called whenever partition-leadership updates are returned in a response from broker(ex - ProduceResponse &amp; FetchResponse).
+     * Note that the updates via Metadata RPC are handled separately in ({@link #update}).
+     * Both partitionLeader and leaderNodes override the existing metadata. Non-overlapping metadata is kept as it is.
+     * @param partitionLeaders map of new leadership information for partitions.
+     * @param leaderNodes a list of nodes for leaders in the above map.
+     * @return a set of partitions, for which leaders were updated.
+     */
+    public synchronized Set&lt;TopicPartition&gt; updatePartitionLeadership(Map&lt;TopicPartition, LeaderIdAndEpoch&gt; partitionLeaders, List&lt;Node&gt; leaderNodes) {
+<span class="nc" id="L383">        Map&lt;Integer, Node&gt; newNodes = leaderNodes.stream().collect(Collectors.toMap(Node::id, node -&gt; node));</span>
+        // Insert non-overlapping nodes from existing-nodes into new-nodes.
+<span class="nc" id="L385">        this.metadataSnapshot.cluster().nodes().forEach(node -&gt; newNodes.putIfAbsent(node.id(), node));</span>
+
+        // Create partition-metadata for all updated partitions. Exclude updates for partitions -
+        // 1. for which the corresponding partition has newer leader in existing metadata.
+        // 2. for which corresponding leader's node is missing in the new-nodes.
+        // 3. for which the existing metadata doesn't know about the partition.
+<span class="nc" id="L391">        List&lt;PartitionMetadata&gt; updatePartitionMetadata = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        for (Entry&lt;TopicPartition, Metadata.LeaderIdAndEpoch&gt; partitionLeader: partitionLeaders.entrySet()) {</span>
+<span class="nc" id="L393">            TopicPartition partition = partitionLeader.getKey();</span>
+<span class="nc" id="L394">            Metadata.LeaderAndEpoch currentLeader = currentLeader(partition);</span>
+<span class="nc" id="L395">            Metadata.LeaderIdAndEpoch newLeader = partitionLeader.getValue();</span>
+<span class="nc bnc" id="L396" title="All 4 branches missed.">            if (newLeader.epoch.isEmpty() || newLeader.leaderId.isEmpty()) {</span>
+<span class="nc" id="L397">                log.debug(&quot;For {}, incoming leader information is incomplete {}&quot;, partition, newLeader);</span>
+<span class="nc" id="L398">                continue;</span>
+            }
+<span class="nc bnc" id="L400" title="All 4 branches missed.">            if (currentLeader.epoch.isPresent() &amp;&amp; newLeader.epoch.get() &lt;= currentLeader.epoch.get()) {</span>
+<span class="nc" id="L401">                log.debug(&quot;For {}, incoming leader({}) is not-newer than the one in the existing metadata {}, so ignoring.&quot;, partition, newLeader, currentLeader);</span>
+<span class="nc" id="L402">                continue;</span>
+            }
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            if (!newNodes.containsKey(newLeader.leaderId.get())) {</span>
+<span class="nc" id="L405">                log.debug(&quot;For {}, incoming leader({}), the corresponding node information for node-id {} is missing, so ignoring.&quot;, partition, newLeader, newLeader.leaderId.get());</span>
+<span class="nc" id="L406">                continue;</span>
+            }
+<span class="nc bnc" id="L408" title="All 2 branches missed.">            if (this.metadataSnapshot.partitionMetadata(partition).isEmpty()) {</span>
+<span class="nc" id="L409">                log.debug(&quot;For {}, incoming leader({}), partition metadata is no longer cached, ignoring.&quot;, partition, newLeader);</span>
+<span class="nc" id="L410">                continue;</span>
+            }
+
+<span class="nc" id="L413">            MetadataResponse.PartitionMetadata existingMetadata = this.metadataSnapshot.partitionMetadata(partition).get();</span>
+<span class="nc" id="L414">            MetadataResponse.PartitionMetadata updatedMetadata = new MetadataResponse.PartitionMetadata(</span>
+                existingMetadata.error,
+                partition,
+                newLeader.leaderId,
+                newLeader.epoch,
+                existingMetadata.replicaIds,
+                existingMetadata.inSyncReplicaIds,
+                existingMetadata.offlineReplicaIds
+            );
+<span class="nc" id="L423">            updatePartitionMetadata.add(updatedMetadata);</span>
+
+<span class="nc" id="L425">            lastSeenLeaderEpochs.put(partition, newLeader.epoch.get());</span>
+<span class="nc" id="L426">        }</span>
+
+<span class="nc bnc" id="L428" title="All 2 branches missed.">        if (updatePartitionMetadata.isEmpty()) {</span>
+<span class="nc" id="L429">            log.debug(&quot;No relevant metadata updates.&quot;);</span>
+<span class="nc" id="L430">            return new HashSet&lt;&gt;();</span>
+        }
+
+<span class="nc" id="L433">        Set&lt;String&gt; updatedTopics = updatePartitionMetadata.stream().map(MetadataResponse.PartitionMetadata::topic).collect(Collectors.toSet());</span>
+
+        // Get topic-ids for updated topics from existing topic-ids.
+<span class="nc" id="L436">        Map&lt;String, Uuid&gt; existingTopicIds = this.metadataSnapshot.topicIds();</span>
+<span class="nc" id="L437">        Map&lt;String, Uuid&gt; topicIdsForUpdatedTopics = updatedTopics.stream()</span>
+<span class="nc" id="L438">            .filter(existingTopicIds::containsKey)</span>
+<span class="nc" id="L439">            .collect(Collectors.toMap(e -&gt; e, existingTopicIds::get));</span>
+
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L442">            updatePartitionMetadata.forEach(</span>
+<span class="nc" id="L443">                partMetadata -&gt; log.debug(&quot;For {} updating leader information, updated metadata is {}.&quot;, partMetadata.topicPartition, partMetadata)</span>
+            );
+        }
+
+        // Fetch responses can include partition level leader changes, when this happens, we perform a partial
+        // metadata update, by keeping the unchanged partition and update the changed partitions.
+<span class="nc" id="L449">        this.metadataSnapshot = metadataSnapshot.mergeWith(</span>
+<span class="nc" id="L450">            metadataSnapshot.clusterResource().clusterId(),</span>
+            newNodes,
+            updatePartitionMetadata,
+<span class="nc" id="L453">            Collections.emptySet(), Collections.emptySet(), Collections.emptySet(),</span>
+<span class="nc" id="L454">            metadataSnapshot.cluster().controller(),</span>
+            topicIdsForUpdatedTopics,
+<span class="nc" id="L456">            (topic, isInternal) -&gt; true);</span>
+<span class="nc" id="L457">        clusterResourceListeners.onUpdate(metadataSnapshot.clusterResource());</span>
+
+<span class="nc" id="L459">        return updatePartitionMetadata.stream()</span>
+<span class="nc" id="L460">            .map(metadata -&gt; metadata.topicPartition)</span>
+<span class="nc" id="L461">            .collect(Collectors.toSet());</span>
+    }
+
+    private void maybeSetMetadataError(Cluster cluster) {
+<span class="nc" id="L465">        clearRecoverableErrors();</span>
+<span class="nc" id="L466">        checkInvalidTopics(cluster);</span>
+<span class="nc" id="L467">        checkUnauthorizedTopics(cluster);</span>
+<span class="nc" id="L468">    }</span>
+
+    private void checkInvalidTopics(Cluster cluster) {
+<span class="nc bnc" id="L471" title="All 2 branches missed.">        if (!cluster.invalidTopics().isEmpty()) {</span>
+<span class="nc" id="L472">            log.error(&quot;Metadata response reported invalid topics {}&quot;, cluster.invalidTopics());</span>
+<span class="nc" id="L473">            invalidTopics = new HashSet&lt;&gt;(cluster.invalidTopics());</span>
+        }
+<span class="nc" id="L475">    }</span>
+
+    private void checkUnauthorizedTopics(Cluster cluster) {
+<span class="nc bnc" id="L478" title="All 2 branches missed.">        if (!cluster.unauthorizedTopics().isEmpty()) {</span>
+<span class="nc" id="L479">            log.error(&quot;Topic authorization failed for topics {}&quot;, cluster.unauthorizedTopics());</span>
+<span class="nc" id="L480">            unauthorizedTopics = new HashSet&lt;&gt;(cluster.unauthorizedTopics());</span>
+        }
+<span class="nc" id="L482">    }</span>
+
+    /**
+     * Transform a MetadataResponse into a new MetadataCache instance.
+     */
+    private MetadataSnapshot handleMetadataResponse(MetadataResponse metadataResponse, boolean isPartialUpdate, long nowMs) {
+        // All encountered topics.
+<span class="nc" id="L489">        Set&lt;String&gt; topics = new HashSet&lt;&gt;();</span>
+
+        // Retained topics to be passed to the metadata cache.
+<span class="nc" id="L492">        Set&lt;String&gt; internalTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L493">        Set&lt;String&gt; unauthorizedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L494">        Set&lt;String&gt; invalidTopics = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L496">        List&lt;MetadataResponse.PartitionMetadata&gt; partitions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L497">        Map&lt;String, Uuid&gt; topicIds = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L498">        Map&lt;String, Uuid&gt; oldTopicIds = metadataSnapshot.topicIds();</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">        for (MetadataResponse.TopicMetadata metadata : metadataResponse.topicMetadata()) {</span>
+<span class="nc" id="L500">            String topicName = metadata.topic();</span>
+<span class="nc" id="L501">            Uuid topicId = metadata.topicId();</span>
+<span class="nc" id="L502">            topics.add(topicName);</span>
+            // We can only reason about topic ID changes when both IDs are valid, so keep oldId null unless the new metadata contains a topic ID
+<span class="nc" id="L504">            Uuid oldTopicId = null;</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">            if (!Uuid.ZERO_UUID.equals(topicId)) {</span>
+<span class="nc" id="L506">                topicIds.put(topicName, topicId);</span>
+<span class="nc" id="L507">                oldTopicId = oldTopicIds.get(topicName);</span>
+            } else {
+<span class="nc" id="L509">                topicId = null;</span>
+            }
+
+<span class="nc bnc" id="L512" title="All 2 branches missed.">            if (!retainTopic(topicName, topicId, metadata.isInternal(), nowMs))</span>
+<span class="nc" id="L513">                continue;</span>
+
+<span class="nc bnc" id="L515" title="All 2 branches missed.">            if (metadata.isInternal())</span>
+<span class="nc" id="L516">                internalTopics.add(topicName);</span>
+
+<span class="nc bnc" id="L518" title="All 2 branches missed.">            if (metadata.error() == Errors.NONE) {</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">                for (MetadataResponse.PartitionMetadata partitionMetadata : metadata.partitionMetadata()) {</span>
+                    // Even if the partition's metadata includes an error, we need to handle
+                    // the update to catch new epochs
+<span class="nc" id="L522">                    updateLatestMetadata(partitionMetadata, metadataResponse.hasReliableLeaderEpochs(), topicId, oldTopicId)</span>
+<span class="nc" id="L523">                        .ifPresent(partitions::add);</span>
+
+<span class="nc bnc" id="L525" title="All 2 branches missed.">                    if (partitionMetadata.error.exception() instanceof InvalidMetadataException) {</span>
+<span class="nc" id="L526">                        log.debug(&quot;Requesting metadata update for partition {} due to error {}&quot;,</span>
+                                partitionMetadata.topicPartition, partitionMetadata.error);
+<span class="nc" id="L528">                        requestUpdate(false);</span>
+                    }
+<span class="nc" id="L530">                }</span>
+            } else {
+<span class="nc bnc" id="L532" title="All 2 branches missed.">                if (metadata.error().exception() instanceof InvalidMetadataException) {</span>
+<span class="nc" id="L533">                    log.debug(&quot;Requesting metadata update for topic {} due to error {}&quot;, topicName, metadata.error());</span>
+<span class="nc" id="L534">                    requestUpdate(false);</span>
+                }
+
+<span class="nc bnc" id="L537" title="All 2 branches missed.">                if (metadata.error() == Errors.INVALID_TOPIC_EXCEPTION)</span>
+<span class="nc" id="L538">                    invalidTopics.add(topicName);</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">                else if (metadata.error() == Errors.TOPIC_AUTHORIZATION_FAILED)</span>
+<span class="nc" id="L540">                    unauthorizedTopics.add(topicName);</span>
+            }
+<span class="nc" id="L542">        }</span>
+
+<span class="nc" id="L544">        Map&lt;Integer, Node&gt; nodes = metadataResponse.brokersById();</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">        if (isPartialUpdate)</span>
+<span class="nc" id="L546">            return this.metadataSnapshot.mergeWith(metadataResponse.clusterId(), nodes, partitions,</span>
+<span class="nc" id="L547">                unauthorizedTopics, invalidTopics, internalTopics, metadataResponse.controller(), topicIds,</span>
+<span class="nc bnc" id="L548" title="All 4 branches missed.">                (topic, isInternal) -&gt; !topics.contains(topic) &amp;&amp; retainTopic(topic, isInternal, nowMs));</span>
+        else
+<span class="nc" id="L550">            return new MetadataSnapshot(metadataResponse.clusterId(), nodes, partitions,</span>
+<span class="nc" id="L551">                unauthorizedTopics, invalidTopics, internalTopics, metadataResponse.controller(), topicIds);</span>
+    }
+
+    /**
+     * Compute the latest partition metadata to cache given ordering by leader epochs (if both
+     * available and reliable) and whether the topic ID changed.
+     */
+    private Optional&lt;MetadataResponse.PartitionMetadata&gt; updateLatestMetadata(
+            MetadataResponse.PartitionMetadata partitionMetadata,
+            boolean hasReliableLeaderEpoch,
+            Uuid topicId,
+            Uuid oldTopicId) {
+<span class="nc" id="L563">        TopicPartition tp = partitionMetadata.topicPartition;</span>
+<span class="nc bnc" id="L564" title="All 4 branches missed.">        if (hasReliableLeaderEpoch &amp;&amp; partitionMetadata.leaderEpoch.isPresent()) {</span>
+<span class="nc" id="L565">            int newEpoch = partitionMetadata.leaderEpoch.get();</span>
+<span class="nc" id="L566">            Integer currentEpoch = lastSeenLeaderEpochs.get(tp);</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">            if (currentEpoch == null) {</span>
+                // We have no previous info, so we can just insert the new epoch info
+<span class="nc" id="L569">                log.debug(&quot;Setting the last seen epoch of partition {} to {} since the last known epoch was undefined.&quot;,</span>
+<span class="nc" id="L570">                        tp, newEpoch);</span>
+<span class="nc" id="L571">                lastSeenLeaderEpochs.put(tp, newEpoch);</span>
+<span class="nc" id="L572">                this.equivalentResponseCount = 0;</span>
+<span class="nc" id="L573">                return Optional.of(partitionMetadata);</span>
+<span class="nc bnc" id="L574" title="All 4 branches missed.">            } else if (topicId != null &amp;&amp; !topicId.equals(oldTopicId)) {</span>
+                // If the new topic ID is valid and different from the last seen topic ID, update the metadata.
+                // Between the time that a topic is deleted and re-created, the client may lose track of the
+                // corresponding topicId (i.e. `oldTopicId` will be null). In this case, when we discover the new
+                // topicId, we allow the corresponding leader epoch to override the last seen value.
+<span class="nc" id="L579">                log.info(&quot;Resetting the last seen epoch of partition {} to {} since the associated topicId changed from {} to {}&quot;,</span>
+<span class="nc" id="L580">                        tp, newEpoch, oldTopicId, topicId);</span>
+<span class="nc" id="L581">                lastSeenLeaderEpochs.put(tp, newEpoch);</span>
+<span class="nc" id="L582">                this.equivalentResponseCount = 0;</span>
+<span class="nc" id="L583">                return Optional.of(partitionMetadata);</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">            } else if (newEpoch &gt;= currentEpoch) {</span>
+                // If the received leader epoch is at least the same as the previous one, update the metadata
+<span class="nc" id="L586">                log.debug(&quot;Updating last seen epoch for partition {} from {} to epoch {} from new metadata&quot;, tp, currentEpoch, newEpoch);</span>
+<span class="nc" id="L587">                lastSeenLeaderEpochs.put(tp, newEpoch);</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">                if (newEpoch &gt; currentEpoch) {</span>
+<span class="nc" id="L589">                    this.equivalentResponseCount = 0;</span>
+                }
+<span class="nc" id="L591">                return Optional.of(partitionMetadata);</span>
+            } else {
+                // Otherwise ignore the new metadata and use the previously cached info
+<span class="nc" id="L594">                log.debug(&quot;Got metadata for an older epoch {} (current is {}) for partition {}, not updating&quot;, newEpoch, currentEpoch, tp);</span>
+<span class="nc" id="L595">                return metadataSnapshot.partitionMetadata(tp);</span>
+            }
+        } else {
+            // Handle old cluster formats as well as error responses where leader and epoch are missing
+<span class="nc" id="L599">            lastSeenLeaderEpochs.remove(tp);</span>
+<span class="nc" id="L600">            this.equivalentResponseCount = 0;</span>
+<span class="nc" id="L601">            return Optional.of(partitionMetadata.withoutLeaderEpoch());</span>
+        }
+    }
+
+    /**
+     * If any non-retriable exceptions were encountered during metadata update, clear and throw the exception.
+     * This is used by the consumer to propagate any fatal exceptions or topic exceptions for any of the topics
+     * in the consumer's Metadata.
+     */
+    public synchronized void maybeThrowAnyException() {
+<span class="nc" id="L611">        clearErrorsAndMaybeThrowException(this::recoverableException);</span>
+<span class="nc" id="L612">    }</span>
+
+    /**
+     * If any fatal exceptions were encountered during metadata update, throw the exception. This is used by
+     * the producer to abort waiting for metadata if there were fatal exceptions (e.g. authentication failures)
+     * in the last metadata update.
+     */
+    protected synchronized void maybeThrowFatalException() {
+<span class="nc" id="L620">        maybeThrowBootstrapFatalException();</span>
+<span class="nc" id="L621">        KafkaException metadataException = this.fatalException;</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        if (metadataException != null) {</span>
+<span class="nc" id="L623">            fatalException = null;</span>
+<span class="nc" id="L624">            throw metadataException;</span>
+        }
+<span class="nc" id="L626">    }</span>
+
+    /**
+     * If any non-retriable exceptions were encountered during metadata update, throw exception if the exception
+     * is fatal or related to the specified topic. All exceptions from the last metadata update are cleared.
+     * This is used by the producer to propagate topic metadata errors for send requests.
+     */
+    public synchronized void maybeThrowExceptionForTopic(String topic) {
+<span class="nc" id="L634">        clearErrorsAndMaybeThrowException(() -&gt; recoverableExceptionForTopic(topic));</span>
+<span class="nc" id="L635">    }</span>
+
+    private void clearErrorsAndMaybeThrowException(Supplier&lt;KafkaException&gt; recoverableExceptionSupplier) {
+<span class="nc" id="L638">        maybeThrowBootstrapFatalException();</span>
+<span class="nc" id="L639">        KafkaException metadataException = Optional.ofNullable(fatalException).orElseGet(recoverableExceptionSupplier);</span>
+<span class="nc" id="L640">        fatalException = null;</span>
+<span class="nc" id="L641">        clearRecoverableErrors();</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        if (metadataException != null)</span>
+<span class="nc" id="L643">            throw metadataException;</span>
+<span class="nc" id="L644">    }</span>
+
+    // We may be able to recover from this exception if metadata for this topic is no longer needed
+    private KafkaException recoverableException() {
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        if (!unauthorizedTopics.isEmpty())</span>
+<span class="nc" id="L649">            return new TopicAuthorizationException(unauthorizedTopics);</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">        else if (!invalidTopics.isEmpty())</span>
+<span class="nc" id="L651">            return new InvalidTopicException(invalidTopics);</span>
+        else
+<span class="nc" id="L653">            return null;</span>
+    }
+
+    private KafkaException recoverableExceptionForTopic(String topic) {
+<span class="nc bnc" id="L657" title="All 2 branches missed.">        if (unauthorizedTopics.contains(topic))</span>
+<span class="nc" id="L658">            return new TopicAuthorizationException(Collections.singleton(topic));</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">        else if (invalidTopics.contains(topic))</span>
+<span class="nc" id="L660">            return new InvalidTopicException(Collections.singleton(topic));</span>
+        else
+<span class="nc" id="L662">            return null;</span>
+    }
+
+    private void clearRecoverableErrors() {
+<span class="nc" id="L666">        invalidTopics = Collections.emptySet();</span>
+<span class="nc" id="L667">        unauthorizedTopics = Collections.emptySet();</span>
+<span class="nc" id="L668">    }</span>
+
+    /**
+     * Record an attempt to update the metadata that failed. We need to keep track of this
+     * to avoid retrying immediately.
+     */
+    public synchronized void failedUpdate(long now) {
+<span class="nc" id="L675">        this.lastRefreshMs = now;</span>
+<span class="nc" id="L676">        this.attempts++;</span>
+<span class="nc" id="L677">        this.equivalentResponseCount = 0;</span>
+<span class="nc" id="L678">    }</span>
+
+    /**
+     * Propagate a fatal error which affects the ability to fetch metadata for the cluster.
+     * Two examples are authentication and unsupported version exceptions.
+     *
+     * @param exception The fatal exception
+     */
+    public synchronized void fatalError(KafkaException exception) {
+<span class="nc" id="L687">        this.fatalException = exception;</span>
+<span class="nc" id="L688">    }</span>
+
+    /**
+     * Record a permanent bootstrap DNS resolution failure. Unlike {@link #fatalError},
+     * this exception is never cleared after being thrown, so all subsequent API calls
+     * will see it (bootstrap failure is not recoverable without recreating the client).
+     */
+    public synchronized void bootstrapFatalError(KafkaException exception) {
+<span class="nc" id="L696">        this.bootstrapFatalException = exception;</span>
+<span class="nc" id="L697">        notifyAll();</span>
+<span class="nc" id="L698">    }</span>
+
+    /**
+     * Throw the permanent bootstrap fatal exception if one was recorded. The exception is
+     * intentionally not cleared so every API call after bootstrap failure sees it.
+     */
+    public synchronized void maybeThrowBootstrapFatalException() {
+<span class="nc bnc" id="L705" title="All 2 branches missed.">        if (bootstrapFatalException != null)</span>
+<span class="nc" id="L706">            throw bootstrapFatalException;</span>
+<span class="nc" id="L707">    }</span>
+
+    /**
+     * @return The current metadata updateVersion
+     */
+    public synchronized int updateVersion() {
+<span class="nc" id="L713">        return this.updateVersion;</span>
+    }
+
+    /**
+     * The last time metadata was successfully updated.
+     */
+    public synchronized long lastSuccessfulUpdate() {
+<span class="nc" id="L720">        return this.lastSuccessfulRefreshMs;</span>
+    }
+
+    /**
+     * Close this metadata instance to indicate that metadata updates are no longer possible.
+     */
+    @Override
+    public synchronized void close() {
+<span class="nc" id="L728">        this.isClosed = true;</span>
+<span class="nc" id="L729">    }</span>
+
+    /**
+     * Check if this metadata instance has been closed. See {@link #close()} for more information.
+     *
+     * @return True if this instance has been closed; false otherwise
+     */
+    public synchronized boolean isClosed() {
+<span class="nc" id="L737">        return this.isClosed;</span>
+    }
+
+    public synchronized MetadataRequestAndVersion newMetadataRequestAndVersion(long nowMs) {
+<span class="nc" id="L741">        MetadataRequest.Builder request = null;</span>
+<span class="nc" id="L742">        boolean isPartialUpdate = false;</span>
+
+        // Perform a partial update only if a full update hasn't been requested, and the last successful
+        // hasn't exceeded the metadata refresh time.
+<span class="nc bnc" id="L746" title="All 4 branches missed.">        if (!this.needFullUpdate &amp;&amp; this.lastSuccessfulRefreshMs + this.metadataExpireMs &gt; nowMs) {</span>
+<span class="nc" id="L747">            request = newMetadataRequestBuilderForNewTopics();</span>
+<span class="nc" id="L748">            isPartialUpdate = true;</span>
+        }
+<span class="nc bnc" id="L750" title="All 2 branches missed.">        if (request == null) {</span>
+<span class="nc" id="L751">            request = newMetadataRequestBuilder();</span>
+<span class="nc" id="L752">            isPartialUpdate = false;</span>
+        }
+<span class="nc" id="L754">        return new MetadataRequestAndVersion(request, requestVersion, isPartialUpdate);</span>
+    }
+
+    /**
+     * Constructs and returns a metadata request builder for fetching cluster data and all active topics.
+     *
+     * @return the constructed non-null metadata builder
+     */
+    protected MetadataRequest.Builder newMetadataRequestBuilder() {
+<span class="nc" id="L763">        return MetadataRequest.Builder.allTopics();</span>
+    }
+
+    /**
+     * Constructs and returns a metadata request builder for fetching cluster data and any uncached topics,
+     * otherwise null if the functionality is not supported.
+     *
+     * @return the constructed metadata builder, or null if not supported
+     */
+    protected MetadataRequest.Builder newMetadataRequestBuilderForNewTopics() {
+<span class="nc" id="L773">        return null;</span>
+    }
+
+    /**
+     * @return Mapping from topic IDs to topic names for all topics in the cache.
+     */
+    public Map&lt;Uuid, String&gt; topicNames() {
+<span class="nc" id="L780">        return metadataSnapshot.topicNames();</span>
+    }
+
+    /**
+     * Based on the topic name, check if the topic metadata should be kept when received in a metadata response.
+     */
+    protected boolean retainTopic(String topic, boolean isInternal, long nowMs) {
+<span class="nc" id="L787">        return true;</span>
+    }
+
+    /**
+     * Based on the topic name and topic ID, check if the topic metadata should be kept when received in a metadata response.
+     */
+    protected boolean retainTopic(String topicName, Uuid topicId, boolean isInternal, long nowMs) {
+<span class="nc" id="L794">        return retainTopic(topicName, isInternal, nowMs);</span>
+    }
+
+    public static class MetadataRequestAndVersion {
+        public final MetadataRequest.Builder requestBuilder;
+        public final int requestVersion;
+        public final boolean isPartialUpdate;
+
+        private MetadataRequestAndVersion(MetadataRequest.Builder requestBuilder,
+                                          int requestVersion,
+<span class="nc" id="L804">                                          boolean isPartialUpdate) {</span>
+<span class="nc" id="L805">            this.requestBuilder = requestBuilder;</span>
+<span class="nc" id="L806">            this.requestVersion = requestVersion;</span>
+<span class="nc" id="L807">            this.isPartialUpdate = isPartialUpdate;</span>
+<span class="nc" id="L808">        }</span>
+    }
+
+    /**
+     * Represents current leader state known in metadata. It is possible that we know the leader, but not the
+     * epoch if the metadata is received from a broker which does not support a sufficient Metadata API version.
+     * It is also possible that we know of the leader epoch, but not the leader when it is derived
+     * from an external source (e.g. a committed offset).
+     */
+    public static class LeaderAndEpoch {
+<span class="nc" id="L818">        private static final LeaderAndEpoch NO_LEADER_OR_EPOCH = new LeaderAndEpoch(Optional.empty(), Optional.empty());</span>
+
+        public final Optional&lt;Node&gt; leader;
+        public final Optional&lt;Integer&gt; epoch;
+
+<span class="nc" id="L823">        public LeaderAndEpoch(Optional&lt;Node&gt; leader, Optional&lt;Integer&gt; epoch) {</span>
+<span class="nc" id="L824">            this.leader = Objects.requireNonNull(leader);</span>
+<span class="nc" id="L825">            this.epoch = Objects.requireNonNull(epoch);</span>
+<span class="nc" id="L826">        }</span>
+
+        public static LeaderAndEpoch noLeaderOrEpoch() {
+<span class="nc" id="L829">            return NO_LEADER_OR_EPOCH;</span>
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L834" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L835" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L837">            LeaderAndEpoch that = (LeaderAndEpoch) o;</span>
+
+<span class="nc bnc" id="L839" title="All 2 branches missed.">            if (!leader.equals(that.leader)) return false;</span>
+<span class="nc" id="L840">            return epoch.equals(that.epoch);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L845">            int result = leader.hashCode();</span>
+<span class="nc" id="L846">            result = 31 * result + epoch.hashCode();</span>
+<span class="nc" id="L847">            return result;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L852">            return &quot;LeaderAndEpoch{&quot; +</span>
+                    &quot;leader=&quot; + leader +
+<span class="nc" id="L854">                    &quot;, epoch=&quot; + epoch.map(Number::toString).orElse(&quot;absent&quot;) +</span>
+                    '}';
+        }
+    }
+
+    public static class LeaderIdAndEpoch {
+        public final Optional&lt;Integer&gt; leaderId;
+        public final Optional&lt;Integer&gt; epoch;
+
+<span class="nc" id="L863">        public LeaderIdAndEpoch(Optional&lt;Integer&gt; leaderId, Optional&lt;Integer&gt; epoch) {</span>
+<span class="nc" id="L864">            this.leaderId = Objects.requireNonNull(leaderId);</span>
+<span class="nc" id="L865">            this.epoch = Objects.requireNonNull(epoch);</span>
+<span class="nc" id="L866">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L870">            return &quot;LeaderIdAndEpoch{&quot; +</span>
+<span class="nc" id="L871">                &quot;leaderId=&quot; + leaderId.map(Number::toString).orElse(&quot;absent&quot;) +</span>
+<span class="nc" id="L872">                &quot;, epoch=&quot; + epoch.map(Number::toString).orElse(&quot;absent&quot;) +</span>
+                '}';
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

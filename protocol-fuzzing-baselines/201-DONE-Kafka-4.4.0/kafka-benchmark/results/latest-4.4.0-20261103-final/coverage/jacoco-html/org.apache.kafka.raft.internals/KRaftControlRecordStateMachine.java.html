@@ -1,0 +1,340 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KRaftControlRecordStateMachine.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.raft.internals</a> &gt; <span class="el_source">KRaftControlRecordStateMachine.java</span></div><h1>KRaftControlRecordStateMachine.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.raft.internals;
+
+import org.apache.kafka.common.message.KRaftVersionRecord;
+import org.apache.kafka.common.message.VotersRecord;
+import org.apache.kafka.common.utils.internals.BufferSupplier;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.raft.Batch;
+import org.apache.kafka.raft.ControlRecord;
+import org.apache.kafka.raft.ExternalKRaftMetrics;
+import org.apache.kafka.raft.Isolation;
+import org.apache.kafka.raft.LogFetchInfo;
+import org.apache.kafka.raft.RaftLog;
+import org.apache.kafka.raft.VoterSet;
+import org.apache.kafka.server.common.KRaftVersion;
+import org.apache.kafka.server.common.serialization.RecordSerde;
+import org.apache.kafka.snapshot.RawSnapshotReader;
+import org.apache.kafka.snapshot.RecordsSnapshotReader;
+import org.apache.kafka.snapshot.SnapshotReader;
+
+import org.slf4j.Logger;
+
+import java.util.Optional;
+import java.util.OptionalLong;
+
+/**
+ * The KRaft state machine for tracking control records in the topic partition.
+ *
+ * This type keeps track of changes to the finalized kraft.version and the sets of voters between
+ * the latest snapshot and the log end offset.
+ *
+ * There are two type of actors/threads accessing this type. One is the KRaft driver which indirectly call a lot of
+ * the public methods. The other actors/threads are the callers of {@code RaftClient.createSnapshot} which
+ * indirectly call {@code voterSetAtOffset} and {@code kraftVersionAtOffset} when freezing a snapshot.
+ */
+public final class KRaftControlRecordStateMachine {
+    private static final long STARTING_NEXT_OFFSET = -1;
+    private static final long SMALLEST_LOG_OFFSET = 0;
+
+    private final LogContext logContext;
+    private final RaftLog log;
+    private final RecordSerde&lt;?&gt; serde;
+    private final Logger logger;
+    private final int maxBatchSizeBytes;
+
+    // These objects are synchronized using their respective object monitor. The two actors
+    // are the KRaft driver when calling updateState and the RaftClient callers when freezing
+    // snapshots
+    private final VoterSetHistory voterSetHistory;
+<span class="nc" id="L65">    private final LogHistory&lt;KRaftVersion&gt; kraftVersionHistory = new TreeMapLogHistory&lt;&gt;();</span>
+
+    // This synchronization is enough because
+    // 1. The write operation updateState only sets the value without reading it and updates to
+    // voterSetHistory or kraftVersionHistory are done before setting the nextOffset
+    //
+    // 2. The read operations lastVoterSet, voterSetAtOffset and kraftVersionAtOffset read
+    // the nextOffset first before reading voterSetHistory or kraftVersionHistory
+<span class="nc" id="L73">    private volatile long nextOffset = STARTING_NEXT_OFFSET;</span>
+    private final KafkaRaftMetrics kafkaRaftMetrics;
+    private final ExternalKRaftMetrics externalKRaftMetrics;
+    private final VoterSet staticVoterSet;
+
+    /**
+     * Constructs an internal log listener
+     *
+     * @param staticVoterSet the set of voter statically configured
+     * @param log the on disk topic partition
+     * @param serde the record decoder for data records
+     * @param maxBatchSizeBytes the maximum size of record batch
+     * @param logContext the log context
+     */
+    public KRaftControlRecordStateMachine(
+        VoterSet staticVoterSet,
+        RaftLog log,
+        RecordSerde&lt;?&gt; serde,
+        int maxBatchSizeBytes,
+        LogContext logContext,
+        KafkaRaftMetrics kafkaRaftMetrics,
+        ExternalKRaftMetrics externalKRaftMetrics
+<span class="nc" id="L95">    ) {</span>
+<span class="nc" id="L96">        this.logContext = logContext;</span>
+<span class="nc" id="L97">        this.log = log;</span>
+<span class="nc" id="L98">        this.voterSetHistory = new VoterSetHistory(staticVoterSet, logContext);</span>
+<span class="nc" id="L99">        this.serde = serde;</span>
+<span class="nc" id="L100">        this.maxBatchSizeBytes = maxBatchSizeBytes;</span>
+<span class="nc" id="L101">        this.logger = logContext.logger(getClass());</span>
+<span class="nc" id="L102">        this.kafkaRaftMetrics = kafkaRaftMetrics;</span>
+<span class="nc" id="L103">        this.externalKRaftMetrics = externalKRaftMetrics;</span>
+<span class="nc" id="L104">        this.staticVoterSet = staticVoterSet;</span>
+
+<span class="nc" id="L106">        kafkaRaftMetrics.updateNumVoters(staticVoterSet.size());</span>
+<span class="nc" id="L107">    }</span>
+
+    /**
+     * Must be called whenever the {@code log} has changed.
+     */
+    public void updateState() {
+<span class="nc" id="L113">        maybeLoadSnapshot();</span>
+<span class="nc" id="L114">        maybeLoadLog();</span>
+<span class="nc" id="L115">    }</span>
+
+    /**
+     * Remove the head of the log until the given offset.
+     *
+     * @param endOffset the end offset (exclusive)
+     */
+    public void truncateNewEntries(long endOffset) {
+<span class="nc" id="L123">        synchronized (voterSetHistory) {</span>
+<span class="nc" id="L124">            voterSetHistory.truncateNewEntries(endOffset);</span>
+<span class="nc" id="L125">        }</span>
+<span class="nc" id="L126">        synchronized (kraftVersionHistory) {</span>
+<span class="nc" id="L127">            kraftVersionHistory.truncateNewEntries(endOffset);</span>
+<span class="nc" id="L128">        }</span>
+
+<span class="nc" id="L130">        kafkaRaftMetrics.updateNumVoters(voterSetHistory.lastValue().size());</span>
+<span class="nc bnc" id="L131" title="All 4 branches missed.">        if (!staticVoterSet.isEmpty() &amp;&amp; voterSetHistory.lastEntry().isEmpty()) {</span>
+<span class="nc" id="L132">            externalKRaftMetrics.setIgnoredStaticVoters(false);</span>
+        }
+<span class="nc" id="L134">    }</span>
+
+    /**
+     * Remove the tail of the log until the given offset.
+     *
+     * @param startOffset the start offset (inclusive)
+     */
+    public void truncateOldEntries(long startOffset) {
+<span class="nc" id="L142">        synchronized (voterSetHistory) {</span>
+<span class="nc" id="L143">            voterSetHistory.truncateOldEntries(startOffset);</span>
+<span class="nc" id="L144">        }</span>
+<span class="nc" id="L145">        synchronized (kraftVersionHistory) {</span>
+<span class="nc" id="L146">            kraftVersionHistory.truncateOldEntries(startOffset);</span>
+<span class="nc" id="L147">        }</span>
+<span class="nc" id="L148">    }</span>
+
+    /**
+     * Returns the last voter set.
+     */
+    public VoterSet lastVoterSet() {
+<span class="nc" id="L154">        synchronized (voterSetHistory) {</span>
+<span class="nc" id="L155">            return voterSetHistory.lastValue();</span>
+        }
+    }
+
+    /**
+     * Return the latest entry for the set of voters.
+     */
+    public Optional&lt;LogHistory.Entry&lt;VoterSet&gt;&gt; lastVoterSetEntry() {
+<span class="nc" id="L163">        synchronized (voterSetHistory) {</span>
+<span class="nc" id="L164">            return voterSetHistory.lastEntry();</span>
+        }
+    }
+
+    /**
+     * Returns the offset of the last voter set.
+     */
+    public OptionalLong lastVoterSetOffset() {
+<span class="nc" id="L172">        synchronized (voterSetHistory) {</span>
+<span class="nc" id="L173">            return voterSetHistory.lastVoterSetOffset();</span>
+        }
+    }
+
+    /**
+     * Returns the last kraft version.
+     */
+    public KRaftVersion lastKraftVersion() {
+<span class="nc" id="L181">        synchronized (kraftVersionHistory) {</span>
+<span class="nc" id="L182">            return kraftVersionHistory.lastEntry().map(LogHistory.Entry::value).</span>
+<span class="nc" id="L183">                orElse(KRaftVersion.KRAFT_VERSION_0);</span>
+        }
+    }
+
+    /**
+     * Returns the voter set at a given offset.
+     *
+     * @param offset the offset (inclusive)
+     * @return the voter set if one exist, otherwise {@code Optional.empty()}
+     */
+    public Optional&lt;VoterSet&gt; voterSetAtOffset(long offset) {
+<span class="nc" id="L194">        checkOffsetIsValid(offset);</span>
+
+<span class="nc" id="L196">        synchronized (voterSetHistory) {</span>
+<span class="nc" id="L197">            return voterSetHistory.valueAtOrBefore(offset);</span>
+        }
+    }
+
+    /**
+     * Returns the finalized kraft version at a given offset.
+     *
+     * @param offset the offset (inclusive)
+     * @return the finalized kraft version if one exist, otherwise 0
+     */
+    public KRaftVersion kraftVersionAtOffset(long offset) {
+<span class="nc" id="L208">        checkOffsetIsValid(offset);</span>
+
+<span class="nc" id="L210">        synchronized (kraftVersionHistory) {</span>
+<span class="nc" id="L211">            return kraftVersionHistory.valueAtOrBefore(offset).</span>
+<span class="nc" id="L212">                orElse(KRaftVersion.KRAFT_VERSION_0);</span>
+        }
+    }
+
+    private void checkOffsetIsValid(long offset) {
+<span class="nc" id="L217">        long fixedNextOffset = nextOffset;</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        if (offset &gt;= fixedNextOffset) {</span>
+<span class="nc" id="L219">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L220">                String.format(</span>
+                    &quot;Attempting the read a value at an offset (%d) which is greater than or &quot; +
+                    &quot;equal to the largest known offset (%d)&quot;,
+<span class="nc" id="L223">                    offset,</span>
+<span class="nc" id="L224">                    fixedNextOffset - 1</span>
+                )
+            );
+        }
+<span class="nc" id="L228">    }</span>
+
+    private void maybeLoadLog() {
+<span class="nc" id="L231">        try (BufferSupplier bufferSupplier = BufferSupplier.create()) {</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">            while (log.endOffset().offset() &gt; nextOffset) {</span>
+<span class="nc" id="L233">                LogFetchInfo info = log.read(</span>
+                    nextOffset,
+                    Isolation.UNCOMMITTED,
+                    Integer.MAX_VALUE
+                );
+<span class="nc" id="L238">                try (RecordsIterator&lt;?&gt; iterator = new RecordsIterator&lt;&gt;(</span>
+                        info.records,
+                        serde,
+                        bufferSupplier,
+                        maxBatchSizeBytes,
+                        true, // Validate batch CRC
+                        logContext
+                    )
+                ) {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                    while (iterator.hasNext()) {</span>
+<span class="nc" id="L248">                        Batch&lt;?&gt; batch = iterator.next();</span>
+<span class="nc" id="L249">                        handleBatch(batch, OptionalLong.empty());</span>
+<span class="nc" id="L250">                        nextOffset = batch.lastOffset() + 1;</span>
+<span class="nc" id="L251">                    }</span>
+                }
+<span class="nc" id="L253">            }</span>
+        }
+<span class="nc" id="L255">    }</span>
+
+    private void maybeLoadSnapshot() {
+<span class="nc bnc" id="L258" title="All 6 branches missed.">        if ((nextOffset == STARTING_NEXT_OFFSET || nextOffset &lt; log.startOffset()) &amp;&amp; log.latestSnapshot().isPresent()) {</span>
+<span class="nc" id="L259">            RawSnapshotReader rawSnapshot = log.latestSnapshot().get();</span>
+            // Clear the current state
+<span class="nc" id="L261">            synchronized (kraftVersionHistory) {</span>
+<span class="nc" id="L262">                kraftVersionHistory.clear();</span>
+<span class="nc" id="L263">            }</span>
+<span class="nc" id="L264">            synchronized (voterSetHistory) {</span>
+<span class="nc" id="L265">                voterSetHistory.clear();</span>
+<span class="nc" id="L266">            }</span>
+
+            // Load the snapshot since the listener is at the start of the log or the log doesn't have the next entry.
+<span class="nc" id="L269">            try (BufferSupplier bufferSupplier = BufferSupplier.create();</span>
+<span class="nc" id="L270">                 SnapshotReader&lt;?&gt; reader = RecordsSnapshotReader.of(</span>
+                    rawSnapshot,
+                    serde,
+                    bufferSupplier,
+                    maxBatchSizeBytes,
+                    true, // Validate batch CRC
+                    logContext
+                )
+            ) {
+<span class="nc" id="L279">                logger.info(</span>
+                    &quot;Loading snapshot ({}) since log start offset ({}) is greater than the internal listener's next offset ({})&quot;,
+<span class="nc" id="L281">                    reader.snapshotId(),</span>
+<span class="nc" id="L282">                    log.startOffset(),</span>
+<span class="nc" id="L283">                    nextOffset</span>
+                );
+<span class="nc" id="L285">                OptionalLong currentOffset = OptionalLong.of(reader.lastContainedLogOffset());</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">                while (reader.hasNext()) {</span>
+<span class="nc" id="L287">                    Batch&lt;?&gt; batch = reader.next();</span>
+<span class="nc" id="L288">                    handleBatch(batch, currentOffset);</span>
+<span class="nc" id="L289">                }</span>
+
+<span class="nc" id="L291">                nextOffset = reader.lastContainedLogOffset() + 1;</span>
+            }
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        } else if (nextOffset == STARTING_NEXT_OFFSET) {</span>
+            // Listener just started and there are no snapshots; set the nextOffset to
+            // 0 to start reading the log
+<span class="nc" id="L296">            nextOffset = SMALLEST_LOG_OFFSET;</span>
+        }
+<span class="nc" id="L298">    }</span>
+
+    private void handleBatch(Batch&lt;?&gt; batch, OptionalLong overrideOffset) {
+<span class="nc" id="L301">        int offsetDelta = 0;</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        for (ControlRecord record : batch.controlRecords()) {</span>
+<span class="nc" id="L303">            long currentOffset = overrideOffset.orElse(batch.baseOffset() + offsetDelta);</span>
+<span class="nc bnc" id="L304" title="All 3 branches missed.">            switch (record.type()) {</span>
+                case KRAFT_VOTERS:
+<span class="nc" id="L306">                    VoterSet voters = VoterSet.fromVotersRecord((VotersRecord) record.message());</span>
+<span class="nc" id="L307">                    kafkaRaftMetrics.updateNumVoters(voters.size());</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">                    if (!staticVoterSet.isEmpty()) {</span>
+<span class="nc" id="L309">                        externalKRaftMetrics.setIgnoredStaticVoters(true);</span>
+                    }
+<span class="nc" id="L311">                    logger.info(&quot;Latest set of voters is {} at offset {}&quot;, voters, currentOffset);</span>
+<span class="nc" id="L312">                    synchronized (voterSetHistory) {</span>
+<span class="nc" id="L313">                        voterSetHistory.addAt(currentOffset, voters);</span>
+<span class="nc" id="L314">                    }</span>
+<span class="nc" id="L315">                    break;</span>
+
+                case KRAFT_VERSION:
+<span class="nc" id="L318">                    KRaftVersion kraftVersion = KRaftVersion.fromFeatureLevel(</span>
+<span class="nc" id="L319">                        ((KRaftVersionRecord) record.message()).kRaftVersion()</span>
+                    );
+<span class="nc" id="L321">                    logger.info(</span>
+                        &quot;Latest {} is {} at offset {}&quot;,
+                        KRaftVersion.FEATURE_NAME,
+                        kraftVersion,
+<span class="nc" id="L325">                        currentOffset</span>
+                    );
+<span class="nc" id="L327">                    synchronized (kraftVersionHistory) {</span>
+<span class="nc" id="L328">                        kraftVersionHistory.addAt(currentOffset, kraftVersion);</span>
+<span class="nc" id="L329">                    }</span>
+<span class="nc" id="L330">                    break;</span>
+
+                default:
+                    // Skip the rest of the control records
+                    break;
+            }
+<span class="nc" id="L336">            ++offsetDelta;</span>
+<span class="nc" id="L337">        }</span>
+<span class="nc" id="L338">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

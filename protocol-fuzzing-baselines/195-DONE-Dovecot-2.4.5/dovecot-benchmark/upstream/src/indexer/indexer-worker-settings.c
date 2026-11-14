@@ -1,0 +1,49 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "buffer.h"
+#include "settings-parser.h"
+#include "service-settings.h"
+
+struct service_settings indexer_worker_service_settings = {
+	.name = "indexer-worker",
+	.protocol = "",
+	.type = "worker",
+	.executable = "indexer-worker",
+	.user = "",
+	.group = "",
+	.privileged_group = "",
+	.chroot = "",
+
+	.drop_priv_before_exec = FALSE,
+
+	.process_limit = 10,
+	.client_limit = 1,
+#ifdef DOVECOT_PRO_EDITION
+	.restart_request_count = 1000,
+#else
+	.restart_request_count = 1,
+#endif
+
+	.unix_listeners = ARRAY_INIT,
+	.fifo_listeners = ARRAY_INIT,
+	.inet_listeners = ARRAY_INIT
+};
+
+const struct setting_keyvalue indexer_worker_service_settings_defaults[] = {
+	{ "unix_listener", "indexer-worker srv.indexer-worker\\s%{pid}" },
+
+	{ "unix_listener/indexer-worker/path", "indexer-worker" },
+	{ "unix_listener/indexer-worker/mode", "0600" },
+	{ "unix_listener/indexer-worker/user", "$SET:default_internal_user" },
+
+	{ "unix_listener/srv.indexer-worker\\s%{pid}/path", "srv.indexer-worker/%{pid}" },
+	{ "unix_listener/srv.indexer-worker\\s%{pid}/type", "admin" },
+	{ "unix_listener/srv.indexer-worker\\s%{pid}/mode", "0600" },
+
+	/* This needs to be here explicitly until the backwards compatibility
+	   is removed from settings-history-core.txt */
+	{ "service_extra_groups", "" },
+
+	{ NULL, NULL }
+};

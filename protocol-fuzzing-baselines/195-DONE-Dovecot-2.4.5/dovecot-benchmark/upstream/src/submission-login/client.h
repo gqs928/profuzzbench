@@ -1,0 +1,45 @@
+#ifndef CLIENT_H
+#define CLIENT_H
+
+#include "net.h"
+#include "client-common.h"
+#include "auth-client.h"
+#include "smtp-server.h"
+#include "smtp-dovecot.h"
+
+enum submission_proxy_state {
+	SUBMISSION_PROXY_BANNER = 0,
+	SUBMISSION_PROXY_EHLO,
+	SUBMISSION_PROXY_STARTTLS,
+	SUBMISSION_PROXY_TLS_EHLO,
+	SUBMISSION_PROXY_XCLIENT,
+	SUBMISSION_PROXY_XCLIENT_EHLO,
+	SUBMISSION_PROXY_AUTHENTICATE,
+
+	SUBMISSION_PROXY_STATE_COUNT
+};
+
+struct submission_client {
+	struct client common;
+	const struct submission_login_settings *set;
+	enum smtp_capability backend_capabilities;
+
+	struct smtp_server_connection *conn;
+
+	struct smtp_server_cmd_ctx *auth_cmd;
+	struct smtp_server_cmd_auth *auth_cmd_data;
+
+	enum submission_proxy_state proxy_state;
+	enum smtp_capability proxy_capability;
+	char *proxy_sasl_ir;
+	unsigned int proxy_reply_status;
+	unsigned int proxy_reply_lines;
+	struct smtp_server_reply *proxy_reply;
+	const char **proxy_xclient;
+	unsigned int proxy_xclient_replies_expected;
+
+	bool auth_cmd_implicit:1;
+	bool auth_cmd_deferred:1;
+};
+
+#endif

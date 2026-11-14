@@ -1,0 +1,386 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DefaultTaskManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals.tasks</a> &gt; <span class="el_source">DefaultTaskManager.java</span></div><h1>DefaultTaskManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals.tasks;
+
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.internals.KafkaFutureImpl;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.ReadOnlyTask;
+import org.apache.kafka.streams.processor.internals.StreamTask;
+import org.apache.kafka.streams.processor.internals.Task;
+import org.apache.kafka.streams.processor.internals.TaskExecutionMetadata;
+import org.apache.kafka.streams.processor.internals.TasksRegistry;
+
+import org.slf4j.Logger;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+/**
+ * An active task could only be in one of the following status:
+ *
+ * 1. It's assigned to one of the executors for processing.
+ * 2. It's locked for committing, removal, other manipulations etc.
+ * 3. Neither 1 or 2, i.e. it stays idle. This is possible if we do not have enough executors or because those tasks
+ *    are not processable (e.g. because no records fetched) yet.
+ */
+<span class="nc" id="L54">public final class DefaultTaskManager implements TaskManager {</span>
+
+    private final Time time;
+    private final Logger log;
+    private final TasksRegistry tasks;
+
+<span class="nc" id="L60">    private final Lock tasksLock = new ReentrantLock();</span>
+<span class="nc" id="L61">    private final Condition tasksCondition = tasksLock.newCondition();</span>
+<span class="nc" id="L62">    private final List&lt;TaskId&gt; lockedTasks = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L63">    private final Map&lt;TaskId, StreamsException&gt; uncaughtExceptions = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L64">    private final Map&lt;TaskId, TaskExecutor&gt; assignedTasks = new HashMap&lt;&gt;();</span>
+    private final TaskExecutionMetadata taskExecutionMetadata;
+
+    private final List&lt;TaskExecutor&gt; taskExecutors;
+
+<span class="nc" id="L69">    public static class DefaultTaskExecutorCreator implements TaskExecutorCreator {</span>
+        @Override
+        public TaskExecutor create(final TaskManager taskManager, final String name, final Time time, final TaskExecutionMetadata taskExecutionMetadata) {
+<span class="nc" id="L72">            return new DefaultTaskExecutor(taskManager, name, time, taskExecutionMetadata);</span>
+        }
+    }
+
+    public DefaultTaskManager(final Time time,
+                              final String clientId,
+                              final TasksRegistry tasks,
+                              final TaskExecutorCreator executorCreator,
+                              final TaskExecutionMetadata taskExecutionMetadata,
+                              final int numExecutors
+<span class="nc" id="L82">                              ) {</span>
+<span class="nc" id="L83">        final String logPrefix = String.format(&quot;%s &quot;, clientId);</span>
+<span class="nc" id="L84">        final LogContext logContext = new LogContext(logPrefix);</span>
+<span class="nc" id="L85">        this.log = logContext.logger(DefaultTaskManager.class);</span>
+<span class="nc" id="L86">        this.time = time;</span>
+<span class="nc" id="L87">        this.tasks = tasks;</span>
+<span class="nc" id="L88">        this.taskExecutionMetadata = taskExecutionMetadata;</span>
+
+<span class="nc" id="L90">        this.taskExecutors = new ArrayList&lt;&gt;(numExecutors);</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">        for (int i = 1; i &lt;= numExecutors; i++) {</span>
+<span class="nc" id="L92">            final String name = clientId + &quot;-TaskExecutor-&quot; + i;</span>
+<span class="nc" id="L93">            this.taskExecutors.add(executorCreator.create(this, name, time, taskExecutionMetadata));</span>
+        }
+<span class="nc" id="L95">    }</span>
+
+    @Override
+    public StreamTask assignNextTask(final TaskExecutor executor) {
+<span class="nc" id="L99">        return returnWithTasksLocked(() -&gt; {</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">            if (!taskExecutors.contains(executor)) {</span>
+<span class="nc" id="L101">                throw new IllegalArgumentException(&quot;The requested executor for getting next task to assign is unrecognized&quot;);</span>
+            }
+
+            // the most naive scheduling algorithm for now: give the next unlocked, unassigned, and  processable task
+<span class="nc bnc" id="L105" title="All 2 branches missed.">            for (final StreamTask task : tasks.activeInitializedTasks()) {</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">                if (!assignedTasks.containsKey(task.id()) &amp;&amp;</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">                    !lockedTasks.contains(task.id()) &amp;&amp;</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">                    canProgress(task, time.milliseconds()) &amp;&amp;</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">                    !hasUncaughtException(task.id())</span>
+                ) {
+
+<span class="nc" id="L112">                    assignedTasks.put(task.id(), executor);</span>
+
+<span class="nc" id="L114">                    log.debug(&quot;Assigned task {} to executor {}&quot;, task.id(), executor.name());</span>
+
+<span class="nc" id="L116">                    return task;</span>
+                }
+<span class="nc" id="L118">            }</span>
+
+<span class="nc" id="L120">            log.debug(&quot;Found no assignable task for executor {}&quot;, executor.name());</span>
+
+<span class="nc" id="L122">            return null;</span>
+        });
+    }
+
+    @Override
+    public void awaitProcessableTasks(final Supplier&lt;Boolean&gt; isShuttingDown) throws InterruptedException {
+<span class="nc" id="L128">        final boolean interrupted = returnWithTasksLocked(() -&gt; {</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            for (final StreamTask task : tasks.activeInitializedTasks()) {</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">                if (!assignedTasks.containsKey(task.id()) &amp;&amp;</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">                    !lockedTasks.contains(task.id()) &amp;&amp;</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">                    canProgress(task, time.milliseconds()) &amp;&amp;</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">                    !hasUncaughtException(task.id())</span>
+                ) {
+<span class="nc" id="L135">                    log.debug(&quot;Await unblocked: returning early from await since a processable task {} was found&quot;, task.id());</span>
+<span class="nc" id="L136">                    return false;</span>
+                }
+<span class="nc" id="L138">            }</span>
+            try {
+                // We re-check the shutdownRequest atomic boolean to avoid a race condition. If this thread was
+                // previously interrupted while awaiting tasksCondition, it is possible to miss the signalAll that
+                // is called during shutdown. If this happens, we end up blocking in the await forever.
+<span class="nc bnc" id="L143" title="All 2 branches missed.">                if (!isShuttingDown.get()) {</span>
+<span class="nc" id="L144">                    log.debug(&quot;Await blocking&quot;);</span>
+<span class="nc" id="L145">                    tasksCondition.await();</span>
+                } else {
+<span class="nc" id="L147">                    log.debug(&quot;Not awaiting since shutdown was requested&quot;);</span>
+                }
+<span class="nc" id="L149">            } catch (final InterruptedException e) {</span>
+<span class="nc" id="L150">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L151">                log.warn(&quot;Await unblocked: Interrupted while waiting for processable tasks&quot;, e);</span>
+<span class="nc" id="L152">                return true;</span>
+<span class="nc" id="L153">            }</span>
+<span class="nc" id="L154">            log.debug(&quot;Await unblocked: Woken up to check for processable tasks&quot;);</span>
+<span class="nc" id="L155">            return false;</span>
+        });
+
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (interrupted) {</span>
+<span class="nc" id="L159">            throw new InterruptedException();</span>
+        }
+<span class="nc" id="L161">    }</span>
+
+    public void signalTaskExecutors() {
+<span class="nc" id="L164">        log.debug(&quot;Waking up task executors&quot;);</span>
+<span class="nc" id="L165">        executeWithTasksLocked(tasksCondition::signalAll);</span>
+<span class="nc" id="L166">    }</span>
+
+    @Override
+    public void unassignTask(final StreamTask task, final TaskExecutor executor) {
+<span class="nc" id="L170">        executeWithTasksLocked(() -&gt; {</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">            if (!taskExecutors.contains(executor)) {</span>
+<span class="nc" id="L172">                throw new IllegalArgumentException(&quot;The requested executor for unassign task is unrecognized&quot;);</span>
+            }
+
+<span class="nc" id="L175">            final TaskExecutor lockedExecutor = assignedTasks.get(task.id());</span>
+<span class="nc bnc" id="L176" title="All 4 branches missed.">            if (lockedExecutor == null || lockedExecutor != executor) {</span>
+<span class="nc" id="L177">                throw new IllegalArgumentException(&quot;Task &quot; + task.id() + &quot; is not locked by the executor&quot;);</span>
+            }
+
+<span class="nc" id="L180">            assignedTasks.remove(task.id());</span>
+
+<span class="nc" id="L182">            log.debug(&quot;Unassigned {} from executor {}&quot;, task.id(), executor.name());</span>
+<span class="nc" id="L183">            tasksCondition.signalAll();</span>
+<span class="nc" id="L184">        });</span>
+<span class="nc" id="L185">    }</span>
+
+    @Override
+    public KafkaFuture&lt;Void&gt; lockTasks(final Set&lt;TaskId&gt; taskIds) {
+<span class="nc" id="L189">        final KafkaFutureImpl&lt;Void&gt; result = new KafkaFutureImpl&lt;&gt;();</span>
+
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (taskIds.isEmpty()) {</span>
+<span class="nc" id="L192">            result.complete(null);</span>
+<span class="nc" id="L193">            return result;</span>
+        }
+
+<span class="nc" id="L196">        return returnWithTasksLocked(() -&gt; {</span>
+<span class="nc" id="L197">            lockedTasks.addAll(taskIds);</span>
+
+<span class="nc" id="L199">            final Set&lt;TaskId&gt; remainingTaskIds = new ConcurrentSkipListSet&lt;&gt;(taskIds);</span>
+
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            for (final TaskId taskId : taskIds) {</span>
+<span class="nc" id="L202">                final Task task = tasks.initializedTask(taskId);</span>
+
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                if (task == null) {</span>
+<span class="nc" id="L205">                    throw new IllegalArgumentException(&quot;Trying to lock task &quot; + taskId + &quot; but it's not owned&quot;);</span>
+                }
+
+<span class="nc bnc" id="L208" title="All 2 branches missed.">                if (!task.isActive()) {</span>
+<span class="nc" id="L209">                    throw new IllegalArgumentException(&quot;The locking task &quot; + taskId + &quot; is not an active task&quot;);</span>
+                }
+
+<span class="nc bnc" id="L212" title="All 2 branches missed.">                if (assignedTasks.containsKey(taskId)) {</span>
+<span class="nc" id="L213">                    final TaskExecutor executor = assignedTasks.get(taskId);</span>
+<span class="nc" id="L214">                    log.debug(&quot;Requesting release of task {} from {}&quot;, taskId, executor.name());</span>
+<span class="nc" id="L215">                    final KafkaFuture&lt;StreamTask&gt; future = executor.unassign();</span>
+<span class="nc" id="L216">                    future.whenComplete((streamTask, throwable) -&gt; {</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">                        if (throwable != null) {</span>
+<span class="nc" id="L218">                            result.completeExceptionally(throwable);</span>
+                        } else {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                            assert !assignedTasks.containsKey(taskId);</span>
+                            // It can happen that the executor handed back the task before we asked it to
+                            // in which case `streamTask` will be null here.
+<span class="nc bnc" id="L223" title="All 4 branches missed.">                            assert streamTask == null || streamTask.id() == taskId;</span>
+<span class="nc" id="L224">                            remainingTaskIds.remove(taskId);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">                            if (remainingTaskIds.isEmpty()) {</span>
+<span class="nc" id="L226">                                result.complete(null);</span>
+                            }
+                        }
+<span class="nc" id="L229">                    });</span>
+<span class="nc" id="L230">                } else {</span>
+<span class="nc" id="L231">                    remainingTaskIds.remove(taskId);</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">                    if (remainingTaskIds.isEmpty()) {</span>
+<span class="nc" id="L233">                        result.complete(null);</span>
+                    }
+                }
+<span class="nc" id="L236">            }</span>
+
+<span class="nc" id="L238">            return result;</span>
+        });
+    }
+
+    @Override
+    public KafkaFuture&lt;Void&gt; lockAllTasks() {
+<span class="nc" id="L244">        return returnWithTasksLocked(() -&gt;</span>
+<span class="nc" id="L245">            lockTasks(tasks.activeInitializedTasks().stream().map(Task::id).collect(Collectors.toSet()))</span>
+        );
+    }
+
+    @Override
+    public void unlockTasks(final Set&lt;TaskId&gt; taskIds) {
+
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        if (taskIds.isEmpty()) {</span>
+<span class="nc" id="L253">            return;</span>
+        }
+
+<span class="nc" id="L256">        executeWithTasksLocked(() -&gt; {</span>
+<span class="nc" id="L257">            lockedTasks.removeAll(taskIds);</span>
+<span class="nc" id="L258">            log.debug(&quot;Waking up task executors&quot;);</span>
+<span class="nc" id="L259">            tasksCondition.signalAll();</span>
+<span class="nc" id="L260">        });</span>
+<span class="nc" id="L261">    }</span>
+
+    @Override
+    public void unlockAllTasks() {
+<span class="nc" id="L265">        executeWithTasksLocked(() -&gt; unlockTasks(tasks.activeInitializedTasks().stream().map(Task::id).collect(Collectors.toSet())));</span>
+<span class="nc" id="L266">    }</span>
+
+    @Override
+    public void add(final Set&lt;StreamTask&gt; tasksToAdd) {
+<span class="nc" id="L270">        executeWithTasksLocked(() -&gt; {</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            for (final StreamTask task : tasksToAdd) {</span>
+<span class="nc" id="L272">                tasks.addActiveTask(task);</span>
+<span class="nc" id="L273">            }</span>
+<span class="nc" id="L274">            log.debug(&quot;Waking up task executors&quot;);</span>
+<span class="nc" id="L275">            tasksCondition.signalAll();</span>
+<span class="nc" id="L276">        });</span>
+
+<span class="nc" id="L278">        log.info(&quot;Added tasks {} to the task manager to process&quot;, tasksToAdd);</span>
+<span class="nc" id="L279">    }</span>
+
+    @Override
+    public void remove(final TaskId taskId) {
+<span class="nc" id="L283">        executeWithTasksLocked(() -&gt; {</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            if (assignedTasks.containsKey(taskId)) {</span>
+<span class="nc" id="L285">                throw new IllegalArgumentException(&quot;The task to remove is still assigned to executors&quot;);</span>
+            }
+
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            if (!lockedTasks.contains(taskId)) {</span>
+<span class="nc" id="L289">                throw new IllegalArgumentException(&quot;The task to remove is not locked yet by the task manager&quot;);</span>
+            }
+
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            if (!tasks.containsInitialized(taskId)) {</span>
+<span class="nc" id="L293">                throw new IllegalArgumentException(&quot;The task to remove is not owned by the task manager&quot;);</span>
+            }
+
+<span class="nc" id="L296">            tasks.removeTask(tasks.initializedTask(taskId));</span>
+<span class="nc" id="L297">        });</span>
+
+<span class="nc" id="L299">        log.info(&quot;Removed task {} from the task manager&quot;, taskId);</span>
+<span class="nc" id="L300">    }</span>
+
+    @Override
+    public Set&lt;ReadOnlyTask&gt; getTasks() {
+<span class="nc" id="L304">        return returnWithTasksLocked(() -&gt; tasks.activeInitializedTasks().stream().map(ReadOnlyTask::new).collect(Collectors.toSet()));</span>
+    }
+
+    @Override
+    public void setUncaughtException(final StreamsException exception, final TaskId taskId) {
+<span class="nc" id="L309">        executeWithTasksLocked(() -&gt; {</span>
+
+<span class="nc bnc" id="L311" title="All 2 branches missed.">            if (!assignedTasks.containsKey(taskId)) {</span>
+<span class="nc" id="L312">                throw new IllegalArgumentException(&quot;An uncaught exception can only be set as long as the task is still assigned&quot;);</span>
+            }
+
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            if (uncaughtExceptions.containsKey(taskId)) {</span>
+<span class="nc" id="L316">                throw new IllegalArgumentException(&quot;The uncaught exception must be cleared before restarting processing&quot;);</span>
+            }
+
+<span class="nc" id="L319">            uncaughtExceptions.put(taskId, exception);</span>
+<span class="nc" id="L320">        });</span>
+
+<span class="nc" id="L322">        log.info(&quot;Set an uncaught exception of type {} for task {}, with error message: {}&quot;,</span>
+<span class="nc" id="L323">            exception.getClass().getName(),</span>
+            taskId,
+<span class="nc" id="L325">            exception.getMessage());</span>
+<span class="nc" id="L326">    }</span>
+
+    public Map&lt;TaskId, RuntimeException&gt; drainUncaughtExceptions() {
+<span class="nc" id="L329">        final Map&lt;TaskId, RuntimeException&gt; returnValue = returnWithTasksLocked(() -&gt; {</span>
+<span class="nc" id="L330">            final Map&lt;TaskId, RuntimeException&gt; result = new HashMap&lt;&gt;(uncaughtExceptions);</span>
+<span class="nc" id="L331">            uncaughtExceptions.clear();</span>
+<span class="nc" id="L332">            return result;</span>
+        });
+
+<span class="nc bnc" id="L335" title="All 2 branches missed.">        if (!returnValue.isEmpty()) {</span>
+<span class="nc" id="L336">            log.debug(&quot;Drained {} uncaught exceptions&quot;, returnValue.size());</span>
+        }
+
+<span class="nc" id="L339">        return returnValue;</span>
+    }
+
+    public boolean hasUncaughtException(final TaskId taskId) {
+<span class="nc" id="L343">        return returnWithTasksLocked(() -&gt; uncaughtExceptions.containsKey(taskId));</span>
+    }
+
+    private void executeWithTasksLocked(final Runnable action) {
+<span class="nc" id="L347">        tasksLock.lock();</span>
+        try {
+<span class="nc" id="L349">            action.run();</span>
+        } finally {
+<span class="nc" id="L351">            tasksLock.unlock();</span>
+        }
+<span class="nc" id="L353">    }</span>
+
+    private &lt;T&gt; T returnWithTasksLocked(final Supplier&lt;T&gt; action) {
+<span class="nc" id="L356">        tasksLock.lock();</span>
+        try {
+<span class="nc" id="L358">            return action.get();</span>
+        } finally {
+<span class="nc" id="L360">            tasksLock.unlock();</span>
+        }
+    }
+
+    private boolean canProgress(final StreamTask task, final long nowMs) {
+<span class="nc" id="L365">        return</span>
+<span class="nc bnc" id="L366" title="All 4 branches missed.">            taskExecutionMetadata.canProcessTask(task, nowMs) &amp;&amp; task.isProcessable(nowMs) ||</span>
+<span class="nc bnc" id="L367" title="All 6 branches missed.">                taskExecutionMetadata.canPunctuateTask(task) &amp;&amp; (task.canPunctuateStreamTime() || task.canPunctuateSystemTime());</span>
+    }
+
+    public void startTaskExecutors() {
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        for (final TaskExecutor t: taskExecutors) {</span>
+<span class="nc" id="L372">            t.start();</span>
+<span class="nc" id="L373">        }</span>
+<span class="nc" id="L374">    }</span>
+
+    public void shutdown(final Duration duration) {
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        for (final TaskExecutor t: taskExecutors) {</span>
+<span class="nc" id="L378">            t.requestShutdown();</span>
+<span class="nc" id="L379">        }</span>
+<span class="nc" id="L380">        signalTaskExecutors();</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        for (final TaskExecutor t: taskExecutors) {</span>
+<span class="nc" id="L382">            t.awaitShutdown(duration);</span>
+<span class="nc" id="L383">        }</span>
+<span class="nc" id="L384">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

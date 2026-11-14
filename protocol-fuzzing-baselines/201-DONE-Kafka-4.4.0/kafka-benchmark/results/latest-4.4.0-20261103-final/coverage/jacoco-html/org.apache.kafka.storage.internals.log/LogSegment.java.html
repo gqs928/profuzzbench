@@ -1,0 +1,903 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogSegment.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.storage.internals.log</a> &gt; <span class="el_source">LogSegment.java</span></div><h1>LogSegment.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.storage.internals.log;
+
+import org.apache.kafka.common.InvalidRecordException;
+import org.apache.kafka.common.errors.CorruptRecordException;
+import org.apache.kafka.common.message.AbortedTxn;
+import org.apache.kafka.common.record.internal.FileLogInputStream.FileChannelRecordBatch;
+import org.apache.kafka.common.record.internal.FileRecords;
+import org.apache.kafka.common.record.internal.FileRecords.LogOffsetPosition;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.BufferSupplier;
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+import org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache;
+
+import com.yammer.metrics.core.Timer;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.attribute.FileTime;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+
+/**
+ * A segment of the log. Each segment has two components: a log and an index. The log is a FileRecords containing
+ * the actual messages. The index is an OffsetIndex that maps from logical offsets to physical file positions. Each
+ * segment has a base offset which is an offset &lt;= the least offset of any message in this segment and &gt; any offset in
+ * any previous segment.
+ *
+ * A segment with a base offset of [base_offset] would be stored in two files, a [base_offset].index and a [base_offset].log file.
+ *
+ * This class is not thread-safe.
+ */
+public class LogSegment implements Closeable {
+<span class="nc" id="L66">    private static final Logger LOGGER = LoggerFactory.getLogger(LogSegment.class);</span>
+    private static final Timer LOG_FLUSH_TIMER;
+    /* a directory that is used for future partition */
+    private static final String FUTURE_DIR_SUFFIX = &quot;-future&quot;;
+<span class="nc" id="L70">    private static final Pattern FUTURE_DIR_PATTERN = Pattern.compile(&quot;^(\\S+)-(\\S+)\\.(\\S+)&quot; + FUTURE_DIR_SUFFIX);</span>
+
+    static {
+        // For compatibility - this metrics group was previously defined within
+        // a Scala object named `kafka.log.LogFlushStats`
+<span class="nc" id="L75">        KafkaMetricsGroup logFlushStatsMetricsGroup = new KafkaMetricsGroup(&quot;kafka.log&quot;, &quot;LogFlushStats&quot;);</span>
+<span class="nc" id="L76">        LOG_FLUSH_TIMER = logFlushStatsMetricsGroup.newTimer(&quot;LogFlushRateAndTimeMs&quot;, TimeUnit.MILLISECONDS, TimeUnit.SECONDS);</span>
+<span class="nc" id="L77">    }</span>
+
+    private final FileRecords log;
+    private final LazyIndex&lt;OffsetIndex&gt; lazyOffsetIndex;
+    private final LazyIndex&lt;TimeIndex&gt; lazyTimeIndex;
+    private final TransactionIndex txnIndex;
+    private final long baseOffset;
+    private final int indexIntervalBytes;
+    private final long rollJitterMs;
+    private final Time time;
+
+    // The timestamp we used for time based log rolling and for ensuring max compaction delay
+    // volatile for LogCleaner to see the update
+<span class="nc" id="L90">    private volatile OptionalLong rollingBasedTimestamp = OptionalLong.empty();</span>
+
+    // The maximum timestamp and offset we see so far
+    // NOTED: the offset is the last offset of batch having the max timestamp.
+<span class="nc" id="L94">    private volatile TimestampOffset maxTimestampAndOffsetSoFar = TimestampOffset.UNKNOWN;</span>
+
+    // Lock for maxTimestampAndOffsetSoFar to ensure that it will be initialized only once
+<span class="nc" id="L97">    private final Object maxTimestampAndOffsetLock = new Object();</span>
+
+    private long created;
+
+    /* the number of bytes since we last added an entry in the offset index */
+<span class="nc" id="L102">    private int bytesSinceLastIndexEntry = 0;</span>
+
+    /**
+     * Create a LogSegment with the provided parameters.
+     *
+     * @param log The file records containing log entries
+     * @param lazyOffsetIndex The offset index
+     * @param lazyTimeIndex The timestamp index
+     * @param txnIndex The transaction index
+     * @param baseOffset A lower bound on the offsets in this segment
+     * @param indexIntervalBytes The approximate number of bytes between entries in the index
+     * @param rollJitterMs The maximum random jitter subtracted from the scheduled segment roll time
+     * @param time The time instance
+     */
+    public LogSegment(FileRecords log,
+                      LazyIndex&lt;OffsetIndex&gt; lazyOffsetIndex,
+                      LazyIndex&lt;TimeIndex&gt; lazyTimeIndex,
+                      TransactionIndex txnIndex,
+                      long baseOffset,
+                      int indexIntervalBytes,
+                      long rollJitterMs,
+<span class="nc" id="L123">                      Time time) {</span>
+<span class="nc" id="L124">        this.log = log;</span>
+<span class="nc" id="L125">        this.lazyOffsetIndex = lazyOffsetIndex;</span>
+<span class="nc" id="L126">        this.lazyTimeIndex = lazyTimeIndex;</span>
+<span class="nc" id="L127">        this.txnIndex = txnIndex;</span>
+<span class="nc" id="L128">        this.baseOffset = baseOffset;</span>
+<span class="nc" id="L129">        this.indexIntervalBytes = indexIntervalBytes;</span>
+<span class="nc" id="L130">        this.rollJitterMs = rollJitterMs;</span>
+<span class="nc" id="L131">        this.time = time;</span>
+<span class="nc" id="L132">        this.created = time.milliseconds();</span>
+<span class="nc" id="L133">    }</span>
+
+    public OffsetIndex offsetIndex() throws IOException {
+<span class="nc" id="L136">        return lazyOffsetIndex.get();</span>
+    }
+
+    public File offsetIndexFile() {
+<span class="nc" id="L140">        return lazyOffsetIndex.file();</span>
+    }
+
+    public TimeIndex timeIndex() throws IOException {
+<span class="nc" id="L144">        return lazyTimeIndex.get();</span>
+    }
+
+    public File timeIndexFile() {
+<span class="nc" id="L148">        return lazyTimeIndex.file();</span>
+    }
+
+    public long baseOffset() {
+<span class="nc" id="L152">        return baseOffset;</span>
+    }
+
+    public FileRecords log() {
+<span class="nc" id="L156">        return log;</span>
+    }
+
+    public long rollJitterMs() {
+<span class="nc" id="L160">        return rollJitterMs;</span>
+    }
+
+    public TransactionIndex txnIndex() {
+<span class="nc" id="L164">        return txnIndex;</span>
+    }
+
+    public boolean shouldRoll(RollParams rollParams) throws IOException {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        boolean reachedRollMs = timeWaitedForRoll(rollParams.now(), rollParams.maxTimestampInMessages()) &gt; rollParams.maxSegmentMs() - rollJitterMs;</span>
+<span class="nc" id="L169">        int size = size();</span>
+<span class="nc bnc" id="L170" title="All 6 branches missed.">        return size &gt; rollParams.maxSegmentBytes() - rollParams.messagesSize() ||</span>
+            (size &gt; 0 &amp;&amp; reachedRollMs) ||
+<span class="nc bnc" id="L172" title="All 6 branches missed.">            offsetIndex().isFull() || timeIndex().isFull() || !canConvertToRelativeOffset(rollParams.maxOffsetInMessages());</span>
+    }
+
+    public void resizeIndexes(int size) throws IOException {
+<span class="nc" id="L176">        offsetIndex().resize(size);</span>
+<span class="nc" id="L177">        timeIndex().resize(size);</span>
+<span class="nc" id="L178">    }</span>
+
+    public void sanityCheck(boolean timeIndexFileNewlyCreated) throws IOException {
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (offsetIndexFile().exists()) {</span>
+            // Resize the time index file to 0 if it is newly created.
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            if (timeIndexFileNewlyCreated)</span>
+<span class="nc" id="L184">                timeIndex().resize(0);</span>
+            // Sanity checks for time index and offset index are skipped because
+            // we will recover the segments above the recovery point in recoverLog()
+            // in any case so sanity checking them here is redundant.
+<span class="nc" id="L188">            txnIndex.sanityCheck();</span>
+        } else
+<span class="nc" id="L190">            throw new NoSuchFileException(&quot;Offset index file &quot; + offsetIndexFile().getAbsolutePath() + &quot; does not exist&quot;);</span>
+<span class="nc" id="L191">    }</span>
+
+    /**
+     * The first time this is invoked, it will result in a time index lookup (including potential materialization of
+     * the time index).
+     */
+    public TimestampOffset readMaxTimestampAndOffsetSoFar() throws IOException {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        if (maxTimestampAndOffsetSoFar == TimestampOffset.UNKNOWN) {</span>
+            // As stated in LogSegment class javadoc, this class is not thread-safe so basically we assume that
+            // methods are called within UnifiedLog#lock.
+            // However, there's exceptional paths where this method can be called outside of the lock,
+            // so we need lock here to prevent multiple threads trying to modify maxTimestampAndOffsetSoFar
+<span class="nc" id="L203">            synchronized (maxTimestampAndOffsetLock) {</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                if (maxTimestampAndOffsetSoFar == TimestampOffset.UNKNOWN) {</span>
+<span class="nc" id="L205">                    maxTimestampAndOffsetSoFar = timeIndex().lastEntry();</span>
+                }
+<span class="nc" id="L207">            }</span>
+        }
+<span class="nc" id="L209">        return maxTimestampAndOffsetSoFar;</span>
+    }
+
+    /**
+     * The maximum timestamp we see so far.
+     *
+     * Note that this may result in time index materialization.
+     */
+    public long maxTimestampSoFar() throws IOException {
+<span class="nc" id="L218">        return readMaxTimestampAndOffsetSoFar().timestamp();</span>
+    }
+
+    /**
+     * Note that this may result in time index materialization.
+     */
+    private long shallowOffsetOfMaxTimestampSoFar() throws IOException {
+<span class="nc" id="L225">        return readMaxTimestampAndOffsetSoFar().offset();</span>
+    }
+
+    /* Return the size in bytes of this log segment */
+    public int size() {
+<span class="nc" id="L230">        return log.sizeInBytes();</span>
+    }
+
+    /**
+     * checks that the argument offset can be represented as an integer offset relative to the baseOffset.
+     */
+    private boolean canConvertToRelativeOffset(long offset) throws IOException {
+<span class="nc" id="L237">        return offsetIndex().canAppendOffset(offset);</span>
+    }
+
+    /**
+     * Append the given messages starting with the given offset. Add
+     * an entry to the index if needed.
+     *
+     * It is assumed this method is being called from within a lock, it is not thread-safe otherwise.
+     *
+     * @param largestOffset The last offset in the message set
+     * @param records       The log entries to append.
+     * @throws LogSegmentOffsetOverflowException if the largest offset causes index offset overflow
+     */
+    public void append(long largestOffset,
+                       MemoryRecords records) throws IOException {
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        if (records.sizeInBytes() &gt; 0) {</span>
+<span class="nc" id="L253">            LOGGER.trace(&quot;Inserting {} bytes at end offset {} at position {}&quot;,</span>
+<span class="nc" id="L254">                records.sizeInBytes(), largestOffset, log.sizeInBytes());</span>
+<span class="nc" id="L255">            int physicalPosition = log.sizeInBytes();</span>
+
+<span class="nc" id="L257">            ensureOffsetInRange(largestOffset);</span>
+
+            // append the messages
+<span class="nc" id="L260">            long appendedBytes = log.append(records);</span>
+<span class="nc" id="L261">            LOGGER.trace(&quot;Appended {} to {} at end offset {}&quot;, appendedBytes, log.file(), largestOffset);</span>
+
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            for (RecordBatch batch : records.batches()) {</span>
+<span class="nc" id="L264">                long batchMaxTimestamp = batch.maxTimestamp();</span>
+<span class="nc" id="L265">                long batchLastOffset = batch.lastOffset();</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">                if (batchMaxTimestamp &gt; maxTimestampSoFar()) {</span>
+<span class="nc" id="L267">                    maxTimestampAndOffsetSoFar = new TimestampOffset(batchMaxTimestamp, batchLastOffset);</span>
+                }
+
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                if (bytesSinceLastIndexEntry &gt; indexIntervalBytes) {</span>
+<span class="nc" id="L271">                    offsetIndex().append(batchLastOffset, physicalPosition);</span>
+<span class="nc" id="L272">                    timeIndex().maybeAppend(maxTimestampSoFar(), shallowOffsetOfMaxTimestampSoFar());</span>
+<span class="nc" id="L273">                    bytesSinceLastIndexEntry = 0;</span>
+                }
+<span class="nc" id="L275">                var sizeInBytes = batch.sizeInBytes();</span>
+<span class="nc" id="L276">                physicalPosition += sizeInBytes;</span>
+<span class="nc" id="L277">                bytesSinceLastIndexEntry += sizeInBytes;</span>
+<span class="nc" id="L278">            }</span>
+        }
+<span class="nc" id="L280">    }</span>
+
+    private void ensureOffsetInRange(long offset) throws IOException {
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if (!canConvertToRelativeOffset(offset))</span>
+<span class="nc" id="L284">            throw new LogSegmentOffsetOverflowException(this, offset);</span>
+<span class="nc" id="L285">    }</span>
+
+    private int appendChunkFromFile(FileRecords records, int position, BufferSupplier bufferSupplier) throws IOException {
+<span class="nc" id="L288">        int bytesToAppend = 0;</span>
+<span class="nc" id="L289">        long maxOffset = Long.MIN_VALUE;</span>
+<span class="nc" id="L290">        ByteBuffer readBuffer = bufferSupplier.get(1024 * 1024);</span>
+
+        // find all batches that are valid to be appended to the current log segment and
+        // determine the maximum offset and timestamp
+<span class="nc" id="L294">        Iterator&lt;FileChannelRecordBatch&gt; nextBatches = records.batchesFrom(position).iterator();</span>
+        FileChannelRecordBatch batch;
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        while ((batch = nextAppendableBatch(nextBatches, readBuffer, bytesToAppend)) != null) {</span>
+<span class="nc" id="L297">            maxOffset = batch.lastOffset();</span>
+<span class="nc" id="L298">            bytesToAppend += batch.sizeInBytes();</span>
+        }
+
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        if (bytesToAppend &gt; 0) {</span>
+            // Grow buffer if needed to ensure we copy at least one batch
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            if (readBuffer.capacity() &lt; bytesToAppend)</span>
+<span class="nc" id="L304">                readBuffer = bufferSupplier.get(bytesToAppend);</span>
+
+<span class="nc" id="L306">            readBuffer.limit(bytesToAppend);</span>
+<span class="nc" id="L307">            records.readInto(readBuffer, position);</span>
+
+<span class="nc" id="L309">            append(maxOffset, MemoryRecords.readableRecords(readBuffer));</span>
+        }
+
+<span class="nc" id="L312">        bufferSupplier.release(readBuffer);</span>
+<span class="nc" id="L313">        return bytesToAppend;</span>
+    }
+
+    private FileChannelRecordBatch nextAppendableBatch(Iterator&lt;FileChannelRecordBatch&gt; recordBatches,
+                                                       ByteBuffer readBuffer,
+                                                       int bytesToAppend) throws IOException {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        if (recordBatches.hasNext()) {</span>
+<span class="nc" id="L320">            FileChannelRecordBatch batch = recordBatches.next();</span>
+<span class="nc bnc" id="L321" title="All 4 branches missed.">            if (canConvertToRelativeOffset(batch.lastOffset()) &amp;&amp;</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">                    (bytesToAppend == 0 || bytesToAppend + batch.sizeInBytes() &lt; readBuffer.capacity()))</span>
+<span class="nc" id="L323">                return batch;</span>
+        }
+<span class="nc" id="L325">        return null;</span>
+    }
+
+    /**
+     * Append records from a file beginning at the given position until either the end of the file
+     * is reached or an offset is found which is too large to convert to a relative offset for the indexes.
+     *
+     * @return the number of bytes appended to the log (may be less than the size of the input if an
+     *         offset is encountered which would overflow this segment)
+     */
+    public int appendFromFile(FileRecords records, int start) throws IOException {
+<span class="nc" id="L336">        int position = start;</span>
+<span class="nc" id="L337">        BufferSupplier bufferSupplier = new BufferSupplier.GrowableBufferSupplier();</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        while (position &lt; start + records.sizeInBytes()) {</span>
+<span class="nc" id="L339">            int bytesAppended = appendChunkFromFile(records, position, bufferSupplier);</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            if (bytesAppended == 0)</span>
+<span class="nc" id="L341">                return position - start;</span>
+<span class="nc" id="L342">            position += bytesAppended;</span>
+<span class="nc" id="L343">        }</span>
+<span class="nc" id="L344">        return position - start;</span>
+    }
+
+    /* not thread safe */
+    public void updateTxnIndex(CompletedTxn completedTxn, long lastStableOffset) throws IOException {
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        if (completedTxn.isAborted()) {</span>
+<span class="nc" id="L350">            LOGGER.trace(&quot;Writing aborted transaction {} to transaction index, last stable offset is {}&quot;, completedTxn, lastStableOffset);</span>
+<span class="nc" id="L351">            txnIndex.append(new AbortedTxn()</span>
+<span class="nc" id="L352">                .setProducerId(completedTxn.producerId())</span>
+<span class="nc" id="L353">                .setFirstOffset(completedTxn.firstOffset())</span>
+<span class="nc" id="L354">                .setLastOffset(completedTxn.lastOffset())</span>
+<span class="nc" id="L355">                .setLastStableOffset(lastStableOffset));</span>
+        }
+<span class="nc" id="L357">    }</span>
+
+    private void updateProducerState(ProducerStateManager producerStateManager, RecordBatch batch) throws IOException {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        if (batch.hasProducerId()) {</span>
+<span class="nc" id="L361">            long producerId = batch.producerId();</span>
+<span class="nc" id="L362">            ProducerAppendInfo appendInfo = producerStateManager.prepareUpdate(producerId, AppendOrigin.REPLICATION);</span>
+<span class="nc" id="L363">            Optional&lt;CompletedTxn&gt; maybeCompletedTxn = appendInfo.append(batch, Optional.empty());</span>
+<span class="nc" id="L364">            producerStateManager.update(appendInfo);</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">            if (maybeCompletedTxn.isPresent()) {</span>
+<span class="nc" id="L366">                CompletedTxn completedTxn = maybeCompletedTxn.get();</span>
+<span class="nc" id="L367">                long lastStableOffset = producerStateManager.lastStableOffset(completedTxn);</span>
+<span class="nc" id="L368">                updateTxnIndex(completedTxn, lastStableOffset);</span>
+<span class="nc" id="L369">                producerStateManager.completeTxn(completedTxn);</span>
+            }
+        }
+<span class="nc" id="L372">        producerStateManager.updateMapEndOffset(batch.lastOffset() + 1);</span>
+<span class="nc" id="L373">    }</span>
+
+    /**
+     * Equivalent to {@code translateOffset(offset, 0)}.
+     *
+     * See {@link #translateOffset(long, int)} for details.
+     */
+    public LogOffsetPosition translateOffset(long offset) throws IOException {
+<span class="nc" id="L381">        return translateOffset(offset, 0);</span>
+    }
+
+    /**
+     * Find the physical file position for the message batch that contains the requested offset.
+     *
+     * The startingFilePosition argument is an optimization that can be used if we already know a valid starting position
+     * in the file higher than the greatest-lower-bound from the index.
+     *
+     * This method is thread-safe.
+     *
+     * @param offset The offset we want to translate
+     * @param startingFilePosition A lower bound on the file position from which to begin the search. This is purely an optimization and
+     * when omitted, the search will begin at the position in the offset index.
+     * @return The base offset, position in the log, and size of the message batch that contains the requested offset,
+     * or null if no such batch is found.
+     */
+    LogOffsetPosition translateOffset(long offset, int startingFilePosition) throws IOException {
+<span class="nc" id="L399">        OffsetPosition mapping = offsetIndex().lookup(offset);</span>
+<span class="nc" id="L400">        return log.searchForOffsetFromPosition(offset, Math.max(mapping.position(), startingFilePosition));</span>
+    }
+
+    /**
+     * Equivalent to {@code read(startOffset, maxSize, size())}.
+     *
+     * See {@link #read(long, int, Optional, boolean)} for details.
+     */
+    public FetchDataInfo read(long startOffset, int maxSize) throws IOException {
+<span class="nc" id="L409">        return read(startOffset, maxSize, size());</span>
+    }
+
+    /**
+     * Equivalent to {@code read(startOffset, maxSize, maxPosition, false)}.
+     *
+     * See {@link #read(long, int, Optional, boolean)} for details.
+     */
+    public FetchDataInfo read(long startOffset, int maxSize, long maxPosition) throws IOException {
+<span class="nc" id="L418">        return read(startOffset, maxSize, Optional.of(maxPosition), false);</span>
+    }
+
+    /**
+     * Read a message set from this segment that contains startOffset. The message set will include
+     * no more than maxSize bytes and will end before maxOffset if a maxOffset is specified.
+     *
+     * This method is thread-safe.
+     *
+     * @param startOffset The logical log offset we are trying to read
+     * @param maxSize The maximum number of bytes to include in the message set we read
+     * @param maxPositionOpt The maximum position in the log segment that should be exposed for read
+     * @param minOneMessage If this is true, the first message will be returned even if it exceeds `maxSize` (if one exists)
+     *
+     * @return The fetched data and the base offset metadata of the message batch that contains startOffset,
+     *         or null if the startOffset is larger than the largest offset in this log
+     */
+    public FetchDataInfo read(long startOffset, int maxSize, Optional&lt;Long&gt; maxPositionOpt, boolean minOneMessage) throws IOException {
+<span class="nc bnc" id="L436" title="All 2 branches missed.">        if (maxSize &lt; 0)</span>
+<span class="nc" id="L437">            throw new IllegalArgumentException(&quot;Invalid max size &quot; + maxSize + &quot; for log read from segment &quot; + log);</span>
+
+<span class="nc" id="L439">        LogOffsetPosition startOffsetAndSize = translateOffset(startOffset);</span>
+
+        // if the start position is already off the end of the log, return null
+<span class="nc bnc" id="L442" title="All 2 branches missed.">        if (startOffsetAndSize == null)</span>
+<span class="nc" id="L443">            return null;</span>
+
+<span class="nc" id="L445">        int startPosition = startOffsetAndSize.position;</span>
+<span class="nc" id="L446">        LogOffsetMetadata offsetMetadata = new LogOffsetMetadata(startOffsetAndSize.offset, this.baseOffset, startPosition);</span>
+
+<span class="nc" id="L448">        int adjustedMaxSize = maxSize;</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">        if (minOneMessage)</span>
+<span class="nc" id="L450">            adjustedMaxSize = Math.max(maxSize, startOffsetAndSize.size);</span>
+
+        // return empty records in the fetch-data-info when:
+        // 1. adjustedMaxSize is 0 (or)
+        // 2. maxPosition to read is unavailable
+<span class="nc bnc" id="L455" title="All 4 branches missed.">        if (adjustedMaxSize == 0 || maxPositionOpt.isEmpty())</span>
+<span class="nc" id="L456">            return new FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY);</span>
+
+        // calculate the length of the message set to read based on whether or not they gave us a maxOffset
+<span class="nc" id="L459">        int fetchSize = Math.min((int) (maxPositionOpt.get() - startPosition), adjustedMaxSize);</span>
+
+<span class="nc bnc" id="L461" title="All 2 branches missed.">        return new FetchDataInfo(offsetMetadata, log.slice(startPosition, fetchSize),</span>
+<span class="nc" id="L462">            adjustedMaxSize &lt; startOffsetAndSize.size, Optional.empty());</span>
+    }
+
+    public OptionalLong fetchUpperBoundOffset(OffsetPosition startOffsetPosition, int fetchSize) throws IOException {
+<span class="nc" id="L466">        return offsetIndex().fetchUpperBoundOffset(startOffsetPosition, fetchSize)</span>
+<span class="nc" id="L467">                .map(offsetPosition -&gt; OptionalLong.of(offsetPosition.offset())).orElseGet(OptionalLong::empty);</span>
+    }
+
+    /**
+     * Run recovery on the given segment. This will rebuild the index from the log file and lop off any invalid bytes
+     * from the end of the log and index.
+     *
+     * This method is not thread-safe.
+     *
+     * @param producerStateManager Producer state corresponding to the segment's base offset. This is needed to recover
+     *                             the transaction index.
+     * @param leaderEpochCache a cache for updating the leader epoch during recovery.
+     * @return The number of bytes truncated from the log
+     * @throws LogSegmentOffsetOverflowException if the log segment contains an offset that causes the index offset to overflow
+     */
+    public int recover(ProducerStateManager producerStateManager, LeaderEpochFileCache leaderEpochCache) throws IOException {
+<span class="nc" id="L483">        offsetIndex().reset();</span>
+<span class="nc" id="L484">        timeIndex().reset();</span>
+<span class="nc" id="L485">        txnIndex.reset();</span>
+<span class="nc" id="L486">        int validBytes = 0;</span>
+<span class="nc" id="L487">        int lastIndexEntry = 0;</span>
+<span class="nc" id="L488">        maxTimestampAndOffsetSoFar = TimestampOffset.UNKNOWN;</span>
+        try {
+<span class="nc bnc" id="L490" title="All 2 branches missed.">            for (RecordBatch batch : log.batches()) {</span>
+<span class="nc" id="L491">                batch.ensureValid();</span>
+<span class="nc" id="L492">                ensureOffsetInRange(batch.lastOffset());</span>
+
+                // The max timestamp is exposed at the batch level, so no need to iterate the records
+<span class="nc bnc" id="L495" title="All 2 branches missed.">                if (batch.maxTimestamp() &gt; maxTimestampSoFar()) {</span>
+<span class="nc" id="L496">                    maxTimestampAndOffsetSoFar = new TimestampOffset(batch.maxTimestamp(), batch.lastOffset());</span>
+                }
+
+                // Build offset index
+<span class="nc bnc" id="L500" title="All 2 branches missed.">                if (validBytes - lastIndexEntry &gt; indexIntervalBytes) {</span>
+<span class="nc" id="L501">                    offsetIndex().append(batch.lastOffset(), validBytes);</span>
+<span class="nc" id="L502">                    timeIndex().maybeAppend(maxTimestampSoFar(), shallowOffsetOfMaxTimestampSoFar());</span>
+<span class="nc" id="L503">                    lastIndexEntry = validBytes;</span>
+                }
+<span class="nc" id="L505">                validBytes += batch.sizeInBytes();</span>
+
+<span class="nc bnc" id="L507" title="All 2 branches missed.">                if (batch.magic() &gt;= RecordBatch.MAGIC_VALUE_V2) {</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">                    if (batch.partitionLeaderEpoch() &gt;= 0 &amp;&amp;</span>
+<span class="nc bnc" id="L509" title="All 4 branches missed.">                            (leaderEpochCache.latestEpoch().isEmpty() || batch.partitionLeaderEpoch() &gt; leaderEpochCache.latestEpoch().get()))</span>
+<span class="nc" id="L510">                        leaderEpochCache.assign(batch.partitionLeaderEpoch(), batch.baseOffset());</span>
+<span class="nc" id="L511">                    updateProducerState(producerStateManager, batch);</span>
+                }
+<span class="nc" id="L513">            }</span>
+<span class="nc" id="L514">        } catch (CorruptRecordException | InvalidRecordException e) {</span>
+<span class="nc" id="L515">            LOGGER.warn(&quot;Found invalid messages in log segment {} at byte offset {}.&quot;, log.file().getAbsolutePath(),</span>
+<span class="nc" id="L516">                validBytes, e);</span>
+<span class="nc" id="L517">        }</span>
+<span class="nc" id="L518">        int truncated = log.sizeInBytes() - validBytes;</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        if (truncated &gt; 0)</span>
+<span class="nc" id="L520">            LOGGER.debug(&quot;Truncated {} invalid bytes at the end of segment {} during recovery&quot;, truncated, log.file().getAbsolutePath());</span>
+
+<span class="nc" id="L522">        log.truncateTo(validBytes);</span>
+<span class="nc" id="L523">        offsetIndex().trimToValidSize();</span>
+        // A normally closed segment always appends the biggest timestamp ever seen into log segment, we do this as well.
+<span class="nc" id="L525">        timeIndex().maybeAppend(maxTimestampSoFar(), shallowOffsetOfMaxTimestampSoFar(), true);</span>
+<span class="nc" id="L526">        timeIndex().trimToValidSize();</span>
+<span class="nc" id="L527">        return truncated;</span>
+    }
+
+    /**
+     * Check whether the last offset of the last batch in this segment overflows the indexes.
+     */
+    public boolean hasOverflow() throws IOException {
+<span class="nc" id="L534">        long nextOffset = readNextOffset();</span>
+<span class="nc bnc" id="L535" title="All 4 branches missed.">        return nextOffset &gt; baseOffset &amp;&amp; !canConvertToRelativeOffset(nextOffset - 1);</span>
+    }
+
+    public TxnIndexSearchResult collectAbortedTxns(long fetchOffset, long upperBoundOffset) {
+<span class="nc" id="L539">        return txnIndex.collectAbortedTxns(fetchOffset, upperBoundOffset);</span>
+    }
+
+    @Override
+    public String toString() {
+        // We don't call `largestRecordTimestamp` below to avoid materializing the time index when `toString` is invoked
+<span class="nc" id="L545">        return &quot;LogSegment(baseOffset=&quot; + baseOffset +</span>
+<span class="nc" id="L546">            &quot;, size=&quot; + size() +</span>
+<span class="nc" id="L547">            &quot;, lastModifiedTime=&quot; + lastModified() +</span>
+<span class="nc" id="L548">            &quot;, largestRecordTimestamp=&quot; + maxTimestampAndOffsetSoFar.timestamp() +</span>
+            &quot;)&quot;;
+    }
+
+    /**
+     * Truncate off all index and log entries with offsets &gt;= the given offset.
+     * If the given offset is larger than the largest message in this segment, do nothing.
+     *
+     * This method is not thread-safe.
+     *
+     * @param offset The offset to truncate to
+     * @return The number of log bytes truncated
+     */
+    public int truncateTo(long offset) throws IOException {
+        // Do offset translation before truncating the index to avoid needless scanning
+        // in case we truncate the full index
+<span class="nc" id="L564">        LogOffsetPosition mapping = translateOffset(offset);</span>
+<span class="nc" id="L565">        OffsetIndex offsetIndex = offsetIndex();</span>
+<span class="nc" id="L566">        TimeIndex timeIndex = timeIndex();</span>
+
+<span class="nc" id="L568">        offsetIndex.truncateTo(offset);</span>
+<span class="nc" id="L569">        timeIndex.truncateTo(offset);</span>
+<span class="nc" id="L570">        txnIndex.truncateTo(offset);</span>
+
+        // After truncation, reset and allocate more space for the (new currently active) index
+<span class="nc" id="L573">        offsetIndex.resize(offsetIndex.maxIndexSize());</span>
+<span class="nc" id="L574">        timeIndex.resize(timeIndex.maxIndexSize());</span>
+
+        int bytesTruncated;
+<span class="nc bnc" id="L577" title="All 2 branches missed.">        if (mapping == null)</span>
+<span class="nc" id="L578">            bytesTruncated = 0;</span>
+        else
+<span class="nc" id="L580">            bytesTruncated = log.truncateTo(mapping.position);</span>
+
+<span class="nc bnc" id="L582" title="All 2 branches missed.">        if (log.sizeInBytes() == 0) {</span>
+<span class="nc" id="L583">            created = time.milliseconds();</span>
+<span class="nc" id="L584">            rollingBasedTimestamp = OptionalLong.empty();</span>
+        }
+
+<span class="nc" id="L587">        bytesSinceLastIndexEntry = 0;</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        if (maxTimestampSoFar() &gt;= 0)</span>
+<span class="nc" id="L589">            maxTimestampAndOffsetSoFar = readLargestTimestamp();</span>
+
+<span class="nc" id="L591">        return bytesTruncated;</span>
+    }
+
+    private TimestampOffset readLargestTimestamp() throws IOException {
+        // Get the last time index entry. If the time index is empty, it will return (-1, baseOffset)
+<span class="nc" id="L596">        TimestampOffset lastTimeIndexEntry = timeIndex().lastEntry();</span>
+<span class="nc" id="L597">        OffsetPosition offsetPosition = offsetIndex().lookup(lastTimeIndexEntry.offset());</span>
+
+        // Scan the rest of the messages to see if there is a larger timestamp after the last time index entry.
+<span class="nc" id="L600">        FileRecords.TimestampAndOffset maxTimestampOffsetAfterLastEntry = log.largestTimestampAfter(offsetPosition.position());</span>
+<span class="nc bnc" id="L601" title="All 2 branches missed.">        if (maxTimestampOffsetAfterLastEntry.timestamp &gt; lastTimeIndexEntry.timestamp())</span>
+<span class="nc" id="L602">            return new TimestampOffset(maxTimestampOffsetAfterLastEntry.timestamp, maxTimestampOffsetAfterLastEntry.offset);</span>
+
+<span class="nc" id="L604">        return lastTimeIndexEntry;</span>
+    }
+
+    /**
+     * Calculate the offset that would be used for the next message to be append to this segment.
+     * Note that this is expensive.
+     *
+     * This method is thread-safe.
+     */
+    public long readNextOffset() throws IOException {
+<span class="nc" id="L614">        FetchDataInfo fetchData = read(offsetIndex().lastOffset(), log.sizeInBytes());</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">        if (fetchData == null)</span>
+<span class="nc" id="L616">            return baseOffset;</span>
+        else
+<span class="nc" id="L618">            return fetchData.records.lastBatch()</span>
+<span class="nc" id="L619">                .map(RecordBatch::nextOffset)</span>
+<span class="nc" id="L620">                .orElse(baseOffset);</span>
+    }
+
+    /**
+     * Flush this log segment to disk.
+     *
+     * This method is thread-safe.
+     */
+    public void flush() throws IOException {
+        try {
+<span class="nc" id="L630">            LOG_FLUSH_TIMER.time((Callable&lt;Void&gt;) () -&gt; {</span>
+<span class="nc" id="L631">                log.flush();</span>
+<span class="nc" id="L632">                offsetIndex().flush();</span>
+<span class="nc" id="L633">                timeIndex().flush();</span>
+<span class="nc" id="L634">                txnIndex.flush();</span>
+<span class="nc" id="L635">                return null;</span>
+            });
+<span class="nc" id="L637">        } catch (Exception e) {</span>
+<span class="nc bnc" id="L638" title="All 2 branches missed.">            if (e instanceof IOException)</span>
+<span class="nc" id="L639">                throw (IOException) e;</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">            else if (e instanceof RuntimeException)</span>
+<span class="nc" id="L641">                throw (RuntimeException) e;</span>
+            else
+<span class="nc" id="L643">                throw new IllegalStateException(&quot;Unexpected exception thrown: &quot; + e, e);</span>
+<span class="nc" id="L644">        }</span>
+<span class="nc" id="L645">    }</span>
+
+    /**
+     * Update the directory reference for the log and indices in this segment. This would typically be called after a
+     * directory is renamed.
+     */
+    void updateParentDir(File dir) {
+<span class="nc" id="L652">        log.updateParentDir(dir);</span>
+<span class="nc" id="L653">        lazyOffsetIndex.updateParentDir(dir);</span>
+<span class="nc" id="L654">        lazyTimeIndex.updateParentDir(dir);</span>
+<span class="nc" id="L655">        txnIndex.updateParentDir(dir);</span>
+<span class="nc" id="L656">    }</span>
+
+    /**
+     * Change the suffix for the index and log files for this log segment
+     * IOException from this method should be handled by the caller
+     */
+    public void changeFileSuffixes(String oldSuffix, String newSuffix) throws IOException {
+<span class="nc" id="L663">        log.renameTo(new File(Utils.replaceSuffix(log.file().getPath(), oldSuffix, newSuffix)));</span>
+<span class="nc" id="L664">        lazyOffsetIndex.renameTo(new File(Utils.replaceSuffix(offsetIndexFile().getPath(), oldSuffix, newSuffix)));</span>
+<span class="nc" id="L665">        lazyTimeIndex.renameTo(new File(Utils.replaceSuffix(timeIndexFile().getPath(), oldSuffix, newSuffix)));</span>
+<span class="nc" id="L666">        txnIndex.renameTo(new File(Utils.replaceSuffix(txnIndex.file().getPath(), oldSuffix, newSuffix)));</span>
+<span class="nc" id="L667">    }</span>
+
+    public boolean hasSuffix(String suffix) {
+<span class="nc bnc" id="L670" title="All 2 branches missed.">        return log.file().getName().endsWith(suffix) &amp;&amp;</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">            offsetIndexFile().getName().endsWith(suffix) &amp;&amp;</span>
+<span class="nc bnc" id="L672" title="All 2 branches missed.">            timeIndexFile().getName().endsWith(suffix) &amp;&amp;</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">            txnIndex.file().getName().endsWith(suffix);</span>
+    }
+
+    /**
+     * Append the largest time index entry to the time index and trim the log and indexes.
+     *
+     * The time index entry appended will be used to decide when to delete the segment.
+     */
+    public void onBecomeInactiveSegment() throws IOException {
+<span class="nc" id="L682">        timeIndex().maybeAppend(maxTimestampSoFar(), shallowOffsetOfMaxTimestampSoFar(), true);</span>
+<span class="nc" id="L683">        offsetIndex().trimToValidSize();</span>
+<span class="nc" id="L684">        timeIndex().trimToValidSize();</span>
+<span class="nc" id="L685">        log.trim();</span>
+<span class="nc" id="L686">    }</span>
+
+    /**
+     * If not previously loaded,
+     * load the timestamp of the first message into memory.
+     */
+    private void loadFirstBatchTimestamp() {
+<span class="nc bnc" id="L693" title="All 2 branches missed.">        if (rollingBasedTimestamp.isEmpty()) {</span>
+<span class="nc" id="L694">            Iterator&lt;FileChannelRecordBatch&gt; iter = log.batches().iterator();</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">            if (iter.hasNext())</span>
+<span class="nc" id="L696">                rollingBasedTimestamp = OptionalLong.of(iter.next().maxTimestamp());</span>
+        }
+<span class="nc" id="L698">    }</span>
+
+    /**
+     * The time this segment has waited to be rolled.
+     * If the first message batch has a timestamp we use its timestamp to determine when to roll a segment. A segment
+     * is rolled if the difference between the new batch's timestamp and the first batch's timestamp exceeds the
+     * segment rolling time.
+     * If the first batch does not have a timestamp, we use the wall clock time to determine when to roll a segment. A
+     * segment is rolled if the difference between the current wall clock time and the segment create time exceeds the
+     * segment rolling time.
+     */
+    public long timeWaitedForRoll(long now, long messageTimestamp) {
+        // Load the timestamp of the first message into memory
+<span class="nc" id="L711">        loadFirstBatchTimestamp();</span>
+<span class="nc" id="L712">        long ts = rollingBasedTimestamp.orElse(-1L);</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        if (ts &gt;= 0)</span>
+<span class="nc" id="L714">            return messageTimestamp - ts;</span>
+<span class="nc" id="L715">        return now - created;</span>
+    }
+
+    /**
+     * @return the first batch timestamp if the timestamp is available. Otherwise, return Long.MaxValue
+     */
+    public long getFirstBatchTimestamp() {
+<span class="nc" id="L722">        loadFirstBatchTimestamp();</span>
+<span class="nc" id="L723">        OptionalLong timestamp = rollingBasedTimestamp;</span>
+<span class="nc bnc" id="L724" title="All 4 branches missed.">        if (timestamp.isPresent() &amp;&amp; timestamp.getAsLong() &gt;= 0)</span>
+<span class="nc" id="L725">            return timestamp.getAsLong();</span>
+<span class="nc" id="L726">        return Long.MAX_VALUE;</span>
+    }
+
+    /**
+     * Search the message offset based on timestamp and offset.
+     *
+     * This method returns an option of TimestampOffset. The returned value is determined using the following ordered list of rules:
+     *
+     * - If all the messages in the segment have smaller offsets, return Empty
+     * - If all the messages in the segment have smaller timestamps, return Empty
+     * - If all the messages in the segment have larger timestamps, or no message in the segment has a timestamp
+     *   the returned the offset will be max(the base offset of the segment, startingOffset) and the timestamp will be Message.NoTimestamp.
+     * - Otherwise, return an option of TimestampOffset. The offset is the offset of the first message whose timestamp
+     *   is greater than or equals to the target timestamp and whose offset is greater than or equals to the startingOffset.
+     *
+     * This method only returns Empty when 1) all messages' offset &lt; startOffing or 2) the log is not empty, but we did not
+     * see any message when scanning the log from the indexed position. The latter could happen if the log is truncated
+     * after we get the indexed position but before we scan the log from there. In this case we simply return Empty and the
+     * caller will need to check on the truncated log and maybe retry or even do the search on another log segment.
+     *
+     * @param timestampMs The timestamp to search for.
+     * @param startingOffset The starting offset to search.
+     * @param maxRecordBodySize The maximum declared (decompressed) body size of a single record; a compressed record
+     *                          exceeding it is rejected with an InvalidRecordException before its body is allocated.
+     * @return the timestamp and offset of the first message that meets the requirements. Empty will be returned if there is no such message.
+     */
+    public Optional&lt;FileRecords.TimestampAndOffset&gt; findOffsetByTimestamp(long timestampMs, long startingOffset, int maxRecordBodySize) throws IOException {
+        // Get the index entry with a timestamp less than or equal to the target timestamp
+<span class="nc" id="L754">        TimestampOffset timestampOffset = timeIndex().lookup(timestampMs);</span>
+<span class="nc" id="L755">        int position = offsetIndex().lookup(Math.max(timestampOffset.offset(), startingOffset)).position();</span>
+
+        // Search the timestamp
+<span class="nc" id="L758">        return Optional.ofNullable(log.searchForTimestamp(timestampMs, position, startingOffset, maxRecordBodySize));</span>
+    }
+
+    /**
+     * Close this log segment
+     */
+    @Override
+    public void close() throws IOException {
+<span class="nc" id="L766">        Utils.closeAll(lazyOffsetIndex, lazyTimeIndex, log, txnIndex);</span>
+<span class="nc" id="L767">    }</span>
+
+    /**
+     * Close the log segment, swallowing any exceptions. This is used when the disk may have failed.
+     */
+    void closeQuietly() {
+<span class="nc" id="L773">        Utils.closeQuietly(lazyOffsetIndex, &quot;offsetIndex&quot;, LOGGER);</span>
+<span class="nc" id="L774">        Utils.closeQuietly(lazyTimeIndex, &quot;timeIndex&quot;, LOGGER);</span>
+<span class="nc" id="L775">        Utils.closeQuietly(log, &quot;log&quot;, LOGGER);</span>
+<span class="nc" id="L776">        Utils.closeQuietly(txnIndex, &quot;txnIndex&quot;, LOGGER);</span>
+<span class="nc" id="L777">    }</span>
+
+    /**
+     * Delete this log segment from the filesystem.
+     */
+    public void deleteIfExists() throws IOException {
+        try {
+<span class="nc" id="L784">            Utils.tryAll(List.of(</span>
+<span class="nc" id="L785">                () -&gt; deleteTypeIfExists(log::deleteIfExists, &quot;log&quot;, log.file(), true),</span>
+<span class="nc" id="L786">                () -&gt; deleteTypeIfExists(lazyOffsetIndex::deleteIfExists, &quot;offset index&quot;, offsetIndexFile(), true),</span>
+<span class="nc" id="L787">                () -&gt; deleteTypeIfExists(lazyTimeIndex::deleteIfExists, &quot;time index&quot;, timeIndexFile(), true),</span>
+<span class="nc" id="L788">                () -&gt; deleteTypeIfExists(txnIndex::deleteIfExists, &quot;transaction index&quot;, txnIndex.file(), false)));</span>
+<span class="nc" id="L789">        } catch (Throwable t) {</span>
+<span class="nc bnc" id="L790" title="All 2 branches missed.">            if (t instanceof IOException)</span>
+<span class="nc" id="L791">                throw (IOException) t;</span>
+<span class="nc bnc" id="L792" title="All 2 branches missed.">            if (t instanceof Error)</span>
+<span class="nc" id="L793">                throw (Error) t;</span>
+<span class="nc bnc" id="L794" title="All 2 branches missed.">            if (t instanceof RuntimeException)</span>
+<span class="nc" id="L795">                throw (RuntimeException) t;</span>
+<span class="nc" id="L796">            throw new IllegalStateException(&quot;Unexpected exception: &quot; + t.getMessage(), t);</span>
+<span class="nc" id="L797">        }</span>
+<span class="nc" id="L798">    }</span>
+
+    // Helper method for `deleteIfExists()`
+    private Void deleteTypeIfExists(StorageAction&lt;Boolean, IOException&gt; delete, String fileType, File file, boolean logIfMissing) throws IOException {
+        try {
+<span class="nc bnc" id="L803" title="All 2 branches missed.">            if (delete.execute())</span>
+<span class="nc" id="L804">                LOGGER.info(&quot;Deleted {} {}.&quot;, fileType, file.getAbsolutePath());</span>
+            else {
+<span class="nc bnc" id="L806" title="All 2 branches missed.">                if (logIfMissing) {</span>
+<span class="nc" id="L807">                    LOGGER.info(&quot;Failed to delete {} {} because it does not exist.&quot;, fileType, file.getAbsolutePath());</span>
+                }
+<span class="nc bnc" id="L809" title="All 2 branches missed.">                if (file.getParent() == null) {</span>
+<span class="nc" id="L810">                    return null;</span>
+                }
+
+                // During alter log dir, the log segment may be moved to a new directory, so async delete may fail.
+                // Fallback to delete the file in the new directory to avoid orphan file.
+<span class="nc" id="L815">                Matcher dirMatcher = FUTURE_DIR_PATTERN.matcher(file.getParent());</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">                if (dirMatcher.matches()) {</span>
+<span class="nc" id="L817">                    String topicPartitionAbsolutePath = dirMatcher.group(1) + &quot;-&quot; + dirMatcher.group(2);</span>
+<span class="nc" id="L818">                    File fallbackFile = new File(topicPartitionAbsolutePath, file.getName());</span>
+<span class="nc bnc" id="L819" title="All 6 branches missed.">                    if (fallbackFile.exists() &amp;&amp; file.getName().endsWith(LogFileUtils.DELETED_FILE_SUFFIX) &amp;&amp; fallbackFile.delete()) {</span>
+<span class="nc" id="L820">                        LOGGER.info(&quot;Fallback to delete {} {}.&quot;, fileType, fallbackFile.getAbsolutePath());</span>
+                    }
+                }
+            }
+<span class="nc" id="L824">            return null;</span>
+<span class="nc" id="L825">        } catch (IOException e) {</span>
+<span class="nc" id="L826">            throw new IOException(&quot;Delete of &quot; + fileType + &quot; &quot; + file.getAbsolutePath() + &quot; failed.&quot;, e);</span>
+        }
+    }
+
+    // Visible for testing
+    public boolean deleted() {
+<span class="nc bnc" id="L832" title="All 8 branches missed.">        return !log.file().exists() &amp;&amp; !offsetIndexFile().exists() &amp;&amp; !timeIndexFile().exists() &amp;&amp; !txnIndex.file().exists();</span>
+    }
+
+
+    /**
+     * The last modified time of this log segment as a unix time stamp
+     */
+    public long lastModified() {
+<span class="nc" id="L840">        return log.file().lastModified();</span>
+    }
+
+    /**
+     * The largest timestamp this segment contains, if maxTimestampSoFar &gt;= 0, otherwise Empty.
+     */
+    public OptionalLong largestRecordTimestamp() throws IOException {
+<span class="nc" id="L847">        long maxTimestampSoFar = maxTimestampSoFar();</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">        if (maxTimestampSoFar &gt;= 0)</span>
+<span class="nc" id="L849">            return OptionalLong.of(maxTimestampSoFar);</span>
+<span class="nc" id="L850">        return OptionalLong.empty();</span>
+    }
+
+    /**
+     * The largest timestamp this segment contains.
+     */
+    public long largestTimestamp() throws IOException {
+<span class="nc" id="L857">        long maxTimestampSoFar = maxTimestampSoFar();</span>
+<span class="nc bnc" id="L858" title="All 2 branches missed.">        if (maxTimestampSoFar &gt;= 0)</span>
+<span class="nc" id="L859">            return maxTimestampSoFar;</span>
+<span class="nc" id="L860">        return lastModified();</span>
+    }
+
+    /**
+     * Change the last modified time for this log segment
+     */
+    public void setLastModified(long ms) throws IOException {
+<span class="nc" id="L867">        FileTime fileTime = FileTime.fromMillis(ms);</span>
+<span class="nc" id="L868">        Files.setLastModifiedTime(log.file().toPath(), fileTime);</span>
+<span class="nc" id="L869">        Files.setLastModifiedTime(offsetIndexFile().toPath(), fileTime);</span>
+<span class="nc" id="L870">        Files.setLastModifiedTime(timeIndexFile().toPath(), fileTime);</span>
+<span class="nc" id="L871">    }</span>
+
+    public static LogSegment open(File dir, long baseOffset, LogConfig config, Time time, int initFileSize, boolean preallocate) throws IOException {
+<span class="nc" id="L874">        return open(dir, baseOffset, config, time, false, initFileSize, preallocate, &quot;&quot;);</span>
+    }
+
+    public static LogSegment open(File dir, long baseOffset, LogConfig config, Time time, boolean fileAlreadyExists,
+                                  int initFileSize, boolean preallocate, String fileSuffix) throws IOException {
+<span class="nc" id="L879">        int maxIndexSize = config.maxIndexSize;</span>
+<span class="nc" id="L880">        return new LogSegment(</span>
+<span class="nc" id="L881">            FileRecords.open(LogFileUtils.logFile(dir, baseOffset, fileSuffix), fileAlreadyExists, initFileSize, preallocate),</span>
+<span class="nc" id="L882">            LazyIndex.forOffset(LogFileUtils.offsetIndexFile(dir, baseOffset, fileSuffix), baseOffset, maxIndexSize),</span>
+<span class="nc" id="L883">            LazyIndex.forTime(LogFileUtils.timeIndexFile(dir, baseOffset, fileSuffix), baseOffset, maxIndexSize),</span>
+<span class="nc" id="L884">            new TransactionIndex(baseOffset, LogFileUtils.transactionIndexFile(dir, baseOffset, fileSuffix)),</span>
+            baseOffset,
+            config.indexInterval,
+<span class="nc" id="L887">            config.randomSegmentJitter(),</span>
+            time);
+    }
+
+    public static void deleteIfExists(File dir, long baseOffset, String fileSuffix) throws IOException {
+<span class="nc" id="L892">        deleteFileIfExists(LogFileUtils.offsetIndexFile(dir, baseOffset, fileSuffix));</span>
+<span class="nc" id="L893">        deleteFileIfExists(LogFileUtils.timeIndexFile(dir, baseOffset, fileSuffix));</span>
+<span class="nc" id="L894">        deleteFileIfExists(LogFileUtils.transactionIndexFile(dir, baseOffset, fileSuffix));</span>
+<span class="nc" id="L895">        deleteFileIfExists(LogFileUtils.logFile(dir, baseOffset, fileSuffix));</span>
+<span class="nc" id="L896">    }</span>
+
+    private static boolean deleteFileIfExists(File file) throws IOException {
+<span class="nc" id="L899">        return Files.deleteIfExists(file.toPath());</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

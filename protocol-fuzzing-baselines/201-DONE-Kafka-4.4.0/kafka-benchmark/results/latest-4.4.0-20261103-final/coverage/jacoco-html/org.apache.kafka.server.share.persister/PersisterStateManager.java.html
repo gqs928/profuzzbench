@@ -1,0 +1,1741 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PersisterStateManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.share.persister</a> &gt; <span class="el_source">PersisterStateManager.java</span></div><h1>PersisterStateManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.server.share.persister;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.KafkaClient;
+import org.apache.kafka.clients.RequestCompletionHandler;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.NetworkException;
+import org.apache.kafka.common.internals.Topic;
+import org.apache.kafka.common.message.DeleteShareGroupStateRequestData;
+import org.apache.kafka.common.message.DeleteShareGroupStateResponseData;
+import org.apache.kafka.common.message.FindCoordinatorRequestData;
+import org.apache.kafka.common.message.FindCoordinatorResponseData;
+import org.apache.kafka.common.message.InitializeShareGroupStateRequestData;
+import org.apache.kafka.common.message.InitializeShareGroupStateResponseData;
+import org.apache.kafka.common.message.ReadShareGroupStateRequestData;
+import org.apache.kafka.common.message.ReadShareGroupStateResponseData;
+import org.apache.kafka.common.message.ReadShareGroupStateSummaryRequestData;
+import org.apache.kafka.common.message.ReadShareGroupStateSummaryResponseData;
+import org.apache.kafka.common.message.WriteShareGroupStateRequestData;
+import org.apache.kafka.common.message.WriteShareGroupStateResponseData;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.requests.DeleteShareGroupStateRequest;
+import org.apache.kafka.common.requests.DeleteShareGroupStateResponse;
+import org.apache.kafka.common.requests.FindCoordinatorRequest;
+import org.apache.kafka.common.requests.FindCoordinatorResponse;
+import org.apache.kafka.common.requests.InitializeShareGroupStateRequest;
+import org.apache.kafka.common.requests.InitializeShareGroupStateResponse;
+import org.apache.kafka.common.requests.ReadShareGroupStateRequest;
+import org.apache.kafka.common.requests.ReadShareGroupStateResponse;
+import org.apache.kafka.common.requests.ReadShareGroupStateSummaryRequest;
+import org.apache.kafka.common.requests.ReadShareGroupStateSummaryResponse;
+import org.apache.kafka.common.requests.WriteShareGroupStateRequest;
+import org.apache.kafka.common.requests.WriteShareGroupStateResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.ExponentialBackoffManager;
+import org.apache.kafka.server.share.SharePartitionKey;
+import org.apache.kafka.server.util.InterBrokerSendThread;
+import org.apache.kafka.server.util.RequestAndCompletionHandler;
+import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.server.util.timer.TimerTask;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+
+/**
+ * This class encapsulates various handler classes corresponding to share
+ * state RPCs. It also holds an {@link InterBrokerSendThread} specialization
+ * which manages the sending the RPC requests over the network.
+ * This class is for the exclusive purpose of being used with {@link DefaultStatePersister}
+ * but can be extended for other {@link Persister} implementations as well.
+ */
+public class PersisterStateManager {
+    private SendThread sender;
+<span class="nc" id="L92">    private final AtomicBoolean isStarted = new AtomicBoolean(false);</span>
+    public static final long REQUEST_BACKOFF_MS = 1_000L;
+    public static final long REQUEST_BACKOFF_MAX_MS = 30_000L;
+    private static final int MAX_FIND_COORD_ATTEMPTS = 5;
+    private static final int RETRY_BACKOFF_EXP_BASE = CommonClientConfigs.RETRY_BACKOFF_EXP_BASE;
+    private static final double RETRY_BACKOFF_JITTER = CommonClientConfigs.RETRY_BACKOFF_JITTER;
+    private final Time time;
+    private final Timer timer;
+    private final ShareCoordinatorMetadataCacheHelper cacheHelper;
+    // holds the set of share coord nodes for each RPC type which is currently sent but not completed
+<span class="nc" id="L102">    private final Map&lt;RPCType, Set&lt;Node&gt;&gt; inFlight = new HashMap&lt;&gt;();</span>
+
+    // Mapping for batchable RPCs. The top level grouping is based on destination share coordinator node.
+    // Since kafkaApis for each RPC type are separate, we cannot batch different types of RPCs. Hence, we need
+    // RPCType'd key inner map.
+    // The RPC schemas defined in kip-932 have a single group id per request. Hence, we cannot batch RPCs
+    // with different groupIds and therefore, another inner map keyed on groupId is needed.
+    // Finally, the value is a list of handlers
+<span class="nc" id="L110">    private final Map&lt;Node, Map&lt;RPCType, Map&lt;String, List&lt;PersisterStateManagerHandler&gt;&gt;&gt;&gt; nodeRPCMap = new HashMap&lt;&gt;();</span>
+
+    // Final object to serve synchronization needs.
+<span class="nc" id="L113">    private final Object nodeMapLock = new Object();</span>
+
+    // Called when the generateRequests method is executed by InterBrokerSendThread, returning requests.
+    // Mainly for testing and introspection purpose to inspect the state of the nodeRPC map
+    // when generateRequests is called.
+    private Runnable generateCallback;
+
+<span class="nc" id="L120">    public enum RPCType {</span>
+<span class="nc" id="L121">        INITIALIZE,</span>
+<span class="nc" id="L122">        READ,</span>
+<span class="nc" id="L123">        WRITE,</span>
+<span class="nc" id="L124">        DELETE,</span>
+<span class="nc" id="L125">        SUMMARY,</span>
+<span class="nc" id="L126">        UNKNOWN</span>
+    }
+
+    /**
+     * Creates a new PersisterStateManager.
+     *
+     * &lt;p&gt;The caller retains ownership of the supplied {@link Timer} and is responsible for
+     * closing it. {@link #stop()} will not close the timer, allowing it to be shared with
+     * other components.
+     */
+<span class="nc" id="L136">    public PersisterStateManager(KafkaClient client, ShareCoordinatorMetadataCacheHelper cacheHelper, Time time, Timer timer) {</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        if (client == null) {</span>
+<span class="nc" id="L138">            throw new IllegalArgumentException(&quot;Kafkaclient must not be null.&quot;);</span>
+        }
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (time == null) {</span>
+<span class="nc" id="L141">            throw new IllegalArgumentException(&quot;Time must not be null.&quot;);</span>
+        }
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        if (timer == null) {</span>
+<span class="nc" id="L144">            throw new IllegalArgumentException(&quot;Timer must not be null.&quot;);</span>
+        }
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (cacheHelper == null) {</span>
+<span class="nc" id="L147">            throw new IllegalArgumentException(&quot;CacheHelper must not be null.&quot;);</span>
+        }
+<span class="nc" id="L149">        this.time = time;</span>
+<span class="nc" id="L150">        this.timer = timer;</span>
+<span class="nc" id="L151">        this.cacheHelper = cacheHelper;</span>
+<span class="nc" id="L152">        this.sender = new SendThread(</span>
+            &quot;PersisterStateManager&quot;,
+            client,
+<span class="nc" id="L155">            Math.toIntExact(CommonClientConfigs.DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS),  //30 seconds</span>
+            this.time,
+            true,
+<span class="nc" id="L158">            new Random(this.time.milliseconds()));</span>
+<span class="nc" id="L159">    }</span>
+
+    public void enqueue(PersisterStateManagerHandler handler) {
+<span class="nc" id="L162">        this.sender.enqueue(handler);</span>
+<span class="nc" id="L163">    }</span>
+
+    public void start() {
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        if (isStarted.compareAndSet(false, true)) {</span>
+<span class="nc" id="L167">            this.sender.start();</span>
+        }
+<span class="nc" id="L169">    }</span>
+
+    public void stop() throws Exception {
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        if (isStarted.compareAndSet(true, false)) {</span>
+<span class="nc" id="L173">            this.sender.shutdown();</span>
+        }
+<span class="nc" id="L175">    }</span>
+
+    // test visibility
+    Map&lt;Node, Map&lt;RPCType, Map&lt;String, List&lt;PersisterStateManagerHandler&gt;&gt;&gt;&gt; nodeRPCMap() {
+<span class="nc" id="L179">        return nodeRPCMap;</span>
+    }
+
+    public void setGenerateCallback(Runnable generateCallback) {
+<span class="nc" id="L183">        this.generateCallback = generateCallback;</span>
+<span class="nc" id="L184">    }</span>
+
+    /**
+     * Parent class of all RPCs. Uses template pattern to implement core methods.
+     * Various child classes can extend this class to define how to handle RPC specific
+     * responses, retries, batching etc.
+     * &lt;p&gt;
+     * Since the find coordinator RPC/lookup is a necessary pre-condition for all
+     * share state RPCs, the infra code for it is encapsulated in this class itself.
+     */
+    public abstract class PersisterStateManagerHandler implements RequestCompletionHandler {
+        protected Node coordinatorNode;
+        private final ExponentialBackoffManager findCoordBackoff;
+        private Consumer&lt;ClientResponse&gt; onCompleteCallback;
+        protected final SharePartitionKey partitionKey;
+
+        public PersisterStateManagerHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            long backoffMs,
+            long backoffMaxMs,
+            int maxRPCRetryAttempts
+<span class="nc" id="L207">        ) {</span>
+<span class="nc" id="L208">            this.findCoordBackoff = new ExponentialBackoffManager(</span>
+                maxRPCRetryAttempts,
+                backoffMs,
+                RETRY_BACKOFF_EXP_BASE,
+                backoffMaxMs,
+                RETRY_BACKOFF_JITTER);
+<span class="nc" id="L214">            this.onCompleteCallback = response -&gt; {</span>
+<span class="nc" id="L215">            }; // noop</span>
+<span class="nc" id="L216">            partitionKey = SharePartitionKey.getInstance(groupId, topicId, partition);</span>
+<span class="nc" id="L217">        }</span>
+
+        /**
+         * Child classes must provide their own static logger instance. This avoids unnecessary resource usage
+         * caused by creating a large number of logger instances.
+         *
+         * @return child class logger
+         */
+        protected abstract Logger log();
+
+        /**
+         * Child class must create appropriate builder object for the handled RPC
+         *
+         * @return builder for the request
+         */
+        protected abstract AbstractRequest.Builder&lt;? extends AbstractRequest&gt; requestBuilder();
+
+        /**
+         * Handles the response for an RPC.
+         *
+         * @param response - Client response
+         */
+        protected abstract void handleRequestResponse(ClientResponse response);
+
+        /**
+         * Returns true if the response is valid for the respective child class.
+         *
+         * @param response - Client response
+         * @return - boolean
+         */
+        protected abstract boolean isResponseForRequest(ClientResponse response);
+
+        /**
+         * Handle invalid find coordinator response. If error is UNKNOWN_SERVER_ERROR, look at the
+         * exception details to figure out the problem.
+         *
+         * @param error
+         * @param exception
+         */
+        protected abstract void findCoordinatorErrorResponse(Errors error, Exception exception);
+
+        /**
+         * Handle invalid RPC request response. If error is UNKNOWN_SERVER_ERROR, look at the
+         * exception details to figure out the problem.
+         *
+         * @param error
+         * @param exception
+         */
+        protected abstract void requestErrorResponse(Errors error, Exception exception);
+
+        /**
+         * Child class must provide a descriptive name for the implementation.
+         *
+         * @return String
+         */
+        protected abstract String name();
+
+        /**
+         * Child class must return appropriate type of RPC here
+         *
+         * @return String
+         */
+        protected abstract RPCType rpcType();
+
+        /**
+         * Child class should return the appropriate completable future encapsulating
+         * the response for the RPC.
+         *
+         * @return A completable future of RPC response
+         */
+        protected abstract CompletableFuture&lt;? extends AbstractResponse&gt; result();
+
+        /**
+         * Returns builder for share coordinator
+         *
+         * @return builder for find coordinator
+         */
+        protected AbstractRequest.Builder&lt;FindCoordinatorRequest&gt; findShareCoordinatorBuilder() {
+<span class="nc" id="L295">            return new FindCoordinatorRequest.Builder(new FindCoordinatorRequestData()</span>
+<span class="nc" id="L296">                .setKeyType(FindCoordinatorRequest.CoordinatorType.SHARE.id())</span>
+<span class="nc" id="L297">                .setKey(partitionKey().asCoordinatorKey()));</span>
+        }
+
+        public void addRequestToNodeMap(Node node, PersisterStateManagerHandler handler) {
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if (!handler.isBatchable()) {</span>
+<span class="nc" id="L302">                return;</span>
+            }
+<span class="nc" id="L304">            synchronized (nodeMapLock) {</span>
+<span class="nc" id="L305">                nodeRPCMap.computeIfAbsent(node, k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L306">                    .computeIfAbsent(handler.rpcType(), k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L307">                    .computeIfAbsent(partitionKey().groupId(), k -&gt; new LinkedList&lt;&gt;())</span>
+<span class="nc" id="L308">                    .add(handler);</span>
+<span class="nc" id="L309">            }</span>
+<span class="nc" id="L310">            sender.wakeup();</span>
+<span class="nc" id="L311">        }</span>
+
+        /**
+         * Returns true is coordinator node is not yet set
+         *
+         * @return boolean
+         */
+        protected boolean lookupNeeded() {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (coordinatorNode != null) {</span>
+<span class="nc" id="L320">                return false;</span>
+            }
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            if (cacheHelper.containsTopic(Topic.SHARE_GROUP_STATE_TOPIC_NAME)) {</span>
+<span class="nc" id="L323">                log().debug(&quot;{} internal topic already exists.&quot;, Topic.SHARE_GROUP_STATE_TOPIC_NAME);</span>
+<span class="nc" id="L324">                Node node = cacheHelper.getShareCoordinator(partitionKey(), Topic.SHARE_GROUP_STATE_TOPIC_NAME);</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                if (node != Node.noNode()) {</span>
+<span class="nc" id="L326">                    log().debug(&quot;Found coordinator node in cache: {}&quot;, node);</span>
+<span class="nc" id="L327">                    coordinatorNode = node;</span>
+<span class="nc" id="L328">                    addRequestToNodeMap(node, this);</span>
+<span class="nc" id="L329">                    return false;</span>
+                }
+            }
+<span class="nc" id="L332">            return true;</span>
+        }
+
+        /**
+         * Returns the String key to be used as share coordinator key
+         *
+         * @return String
+         */
+        protected SharePartitionKey partitionKey() {
+<span class="nc" id="L341">            return partitionKey;</span>
+        }
+
+        /**
+         * Returns true if the RPC response if for Find Coordinator RPC.
+         *
+         * @param response - Client response object
+         * @return boolean
+         */
+        protected boolean isFindCoordinatorResponse(ClientResponse response) {
+<span class="nc bnc" id="L351" title="All 4 branches missed.">            return response != null &amp;&amp; response.requestHeader().apiKey() == ApiKeys.FIND_COORDINATOR;</span>
+        }
+
+        @Override
+        public void onComplete(ClientResponse response) {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            if (onCompleteCallback != null) {</span>
+<span class="nc" id="L357">                onCompleteCallback.accept(response);</span>
+            }
+
+            // We don't know if FIND_COORD or actual REQUEST. Let's err on side of request.
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            if (response == null) {</span>
+<span class="nc" id="L362">                requestErrorResponse(Errors.UNKNOWN_SERVER_ERROR, new NetworkException(&quot;Did not receive any response (response = null)&quot;));</span>
+<span class="nc" id="L363">                sender.wakeup();</span>
+<span class="nc" id="L364">                return;</span>
+            }
+
+<span class="nc bnc" id="L367" title="All 2 branches missed.">            if (isFindCoordinatorResponse(response)) {</span>
+<span class="nc" id="L368">                handleFindCoordinatorResponse(response);</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            } else if (isResponseForRequest(response)) {</span>
+<span class="nc" id="L370">                handleRequestResponse(response);</span>
+            }
+<span class="nc" id="L372">            sender.wakeup();</span>
+<span class="nc" id="L373">        }</span>
+
+        // Visibility for testing
+        Optional&lt;Errors&gt; checkResponseError(ClientResponse response) {
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            if (response.hasResponse()) {</span>
+<span class="nc" id="L378">                return Optional.empty();</span>
+            }
+
+<span class="nc" id="L381">            log().debug(&quot;Response for RPC {} with key {} is invalid - {}&quot;, name(), this.partitionKey, response);</span>
+
+<span class="nc bnc" id="L383" title="All 2 branches missed.">            if (response.authenticationException() != null) {</span>
+<span class="nc" id="L384">                log().error(&quot;Authentication exception&quot;, response.authenticationException());</span>
+<span class="nc" id="L385">                Errors error = Errors.forException(response.authenticationException());</span>
+<span class="nc" id="L386">                return Optional.of(error);</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">            } else if (response.versionMismatch() != null) {</span>
+<span class="nc" id="L388">                log().error(&quot;Version mismatch exception&quot;, response.versionMismatch());</span>
+<span class="nc" id="L389">                Errors error = Errors.forException(response.versionMismatch());</span>
+<span class="nc" id="L390">                return Optional.of(error);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">            } else if (response.wasDisconnected()) {    // Retriable</span>
+<span class="nc" id="L392">                return Optional.of(Errors.NETWORK_EXCEPTION);</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">            } else if (response.wasTimedOut()) {    // Retriable</span>
+<span class="nc" id="L394">                log().debug(&quot;Response for RPC {} with key {} timed out - {}.&quot;, name(), this.partitionKey, response);</span>
+<span class="nc" id="L395">                return Optional.of(Errors.REQUEST_TIMED_OUT);</span>
+            } else {
+<span class="nc" id="L397">                return Optional.of(Errors.UNKNOWN_SERVER_ERROR);</span>
+            }
+        }
+
+        protected void resetCoordinatorNode() {
+<span class="nc" id="L402">            coordinatorNode = null;</span>
+<span class="nc" id="L403">        }</span>
+
+        /**
+         * Handles the response for find coordinator RPC and sets appropriate state.
+         *
+         * @param response - Client response for find coordinator RPC
+         */
+        protected void handleFindCoordinatorResponse(ClientResponse response) {
+<span class="nc" id="L411">            log().debug(&quot;Find coordinator response received - {}&quot;, response);</span>
+
+            // Incrementing the number of find coordinator attempts
+<span class="nc" id="L414">            findCoordBackoff.incrementAttempt();</span>
+<span class="nc" id="L415">            Errors clientResponseError = checkResponseError(response).orElse(Errors.NONE);</span>
+<span class="nc" id="L416">            String clientResponseErrorMessage = clientResponseError.message();</span>
+
+<span class="nc bnc" id="L418" title="All 3 branches missed.">            switch (clientResponseError) {</span>
+                case NONE:
+<span class="nc" id="L420">                    List&lt;FindCoordinatorResponseData.Coordinator&gt; coordinators = ((FindCoordinatorResponse) response.responseBody()).coordinators();</span>
+<span class="nc bnc" id="L421" title="All 2 branches missed.">                    if (coordinators.size() != 1) {</span>
+<span class="nc" id="L422">                        log().error(&quot;Find coordinator response for {} is invalid. Number of coordinators = {}&quot;, partitionKey(), coordinators.size());</span>
+<span class="nc" id="L423">                        findCoordinatorErrorResponse(Errors.UNKNOWN_SERVER_ERROR, new IllegalStateException(&quot;Invalid response with multiple coordinators.&quot;));</span>
+<span class="nc" id="L424">                        return;</span>
+                    }
+
+<span class="nc" id="L427">                    FindCoordinatorResponseData.Coordinator coordinatorData = coordinators.get(0);</span>
+<span class="nc" id="L428">                    Errors error = Errors.forCode(coordinatorData.errorCode());</span>
+<span class="nc" id="L429">                    String errorMessage = coordinatorData.errorMessage();</span>
+<span class="nc bnc" id="L430" title="All 4 branches missed.">                    if (errorMessage == null || errorMessage.isEmpty()) {</span>
+<span class="nc" id="L431">                        errorMessage = error.message();</span>
+                    }
+<span class="nc bnc" id="L433" title="All 3 branches missed.">                    switch (error) {</span>
+                        case NONE:
+<span class="nc" id="L435">                            log().trace(&quot;Find coordinator response valid. Enqueuing actual request.&quot;);</span>
+<span class="nc" id="L436">                            findCoordBackoff.resetAttempts();</span>
+<span class="nc" id="L437">                            coordinatorNode = new Node(coordinatorData.nodeId(), coordinatorData.host(), coordinatorData.port());</span>
+                            // now we want the actual share state RPC call to happen
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                            if (this.isBatchable()) {</span>
+<span class="nc" id="L440">                                addRequestToNodeMap(coordinatorNode, this);</span>
+                            } else {
+<span class="nc" id="L442">                                enqueue(this);</span>
+                            }
+<span class="nc" id="L444">                            break;</span>
+
+                        case COORDINATOR_NOT_AVAILABLE: // retriable error codes
+                        case COORDINATOR_LOAD_IN_PROGRESS:
+                        case NOT_COORDINATOR:
+                        case UNKNOWN_TOPIC_OR_PARTITION:
+<span class="nc" id="L450">                            log().debug(&quot;Received retriable error in find coordinator for {} using key {}: {}&quot;, name(), partitionKey(), errorMessage);</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">                            if (!findCoordBackoff.canAttempt()) {</span>
+<span class="nc" id="L452">                                log().error(&quot;Exhausted max retries to find coordinator for {} using key {} without success.&quot;, name(), partitionKey());</span>
+<span class="nc" id="L453">                                findCoordinatorErrorResponse(error, new Exception(&quot;Exhausted max retries to find coordinator without success.&quot;));</span>
+<span class="nc" id="L454">                                break;</span>
+                            }
+<span class="nc" id="L456">                            resetCoordinatorNode();</span>
+<span class="nc" id="L457">                            timer.add(new PersisterTimerTask(findCoordBackoff.backOff(), this));</span>
+<span class="nc" id="L458">                            break;</span>
+
+                        default:
+<span class="nc" id="L461">                            log().error(&quot;Unable to find coordinator for {} using key {}: {}.&quot;, name(), partitionKey(), errorMessage);</span>
+<span class="nc" id="L462">                            findCoordinatorErrorResponse(error, new Exception(errorMessage));</span>
+                    }
+<span class="nc" id="L464">                    return;</span>
+
+                case NETWORK_EXCEPTION: // Retriable client response error codes.
+                case REQUEST_TIMED_OUT:
+<span class="nc" id="L468">                    log().debug(&quot;Received retriable error in find coordinator client response for {} using key {} due to {}.&quot;, name(), partitionKey(), clientResponseErrorMessage);</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">                    if (!findCoordBackoff.canAttempt()) {</span>
+<span class="nc" id="L470">                        log().error(&quot;Exhausted max retries to find coordinator due to error in client response for {} using key {}.&quot;, name(), partitionKey());</span>
+<span class="nc" id="L471">                        findCoordinatorErrorResponse(clientResponseError, new Exception(&quot;Exhausted max retries to find coordinator without success.&quot;));</span>
+<span class="nc" id="L472">                        break;</span>
+                    }
+<span class="nc" id="L474">                    resetCoordinatorNode();</span>
+<span class="nc" id="L475">                    timer.add(new PersisterTimerTask(findCoordBackoff.backOff(), this));</span>
+<span class="nc" id="L476">                    break;</span>
+
+                default:
+<span class="nc" id="L479">                    log().error(&quot;Unable to find coordinator due to error in client response for {} using key {}: {}&quot;, name(), partitionKey(), clientResponseError.code());</span>
+<span class="nc" id="L480">                    findCoordinatorErrorResponse(clientResponseError, new Exception(clientResponseErrorMessage));</span>
+            }
+<span class="nc" id="L482">        }</span>
+
+        // Visible for testing
+        public Node getCoordinatorNode() {
+<span class="nc" id="L486">            return coordinatorNode;</span>
+        }
+
+        protected abstract boolean isBatchable();
+
+        /**
+         * This method can be called by child class objects to register a callback
+         * which will be called when the onComplete cb is called on request completion.
+         *
+         * @param callback
+         */
+        protected void setOnCompleteCallback(Consumer&lt;ClientResponse&gt; callback) {
+<span class="nc" id="L498">            this.onCompleteCallback = callback;</span>
+<span class="nc" id="L499">        }</span>
+    }
+
+    public class InitializeStateHandler extends PersisterStateManagerHandler {
+
+<span class="nc" id="L504">        private static final Logger LOG = LoggerFactory.getLogger(InitializeStateHandler.class);</span>
+
+        private final int stateEpoch;
+        private final long startOffset;
+        private final CompletableFuture&lt;InitializeShareGroupStateResponse&gt; result;
+        private final ExponentialBackoffManager initializeStateBackoff;
+
+        public InitializeStateHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            int stateEpoch,
+            long startOffset,
+            CompletableFuture&lt;InitializeShareGroupStateResponse&gt; result,
+            long backoffMs,
+            long backoffMaxMs,
+            int maxRPCRetryAttempts
+<span class="nc" id="L521">        ) {</span>
+<span class="nc" id="L522">            super(groupId, topicId, partition, backoffMs, backoffMaxMs, maxRPCRetryAttempts);</span>
+<span class="nc" id="L523">            this.stateEpoch = stateEpoch;</span>
+<span class="nc" id="L524">            this.startOffset = startOffset;</span>
+<span class="nc" id="L525">            this.result = result;</span>
+<span class="nc" id="L526">            this.initializeStateBackoff = new ExponentialBackoffManager(</span>
+                maxRPCRetryAttempts,
+                backoffMs,
+                RETRY_BACKOFF_EXP_BASE,
+                backoffMaxMs,
+                RETRY_BACKOFF_JITTER);
+<span class="nc" id="L532">        }</span>
+
+        public InitializeStateHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            int stateEpoch,
+            long startOffset,
+            CompletableFuture&lt;InitializeShareGroupStateResponse&gt; result,
+            Consumer&lt;ClientResponse&gt; onCompleteCallback
+        ) {
+<span class="nc" id="L543">            this(</span>
+                groupId,
+                topicId,
+                partition,
+                stateEpoch,
+                startOffset,
+                result,
+                REQUEST_BACKOFF_MS,
+                REQUEST_BACKOFF_MAX_MS,
+                MAX_FIND_COORD_ATTEMPTS
+            );
+<span class="nc" id="L554">        }</span>
+
+        @Override
+        protected Logger log() {
+<span class="nc" id="L558">            return LOG;</span>
+        }
+
+        @Override
+        protected String name() {
+<span class="nc" id="L563">            return &quot;InitializeStateHandler&quot;;</span>
+        }
+
+        @Override
+        protected AbstractRequest.Builder&lt;? extends AbstractRequest&gt; requestBuilder() {
+<span class="nc" id="L568">            throw new RuntimeException(&quot;Initialize requests are batchable, hence individual requests not needed.&quot;);</span>
+        }
+
+        @Override
+        protected boolean isResponseForRequest(ClientResponse response) {
+<span class="nc bnc" id="L573" title="All 2 branches missed.">            return response.requestHeader().apiKey() == ApiKeys.INITIALIZE_SHARE_GROUP_STATE;</span>
+        }
+
+        @Override
+        protected void handleRequestResponse(ClientResponse response) {
+<span class="nc" id="L578">            log().debug(&quot;Initialize state response received - {}&quot;, response);</span>
+<span class="nc" id="L579">            initializeStateBackoff.incrementAttempt();</span>
+<span class="nc" id="L580">            Errors clientResponseError = checkResponseError(response).orElse(Errors.NONE);</span>
+<span class="nc" id="L581">            String clientResponseErrorMessage = clientResponseError.message();</span>
+
+<span class="nc bnc" id="L583" title="All 3 branches missed.">            switch (clientResponseError) {</span>
+                case NONE:
+                    // response can be a combined one for large number of requests
+                    // we need to deconstruct it
+<span class="nc" id="L587">                    InitializeShareGroupStateResponse combinedResponse = (InitializeShareGroupStateResponse) response.responseBody();</span>
+
+<span class="nc bnc" id="L589" title="All 2 branches missed.">                    for (InitializeShareGroupStateResponseData.InitializeStateResult initializeStateResult : combinedResponse.data().results()) {</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">                        if (initializeStateResult.topicId().equals(partitionKey().topicId())) {</span>
+<span class="nc" id="L591">                            Optional&lt;InitializeShareGroupStateResponseData.PartitionResult&gt; partitionStateData =</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">                                initializeStateResult.partitions().stream().filter(partitionResult -&gt; partitionResult.partition() == partitionKey().partition())</span>
+<span class="nc" id="L593">                                    .findFirst();</span>
+
+<span class="nc bnc" id="L595" title="All 2 branches missed.">                            if (partitionStateData.isPresent()) {</span>
+<span class="nc" id="L596">                                Errors error = Errors.forCode(partitionStateData.get().errorCode());</span>
+<span class="nc" id="L597">                                String errorMessage = partitionStateData.get().errorMessage();</span>
+<span class="nc bnc" id="L598" title="All 4 branches missed.">                                if (errorMessage == null || errorMessage.isEmpty()) {</span>
+<span class="nc" id="L599">                                    errorMessage = error.message();</span>
+                                }
+
+<span class="nc bnc" id="L602" title="All 3 branches missed.">                                switch (error) {</span>
+                                    case NONE:
+<span class="nc" id="L604">                                        initializeStateBackoff.resetAttempts();</span>
+<span class="nc" id="L605">                                        InitializeShareGroupStateResponseData.InitializeStateResult result = InitializeShareGroupStateResponse.toResponseInitializeStateResult(</span>
+<span class="nc" id="L606">                                            partitionKey().topicId(),</span>
+<span class="nc" id="L607">                                            List.of(partitionStateData.get())</span>
+                                        );
+<span class="nc" id="L609">                                        this.result.complete(new InitializeShareGroupStateResponse(</span>
+<span class="nc" id="L610">                                            new InitializeShareGroupStateResponseData().setResults(List.of(result))));</span>
+<span class="nc" id="L611">                                        return;</span>
+
+                                    // check retriable errors
+                                    case COORDINATOR_NOT_AVAILABLE:
+                                    case COORDINATOR_LOAD_IN_PROGRESS:
+                                    case NOT_COORDINATOR:
+                                    case UNKNOWN_TOPIC_OR_PARTITION:
+<span class="nc" id="L618">                                        log().debug(&quot;Received retriable error in initialize state RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">                                        if (!initializeStateBackoff.canAttempt()) {</span>
+<span class="nc" id="L620">                                            log().error(&quot;Exhausted max retries for initialize state RPC for key {} without success.&quot;, partitionKey());</span>
+<span class="nc" id="L621">                                            requestErrorResponse(error, new Exception(&quot;Exhausted max retries to complete initialize state RPC without success.&quot;));</span>
+<span class="nc" id="L622">                                            return;</span>
+                                        }
+<span class="nc" id="L624">                                        super.resetCoordinatorNode();</span>
+<span class="nc" id="L625">                                        timer.add(new PersisterTimerTask(initializeStateBackoff.backOff(), this));</span>
+<span class="nc" id="L626">                                        return;</span>
+
+                                    default:
+<span class="nc" id="L629">                                        log().error(&quot;Unable to perform initialize state RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc" id="L630">                                        requestErrorResponse(error, new Exception(errorMessage));</span>
+<span class="nc" id="L631">                                        return;</span>
+                                }
+                            }
+                        }
+<span class="nc" id="L635">                    }</span>
+
+                    // no response found specific topic partition
+<span class="nc" id="L638">                    IllegalStateException exception = new IllegalStateException(</span>
+<span class="nc" id="L639">                        &quot;Failed to initialize state for share partition: &quot; + partitionKey()</span>
+                    );
+<span class="nc" id="L641">                    requestErrorResponse(Errors.forException(exception), exception);</span>
+<span class="nc" id="L642">                    return;</span>
+
+                case NETWORK_EXCEPTION: // Retriable client response error codes.
+                case REQUEST_TIMED_OUT:
+<span class="nc" id="L646">                    log().debug(&quot;Received retriable error in initialize state RPC client response for key {}: {}&quot;, partitionKey(), clientResponseErrorMessage);</span>
+<span class="nc bnc" id="L647" title="All 2 branches missed.">                    if (!initializeStateBackoff.canAttempt()) {</span>
+<span class="nc" id="L648">                        log().error(&quot;Exhausted max retries for initialize state RPC due to error in client response for key {}.&quot;, partitionKey());</span>
+<span class="nc" id="L649">                        requestErrorResponse(clientResponseError, new Exception(&quot;Exhausted max retries to complete initialize state RPC without success.&quot;));</span>
+<span class="nc" id="L650">                        return;</span>
+                    }
+<span class="nc" id="L652">                    super.resetCoordinatorNode();</span>
+<span class="nc" id="L653">                    timer.add(new PersisterTimerTask(initializeStateBackoff.backOff(), this));</span>
+<span class="nc" id="L654">                    return;</span>
+
+                default:
+<span class="nc" id="L657">                    log().error(&quot;Unable to perform initialize state RPC due to error in client response for key {}: {}&quot;, partitionKey(), clientResponseError.code());</span>
+<span class="nc" id="L658">                    requestErrorResponse(clientResponseError, new Exception(clientResponseErrorMessage));</span>
+            }
+<span class="nc" id="L660">        }</span>
+
+        @Override
+        public void requestErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L664">            this.result.complete(new InitializeShareGroupStateResponse(</span>
+<span class="nc" id="L665">                InitializeShareGroupStateResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in initialize state RPC. &quot; +</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L667">        }</span>
+
+        @Override
+        protected void findCoordinatorErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L671">            this.result.complete(new InitializeShareGroupStateResponse(</span>
+<span class="nc" id="L672">                InitializeShareGroupStateResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in find coordinator. &quot; +</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L674">        }</span>
+
+        protected CompletableFuture&lt;InitializeShareGroupStateResponse&gt; result() {
+<span class="nc" id="L677">            return result;</span>
+        }
+
+        @Override
+        protected boolean isBatchable() {
+<span class="nc" id="L682">            return true;</span>
+        }
+
+        @Override
+        protected RPCType rpcType() {
+<span class="nc" id="L687">            return RPCType.INITIALIZE;</span>
+        }
+    }
+
+    public class WriteStateHandler extends PersisterStateManagerHandler {
+<span class="nc" id="L692">        private static final Logger LOG = LoggerFactory.getLogger(WriteStateHandler.class);</span>
+        private final int stateEpoch;
+        private final int leaderEpoch;
+        private final long startOffset;
+        private final int deliveryCompleteCount;
+        private final List&lt;PersisterStateBatch&gt; batches;
+        private final CompletableFuture&lt;WriteShareGroupStateResponse&gt; result;
+        private final ExponentialBackoffManager writeStateBackoff;
+
+        public WriteStateHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            int stateEpoch,
+            int leaderEpoch,
+            long startOffset,
+            int deliveryCompleteCount,
+            List&lt;PersisterStateBatch&gt; batches,
+            CompletableFuture&lt;WriteShareGroupStateResponse&gt; result,
+            long backoffMs,
+            long backoffMaxMs,
+            int maxRPCRetryAttempts
+<span class="nc" id="L714">        ) {</span>
+<span class="nc" id="L715">            super(groupId, topicId, partition, backoffMs, backoffMaxMs, maxRPCRetryAttempts);</span>
+<span class="nc" id="L716">            this.stateEpoch = stateEpoch;</span>
+<span class="nc" id="L717">            this.leaderEpoch = leaderEpoch;</span>
+<span class="nc" id="L718">            this.startOffset = startOffset;</span>
+<span class="nc" id="L719">            this.deliveryCompleteCount = deliveryCompleteCount;</span>
+<span class="nc" id="L720">            this.batches = batches;</span>
+<span class="nc" id="L721">            this.result = result;</span>
+<span class="nc" id="L722">            this.writeStateBackoff = new ExponentialBackoffManager(</span>
+                maxRPCRetryAttempts,
+                backoffMs,
+                RETRY_BACKOFF_EXP_BASE,
+                backoffMaxMs,
+                RETRY_BACKOFF_JITTER);
+<span class="nc" id="L728">        }</span>
+
+        public WriteStateHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            int stateEpoch,
+            int leaderEpoch,
+            long startOffset,
+            int deliveryCompleteCount,
+            List&lt;PersisterStateBatch&gt; batches,
+            CompletableFuture&lt;WriteShareGroupStateResponse&gt; result,
+            Consumer&lt;ClientResponse&gt; onCompleteCallback
+        ) {
+<span class="nc" id="L742">            this(</span>
+                groupId,
+                topicId,
+                partition,
+                stateEpoch,
+                leaderEpoch,
+                startOffset,
+                deliveryCompleteCount,
+                batches,
+                result,
+                REQUEST_BACKOFF_MS,
+                REQUEST_BACKOFF_MAX_MS,
+                MAX_FIND_COORD_ATTEMPTS
+            );
+<span class="nc" id="L756">        }</span>
+
+        @Override
+        protected Logger log() {
+<span class="nc" id="L760">            return LOG;</span>
+        }
+
+        @Override
+        protected String name() {
+<span class="nc" id="L765">            return &quot;WriteStateHandler&quot;;</span>
+        }
+
+        @Override
+        protected AbstractRequest.Builder&lt;? extends AbstractRequest&gt; requestBuilder() {
+<span class="nc" id="L770">            throw new RuntimeException(&quot;Write requests are batchable, hence individual requests not needed.&quot;);</span>
+        }
+
+        @Override
+        protected boolean isResponseForRequest(ClientResponse response) {
+<span class="nc bnc" id="L775" title="All 2 branches missed.">            return response.requestHeader().apiKey() == ApiKeys.WRITE_SHARE_GROUP_STATE;</span>
+        }
+
+        @Override
+        protected void handleRequestResponse(ClientResponse response) {
+<span class="nc" id="L780">            log().debug(&quot;Write state response received - {}&quot;, response);</span>
+<span class="nc" id="L781">            writeStateBackoff.incrementAttempt();</span>
+<span class="nc" id="L782">            Errors clientResponseError = checkResponseError(response).orElse(Errors.NONE);</span>
+<span class="nc" id="L783">            String clientResponseErrorMessage = clientResponseError.message();</span>
+<span class="nc bnc" id="L784" title="All 3 branches missed.">            switch (clientResponseError) {</span>
+                case NONE:
+                    // response can be a combined one for large number of requests
+                    // we need to deconstruct it
+<span class="nc" id="L788">                    WriteShareGroupStateResponse combinedResponse = (WriteShareGroupStateResponse) response.responseBody();</span>
+
+<span class="nc bnc" id="L790" title="All 2 branches missed.">                    for (WriteShareGroupStateResponseData.WriteStateResult writeStateResult : combinedResponse.data().results()) {</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">                        if (writeStateResult.topicId().equals(partitionKey().topicId())) {</span>
+<span class="nc" id="L792">                            Optional&lt;WriteShareGroupStateResponseData.PartitionResult&gt; partitionStateData =</span>
+<span class="nc bnc" id="L793" title="All 2 branches missed.">                                writeStateResult.partitions().stream().filter(partitionResult -&gt; partitionResult.partition() == partitionKey().partition())</span>
+<span class="nc" id="L794">                                    .findFirst();</span>
+
+<span class="nc bnc" id="L796" title="All 2 branches missed.">                            if (partitionStateData.isPresent()) {</span>
+<span class="nc" id="L797">                                Errors error = Errors.forCode(partitionStateData.get().errorCode());</span>
+<span class="nc" id="L798">                                String errorMessage = partitionStateData.get().errorMessage();</span>
+<span class="nc bnc" id="L799" title="All 4 branches missed.">                                if (errorMessage == null || errorMessage.isEmpty()) {</span>
+<span class="nc" id="L800">                                    errorMessage = error.message();</span>
+                                }
+
+<span class="nc bnc" id="L803" title="All 3 branches missed.">                                switch (error) {</span>
+                                    case NONE:
+<span class="nc" id="L805">                                        writeStateBackoff.resetAttempts();</span>
+<span class="nc" id="L806">                                        WriteShareGroupStateResponseData.WriteStateResult result = WriteShareGroupStateResponse.toResponseWriteStateResult(</span>
+<span class="nc" id="L807">                                            partitionKey().topicId(),</span>
+<span class="nc" id="L808">                                            List.of(partitionStateData.get())</span>
+                                        );
+<span class="nc" id="L810">                                        this.result.complete(new WriteShareGroupStateResponse(</span>
+<span class="nc" id="L811">                                            new WriteShareGroupStateResponseData().setResults(List.of(result))));</span>
+<span class="nc" id="L812">                                        return;</span>
+
+                                    // check retriable errors
+                                    case COORDINATOR_NOT_AVAILABLE:
+                                    case COORDINATOR_LOAD_IN_PROGRESS:
+                                    case NOT_COORDINATOR:
+                                    case UNKNOWN_TOPIC_OR_PARTITION:
+<span class="nc" id="L819">                                        log().debug(&quot;Received retriable error in write state RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">                                        if (!writeStateBackoff.canAttempt()) {</span>
+<span class="nc" id="L821">                                            log().error(&quot;Exhausted max retries for write state RPC for key {} without success.&quot;, partitionKey());</span>
+<span class="nc" id="L822">                                            requestErrorResponse(error, new Exception(&quot;Exhausted max retries to complete write state RPC without success.&quot;));</span>
+<span class="nc" id="L823">                                            return;</span>
+                                        }
+<span class="nc" id="L825">                                        super.resetCoordinatorNode();</span>
+<span class="nc" id="L826">                                        timer.add(new PersisterTimerTask(writeStateBackoff.backOff(), this));</span>
+<span class="nc" id="L827">                                        return;</span>
+
+                                    default:
+<span class="nc" id="L830">                                        log().error(&quot;Unable to perform write state RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc" id="L831">                                        requestErrorResponse(error, new Exception(errorMessage));</span>
+<span class="nc" id="L832">                                        return;</span>
+                                }
+                            }
+                        }
+<span class="nc" id="L836">                    }</span>
+
+                    // no response found specific topic partition
+<span class="nc" id="L839">                    IllegalStateException exception = new IllegalStateException(</span>
+<span class="nc" id="L840">                        &quot;Failed to write state for share partition: &quot; + partitionKey()</span>
+                    );
+<span class="nc" id="L842">                    requestErrorResponse(Errors.forException(exception), exception);</span>
+<span class="nc" id="L843">                    return;</span>
+
+                case NETWORK_EXCEPTION: // Retriable client response error codes.
+                case REQUEST_TIMED_OUT:
+<span class="nc" id="L847">                    log().debug(&quot;Received retriable error in write state RPC client response for key {}: {}&quot;, partitionKey(), clientResponseErrorMessage);</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">                    if (!writeStateBackoff.canAttempt()) {</span>
+<span class="nc" id="L849">                        log().error(&quot;Exhausted max retries for write state RPC due to error in client response for key {}.&quot;, partitionKey());</span>
+<span class="nc" id="L850">                        requestErrorResponse(clientResponseError, new Exception(&quot;Exhausted max retries to complete write state RPC without success.&quot;));</span>
+<span class="nc" id="L851">                        return;</span>
+                    }
+<span class="nc" id="L853">                    super.resetCoordinatorNode();</span>
+<span class="nc" id="L854">                    timer.add(new PersisterTimerTask(writeStateBackoff.backOff(), this));</span>
+<span class="nc" id="L855">                    return;</span>
+
+                default:
+<span class="nc" id="L858">                    log().error(&quot;Unable to perform write state RPC due to error in client response for key {}: {}&quot;, partitionKey(), clientResponseError.code());</span>
+<span class="nc" id="L859">                    requestErrorResponse(clientResponseError, new Exception(clientResponseErrorMessage));</span>
+            }
+<span class="nc" id="L861">        }</span>
+
+        @Override
+        public void requestErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L865">            this.result.complete(new WriteShareGroupStateResponse(</span>
+<span class="nc" id="L866">                WriteShareGroupStateResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in write state RPC. &quot; +</span>
+<span class="nc bnc" id="L867" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L868">        }</span>
+
+        @Override
+        protected void findCoordinatorErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L872">            this.result.complete(new WriteShareGroupStateResponse(</span>
+<span class="nc" id="L873">                WriteShareGroupStateResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in find coordinator. &quot; +</span>
+<span class="nc bnc" id="L874" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L875">        }</span>
+
+        protected CompletableFuture&lt;WriteShareGroupStateResponse&gt; result() {
+<span class="nc" id="L878">            return result;</span>
+        }
+
+        @Override
+        protected boolean isBatchable() {
+<span class="nc" id="L883">            return true;</span>
+        }
+
+        @Override
+        protected RPCType rpcType() {
+<span class="nc" id="L888">            return RPCType.WRITE;</span>
+        }
+    }
+
+    public class ReadStateHandler extends PersisterStateManagerHandler {
+<span class="nc" id="L893">        private static final Logger LOG = LoggerFactory.getLogger(ReadStateHandler.class);</span>
+        private final int leaderEpoch;
+        private final CompletableFuture&lt;ReadShareGroupStateResponse&gt; result;
+        private final ExponentialBackoffManager readStateBackoff;
+
+        public ReadStateHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            int leaderEpoch,
+            CompletableFuture&lt;ReadShareGroupStateResponse&gt; result,
+            long backoffMs,
+            long backoffMaxMs,
+            int maxRPCRetryAttempts,
+            Consumer&lt;ClientResponse&gt; onCompleteCallback
+<span class="nc" id="L908">        ) {</span>
+<span class="nc" id="L909">            super(groupId, topicId, partition, backoffMs, backoffMaxMs, maxRPCRetryAttempts);</span>
+<span class="nc" id="L910">            this.leaderEpoch = leaderEpoch;</span>
+<span class="nc" id="L911">            this.result = result;</span>
+<span class="nc" id="L912">            this.readStateBackoff = new ExponentialBackoffManager(</span>
+                maxRPCRetryAttempts,
+                backoffMs,
+                RETRY_BACKOFF_EXP_BASE,
+                backoffMaxMs,
+                RETRY_BACKOFF_JITTER);
+<span class="nc" id="L918">        }</span>
+
+        public ReadStateHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            int leaderEpoch,
+            CompletableFuture&lt;ReadShareGroupStateResponse&gt; result,
+            Consumer&lt;ClientResponse&gt; onCompleteCallback
+        ) {
+<span class="nc" id="L928">            this(</span>
+                groupId,
+                topicId,
+                partition,
+                leaderEpoch,
+                result,
+                REQUEST_BACKOFF_MS,
+                REQUEST_BACKOFF_MAX_MS,
+                MAX_FIND_COORD_ATTEMPTS,
+                onCompleteCallback
+            );
+<span class="nc" id="L939">        }</span>
+
+        @Override
+        protected Logger log() {
+<span class="nc" id="L943">            return LOG;</span>
+        }
+
+        @Override
+        protected String name() {
+<span class="nc" id="L948">            return &quot;ReadStateHandler&quot;;</span>
+        }
+
+        @Override
+        protected AbstractRequest.Builder&lt;ReadShareGroupStateRequest&gt; requestBuilder() {
+<span class="nc" id="L953">            throw new RuntimeException(&quot;Read requests are batchable, hence individual requests not needed.&quot;);</span>
+        }
+
+        @Override
+        protected boolean isResponseForRequest(ClientResponse response) {
+<span class="nc bnc" id="L958" title="All 2 branches missed.">            return response.requestHeader().apiKey() == ApiKeys.READ_SHARE_GROUP_STATE;</span>
+        }
+
+        @Override
+        protected void handleRequestResponse(ClientResponse response) {
+<span class="nc" id="L963">            log().debug(&quot;Read state response received - {}&quot;, response);</span>
+<span class="nc" id="L964">            readStateBackoff.incrementAttempt();</span>
+<span class="nc" id="L965">            Errors clientResponseError = checkResponseError(response).orElse(Errors.NONE);</span>
+<span class="nc" id="L966">            String clientResponseErrorMessage = clientResponseError.message();</span>
+
+<span class="nc bnc" id="L968" title="All 3 branches missed.">            switch (clientResponseError) {</span>
+                case NONE:
+<span class="nc" id="L970">                    ReadShareGroupStateResponse combinedResponse = (ReadShareGroupStateResponse) response.responseBody();</span>
+<span class="nc bnc" id="L971" title="All 2 branches missed.">                    for (ReadShareGroupStateResponseData.ReadStateResult readStateResult : combinedResponse.data().results()) {</span>
+<span class="nc bnc" id="L972" title="All 2 branches missed.">                        if (readStateResult.topicId().equals(partitionKey().topicId())) {</span>
+<span class="nc" id="L973">                            Optional&lt;ReadShareGroupStateResponseData.PartitionResult&gt; partitionStateData =</span>
+<span class="nc bnc" id="L974" title="All 2 branches missed.">                                readStateResult.partitions().stream().filter(partitionResult -&gt; partitionResult.partition() == partitionKey().partition())</span>
+<span class="nc" id="L975">                                    .findFirst();</span>
+
+<span class="nc bnc" id="L977" title="All 2 branches missed.">                            if (partitionStateData.isPresent()) {</span>
+<span class="nc" id="L978">                                Errors error = Errors.forCode(partitionStateData.get().errorCode());</span>
+<span class="nc" id="L979">                                String errorMessage = partitionStateData.get().errorMessage();</span>
+<span class="nc bnc" id="L980" title="All 4 branches missed.">                                if (errorMessage == null || errorMessage.isEmpty()) {</span>
+<span class="nc" id="L981">                                    errorMessage = error.message();</span>
+                                }
+
+<span class="nc bnc" id="L984" title="All 3 branches missed.">                                switch (error) {</span>
+                                    case NONE:
+<span class="nc" id="L986">                                        readStateBackoff.resetAttempts();</span>
+<span class="nc" id="L987">                                        ReadShareGroupStateResponseData.ReadStateResult result = ReadShareGroupStateResponse.toResponseReadStateResult(</span>
+<span class="nc" id="L988">                                            partitionKey().topicId(),</span>
+<span class="nc" id="L989">                                            List.of(partitionStateData.get())</span>
+                                        );
+<span class="nc" id="L991">                                        this.result.complete(new ReadShareGroupStateResponse(new ReadShareGroupStateResponseData()</span>
+<span class="nc" id="L992">                                            .setResults(List.of(result))));</span>
+<span class="nc" id="L993">                                        return;</span>
+
+                                    // check retriable errors
+                                    case COORDINATOR_NOT_AVAILABLE:
+                                    case COORDINATOR_LOAD_IN_PROGRESS:
+                                    case NOT_COORDINATOR:
+                                    case UNKNOWN_TOPIC_OR_PARTITION:
+<span class="nc" id="L1000">                                        log().debug(&quot;Received retriable error in read state RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc bnc" id="L1001" title="All 2 branches missed.">                                        if (!readStateBackoff.canAttempt()) {</span>
+<span class="nc" id="L1002">                                            log().error(&quot;Exhausted max retries for read state RPC for key {} without success.&quot;, partitionKey());</span>
+<span class="nc" id="L1003">                                            requestErrorResponse(error, new Exception(&quot;Exhausted max retries to complete read state RPC without success.&quot;));</span>
+<span class="nc" id="L1004">                                            return;</span>
+                                        }
+<span class="nc" id="L1006">                                        super.resetCoordinatorNode();</span>
+<span class="nc" id="L1007">                                        timer.add(new PersisterTimerTask(readStateBackoff.backOff(), this));</span>
+<span class="nc" id="L1008">                                        return;</span>
+
+                                    default:
+<span class="nc" id="L1011">                                        log().error(&quot;Unable to perform read state RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc" id="L1012">                                        requestErrorResponse(error, new Exception(errorMessage));</span>
+<span class="nc" id="L1013">                                        return;</span>
+                                }
+                            }
+                        }
+<span class="nc" id="L1017">                    }</span>
+
+                    // no response found specific topic partition
+<span class="nc" id="L1020">                    IllegalStateException exception = new IllegalStateException(</span>
+<span class="nc" id="L1021">                        &quot;Failed to read state for share partition &quot; + partitionKey()</span>
+                    );
+<span class="nc" id="L1023">                    requestErrorResponse(Errors.forException(exception), exception);</span>
+<span class="nc" id="L1024">                    return;</span>
+
+                case NETWORK_EXCEPTION: // Retriable client response error codes.
+                case REQUEST_TIMED_OUT:
+<span class="nc" id="L1028">                    log().debug(&quot;Received retriable error in read state RPC client response for key {}: {}&quot;, partitionKey(), clientResponseErrorMessage);</span>
+<span class="nc bnc" id="L1029" title="All 2 branches missed.">                    if (!readStateBackoff.canAttempt()) {</span>
+<span class="nc" id="L1030">                        log().error(&quot;Exhausted max retries for read state RPC due to error in client response for key {}.&quot;, partitionKey());</span>
+<span class="nc" id="L1031">                        requestErrorResponse(clientResponseError, new Exception(&quot;Exhausted max retries to complete read state RPC without success.&quot;));</span>
+<span class="nc" id="L1032">                        return;</span>
+                    }
+<span class="nc" id="L1034">                    super.resetCoordinatorNode();</span>
+<span class="nc" id="L1035">                    timer.add(new PersisterTimerTask(readStateBackoff.backOff(), this));</span>
+<span class="nc" id="L1036">                    return;</span>
+
+                default:
+<span class="nc" id="L1039">                    log().error(&quot;Unable to perform read state RPC due to error in client response for key {}: {}&quot;, partitionKey(), clientResponseError.code());</span>
+<span class="nc" id="L1040">                    requestErrorResponse(clientResponseError, new Exception(clientResponseErrorMessage));</span>
+            }
+<span class="nc" id="L1042">        }</span>
+
+        @Override
+        protected void requestErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L1046">            this.result.complete(new ReadShareGroupStateResponse(</span>
+<span class="nc" id="L1047">                ReadShareGroupStateResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in read state RPC. &quot; +</span>
+<span class="nc bnc" id="L1048" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L1049">        }</span>
+
+        @Override
+        protected void findCoordinatorErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L1053">            this.result.complete(new ReadShareGroupStateResponse(</span>
+<span class="nc" id="L1054">                ReadShareGroupStateResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in find coordinator. &quot; +</span>
+<span class="nc bnc" id="L1055" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L1056">        }</span>
+
+        protected CompletableFuture&lt;ReadShareGroupStateResponse&gt; result() {
+<span class="nc" id="L1059">            return result;</span>
+        }
+
+        @Override
+        protected boolean isBatchable() {
+<span class="nc" id="L1064">            return true;</span>
+        }
+
+        @Override
+        protected RPCType rpcType() {
+<span class="nc" id="L1069">            return RPCType.READ;</span>
+        }
+    }
+
+    public class ReadStateSummaryHandler extends PersisterStateManagerHandler {
+<span class="nc" id="L1074">        private static final Logger LOG = LoggerFactory.getLogger(ReadStateSummaryHandler.class);</span>
+        private final int leaderEpoch;
+        private final CompletableFuture&lt;ReadShareGroupStateSummaryResponse&gt; result;
+        private final ExponentialBackoffManager readStateSummaryBackoff;
+
+        public ReadStateSummaryHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            int leaderEpoch,
+            CompletableFuture&lt;ReadShareGroupStateSummaryResponse&gt; result,
+            long backoffMs,
+            long backoffMaxMs,
+            int maxRPCRetryAttempts,
+            Consumer&lt;ClientResponse&gt; onCompleteCallback
+<span class="nc" id="L1089">        ) {</span>
+<span class="nc" id="L1090">            super(groupId, topicId, partition, backoffMs, backoffMaxMs, maxRPCRetryAttempts);</span>
+<span class="nc" id="L1091">            this.leaderEpoch = leaderEpoch;</span>
+<span class="nc" id="L1092">            this.result = result;</span>
+<span class="nc" id="L1093">            this.readStateSummaryBackoff = new ExponentialBackoffManager(</span>
+                maxRPCRetryAttempts,
+                backoffMs,
+                RETRY_BACKOFF_EXP_BASE,
+                backoffMaxMs,
+                RETRY_BACKOFF_JITTER);
+<span class="nc" id="L1099">        }</span>
+
+        public ReadStateSummaryHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            int leaderEpoch,
+            CompletableFuture&lt;ReadShareGroupStateSummaryResponse&gt; result,
+            Consumer&lt;ClientResponse&gt; onCompleteCallback
+        ) {
+<span class="nc" id="L1109">            this(</span>
+                groupId,
+                topicId,
+                partition,
+                leaderEpoch,
+                result,
+                REQUEST_BACKOFF_MS,
+                REQUEST_BACKOFF_MAX_MS,
+                MAX_FIND_COORD_ATTEMPTS,
+                onCompleteCallback
+            );
+<span class="nc" id="L1120">        }</span>
+
+        @Override
+        protected Logger log() {
+<span class="nc" id="L1124">            return LOG;</span>
+        }
+
+        @Override
+        protected String name() {
+<span class="nc" id="L1129">            return &quot;ReadStateSummaryHandler&quot;;</span>
+        }
+
+        @Override
+        protected AbstractRequest.Builder&lt;ReadShareGroupStateSummaryRequest&gt; requestBuilder() {
+<span class="nc" id="L1134">            throw new RuntimeException(&quot;Read Summary requests are batchable, hence individual requests not needed.&quot;);</span>
+        }
+
+        @Override
+        protected boolean isResponseForRequest(ClientResponse response) {
+<span class="nc bnc" id="L1139" title="All 2 branches missed.">            return response.requestHeader().apiKey() == ApiKeys.READ_SHARE_GROUP_STATE_SUMMARY;</span>
+        }
+
+        @Override
+        protected void handleRequestResponse(ClientResponse response) {
+<span class="nc" id="L1144">            log().debug(&quot;Read state summary response received - {}&quot;, response);</span>
+<span class="nc" id="L1145">            readStateSummaryBackoff.incrementAttempt();</span>
+<span class="nc" id="L1146">            Errors clientResponseError = checkResponseError(response).orElse(Errors.NONE);</span>
+<span class="nc" id="L1147">            String clientResponseErrorMessage = clientResponseError.message();</span>
+
+<span class="nc bnc" id="L1149" title="All 3 branches missed.">            switch (clientResponseError) {</span>
+                case NONE:
+<span class="nc" id="L1151">                    ReadShareGroupStateSummaryResponse combinedResponse = (ReadShareGroupStateSummaryResponse) response.responseBody();</span>
+<span class="nc bnc" id="L1152" title="All 2 branches missed.">                    for (ReadShareGroupStateSummaryResponseData.ReadStateSummaryResult readStateSummaryResult : combinedResponse.data().results()) {</span>
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">                        if (readStateSummaryResult.topicId().equals(partitionKey().topicId())) {</span>
+<span class="nc" id="L1154">                            Optional&lt;ReadShareGroupStateSummaryResponseData.PartitionResult&gt; partitionStateData =</span>
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">                                readStateSummaryResult.partitions().stream().filter(partitionResult -&gt; partitionResult.partition() == partitionKey().partition())</span>
+<span class="nc" id="L1156">                                    .findFirst();</span>
+
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">                            if (partitionStateData.isPresent()) {</span>
+<span class="nc" id="L1159">                                Errors error = Errors.forCode(partitionStateData.get().errorCode());</span>
+<span class="nc" id="L1160">                                String errorMessage = partitionStateData.get().errorMessage();</span>
+<span class="nc bnc" id="L1161" title="All 4 branches missed.">                                if (errorMessage == null || errorMessage.isEmpty()) {</span>
+<span class="nc" id="L1162">                                    errorMessage = error.message();</span>
+                                }
+
+<span class="nc bnc" id="L1165" title="All 3 branches missed.">                                switch (error) {</span>
+                                    case NONE:
+<span class="nc" id="L1167">                                        readStateSummaryBackoff.resetAttempts();</span>
+<span class="nc" id="L1168">                                        ReadShareGroupStateSummaryResponseData.ReadStateSummaryResult result = ReadShareGroupStateSummaryResponse.toResponseReadStateSummaryResult(</span>
+<span class="nc" id="L1169">                                            partitionKey().topicId(),</span>
+<span class="nc" id="L1170">                                            List.of(partitionStateData.get())</span>
+                                        );
+<span class="nc" id="L1172">                                        this.result.complete(new ReadShareGroupStateSummaryResponse(new ReadShareGroupStateSummaryResponseData()</span>
+<span class="nc" id="L1173">                                            .setResults(List.of(result))));</span>
+<span class="nc" id="L1174">                                        return;</span>
+
+                                    // check retriable errors
+                                    case COORDINATOR_NOT_AVAILABLE:
+                                    case COORDINATOR_LOAD_IN_PROGRESS:
+                                    case NOT_COORDINATOR:
+                                    case UNKNOWN_TOPIC_OR_PARTITION:
+<span class="nc" id="L1181">                                        log().debug(&quot;Received retriable error in read state summary RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc bnc" id="L1182" title="All 2 branches missed.">                                        if (!readStateSummaryBackoff.canAttempt()) {</span>
+<span class="nc" id="L1183">                                            log().error(&quot;Exhausted max retries for read state summary RPC for key {} without success.&quot;, partitionKey());</span>
+<span class="nc" id="L1184">                                            requestErrorResponse(error, new Exception(&quot;Exhausted max retries to complete read state summary RPC without success.&quot;));</span>
+<span class="nc" id="L1185">                                            return;</span>
+                                        }
+<span class="nc" id="L1187">                                        super.resetCoordinatorNode();</span>
+<span class="nc" id="L1188">                                        timer.add(new PersisterTimerTask(readStateSummaryBackoff.backOff(), this));</span>
+<span class="nc" id="L1189">                                        return;</span>
+
+                                    default:
+<span class="nc" id="L1192">                                        log().error(&quot;Unable to perform read state summary RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc" id="L1193">                                        requestErrorResponse(error, new Exception(errorMessage));</span>
+<span class="nc" id="L1194">                                        return;</span>
+                                }
+                            }
+                        }
+<span class="nc" id="L1198">                    }</span>
+
+                    // no response found specific topic partition
+<span class="nc" id="L1201">                    IllegalStateException exception = new IllegalStateException(</span>
+<span class="nc" id="L1202">                        &quot;Failed to read state summary for share partition &quot; + partitionKey()</span>
+                    );
+<span class="nc" id="L1204">                    requestErrorResponse(Errors.forException(exception), exception);</span>
+<span class="nc" id="L1205">                    return;</span>
+
+                case NETWORK_EXCEPTION: // Retriable client response error codes.
+                case REQUEST_TIMED_OUT:
+<span class="nc" id="L1209">                    log().debug(&quot;Received retriable error in read state summary RPC client response for key {}: {}&quot;, partitionKey(), clientResponseErrorMessage);</span>
+<span class="nc bnc" id="L1210" title="All 2 branches missed.">                    if (!readStateSummaryBackoff.canAttempt()) {</span>
+<span class="nc" id="L1211">                        log().error(&quot;Exhausted max retries for read state summary RPC due to error in client response for key {}.&quot;, partitionKey());</span>
+<span class="nc" id="L1212">                        requestErrorResponse(clientResponseError, new Exception(&quot;Exhausted max retries to complete read state summary RPC without success.&quot;));</span>
+<span class="nc" id="L1213">                        return;</span>
+                    }
+<span class="nc" id="L1215">                    super.resetCoordinatorNode();</span>
+<span class="nc" id="L1216">                    timer.add(new PersisterTimerTask(readStateSummaryBackoff.backOff(), this));</span>
+<span class="nc" id="L1217">                    return;</span>
+
+                default:
+<span class="nc" id="L1220">                    log().error(&quot;Unable to perform read state summary RPC due to error in client response for key {}: {}&quot;, partitionKey(), clientResponseError.code());</span>
+<span class="nc" id="L1221">                    requestErrorResponse(clientResponseError, new Exception(clientResponseErrorMessage));</span>
+            }
+<span class="nc" id="L1223">        }</span>
+
+        @Override
+        protected void requestErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L1227">            this.result.complete(new ReadShareGroupStateSummaryResponse(</span>
+<span class="nc" id="L1228">                ReadShareGroupStateSummaryResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in read state summary RPC. &quot; +</span>
+<span class="nc bnc" id="L1229" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L1230">        }</span>
+
+        @Override
+        protected void findCoordinatorErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L1234">            this.result.complete(new ReadShareGroupStateSummaryResponse(</span>
+<span class="nc" id="L1235">                ReadShareGroupStateSummaryResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in find coordinator. &quot; +</span>
+<span class="nc bnc" id="L1236" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L1237">        }</span>
+
+        protected CompletableFuture&lt;ReadShareGroupStateSummaryResponse&gt; result() {
+<span class="nc" id="L1240">            return result;</span>
+        }
+
+        @Override
+        protected boolean isBatchable() {
+<span class="nc" id="L1245">            return true;</span>
+        }
+
+        @Override
+        protected RPCType rpcType() {
+<span class="nc" id="L1250">            return RPCType.SUMMARY;</span>
+        }
+    }
+
+    public class DeleteStateHandler extends PersisterStateManagerHandler {
+<span class="nc" id="L1255">        private static final Logger LOG = LoggerFactory.getLogger(DeleteStateHandler.class);</span>
+        private final CompletableFuture&lt;DeleteShareGroupStateResponse&gt; result;
+        private final ExponentialBackoffManager deleteStateBackoff;
+
+        public DeleteStateHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            CompletableFuture&lt;DeleteShareGroupStateResponse&gt; result,
+            long backoffMs,
+            long backoffMaxMs,
+            int maxRPCRetryAttempts
+<span class="nc" id="L1267">        ) {</span>
+<span class="nc" id="L1268">            super(groupId, topicId, partition, backoffMs, backoffMaxMs, maxRPCRetryAttempts);</span>
+<span class="nc" id="L1269">            this.result = result;</span>
+<span class="nc" id="L1270">            this.deleteStateBackoff = new ExponentialBackoffManager(</span>
+                maxRPCRetryAttempts,
+                backoffMs,
+                RETRY_BACKOFF_EXP_BASE,
+                backoffMaxMs,
+                RETRY_BACKOFF_JITTER);
+<span class="nc" id="L1276">        }</span>
+
+        public DeleteStateHandler(
+            String groupId,
+            Uuid topicId,
+            int partition,
+            CompletableFuture&lt;DeleteShareGroupStateResponse&gt; result,
+            Consumer&lt;ClientResponse&gt; onCompleteCallback
+        ) {
+<span class="nc" id="L1285">            this(</span>
+                groupId,
+                topicId,
+                partition,
+                result,
+                REQUEST_BACKOFF_MS,
+                REQUEST_BACKOFF_MAX_MS,
+                MAX_FIND_COORD_ATTEMPTS
+            );
+<span class="nc" id="L1294">        }</span>
+
+        @Override
+        protected Logger log() {
+<span class="nc" id="L1298">            return LOG;</span>
+        }
+
+        @Override
+        protected String name() {
+<span class="nc" id="L1303">            return &quot;DeleteStateHandler&quot;;</span>
+        }
+
+        @Override
+        protected AbstractRequest.Builder&lt;? extends AbstractRequest&gt; requestBuilder() {
+<span class="nc" id="L1308">            throw new RuntimeException(&quot;Delete requests are batchable, hence individual requests not needed.&quot;);</span>
+        }
+
+        @Override
+        protected boolean isResponseForRequest(ClientResponse response) {
+<span class="nc bnc" id="L1313" title="All 2 branches missed.">            return response.requestHeader().apiKey() == ApiKeys.DELETE_SHARE_GROUP_STATE;</span>
+        }
+
+        @Override
+        protected void handleRequestResponse(ClientResponse response) {
+<span class="nc" id="L1318">            log().debug(&quot;Delete state response received - {}&quot;, response);</span>
+<span class="nc" id="L1319">            deleteStateBackoff.incrementAttempt();</span>
+<span class="nc" id="L1320">            Errors clientResponseError = checkResponseError(response).orElse(Errors.NONE);</span>
+<span class="nc" id="L1321">            String clientResponseErrorMessage = clientResponseError.message();</span>
+
+<span class="nc bnc" id="L1323" title="All 3 branches missed.">            switch (clientResponseError) {</span>
+                case NONE:
+                    // response can be a combined one for large number of requests
+                    // we need to deconstruct it
+<span class="nc" id="L1327">                    DeleteShareGroupStateResponse combinedResponse = (DeleteShareGroupStateResponse) response.responseBody();</span>
+
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">                    for (DeleteShareGroupStateResponseData.DeleteStateResult deleteStateResult : combinedResponse.data().results()) {</span>
+<span class="nc bnc" id="L1330" title="All 2 branches missed.">                        if (deleteStateResult.topicId().equals(partitionKey().topicId())) {</span>
+<span class="nc" id="L1331">                            Optional&lt;DeleteShareGroupStateResponseData.PartitionResult&gt; partitionStateData =</span>
+<span class="nc" id="L1332">                                deleteStateResult.partitions().stream()</span>
+<span class="nc bnc" id="L1333" title="All 2 branches missed.">                                    .filter(partitionResult -&gt; partitionResult.partition() == partitionKey().partition())</span>
+<span class="nc" id="L1334">                                    .findFirst();</span>
+
+<span class="nc bnc" id="L1336" title="All 2 branches missed.">                            if (partitionStateData.isPresent()) {</span>
+<span class="nc" id="L1337">                                Errors error = Errors.forCode(partitionStateData.get().errorCode());</span>
+<span class="nc" id="L1338">                                String errorMessage = partitionStateData.get().errorMessage();</span>
+<span class="nc bnc" id="L1339" title="All 4 branches missed.">                                if (errorMessage == null || errorMessage.isEmpty()) {</span>
+<span class="nc" id="L1340">                                    errorMessage = error.message();</span>
+                                }
+
+<span class="nc bnc" id="L1343" title="All 3 branches missed.">                                switch (error) {</span>
+                                    case NONE:
+<span class="nc" id="L1345">                                        deleteStateBackoff.resetAttempts();</span>
+<span class="nc" id="L1346">                                        DeleteShareGroupStateResponseData.DeleteStateResult result = DeleteShareGroupStateResponse.toResponseDeleteStateResult(</span>
+<span class="nc" id="L1347">                                            partitionKey().topicId(),</span>
+<span class="nc" id="L1348">                                            List.of(partitionStateData.get())</span>
+                                        );
+<span class="nc" id="L1350">                                        this.result.complete(new DeleteShareGroupStateResponse(</span>
+<span class="nc" id="L1351">                                            new DeleteShareGroupStateResponseData().setResults(List.of(result))));</span>
+<span class="nc" id="L1352">                                        return;</span>
+
+                                    // check retriable errors
+                                    case COORDINATOR_NOT_AVAILABLE:
+                                    case COORDINATOR_LOAD_IN_PROGRESS:
+                                    case NOT_COORDINATOR:
+                                    case UNKNOWN_TOPIC_OR_PARTITION:
+<span class="nc" id="L1359">                                        log().debug(&quot;Received retriable error in delete state RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc bnc" id="L1360" title="All 2 branches missed.">                                        if (!deleteStateBackoff.canAttempt()) {</span>
+<span class="nc" id="L1361">                                            log().error(&quot;Exhausted max retries for delete state RPC for key {} without success.&quot;, partitionKey());</span>
+<span class="nc" id="L1362">                                            requestErrorResponse(error, new Exception(&quot;Exhausted max retries to complete delete state RPC without success.&quot;));</span>
+<span class="nc" id="L1363">                                            return;</span>
+                                        }
+<span class="nc" id="L1365">                                        super.resetCoordinatorNode();</span>
+<span class="nc" id="L1366">                                        timer.add(new PersisterTimerTask(deleteStateBackoff.backOff(), this));</span>
+<span class="nc" id="L1367">                                        return;</span>
+
+                                    default:
+<span class="nc" id="L1370">                                        log().error(&quot;Unable to perform delete state RPC for key {}: {}&quot;, partitionKey(), errorMessage);</span>
+<span class="nc" id="L1371">                                        requestErrorResponse(error, new Exception(errorMessage));</span>
+<span class="nc" id="L1372">                                        return;</span>
+                                }
+                            }
+                        }
+<span class="nc" id="L1376">                    }</span>
+
+                    // no response found specific topic partition
+<span class="nc" id="L1379">                    IllegalStateException exception = new IllegalStateException(</span>
+<span class="nc" id="L1380">                        &quot;Failed to delete state for share partition: &quot; + partitionKey()</span>
+                    );
+<span class="nc" id="L1382">                    requestErrorResponse(Errors.forException(exception), exception);</span>
+<span class="nc" id="L1383">                    return;</span>
+
+                case NETWORK_EXCEPTION: // Retriable client response error codes.
+                case REQUEST_TIMED_OUT:
+<span class="nc" id="L1387">                    log().debug(&quot;Received retriable error in delete state RPC client response for key {}: {}&quot;, partitionKey(), clientResponseErrorMessage);</span>
+<span class="nc bnc" id="L1388" title="All 2 branches missed.">                    if (!deleteStateBackoff.canAttempt()) {</span>
+<span class="nc" id="L1389">                        log().error(&quot;Exhausted max retries for delete state RPC due to error in client response for key {}.&quot;, partitionKey());</span>
+<span class="nc" id="L1390">                        requestErrorResponse(clientResponseError, new Exception(&quot;Exhausted max retries to complete delete state RPC without success.&quot;));</span>
+<span class="nc" id="L1391">                        return;</span>
+                    }
+<span class="nc" id="L1393">                    super.resetCoordinatorNode();</span>
+<span class="nc" id="L1394">                    timer.add(new PersisterTimerTask(deleteStateBackoff.backOff(), this));</span>
+<span class="nc" id="L1395">                    return;</span>
+
+                default:
+<span class="nc" id="L1398">                    log().error(&quot;Unable to perform delete state RPC due to error in client response for key {}: {}&quot;, partitionKey(), clientResponseError.code());</span>
+<span class="nc" id="L1399">                    requestErrorResponse(clientResponseError, new Exception(clientResponseErrorMessage));</span>
+            }
+<span class="nc" id="L1401">        }</span>
+
+        @Override
+        protected void requestErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L1405">            this.result.complete(new DeleteShareGroupStateResponse(</span>
+<span class="nc" id="L1406">                DeleteShareGroupStateResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in delete state RPC. &quot; +</span>
+<span class="nc bnc" id="L1407" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L1408">        }</span>
+
+        @Override
+        protected void findCoordinatorErrorResponse(Errors error, Exception exception) {
+<span class="nc" id="L1412">            this.result.complete(new DeleteShareGroupStateResponse(</span>
+<span class="nc" id="L1413">                DeleteShareGroupStateResponse.toErrorResponseData(partitionKey().topicId(), partitionKey().partition(), error, &quot;Error in find coordinator. &quot; +</span>
+<span class="nc bnc" id="L1414" title="All 2 branches missed.">                    (exception == null ? error.message() : exception.getMessage()))));</span>
+<span class="nc" id="L1415">        }</span>
+
+        protected CompletableFuture&lt;DeleteShareGroupStateResponse&gt; result() {
+<span class="nc" id="L1418">            return result;</span>
+        }
+
+        @Override
+        protected boolean isBatchable() {
+<span class="nc" id="L1423">            return true;</span>
+        }
+
+        @Override
+        protected RPCType rpcType() {
+<span class="nc" id="L1428">            return RPCType.DELETE;</span>
+        }
+    }
+
+    private class SendThread extends InterBrokerSendThread {
+<span class="nc" id="L1433">        private final ConcurrentLinkedQueue&lt;PersisterStateManagerHandler&gt; queue = new ConcurrentLinkedQueue&lt;&gt;();</span>
+        private final Random random;
+
+<span class="nc" id="L1436">        public SendThread(String name, KafkaClient networkClient, int requestTimeoutMs, Time time, boolean isInterruptible, Random random) {</span>
+<span class="nc" id="L1437">            super(name, networkClient, requestTimeoutMs, time, isInterruptible);</span>
+<span class="nc" id="L1438">            this.random = random;</span>
+<span class="nc" id="L1439">        }</span>
+
+        private Node randomNode() {
+<span class="nc" id="L1442">            List&lt;Node&gt; nodes = cacheHelper.getClusterNodes();</span>
+<span class="nc bnc" id="L1443" title="All 4 branches missed.">            if (nodes == null || nodes.isEmpty()) {</span>
+<span class="nc" id="L1444">                return Node.noNode();</span>
+            }
+<span class="nc" id="L1446">            return nodes.get(random.nextInt(nodes.size()));</span>
+        }
+
+        /**
+         * The incoming requests will have the keys in the following format
+         * groupId: [
+         * topidId1: [part1, part2, part3],
+         * topicId2: [part1, part2, part3]
+         * ...
+         * ]
+         * Hence, the total number of keys would be 1 x m x n (1 is for the groupId) where m is number of topicIds
+         * and n is number of partitions specified per topicId.
+         * &lt;p&gt;
+         * For each RPC, we need to identify the coordinator node first.
+         * If the internal share state topic is not found in the metadata cache, when RPC is received
+         * we will need to make a FIND_COORDINATOR RPC which will have the side effect of creating the internal
+         * topic as well. If the node is found in the cache, we will use it directly.
+         *
+         * @return list of requests to send
+         */
+        @Override
+        public Collection&lt;RequestAndCompletionHandler&gt; generateRequests() {
+            // There are two sources for requests here:
+            // 1. A queue which will contain FIND_CORD RPCs and other non-batchable RPCs.
+            // 2. A hashMap keyed on the share coordinator nodes which may contain batched requests.
+
+<span class="nc bnc" id="L1472" title="All 2 branches missed.">            if (generateCallback != null) {</span>
+<span class="nc" id="L1473">                generateCallback.run();</span>
+            }
+<span class="nc" id="L1475">            List&lt;RequestAndCompletionHandler&gt; requests = new ArrayList&lt;&gt;();</span>
+
+            // honor queue first as find coordinator
+            // is mandatory for batching and sending the
+            // request to correct destination node
+<span class="nc bnc" id="L1480" title="All 2 branches missed.">            if (!queue.isEmpty()) {</span>
+<span class="nc" id="L1481">                PersisterStateManagerHandler handler = queue.peek();</span>
+<span class="nc" id="L1482">                queue.poll();</span>
+<span class="nc bnc" id="L1483" title="All 2 branches missed.">                if (handler.lookupNeeded()) {</span>
+                    // we need to find the coordinator node
+<span class="nc" id="L1485">                    Node randomNode = randomNode();</span>
+<span class="nc bnc" id="L1486" title="All 2 branches missed.">                    if (randomNode == Node.noNode()) {</span>
+<span class="nc" id="L1487">                        log.error(&quot;Unable to find node to use for coordinator lookup.&quot;);</span>
+                        // fatal failure, cannot retry or progress
+                        // fail the RPC
+<span class="nc" id="L1490">                        handler.findCoordinatorErrorResponse(Errors.COORDINATOR_NOT_AVAILABLE, Errors.COORDINATOR_NOT_AVAILABLE.exception());</span>
+<span class="nc" id="L1491">                        return List.of();</span>
+                    }
+<span class="nc" id="L1493">                    log.debug(&quot;Sending find coordinator RPC&quot;);</span>
+<span class="nc" id="L1494">                    return List.of(new RequestAndCompletionHandler(</span>
+<span class="nc" id="L1495">                        time.milliseconds(),</span>
+                        randomNode,
+<span class="nc" id="L1497">                        handler.findShareCoordinatorBuilder(),</span>
+                        handler
+                    ));
+                } else {
+                    // useful for tests and
+                    // other RPCs which might not be batchable
+<span class="nc bnc" id="L1503" title="All 2 branches missed.">                    if (!handler.isBatchable()) {</span>
+<span class="nc" id="L1504">                        requests.add(new RequestAndCompletionHandler(</span>
+<span class="nc" id="L1505">                            time.milliseconds(),</span>
+                            handler.coordinatorNode,
+<span class="nc" id="L1507">                            handler.requestBuilder(),</span>
+                            handler
+                        ));
+                    }
+                }
+            }
+
+            // node1: {
+            //   group1: {
+            //      write: [w1, w2],
+            //      read: [r1, r2],
+            //      delete: [d1],
+            //      summary: [s1],
+            //   }
+            //   group2: {
+            //      write: [w3, w4]
+            //   }
+            // }
+            // For a sequence of writes, the flow would be:
+            // 1. 1st write request arrives
+            // 2. it is enqueued in the send thread
+            // 3. wakeup event causes the generate requests to find the coordinator
+            // 4. it will cause either RPC or cache lookup
+            // 5. once complete, the write handler is added to the nodeMap for batching and not the queue
+            // 6. wakeup event causes generate requests to iterate over the map and send the write request (W1) and
+            // remove node from the nodeMap and add it to inFlight
+            // 7. until W1 completes, more write requests (W2, W3, ...) could come in and get added to the nodeMap as per point 3, 4, 5.
+            // 8. if these belong to same node as W1. They will not be sent as the membership test with inFlight will pass.
+            // 9. when W1 completes, it will clear inFlight and raise wakeup event.
+            // 10. at this point W2, W3, etc. could be sent as a combined request thus achieving batching.
+<span class="nc" id="L1537">            final Map&lt;RPCType, Set&lt;Node&gt;&gt; sending = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1538">            synchronized (nodeMapLock) {</span>
+<span class="nc" id="L1539">                nodeRPCMap.forEach((coordNode, rpcTypesPerNode) -&gt;</span>
+<span class="nc" id="L1540">                    rpcTypesPerNode.forEach((rpcType, groupsPerRpcType) -&gt;</span>
+<span class="nc" id="L1541">                        groupsPerRpcType.forEach((groupId, handlersPerGroup) -&gt; {</span>
+                            // this condition causes requests of same type and same destination node
+                            // to not be sent immediately but get batched
+<span class="nc bnc" id="L1544" title="All 4 branches missed.">                            if (!inFlight.containsKey(rpcType) || !inFlight.get(rpcType).contains(coordNode)) {</span>
+<span class="nc" id="L1545">                                AbstractRequest.Builder&lt;? extends AbstractRequest&gt; combinedRequestPerTypePerGroup =</span>
+<span class="nc" id="L1546">                                    RequestCoalescerHelper.coalesceRequests(groupId, rpcType, handlersPerGroup);</span>
+<span class="nc" id="L1547">                                requests.add(new RequestAndCompletionHandler(</span>
+<span class="nc" id="L1548">                                    time.milliseconds(),</span>
+                                    coordNode,
+                                    combinedRequestPerTypePerGroup,
+                                    response -&gt; {
+<span class="nc" id="L1552">                                        inFlight.computeIfPresent(rpcType, (key, oldVal) -&gt; {</span>
+<span class="nc" id="L1553">                                            oldVal.remove(coordNode);</span>
+<span class="nc" id="L1554">                                            return oldVal;</span>
+                                        });
+                                        // now the combined request has completed
+                                        // we need to create responses for individual
+                                        // requests which composed the combined request
+<span class="nc" id="L1559">                                        handlersPerGroup.forEach(handler1 -&gt; handler1.onComplete(response));</span>
+<span class="nc" id="L1560">                                        wakeup();</span>
+<span class="nc" id="L1561">                                    }));</span>
+<span class="nc" id="L1562">                                sending.computeIfAbsent(rpcType, key -&gt; new HashSet&lt;&gt;()).add(coordNode);</span>
+                            }
+<span class="nc" id="L1564">                        })));</span>
+
+<span class="nc" id="L1566">                sending.forEach((rpcType, nodeSet) -&gt; {</span>
+                    // we need to add these nodes to inFlight
+<span class="nc" id="L1568">                    inFlight.computeIfAbsent(rpcType, key -&gt; new HashSet&lt;&gt;()).addAll(nodeSet);</span>
+
+                    // remove from nodeMap
+<span class="nc" id="L1571">                    nodeSet.forEach(node -&gt; nodeRPCMap.computeIfPresent(node, (nodeKey, oldRPCTypeSet) -&gt; {</span>
+<span class="nc" id="L1572">                        oldRPCTypeSet.remove(rpcType);</span>
+<span class="nc" id="L1573">                        return oldRPCTypeSet;</span>
+                    }));
+<span class="nc" id="L1575">                });</span>
+<span class="nc" id="L1576">            } // close of synchronized context</span>
+
+<span class="nc" id="L1578">            return requests;</span>
+        }
+
+        public void enqueue(PersisterStateManagerHandler handler) {
+<span class="nc" id="L1582">            queue.add(handler);</span>
+<span class="nc" id="L1583">            wakeup();</span>
+<span class="nc" id="L1584">        }</span>
+    }
+
+    private final class PersisterTimerTask extends TimerTask {
+        private final PersisterStateManagerHandler handler;
+
+<span class="nc" id="L1590">        PersisterTimerTask(long delayMs, PersisterStateManagerHandler handler) {</span>
+<span class="nc" id="L1591">            super(delayMs);</span>
+<span class="nc" id="L1592">            this.handler = handler;</span>
+<span class="nc" id="L1593">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc" id="L1597">            enqueue(handler);</span>
+<span class="nc" id="L1598">            sender.wakeup();</span>
+<span class="nc" id="L1599">        }</span>
+    }
+
+    /**
+     * Util class which takes in builders of requests of the same type
+     * and returns a combined request of the same type. This is required for
+     * batching requests.
+     */
+<span class="nc" id="L1607">    private static class RequestCoalescerHelper {</span>
+        public static AbstractRequest.Builder&lt;? extends AbstractRequest&gt; coalesceRequests(String groupId, RPCType rpcType, List&lt;? extends PersisterStateManagerHandler&gt; handlers) {
+<span class="nc bnc" id="L1609" title="All 6 branches missed.">            return switch (rpcType) {</span>
+<span class="nc" id="L1610">                case WRITE -&gt; coalesceWrites(groupId, handlers);</span>
+<span class="nc" id="L1611">                case READ -&gt; coalesceReads(groupId, handlers);</span>
+<span class="nc" id="L1612">                case SUMMARY -&gt; coalesceReadSummaries(groupId, handlers);</span>
+<span class="nc" id="L1613">                case DELETE -&gt; coalesceDeletes(groupId, handlers);</span>
+<span class="nc" id="L1614">                case INITIALIZE -&gt; coalesceInitializations(groupId, handlers);</span>
+<span class="nc" id="L1615">                default -&gt; throw new RuntimeException(&quot;Unknown rpc type: &quot; + rpcType);</span>
+            };
+        }
+
+        private static AbstractRequest.Builder&lt;? extends AbstractRequest&gt; coalesceWrites(String groupId, List&lt;? extends PersisterStateManagerHandler&gt; handlers) {
+<span class="nc" id="L1620">            Map&lt;Uuid, List&lt;WriteShareGroupStateRequestData.PartitionData&gt;&gt; partitionData = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1621">            handlers.forEach(persHandler -&gt; {</span>
+<span class="nc bnc" id="L1622" title="All 2 branches missed.">                assert persHandler instanceof WriteStateHandler;</span>
+<span class="nc" id="L1623">                WriteStateHandler handler = (WriteStateHandler) persHandler;</span>
+<span class="nc" id="L1624">                partitionData.computeIfAbsent(handler.partitionKey().topicId(), topicId -&gt; new LinkedList&lt;&gt;())</span>
+<span class="nc" id="L1625">                    .add(</span>
+                        new WriteShareGroupStateRequestData.PartitionData()
+<span class="nc" id="L1627">                            .setPartition(handler.partitionKey().partition())</span>
+<span class="nc" id="L1628">                            .setStateEpoch(handler.stateEpoch)</span>
+<span class="nc" id="L1629">                            .setLeaderEpoch(handler.leaderEpoch)</span>
+<span class="nc" id="L1630">                            .setStartOffset(handler.startOffset)</span>
+<span class="nc" id="L1631">                            .setDeliveryCompleteCount(handler.deliveryCompleteCount)</span>
+<span class="nc" id="L1632">                            .setStateBatches(handler.batches.stream()</span>
+<span class="nc" id="L1633">                                .map(batch -&gt; new WriteShareGroupStateRequestData.StateBatch()</span>
+<span class="nc" id="L1634">                                    .setFirstOffset(batch.firstOffset())</span>
+<span class="nc" id="L1635">                                    .setLastOffset(batch.lastOffset())</span>
+<span class="nc" id="L1636">                                    .setDeliveryState(batch.deliveryState())</span>
+<span class="nc" id="L1637">                                    .setDeliveryCount(batch.deliveryCount()))</span>
+<span class="nc" id="L1638">                                .collect(Collectors.toList()))</span>
+                    );
+<span class="nc" id="L1640">            });</span>
+
+<span class="nc" id="L1642">            return new WriteShareGroupStateRequest.Builder(new WriteShareGroupStateRequestData()</span>
+<span class="nc" id="L1643">                .setGroupId(groupId)</span>
+<span class="nc" id="L1644">                .setTopics(partitionData.entrySet().stream()</span>
+<span class="nc" id="L1645">                    .map(entry -&gt; new WriteShareGroupStateRequestData.WriteStateData()</span>
+<span class="nc" id="L1646">                        .setTopicId(entry.getKey())</span>
+<span class="nc" id="L1647">                        .setPartitions(entry.getValue()))</span>
+<span class="nc" id="L1648">                    .collect(Collectors.toList())));</span>
+        }
+
+        private static AbstractRequest.Builder&lt;? extends AbstractRequest&gt; coalesceReads(String groupId, List&lt;? extends PersisterStateManagerHandler&gt; handlers) {
+<span class="nc" id="L1652">            Map&lt;Uuid, List&lt;ReadShareGroupStateRequestData.PartitionData&gt;&gt; partitionData = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1653">            handlers.forEach(persHandler -&gt; {</span>
+<span class="nc bnc" id="L1654" title="All 2 branches missed.">                assert persHandler instanceof ReadStateHandler;</span>
+<span class="nc" id="L1655">                ReadStateHandler handler = (ReadStateHandler) persHandler;</span>
+<span class="nc" id="L1656">                partitionData.computeIfAbsent(handler.partitionKey().topicId(), topicId -&gt; new LinkedList&lt;&gt;())</span>
+<span class="nc" id="L1657">                    .add(</span>
+                        new ReadShareGroupStateRequestData.PartitionData()
+<span class="nc" id="L1659">                            .setPartition(handler.partitionKey().partition())</span>
+<span class="nc" id="L1660">                            .setLeaderEpoch(handler.leaderEpoch)</span>
+                    );
+<span class="nc" id="L1662">            });</span>
+
+<span class="nc" id="L1664">            return new ReadShareGroupStateRequest.Builder(new ReadShareGroupStateRequestData()</span>
+<span class="nc" id="L1665">                .setGroupId(groupId)</span>
+<span class="nc" id="L1666">                .setTopics(partitionData.entrySet().stream()</span>
+<span class="nc" id="L1667">                    .map(entry -&gt; new ReadShareGroupStateRequestData.ReadStateData()</span>
+<span class="nc" id="L1668">                        .setTopicId(entry.getKey())</span>
+<span class="nc" id="L1669">                        .setPartitions(entry.getValue()))</span>
+<span class="nc" id="L1670">                    .collect(Collectors.toList())));</span>
+        }
+
+        private static AbstractRequest.Builder&lt;? extends AbstractRequest&gt; coalesceReadSummaries(String groupId, List&lt;? extends PersisterStateManagerHandler&gt; handlers) {
+<span class="nc" id="L1674">            Map&lt;Uuid, List&lt;ReadShareGroupStateSummaryRequestData.PartitionData&gt;&gt; partitionData = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1675">            handlers.forEach(persisterStateManagerHandler -&gt; {</span>
+<span class="nc bnc" id="L1676" title="All 2 branches missed.">                assert persisterStateManagerHandler instanceof ReadStateSummaryHandler;</span>
+<span class="nc" id="L1677">                ReadStateSummaryHandler handler = (ReadStateSummaryHandler) persisterStateManagerHandler;</span>
+<span class="nc" id="L1678">                partitionData.computeIfAbsent(handler.partitionKey().topicId(), topicId -&gt; new LinkedList&lt;&gt;())</span>
+<span class="nc" id="L1679">                    .add(</span>
+                        new ReadShareGroupStateSummaryRequestData.PartitionData()
+<span class="nc" id="L1681">                            .setPartition(handler.partitionKey().partition())</span>
+<span class="nc" id="L1682">                            .setLeaderEpoch(handler.leaderEpoch)</span>
+                    );
+<span class="nc" id="L1684">            });</span>
+
+<span class="nc" id="L1686">            return new ReadShareGroupStateSummaryRequest.Builder(new ReadShareGroupStateSummaryRequestData()</span>
+<span class="nc" id="L1687">                .setGroupId(groupId)</span>
+<span class="nc" id="L1688">                .setTopics(partitionData.entrySet().stream()</span>
+<span class="nc" id="L1689">                    .map(entry -&gt; new ReadShareGroupStateSummaryRequestData.ReadStateSummaryData()</span>
+<span class="nc" id="L1690">                        .setTopicId(entry.getKey())</span>
+<span class="nc" id="L1691">                        .setPartitions(entry.getValue()))</span>
+<span class="nc" id="L1692">                    .collect(Collectors.toList()))</span>
+            );
+        }
+
+        private static AbstractRequest.Builder&lt;? extends AbstractRequest&gt; coalesceDeletes(String groupId, List&lt;? extends PersisterStateManagerHandler&gt; handlers) {
+<span class="nc" id="L1697">            Map&lt;Uuid, List&lt;DeleteShareGroupStateRequestData.PartitionData&gt;&gt; partitionData = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1698">            handlers.forEach(persHandler -&gt; {</span>
+<span class="nc bnc" id="L1699" title="All 2 branches missed.">                assert persHandler instanceof DeleteStateHandler;</span>
+<span class="nc" id="L1700">                DeleteStateHandler handler = (DeleteStateHandler) persHandler;</span>
+<span class="nc" id="L1701">                partitionData.computeIfAbsent(handler.partitionKey().topicId(), topicId -&gt; new LinkedList&lt;&gt;())</span>
+<span class="nc" id="L1702">                    .add(</span>
+                        new DeleteShareGroupStateRequestData.PartitionData()
+<span class="nc" id="L1704">                            .setPartition(handler.partitionKey().partition())</span>
+                    );
+<span class="nc" id="L1706">            });</span>
+
+<span class="nc" id="L1708">            return new DeleteShareGroupStateRequest.Builder(new DeleteShareGroupStateRequestData()</span>
+<span class="nc" id="L1709">                .setGroupId(groupId)</span>
+<span class="nc" id="L1710">                .setTopics(partitionData.entrySet().stream()</span>
+<span class="nc" id="L1711">                    .map(entry -&gt; new DeleteShareGroupStateRequestData.DeleteStateData()</span>
+<span class="nc" id="L1712">                        .setTopicId(entry.getKey())</span>
+<span class="nc" id="L1713">                        .setPartitions(entry.getValue()))</span>
+<span class="nc" id="L1714">                    .toList()));</span>
+        }
+
+        private static AbstractRequest.Builder&lt;? extends AbstractRequest&gt; coalesceInitializations(String groupId, List&lt;? extends PersisterStateManagerHandler&gt; handlers) {
+<span class="nc" id="L1718">            Map&lt;Uuid, List&lt;InitializeShareGroupStateRequestData.PartitionData&gt;&gt; partitionData = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1719">            handlers.forEach(persHandler -&gt; {</span>
+<span class="nc bnc" id="L1720" title="All 2 branches missed.">                assert persHandler instanceof InitializeStateHandler;</span>
+<span class="nc" id="L1721">                InitializeStateHandler handler = (InitializeStateHandler) persHandler;</span>
+<span class="nc" id="L1722">                partitionData.computeIfAbsent(handler.partitionKey().topicId(), topicId -&gt; new LinkedList&lt;&gt;())</span>
+<span class="nc" id="L1723">                    .add(</span>
+                        new InitializeShareGroupStateRequestData.PartitionData()
+<span class="nc" id="L1725">                            .setPartition(handler.partitionKey().partition())</span>
+<span class="nc" id="L1726">                            .setStateEpoch(handler.stateEpoch)</span>
+<span class="nc" id="L1727">                            .setStartOffset(handler.startOffset)</span>
+                    );
+<span class="nc" id="L1729">            });</span>
+
+<span class="nc" id="L1731">            return new InitializeShareGroupStateRequest.Builder(new InitializeShareGroupStateRequestData()</span>
+<span class="nc" id="L1732">                .setGroupId(groupId)</span>
+<span class="nc" id="L1733">                .setTopics(partitionData.entrySet().stream()</span>
+<span class="nc" id="L1734">                    .map(entry -&gt; new InitializeShareGroupStateRequestData.InitializeStateData()</span>
+<span class="nc" id="L1735">                        .setTopicId(entry.getKey())</span>
+<span class="nc" id="L1736">                        .setPartitions(entry.getValue()))</span>
+<span class="nc" id="L1737">                    .toList()));</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

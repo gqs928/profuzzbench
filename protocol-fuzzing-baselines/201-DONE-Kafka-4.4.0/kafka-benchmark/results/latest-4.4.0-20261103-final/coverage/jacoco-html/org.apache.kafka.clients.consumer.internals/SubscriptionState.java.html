@@ -1,0 +1,1462 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SubscriptionState.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">SubscriptionState.java</span></div><h1>SubscriptionState.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.ApiVersions;
+import org.apache.kafka.clients.Metadata;
+import org.apache.kafka.clients.NodeApiVersions;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
+import org.apache.kafka.clients.consumer.NoOffsetForPartitionException;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.SubscriptionPattern;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.internals.PartitionStates;
+import org.apache.kafka.common.message.OffsetForLeaderEpochResponseData.EpochEndOffset;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.function.LongSupplier;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
+
+import static org.apache.kafka.clients.consumer.internals.OffsetFetcherUtils.hasUsableOffsetForLeaderEpochVersion;
+import static org.apache.kafka.common.requests.OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH;
+import static org.apache.kafka.common.requests.OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH_OFFSET;
+
+/**
+ * A class for tracking the topics, partitions, and offsets for the consumer. A partition
+ * is &quot;assigned&quot; either directly with {@link #assignFromUser(Set)} (manual assignment)
+ * or with {@link #assignFromSubscribed(Collection)} (automatic assignment from subscription).
+ * &lt;p&gt;
+ * Once assigned, the partition is not considered &quot;fetchable&quot; until its initial position has
+ * been set with {@link #seekValidated(TopicPartition, FetchPosition)}. Fetchable partitions
+ * track a position which is the last offset that has been returned to the user. You can
+ * suspend fetching from a partition through {@link #pause(TopicPartition)} without affecting the consumed
+ * position. The partition will remain unfetchable until the {@link #resume(TopicPartition)} is
+ * used. You can also query the pause state independently with {@link #isPaused(TopicPartition)}.
+ * &lt;p&gt;
+ * Note that pause state as well as the consumed positions are not preserved when partition
+ * assignment is changed whether directly by the user or through a group rebalance.
+ * &lt;p&gt;
+ * Thread Safety: this class is thread-safe.
+ */
+public class SubscriptionState {
+    private static final String SUBSCRIPTION_EXCEPTION_MESSAGE =
+            &quot;Subscription to topics, partitions and pattern are mutually exclusive&quot;;
+
+    private final Logger log;
+
+<span class="nc" id="L80">    private enum SubscriptionType {</span>
+<span class="nc" id="L81">        NONE, AUTO_TOPICS, AUTO_PATTERN, AUTO_PATTERN_RE2J, USER_ASSIGNED, AUTO_TOPICS_SHARE</span>
+    }
+
+    /* the type of subscription */
+    private SubscriptionType subscriptionType;
+
+    /* the pattern user has requested */
+    private Pattern subscribedPattern;
+
+    /* the Re2J pattern user has requested */
+    private SubscriptionPattern subscribedRe2JPattern;
+
+    /* the list of topics the user has requested */
+    private Set&lt;String&gt; subscription;
+
+    /**
+     * Topic IDs received in an assignment from the coordinator when using the Consumer rebalance protocol.
+     * This will be used to include assigned topic IDs in metadata requests when the consumer
+     * does not know the topic names (ex. when the user subscribes to a RE2J regex computed on the broker)
+     */
+    private Set&lt;Uuid&gt; assignedTopicIds;
+
+    /* The list of topics the group has subscribed to. This may include some topics which are not part
+     * of `subscription` for the leader of a group since it is responsible for detecting metadata changes
+     * which require a group rebalance. */
+    private Set&lt;String&gt; groupSubscription;
+
+    /* the partitions that are currently assigned, note that the order of partition matters (see FetchBuilder for more details) */
+    private final PartitionStates&lt;TopicPartitionState&gt; assignment;
+
+    /* Default offset reset strategy */
+    private final AutoOffsetResetStrategy defaultResetStrategy;
+
+    /* User-provided listener to be invoked when assignment changes */
+<span class="nc" id="L115">    private Optional&lt;ConsumerRebalanceListener&gt; rebalanceListener = Optional.empty();</span>
+
+<span class="nc" id="L117">    private int assignmentId = 0;</span>
+
+    @Override
+    public synchronized String toString() {
+<span class="nc" id="L121">        return &quot;SubscriptionState{&quot; +</span>
+            &quot;type=&quot; + subscriptionType +
+<span class="nc" id="L123">            &quot;, subscribedPattern=&quot; + subscribedPatternInUse() +</span>
+<span class="nc" id="L124">            &quot;, subscription=&quot; + String.join(&quot;,&quot;, subscription) +</span>
+<span class="nc" id="L125">            &quot;, groupSubscription=&quot; + String.join(&quot;,&quot;, groupSubscription) +</span>
+            &quot;, defaultResetStrategy=&quot; + defaultResetStrategy +
+<span class="nc" id="L127">            &quot;, assignment=&quot; + assignment.partitionStateValues() + &quot; (id=&quot; + assignmentId + &quot;)}&quot;;</span>
+    }
+
+    private Object subscribedPatternInUse() {
+<span class="nc bnc" id="L131" title="All 2 branches missed.">        if (subscriptionType == SubscriptionType.AUTO_PATTERN_RE2J)</span>
+<span class="nc" id="L132">            return subscribedRe2JPattern;</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (subscriptionType == SubscriptionType.AUTO_PATTERN)</span>
+<span class="nc" id="L134">            return subscribedPattern;</span>
+<span class="nc" id="L135">        return null;</span>
+    }
+
+    public synchronized String prettyString() {
+<span class="nc bnc" id="L139" title="All 7 branches missed.">        switch (subscriptionType) {</span>
+            case NONE:
+<span class="nc" id="L141">                return &quot;None&quot;;</span>
+            case AUTO_TOPICS:
+<span class="nc" id="L143">                return &quot;Subscribe(&quot; + String.join(&quot;,&quot;, subscription) + &quot;)&quot;;</span>
+            case AUTO_PATTERN:
+<span class="nc" id="L145">                return &quot;Subscribe(&quot; + subscribedPattern + &quot;)&quot;;</span>
+            case AUTO_PATTERN_RE2J:
+<span class="nc" id="L147">                return &quot;Subscribe(&quot; + subscribedRe2JPattern + &quot;)&quot;;</span>
+            case USER_ASSIGNED:
+<span class="nc" id="L149">                return &quot;Assign(&quot; + assignedPartitions() + &quot; , id=&quot; + assignmentId + &quot;)&quot;;</span>
+            case AUTO_TOPICS_SHARE:
+<span class="nc" id="L151">                return &quot;Subscribe to Share Group(&quot; + String.join(&quot;,&quot;, subscription) + &quot;)&quot;;</span>
+            default:
+<span class="nc" id="L153">                throw new IllegalStateException(&quot;Unrecognized subscription type: &quot; + subscriptionType);</span>
+        }
+    }
+
+<span class="nc" id="L157">    public SubscriptionState(LogContext logContext, AutoOffsetResetStrategy defaultResetStrategy) {</span>
+<span class="nc" id="L158">        this.log = logContext.logger(this.getClass());</span>
+<span class="nc" id="L159">        this.defaultResetStrategy = defaultResetStrategy;</span>
+<span class="nc" id="L160">        this.subscription = new TreeSet&lt;&gt;(); // use a sorted set for better logging</span>
+<span class="nc" id="L161">        this.assignedTopicIds = new TreeSet&lt;&gt;();</span>
+<span class="nc" id="L162">        this.assignment = new PartitionStates&lt;&gt;();</span>
+<span class="nc" id="L163">        this.groupSubscription = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L164">        this.subscribedPattern = null;</span>
+<span class="nc" id="L165">        this.subscribedRe2JPattern = null;</span>
+<span class="nc" id="L166">        this.subscriptionType = SubscriptionType.NONE;</span>
+<span class="nc" id="L167">    }</span>
+
+    /**
+     * Monotonically increasing id which is incremented after every assignment change. This can
+     * be used to check when an assignment has changed.
+     *
+     * @return The current assignment Id
+     */
+    synchronized int assignmentId() {
+<span class="nc" id="L176">        return assignmentId;</span>
+    }
+
+    /**
+     * This method sets the subscription type if it is not already set (i.e. when it is NONE),
+     * or verifies that the subscription type is equal to the give type when it is set (i.e.
+     * when it is not NONE)
+     * @param type The given subscription type
+     */
+    private void setSubscriptionType(SubscriptionType type) {
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        if (this.subscriptionType == SubscriptionType.NONE)</span>
+<span class="nc" id="L187">            this.subscriptionType = type;</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        else if (this.subscriptionType != type)</span>
+<span class="nc" id="L189">            throw new IllegalStateException(SUBSCRIPTION_EXCEPTION_MESSAGE);</span>
+<span class="nc" id="L190">    }</span>
+
+    public synchronized boolean subscribe(Set&lt;String&gt; topics, Optional&lt;ConsumerRebalanceListener&gt; listener) {
+<span class="nc" id="L193">        registerRebalanceListener(listener);</span>
+<span class="nc" id="L194">        setSubscriptionType(SubscriptionType.AUTO_TOPICS);</span>
+<span class="nc" id="L195">        return changeSubscription(topics);</span>
+    }
+
+    public synchronized void subscribe(Pattern pattern, Optional&lt;ConsumerRebalanceListener&gt; listener) {
+<span class="nc" id="L199">        registerRebalanceListener(listener);</span>
+<span class="nc" id="L200">        setSubscriptionType(SubscriptionType.AUTO_PATTERN);</span>
+<span class="nc" id="L201">        this.subscribedPattern = pattern;</span>
+<span class="nc" id="L202">    }</span>
+
+    public synchronized void subscribe(SubscriptionPattern pattern, Optional&lt;ConsumerRebalanceListener&gt; listener) {
+<span class="nc" id="L205">        registerRebalanceListener(listener);</span>
+<span class="nc" id="L206">        setSubscriptionType(SubscriptionType.AUTO_PATTERN_RE2J);</span>
+<span class="nc" id="L207">        this.subscribedRe2JPattern = pattern;</span>
+<span class="nc" id="L208">    }</span>
+
+    public synchronized boolean subscribeFromPattern(Set&lt;String&gt; topics) {
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        if (subscriptionType != SubscriptionType.AUTO_PATTERN)</span>
+<span class="nc" id="L212">            throw new IllegalArgumentException(&quot;Attempt to subscribe from pattern while subscription type set to &quot; +</span>
+                    subscriptionType);
+
+<span class="nc" id="L215">        return changeSubscription(topics);</span>
+    }
+
+    public synchronized boolean subscribeToShareGroup(Set&lt;String&gt; topics) {
+<span class="nc" id="L219">        registerRebalanceListener(Optional.empty());</span>
+<span class="nc" id="L220">        setSubscriptionType(SubscriptionType.AUTO_TOPICS_SHARE);</span>
+<span class="nc" id="L221">        return changeSubscription(topics);</span>
+    }
+
+    private boolean changeSubscription(Set&lt;String&gt; topicsToSubscribe) {
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (subscription.equals(topicsToSubscribe))</span>
+<span class="nc" id="L226">            return false;</span>
+
+<span class="nc" id="L228">        subscription = topicsToSubscribe;</span>
+<span class="nc" id="L229">        return true;</span>
+    }
+
+    /**
+     * Set the current group subscription. This is used by the group leader to ensure
+     * that it receives metadata updates for all topics that the group is interested in.
+     *
+     * @param topics All topics from the group subscription
+     * @return true if the group subscription contains topics which are not part of the local subscription
+     */
+    synchronized boolean groupSubscribe(Collection&lt;String&gt; topics) {
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        if (!hasAutoAssignedPartitions())</span>
+<span class="nc" id="L241">            throw new IllegalStateException(SUBSCRIPTION_EXCEPTION_MESSAGE);</span>
+<span class="nc" id="L242">        groupSubscription = new HashSet&lt;&gt;(topics);</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        return !subscription.containsAll(groupSubscription);</span>
+    }
+
+    /**
+     * Reset the group's subscription to only contain topics subscribed by this consumer.
+     */
+    synchronized void resetGroupSubscription() {
+<span class="nc" id="L250">        groupSubscription = Collections.emptySet();</span>
+<span class="nc" id="L251">    }</span>
+
+    /**
+     * Change the assignment to the specified partitions provided by the user,
+     * note this is different from {@link #assignFromSubscribed(Collection)}
+     * whose input partitions are provided from the subscribed topics.
+     */
+    public synchronized boolean assignFromUser(Set&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L259">        setSubscriptionType(SubscriptionType.USER_ASSIGNED);</span>
+
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        if (this.assignment.partitionSet().equals(partitions))</span>
+<span class="nc" id="L262">            return false;</span>
+
+<span class="nc" id="L264">        assignmentId++;</span>
+
+        // update the subscribed topics
+<span class="nc" id="L267">        Set&lt;String&gt; manualSubscribedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L268">        Map&lt;TopicPartition, TopicPartitionState&gt; partitionToState = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        for (TopicPartition partition : partitions) {</span>
+<span class="nc" id="L270">            TopicPartitionState state = assignment.stateValue(partition);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            if (state == null)</span>
+<span class="nc" id="L272">                state = new TopicPartitionState();</span>
+<span class="nc" id="L273">            partitionToState.put(partition, state);</span>
+
+<span class="nc" id="L275">            manualSubscribedTopics.add(partition.topic());</span>
+<span class="nc" id="L276">        }</span>
+
+<span class="nc" id="L278">        this.assignment.set(partitionToState);</span>
+<span class="nc" id="L279">        return changeSubscription(manualSubscribedTopics);</span>
+    }
+
+    /**
+     * Check if an assignment received while using the classic group protocol matches the subscription.
+     * Note that this only considers the subscribedPattern because this functionality is only used under the
+     * classic protocol, where subscribedRe2JPattern is not supported.
+     *
+     * @return true if assignments matches subscription, otherwise false.
+     */
+    public synchronized boolean checkAssignmentMatchedSubscription(Collection&lt;TopicPartition&gt; assignments) {
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        for (TopicPartition topicPartition : assignments) {</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (this.subscribedPattern != null) {</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">                if (!this.subscribedPattern.matcher(topicPartition.topic()).matches()) {</span>
+<span class="nc" id="L293">                    log.info(&quot;Assigned partition {} for non-subscribed topic regex pattern; subscription pattern is {}&quot;,</span>
+                        topicPartition,
+                        this.subscribedPattern);
+
+<span class="nc" id="L297">                    return false;</span>
+                }
+            } else {
+<span class="nc bnc" id="L300" title="All 2 branches missed.">                if (!this.subscription.contains(topicPartition.topic())) {</span>
+<span class="nc" id="L301">                    log.info(&quot;Assigned partition {} for non-subscribed topic; subscription is {}&quot;, topicPartition, this.subscription);</span>
+
+<span class="nc" id="L303">                    return false;</span>
+                }
+            }
+<span class="nc" id="L306">        }</span>
+
+<span class="nc" id="L308">        return true;</span>
+    }
+
+    /**
+     * Change the assignment to the specified partitions returned from the coordinator, note this is
+     * different from {@link #assignFromUser(Set)} which directly set the assignment from user inputs.
+     */
+    public synchronized void assignFromSubscribed(Collection&lt;TopicPartition&gt; assignments) {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        if (!this.hasAutoAssignedPartitions())</span>
+<span class="nc" id="L317">            throw new IllegalArgumentException(&quot;Attempt to dynamically assign partitions while manual assignment in use&quot;);</span>
+
+<span class="nc" id="L319">        Map&lt;TopicPartition, TopicPartitionState&gt; assignedPartitionStates = new LinkedHashMap&lt;&gt;(assignments.size());</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        for (TopicPartition tp : assignments) {</span>
+<span class="nc" id="L321">            TopicPartitionState state = this.assignment.stateValue(tp);</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            if (state == null)</span>
+<span class="nc" id="L323">                state = new TopicPartitionState();</span>
+<span class="nc" id="L324">            assignedPartitionStates.put(tp, state);</span>
+<span class="nc" id="L325">        }</span>
+
+<span class="nc" id="L327">        assignmentId++;</span>
+<span class="nc" id="L328">        this.assignment.set(assignedPartitionStates);</span>
+<span class="nc" id="L329">    }</span>
+
+    private void registerRebalanceListener(Optional&lt;ConsumerRebalanceListener&gt; listener) {
+<span class="nc" id="L332">        this.rebalanceListener = Objects.requireNonNull(listener, &quot;RebalanceListener cannot be null&quot;);</span>
+<span class="nc" id="L333">    }</span>
+
+    /**
+     * Check whether pattern subscription is in use.
+     *
+     */
+    public synchronized boolean hasPatternSubscription() {
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        return this.subscriptionType == SubscriptionType.AUTO_PATTERN;</span>
+    }
+
+    public synchronized boolean hasNoSubscriptionOrUserAssignment() {
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        return this.subscriptionType == SubscriptionType.NONE;</span>
+    }
+
+    public synchronized void unsubscribe() {
+<span class="nc" id="L348">        this.subscription = Collections.emptySet();</span>
+<span class="nc" id="L349">        this.groupSubscription = Collections.emptySet();</span>
+<span class="nc" id="L350">        this.assignment.clear();</span>
+<span class="nc" id="L351">        this.assignedTopicIds = Collections.emptySet();</span>
+<span class="nc" id="L352">        this.subscribedPattern = null;</span>
+<span class="nc" id="L353">        this.subscriptionType = SubscriptionType.NONE;</span>
+<span class="nc" id="L354">        this.assignmentId++;</span>
+<span class="nc" id="L355">    }</span>
+
+    /**
+     * Check whether a topic matches a subscribed pattern.
+     *
+     * @return true if pattern subscription is in use and the topic matches the subscribed pattern, false otherwise
+     */
+    public synchronized boolean matchesSubscribedPattern(String topic) {
+<span class="nc" id="L363">        Pattern pattern = this.subscribedPattern;</span>
+<span class="nc bnc" id="L364" title="All 4 branches missed.">        if (hasPatternSubscription() &amp;&amp; pattern != null)</span>
+<span class="nc" id="L365">            return pattern.matcher(topic).matches();</span>
+<span class="nc" id="L366">        return false;</span>
+    }
+
+    public synchronized Set&lt;String&gt; subscription() {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        if (hasAutoAssignedPartitions())</span>
+<span class="nc" id="L371">            return this.subscription;</span>
+<span class="nc" id="L372">        return Collections.emptySet();</span>
+    }
+
+    /**
+     * @return The RE2J compatible pattern in use, provided via a call to
+     * {@link #subscribe(SubscriptionPattern, Optional)}.
+     * Null if there is no SubscriptionPattern in use.
+     */
+    public synchronized SubscriptionPattern subscriptionPattern() {
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (hasRe2JPatternSubscription())</span>
+<span class="nc" id="L382">            return this.subscribedRe2JPattern;</span>
+<span class="nc" id="L383">        return null;</span>
+    }
+
+    /**
+     * @return True if subscribed using RE2J pattern. False otherwise.
+     */
+    public synchronized boolean hasRe2JPatternSubscription() {
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        return this.subscriptionType == SubscriptionType.AUTO_PATTERN_RE2J;</span>
+    }
+
+    public synchronized Set&lt;TopicPartition&gt; pausedPartitions() {
+<span class="nc" id="L394">        return collectPartitions(TopicPartitionState::isPaused);</span>
+    }
+
+    /**
+     * Get the subscription topics for which metadata is required. For the leader, this will include
+     * the union of the subscriptions of all group members. For followers, it is just that member's
+     * subscription. This is used when querying topic metadata to detect the metadata changes which would
+     * require rebalancing. The leader fetches metadata for all topics in the group so that it
+     * can do the partition assignment (which requires at least partition counts for all topics
+     * to be assigned).
+     *
+     * @return The union of all subscribed topics in the group if this member is the leader
+     *   of the current generation; otherwise it returns the same set as {@link #subscription()}
+     */
+    synchronized Set&lt;String&gt; metadataTopics() {
+<span class="nc bnc" id="L409" title="All 2 branches missed.">        if (groupSubscription.isEmpty())</span>
+<span class="nc" id="L410">            return subscription;</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        else if (groupSubscription.containsAll(subscription))</span>
+<span class="nc" id="L412">            return groupSubscription;</span>
+        else {
+            // When subscription changes `groupSubscription` may be outdated, ensure that
+            // new subscription topics are returned.
+<span class="nc" id="L416">            Set&lt;String&gt; topics = new HashSet&lt;&gt;(groupSubscription);</span>
+<span class="nc" id="L417">            topics.addAll(subscription);</span>
+<span class="nc" id="L418">            return topics;</span>
+        }
+    }
+
+    synchronized boolean needsMetadata(String topic) {
+<span class="nc bnc" id="L423" title="All 4 branches missed.">        return subscription.contains(topic) || groupSubscription.contains(topic);</span>
+    }
+
+    private TopicPartitionState assignedState(TopicPartition tp) {
+<span class="nc" id="L427">        TopicPartitionState state = this.assignment.stateValue(tp);</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">        if (state == null)</span>
+<span class="nc" id="L429">            throw new IllegalStateException(&quot;No current assignment for partition &quot; + tp);</span>
+<span class="nc" id="L430">        return state;</span>
+    }
+
+    private TopicPartitionState assignedStateOrNull(TopicPartition tp) {
+<span class="nc" id="L434">        return this.assignment.stateValue(tp);</span>
+    }
+
+    public synchronized void seekValidated(TopicPartition tp, FetchPosition position) {
+<span class="nc" id="L438">        assignedState(tp).seekValidated(position);</span>
+<span class="nc" id="L439">    }</span>
+
+    public void seek(TopicPartition tp, long offset) {
+<span class="nc" id="L442">        seekValidated(tp, new FetchPosition(offset));</span>
+<span class="nc" id="L443">    }</span>
+
+    public void seekUnvalidated(TopicPartition tp, FetchPosition position) {
+<span class="nc" id="L446">        assignedState(tp).seekUnvalidated(position);</span>
+<span class="nc" id="L447">    }</span>
+
+    synchronized void maybeSeekUnvalidated(TopicPartition tp, FetchPosition position, AutoOffsetResetStrategy requestedResetStrategy) {
+<span class="nc" id="L450">        TopicPartitionState state = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">        if (state == null) {</span>
+<span class="nc" id="L452">            log.debug(&quot;Skipping reset of partition {} since it is no longer assigned&quot;, tp);</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        } else if (!state.awaitingReset()) {</span>
+<span class="nc" id="L454">            log.debug(&quot;Skipping reset of partition {} since reset is no longer needed&quot;, tp);</span>
+<span class="nc bnc" id="L455" title="All 4 branches missed.">        } else if (requestedResetStrategy != null &amp;&amp; !requestedResetStrategy.equals(state.resetStrategy)) {</span>
+<span class="nc" id="L456">            log.debug(&quot;Skipping reset of partition {} since an alternative reset has been requested&quot;, tp);</span>
+        } else {
+<span class="nc" id="L458">            log.info(&quot;Resetting offset for partition {} to position {}.&quot;, tp, position);</span>
+<span class="nc" id="L459">            state.seekUnvalidated(position);</span>
+        }
+<span class="nc" id="L461">    }</span>
+
+    /**
+     * @return a modifiable copy of the currently assigned partitions
+     */
+    public synchronized Set&lt;TopicPartition&gt; assignedPartitions() {
+<span class="nc" id="L467">        return new HashSet&lt;&gt;(this.assignment.partitionSet());</span>
+    }
+
+    /**
+     * @return a modifiable copy of the currently assigned partitions as a list
+     */
+    public synchronized List&lt;TopicPartition&gt; assignedPartitionsList() {
+<span class="nc" id="L474">        return new ArrayList&lt;&gt;(this.assignment.partitionSet());</span>
+    }
+
+    /**
+     * Provides the number of assigned partitions in a thread safe manner.
+     * @return the number of assigned partitions.
+     */
+    public synchronized int numAssignedPartitions() {
+<span class="nc" id="L482">        return this.assignment.size();</span>
+    }
+
+    // Visible for testing
+    public synchronized List&lt;TopicPartition&gt; fetchablePartitions(Predicate&lt;TopicPartition&gt; isAvailable) {
+        // Since this is in the hot-path for fetching, we do this instead of using java.util.stream API
+<span class="nc" id="L488">        List&lt;TopicPartition&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L489">        assignment.forEach((topicPartition, topicPartitionState) -&gt; {</span>
+            // Cheap check is first to avoid evaluating the predicate if possible
+<span class="nc bnc" id="L491" title="All 4 branches missed.">            if ((subscriptionType.equals(SubscriptionType.AUTO_TOPICS_SHARE) || isFetchableAndSubscribed(topicPartition, topicPartitionState))</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                    &amp;&amp; isAvailable.test(topicPartition)) {</span>
+<span class="nc" id="L493">                result.add(topicPartition);</span>
+            }
+<span class="nc" id="L495">        });</span>
+<span class="nc" id="L496">        return result;</span>
+    }
+
+    public synchronized boolean hasFetchablePartitions(Predicate&lt;TopicPartition&gt; isAvailable) {
+<span class="nc bnc" id="L500" title="All 2 branches missed.">        for (Map.Entry&lt;TopicPartition, TopicPartitionState&gt; entry : assignment.partitionStateMap().entrySet()) {</span>
+<span class="nc" id="L501">            TopicPartition topicPartition = entry.getKey();</span>
+<span class="nc bnc" id="L502" title="All 4 branches missed.">            if ((subscriptionType.equals(SubscriptionType.AUTO_TOPICS_SHARE) || isFetchableAndSubscribed(topicPartition, entry.getValue()))</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">                    &amp;&amp; isAvailable.test(topicPartition)) {</span>
+<span class="nc" id="L504">                return true;</span>
+            }
+<span class="nc" id="L506">        }</span>
+<span class="nc" id="L507">        return false;</span>
+    }
+
+    /**
+     * Check if the partition is fetchable.
+     * If the consumer has explicitly subscribed to a list of topic names,
+     * this will also check that the partition is contained in the subscription.
+     */
+    private synchronized boolean isFetchableAndSubscribed(TopicPartition topicPartition, TopicPartitionState topicPartitionState) {
+<span class="nc bnc" id="L516" title="All 4 branches missed.">        if (subscriptionType.equals(SubscriptionType.AUTO_TOPICS) &amp;&amp; !subscription.contains(topicPartition.topic())) {</span>
+<span class="nc" id="L517">            log.trace(&quot;Assigned partition {} is not in the subscription {} so will be considered not fetchable.&quot;, topicPartition, subscription);</span>
+<span class="nc" id="L518">            return false;</span>
+        }
+<span class="nc" id="L520">        return topicPartitionState.isFetchable();</span>
+    }
+
+    public synchronized boolean hasAutoAssignedPartitions() {
+<span class="nc bnc" id="L524" title="All 8 branches missed.">        return this.subscriptionType == SubscriptionType.AUTO_TOPICS || this.subscriptionType == SubscriptionType.AUTO_PATTERN</span>
+                || this.subscriptionType == SubscriptionType.AUTO_TOPICS_SHARE || this.subscriptionType == SubscriptionType.AUTO_PATTERN_RE2J;
+    }
+
+    /**
+     * Check if the topic ID has been received in an assignment
+     * from the coordinator after subscribing to a broker-side regex.
+     */
+    public synchronized boolean isAssignedFromRe2j(Uuid topicId) {
+<span class="nc bnc" id="L533" title="All 4 branches missed.">        if (topicId == null || !hasRe2JPatternSubscription()) {</span>
+<span class="nc" id="L534">            return false;</span>
+        }
+
+<span class="nc" id="L537">        return this.assignedTopicIds.contains(topicId);</span>
+    }
+
+    public synchronized void position(TopicPartition tp, FetchPosition position) {
+<span class="nc" id="L541">        assignedState(tp).position(position);</span>
+<span class="nc" id="L542">    }</span>
+
+    /**
+     * Enter the offset validation state if the leader for this partition is known to support a usable version of the
+     * OffsetsForLeaderEpoch API. If the leader node does not support the API, simply complete the offset validation.
+     *
+     * @param apiVersions supported API versions
+     * @param tp topic partition to validate
+     * @param leaderAndEpoch leader epoch of the topic partition
+     * @return true if we enter the offset validation state
+     */
+    public synchronized boolean maybeValidatePositionForCurrentLeader(ApiVersions apiVersions,
+                                                                      TopicPartition tp,
+                                                                      Metadata.LeaderAndEpoch leaderAndEpoch) {
+<span class="nc" id="L556">        TopicPartitionState state = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">        if (state == null) {</span>
+<span class="nc" id="L558">            log.debug(&quot;Skipping validating position for partition {} which is not currently assigned.&quot;, tp);</span>
+<span class="nc" id="L559">            return false;</span>
+        }
+<span class="nc bnc" id="L561" title="All 2 branches missed.">        if (leaderAndEpoch.leader.isPresent()) {</span>
+<span class="nc" id="L562">            NodeApiVersions nodeApiVersions = apiVersions.get(leaderAndEpoch.leader.get().idString());</span>
+<span class="nc bnc" id="L563" title="All 4 branches missed.">            if (nodeApiVersions == null || hasUsableOffsetForLeaderEpochVersion(nodeApiVersions)) {</span>
+<span class="nc" id="L564">                return state.maybeValidatePosition(leaderAndEpoch);</span>
+            } else {
+                // If the broker does not support a newer version of OffsetsForLeaderEpoch, we skip validation
+<span class="nc" id="L567">                state.updatePositionLeaderNoValidation(leaderAndEpoch);</span>
+<span class="nc" id="L568">                return false;</span>
+            }
+        } else {
+<span class="nc" id="L571">            return state.maybeValidatePosition(leaderAndEpoch);</span>
+        }
+    }
+
+    /**
+     * Attempt to complete validation with the end offset returned from the OffsetForLeaderEpoch request.
+     * @return Log truncation details if detected and no reset policy is defined.
+     */
+    public synchronized Optional&lt;LogTruncation&gt; maybeCompleteValidation(TopicPartition tp,
+                                                                        FetchPosition requestPosition,
+                                                                        EpochEndOffset epochEndOffset) {
+<span class="nc" id="L582">        TopicPartitionState state = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L583" title="All 2 branches missed.">        if (state == null) {</span>
+<span class="nc" id="L584">            log.debug(&quot;Skipping completed validation for partition {} which is not currently assigned.&quot;, tp);</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">        } else if (!state.awaitingValidation()) {</span>
+<span class="nc" id="L586">            log.debug(&quot;Skipping completed validation for partition {} which is no longer expecting validation.&quot;, tp);</span>
+        } else {
+<span class="nc" id="L588">            SubscriptionState.FetchPosition currentPosition = state.position;</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">            if (!currentPosition.equals(requestPosition)) {</span>
+<span class="nc" id="L590">                log.debug(&quot;Skipping completed validation for partition {} since the current position {} &quot; +</span>
+                          &quot;no longer matches the position {} when the request was sent&quot;,
+                          tp, currentPosition, requestPosition);
+<span class="nc bnc" id="L593" title="All 2 branches missed.">            } else if (epochEndOffset.endOffset() == UNDEFINED_EPOCH_OFFSET ||</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">                        epochEndOffset.leaderEpoch() == UNDEFINED_EPOCH) {</span>
+<span class="nc bnc" id="L595" title="All 2 branches missed.">                if (hasDefaultOffsetResetPolicy()) {</span>
+<span class="nc" id="L596">                    log.info(&quot;Truncation detected for partition {} at offset {}, resetting offset&quot;,</span>
+                             tp, currentPosition);
+<span class="nc" id="L598">                    requestOffsetReset(tp);</span>
+                } else {
+<span class="nc" id="L600">                    log.warn(&quot;Truncation detected for partition {} at offset {}, but no reset policy is set&quot;,</span>
+                             tp, currentPosition);
+<span class="nc" id="L602">                    return Optional.of(new LogTruncation(tp, requestPosition, Optional.empty()));</span>
+                }
+<span class="nc bnc" id="L604" title="All 2 branches missed.">            } else if (epochEndOffset.endOffset() &lt; currentPosition.offset) {</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">                if (hasDefaultOffsetResetPolicy()) {</span>
+<span class="nc" id="L606">                    SubscriptionState.FetchPosition newPosition = new SubscriptionState.FetchPosition(</span>
+<span class="nc" id="L607">                            epochEndOffset.endOffset(), Optional.of(epochEndOffset.leaderEpoch()),</span>
+                            currentPosition.currentLeader);
+<span class="nc" id="L609">                    log.info(&quot;Truncation detected for partition {} at offset {}, resetting offset to &quot; +</span>
+                             &quot;the first offset known to diverge {}&quot;, tp, currentPosition, newPosition);
+<span class="nc" id="L611">                    state.seekValidated(newPosition);</span>
+<span class="nc" id="L612">                } else {</span>
+<span class="nc" id="L613">                    OffsetAndMetadata divergentOffset = new OffsetAndMetadata(epochEndOffset.endOffset(),</span>
+<span class="nc" id="L614">                        Optional.of(epochEndOffset.leaderEpoch()), null);</span>
+<span class="nc" id="L615">                    log.warn(&quot;Truncation detected for partition {} at offset {} (the end offset from the &quot; +</span>
+                             &quot;broker is {}), but no reset policy is set&quot;, tp, currentPosition, divergentOffset);
+<span class="nc" id="L617">                    return Optional.of(new LogTruncation(tp, requestPosition, Optional.of(divergentOffset)));</span>
+                }
+            } else {
+<span class="nc" id="L620">                state.completeValidation();</span>
+            }
+        }
+
+<span class="nc" id="L624">        return Optional.empty();</span>
+    }
+
+    public synchronized boolean awaitingValidation(TopicPartition tp) {
+<span class="nc" id="L628">        return assignedState(tp).awaitingValidation();</span>
+    }
+
+    public synchronized void completeValidation(TopicPartition tp) {
+<span class="nc" id="L632">        assignedState(tp).completeValidation();</span>
+<span class="nc" id="L633">    }</span>
+
+    public synchronized FetchPosition validPosition(TopicPartition tp) {
+<span class="nc" id="L636">        return assignedState(tp).validPosition();</span>
+    }
+
+    public synchronized FetchPosition position(TopicPartition tp) {
+<span class="nc" id="L640">        return assignedState(tp).position;</span>
+    }
+
+    public synchronized FetchPosition positionOrNull(TopicPartition tp) {
+<span class="nc" id="L644">        final TopicPartitionState state = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (state == null) {</span>
+<span class="nc" id="L646">            return null;</span>
+        }
+<span class="nc" id="L648">        return assignedState(tp).position;</span>
+    }
+
+    public synchronized Long partitionLag(TopicPartition tp, IsolationLevel isolationLevel) {
+<span class="nc" id="L652">        TopicPartitionState topicPartitionState = assignedState(tp);</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">        if (topicPartitionState.position == null) {</span>
+<span class="nc" id="L654">            return null;</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        } else if (isolationLevel == IsolationLevel.READ_COMMITTED) {</span>
+<span class="nc bnc" id="L656" title="All 2 branches missed.">            return topicPartitionState.lastStableOffset == null ? null : topicPartitionState.lastStableOffset - topicPartitionState.position.offset;</span>
+        } else {
+<span class="nc bnc" id="L658" title="All 2 branches missed.">            return topicPartitionState.highWatermark == null ? null : topicPartitionState.highWatermark - topicPartitionState.position.offset;</span>
+        }
+    }
+
+    public synchronized Long partitionEndOffset(TopicPartition tp, IsolationLevel isolationLevel) {
+<span class="nc" id="L663">        TopicPartitionState topicPartitionState = assignedState(tp);</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">        if (isolationLevel == IsolationLevel.READ_COMMITTED) {</span>
+<span class="nc" id="L665">            return topicPartitionState.lastStableOffset;</span>
+        } else {
+<span class="nc" id="L667">            return topicPartitionState.highWatermark;</span>
+        }
+    }
+
+    public synchronized void requestPartitionEndOffset(TopicPartition tp) {
+<span class="nc" id="L672">        TopicPartitionState topicPartitionState = assignedState(tp);</span>
+<span class="nc" id="L673">        topicPartitionState.requestEndOffset();</span>
+<span class="nc" id="L674">    }</span>
+
+    public synchronized boolean partitionEndOffsetRequested(TopicPartition tp) {
+<span class="nc" id="L677">        TopicPartitionState topicPartitionState = assignedState(tp);</span>
+<span class="nc" id="L678">        return topicPartitionState.endOffsetRequested();</span>
+    }
+
+    public synchronized boolean maybeClearPartitionEndOffsetRequested(TopicPartition tp) {
+<span class="nc" id="L682">        TopicPartitionState topicPartitionState = assignedStateOrNull(tp);</span>
+
+<span class="nc bnc" id="L684" title="All 4 branches missed.">        if (topicPartitionState != null &amp;&amp; topicPartitionState.endOffsetRequested()) {</span>
+<span class="nc" id="L685">            topicPartitionState.clearEndOffset();</span>
+<span class="nc" id="L686">            return true;</span>
+        } else {
+<span class="nc" id="L688">            return false;</span>
+        }
+    }
+
+    synchronized Long partitionLead(TopicPartition tp) {
+<span class="nc" id="L693">        TopicPartitionState topicPartitionState = assignedState(tp);</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">        return topicPartitionState.logStartOffset == null ? null : topicPartitionState.position.offset - topicPartitionState.logStartOffset;</span>
+    }
+
+    synchronized void updateHighWatermark(TopicPartition tp, long highWatermark) {
+<span class="nc" id="L698">        assignedState(tp).highWatermark(highWatermark);</span>
+<span class="nc" id="L699">    }</span>
+
+    synchronized boolean tryUpdatingHighWatermark(TopicPartition tp, long highWatermark) {
+<span class="nc" id="L702">        final TopicPartitionState state = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L703" title="All 2 branches missed.">        if (state != null) {</span>
+<span class="nc" id="L704">            assignedState(tp).highWatermark(highWatermark);</span>
+<span class="nc" id="L705">            return true;</span>
+        }
+<span class="nc" id="L707">        return false;</span>
+    }
+
+    synchronized boolean tryUpdatingLogStartOffset(TopicPartition tp, long highWatermark) {
+<span class="nc" id="L711">        final TopicPartitionState state = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">        if (state != null) {</span>
+<span class="nc" id="L713">            assignedState(tp).logStartOffset(highWatermark);</span>
+<span class="nc" id="L714">            return true;</span>
+        }
+<span class="nc" id="L716">        return false;</span>
+    }
+
+    synchronized void updateLastStableOffset(TopicPartition tp, long lastStableOffset) {
+<span class="nc" id="L720">        assignedState(tp).lastStableOffset(lastStableOffset);</span>
+<span class="nc" id="L721">    }</span>
+
+    synchronized boolean tryUpdatingLastStableOffset(TopicPartition tp, long lastStableOffset) {
+<span class="nc" id="L724">        final TopicPartitionState state = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">        if (state != null) {</span>
+<span class="nc" id="L726">            assignedState(tp).lastStableOffset(lastStableOffset);</span>
+<span class="nc" id="L727">            return true;</span>
+        }
+<span class="nc" id="L729">        return false;</span>
+    }
+
+    /**
+     * Set the preferred read replica with a lease timeout. After this time, the replica will no longer be valid and
+     * {@link #preferredReadReplica(TopicPartition, long)} will return an empty result.
+     *
+     * @param tp The topic partition
+     * @param preferredReadReplicaId The preferred read replica
+     * @param timeMs The time at which this preferred replica is no longer valid
+     */
+    public synchronized void updatePreferredReadReplica(TopicPartition tp, int preferredReadReplicaId, LongSupplier timeMs) {
+<span class="nc" id="L741">        assignedState(tp).updatePreferredReadReplica(preferredReadReplicaId, timeMs);</span>
+<span class="nc" id="L742">    }</span>
+
+    /**
+     * Tries to set the preferred read replica with a lease timeout. After this time, the replica will no longer be valid and
+     * {@link #preferredReadReplica(TopicPartition, long)} will return an empty result. If the preferred replica of
+     * the partition could not be updated (e.g. because the partition is not assigned) this method will return
+     * {@code false}, otherwise it will return {@code true}.
+     *
+     * @param tp The topic partition
+     * @param preferredReadReplicaId The preferred read replica
+     * @param timeMs The time at which this preferred replica is no longer valid
+     * @return {@code true} if the preferred read replica was updated, {@code false} otherwise.
+     */
+    public synchronized boolean tryUpdatingPreferredReadReplica(TopicPartition tp,
+                                                             int preferredReadReplicaId,
+                                                             LongSupplier timeMs) {
+<span class="nc" id="L758">        final TopicPartitionState state = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">        if (state != null) {</span>
+<span class="nc" id="L760">            assignedState(tp).updatePreferredReadReplica(preferredReadReplicaId, timeMs);</span>
+<span class="nc" id="L761">            return true;</span>
+        }
+<span class="nc" id="L763">        return false;</span>
+    }
+
+    /**
+     * Get the preferred read replica
+     *
+     * @param tp The topic partition
+     * @param timeMs The current time
+     * @return Returns the current preferred read replica, if it has been set and if it has not expired.
+     */
+    public synchronized Optional&lt;Integer&gt; preferredReadReplica(TopicPartition tp, long timeMs) {
+<span class="nc" id="L774">        final TopicPartitionState topicPartitionState = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">        if (topicPartitionState == null) {</span>
+<span class="nc" id="L776">            return Optional.empty();</span>
+        } else {
+<span class="nc" id="L778">            return topicPartitionState.preferredReadReplica(timeMs);</span>
+        }
+    }
+
+    /**
+     * Unset the preferred read replica. This causes the fetcher to go back to the leader for fetches.
+     *
+     * @param tp The topic partition
+     * @return the removed preferred read replica if set, Empty otherwise.
+     */
+    public synchronized Optional&lt;Integer&gt; clearPreferredReadReplica(TopicPartition tp) {
+<span class="nc" id="L789">        final TopicPartitionState topicPartitionState = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L790" title="All 2 branches missed.">        if (topicPartitionState == null) {</span>
+<span class="nc" id="L791">            return Optional.empty();</span>
+        } else {
+<span class="nc" id="L793">            return topicPartitionState.clearPreferredReadReplica();</span>
+        }
+    }
+
+    public synchronized Map&lt;TopicPartition, OffsetAndMetadata&gt; allConsumed() {
+<span class="nc" id="L798">        Map&lt;TopicPartition, OffsetAndMetadata&gt; allConsumed = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L799">        assignment.forEach((topicPartition, partitionState) -&gt; {</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">            if (partitionState.hasValidPosition())</span>
+<span class="nc" id="L801">                allConsumed.put(topicPartition, new OffsetAndMetadata(partitionState.position.offset,</span>
+                        partitionState.position.offsetEpoch, &quot;&quot;));
+<span class="nc" id="L803">        });</span>
+<span class="nc" id="L804">        return allConsumed;</span>
+    }
+
+    public synchronized void requestOffsetReset(TopicPartition partition, AutoOffsetResetStrategy offsetResetStrategy) {
+<span class="nc" id="L808">        assignedState(partition).reset(offsetResetStrategy);</span>
+<span class="nc" id="L809">    }</span>
+
+    public synchronized void requestOffsetReset(Collection&lt;TopicPartition&gt; partitions, AutoOffsetResetStrategy offsetResetStrategy) {
+<span class="nc" id="L812">        partitions.forEach(tp -&gt; {</span>
+<span class="nc" id="L813">            log.info(&quot;Seeking to {} offset of partition {}&quot;, offsetResetStrategy, tp);</span>
+<span class="nc" id="L814">            assignedState(tp).reset(offsetResetStrategy);</span>
+<span class="nc" id="L815">        });</span>
+<span class="nc" id="L816">    }</span>
+
+    public void requestOffsetReset(TopicPartition partition) {
+<span class="nc" id="L819">        requestOffsetReset(partition, defaultResetStrategy);</span>
+<span class="nc" id="L820">    }</span>
+
+    public synchronized void requestOffsetResetIfPartitionAssigned(TopicPartition partition) {
+<span class="nc" id="L823">        final TopicPartitionState state = assignedStateOrNull(partition);</span>
+<span class="nc bnc" id="L824" title="All 2 branches missed.">        if (state != null) {</span>
+<span class="nc" id="L825">            state.reset(defaultResetStrategy);</span>
+        }
+<span class="nc" id="L827">    }</span>
+
+
+    synchronized void setNextAllowedRetry(Set&lt;TopicPartition&gt; partitions, long nextAllowResetTimeMs) {
+<span class="nc bnc" id="L831" title="All 2 branches missed.">        for (TopicPartition partition : partitions) {</span>
+<span class="nc" id="L832">            assignedState(partition).setNextAllowedRetry(nextAllowResetTimeMs);</span>
+<span class="nc" id="L833">        }</span>
+<span class="nc" id="L834">    }</span>
+
+    boolean hasDefaultOffsetResetPolicy() {
+<span class="nc bnc" id="L837" title="All 2 branches missed.">        return defaultResetStrategy != AutoOffsetResetStrategy.NONE;</span>
+    }
+
+    public synchronized boolean isOffsetResetNeeded(TopicPartition partition) {
+<span class="nc" id="L841">        return assignedState(partition).awaitingReset();</span>
+    }
+
+    public synchronized AutoOffsetResetStrategy resetStrategy(TopicPartition partition) {
+<span class="nc" id="L845">        return assignedState(partition).resetStrategy();</span>
+    }
+
+    public synchronized boolean hasAllFetchPositions() {
+        // Since this is in the hot-path for fetching, we do this instead of using java.util.stream API
+<span class="nc" id="L850">        Iterator&lt;TopicPartitionState&gt; it = assignment.stateIterator();</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">            if (!it.next().hasValidPosition()) {</span>
+<span class="nc" id="L853">                return false;</span>
+            }
+        }
+<span class="nc" id="L856">        return true;</span>
+    }
+
+    public synchronized Set&lt;TopicPartition&gt; initializingPartitions() {
+<span class="nc" id="L860">        return collectPartitions(TopicPartitionState::shouldInitialize);</span>
+    }
+
+    private Set&lt;TopicPartition&gt; collectPartitions(Predicate&lt;TopicPartitionState&gt; filter) {
+<span class="nc" id="L864">        Set&lt;TopicPartition&gt; result = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L865">        assignment.forEach((topicPartition, topicPartitionState) -&gt; {</span>
+<span class="nc bnc" id="L866" title="All 2 branches missed.">            if (filter.test(topicPartitionState)) {</span>
+<span class="nc" id="L867">                result.add(topicPartition);</span>
+            }
+<span class="nc" id="L869">        });</span>
+<span class="nc" id="L870">        return result;</span>
+    }
+
+    /**
+     * Request reset for partitions that require a position, using the configured reset strategy.
+     *
+     * @param initPartitionsToInclude Initializing partitions to include in the reset. Assigned partitions that
+     *                                require a positions but are not included in this set won't be reset.
+     * @throws NoOffsetForPartitionException If there are partitions assigned that require a position but
+     *                                       there is no reset strategy configured.
+     */
+    public synchronized void resetInitializingPositions(Predicate&lt;TopicPartition&gt; initPartitionsToInclude) {
+<span class="nc" id="L882">        final Set&lt;TopicPartition&gt; partitionsWithNoOffsets = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L883">        assignment.forEach((tp, partitionState) -&gt; {</span>
+<span class="nc bnc" id="L884" title="All 4 branches missed.">            if (partitionState.shouldInitialize() &amp;&amp; initPartitionsToInclude.test(tp)) {</span>
+<span class="nc bnc" id="L885" title="All 2 branches missed.">                if (defaultResetStrategy == AutoOffsetResetStrategy.NONE)</span>
+<span class="nc" id="L886">                    partitionsWithNoOffsets.add(tp);</span>
+                else
+<span class="nc" id="L888">                    requestOffsetReset(tp);</span>
+            }
+<span class="nc" id="L890">        });</span>
+
+<span class="nc bnc" id="L892" title="All 2 branches missed.">        if (!partitionsWithNoOffsets.isEmpty())</span>
+<span class="nc" id="L893">            throw new NoOffsetForPartitionException(partitionsWithNoOffsets);</span>
+<span class="nc" id="L894">    }</span>
+
+    public synchronized void resetInitializingPositions() {
+<span class="nc" id="L897">        resetInitializingPositions(tp -&gt; true);</span>
+<span class="nc" id="L898">    }</span>
+
+    public synchronized Set&lt;TopicPartition&gt; partitionsNeedingReset(long nowMs) {
+<span class="nc bnc" id="L901" title="All 4 branches missed.">        return collectPartitions(state -&gt; state.awaitingReset() &amp;&amp; !state.awaitingRetryBackoff(nowMs));</span>
+    }
+
+    public synchronized Map&lt;TopicPartition, FetchPosition&gt; partitionsNeedingValidation(long nowMs) {
+<span class="nc" id="L905">        Map&lt;TopicPartition, FetchPosition&gt; result = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L907">        assignment.forEach((tp, tps) -&gt; {</span>
+<span class="nc bnc" id="L908" title="All 6 branches missed.">            if (tps.awaitingValidation() &amp;&amp; !tps.awaitingRetryBackoff(nowMs) &amp;&amp; tps.position != null) {</span>
+<span class="nc" id="L909">                result.put(tp, tps.position);</span>
+            }
+<span class="nc" id="L911">        });</span>
+
+<span class="nc" id="L913">        return result;</span>
+    }
+
+    public synchronized boolean isAssigned(TopicPartition tp) {
+<span class="nc" id="L917">        return assignment.contains(tp);</span>
+    }
+
+    public synchronized boolean isPaused(TopicPartition tp) {
+<span class="nc" id="L921">        TopicPartitionState assignedOrNull = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L922" title="All 4 branches missed.">        return assignedOrNull != null &amp;&amp; assignedOrNull.isPaused();</span>
+    }
+
+    synchronized boolean isFetchable(TopicPartition tp) {
+<span class="nc" id="L926">        TopicPartitionState tps = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L927" title="All 4 branches missed.">        return tps != null &amp;&amp; isFetchableAndSubscribed(tp, tps);</span>
+    }
+
+    public synchronized boolean hasValidPosition(TopicPartition tp) {
+<span class="nc" id="L931">        TopicPartitionState assignedOrNull = assignedStateOrNull(tp);</span>
+<span class="nc bnc" id="L932" title="All 4 branches missed.">        return assignedOrNull != null &amp;&amp; assignedOrNull.hasValidPosition();</span>
+    }
+
+    public synchronized void pause(TopicPartition tp) {
+<span class="nc" id="L936">        assignedState(tp).pause();</span>
+<span class="nc" id="L937">    }</span>
+
+    public synchronized void markPendingRevocation(Set&lt;TopicPartition&gt; tps) {
+<span class="nc" id="L940">        tps.forEach(tp -&gt; assignedState(tp).markPendingRevocation());</span>
+<span class="nc" id="L941">    }</span>
+
+    // Visible for testing
+    synchronized void markPendingOnAssignedCallback(Collection&lt;TopicPartition&gt; tps,
+                                                    boolean pendingOnAssignedCallback) {
+<span class="nc" id="L946">        tps.forEach(tp -&gt; assignedState(tp).markPendingOnAssignedCallback(pendingOnAssignedCallback));</span>
+<span class="nc" id="L947">    }</span>
+
+    /**
+     * Change the assignment to the specified partitions returned from the coordinator and mark
+     * them as awaiting onPartitionsAssigned callback. This will ensure that the partitions are
+     * included in the assignment, but are not fetchable or initialize positions while the
+     * callback runs. This is expected to be used by the async consumer.
+     *
+     * @param fullAssignment  Full collection of partitions assigned. Includes previously owned
+     *                        and newly added partitions.
+     * @param addedPartitions Subset of the fullAssignment containing the added partitions. These
+     *                        are not fetchable until the onPartitionsAssigned callback completes.
+     */
+    public synchronized void assignFromSubscribedAwaitingCallback(Collection&lt;TopicPartition&gt; fullAssignment,
+                                                                  Collection&lt;TopicPartition&gt; addedPartitions) {
+<span class="nc" id="L962">        assignFromSubscribed(fullAssignment);</span>
+<span class="nc" id="L963">        markPendingOnAssignedCallback(addedPartitions, true);</span>
+<span class="nc" id="L964">    }</span>
+
+    /**
+     * @return Topic IDs received in an assignment that have not been reconciled yet, so we need metadata for them.
+     */
+    public synchronized Set&lt;Uuid&gt; assignedTopicIds() {
+<span class="nc" id="L970">        return assignedTopicIds;</span>
+    }
+
+    /**
+     * Set the set of topic IDs that have been assigned to the consumer by the coordinator.
+     * This is used for topic IDs received in an assignment when using the new consumer rebalance protocol (KIP-848).
+     */
+    public synchronized  void setAssignedTopicIds(Set&lt;Uuid&gt; assignedTopicIds) {
+<span class="nc" id="L978">        this.assignedTopicIds = assignedTopicIds;</span>
+<span class="nc" id="L979">    }</span>
+
+    /**
+     * Enable fetching and updating positions for the given partitions that were assigned to the
+     * consumer, but waiting for the onPartitionsAssigned callback to complete. This is
+     * expected to be used by the async consumer.
+     */
+    public synchronized void enablePartitionsAwaitingCallback(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L987">        markPendingOnAssignedCallback(partitions, false);</span>
+<span class="nc" id="L988">    }</span>
+
+    public synchronized void resume(TopicPartition tp) {
+<span class="nc" id="L991">        assignedState(tp).resume();</span>
+<span class="nc" id="L992">    }</span>
+
+    synchronized void requestFailed(Set&lt;TopicPartition&gt; partitions, long nextRetryTimeMs) {
+<span class="nc bnc" id="L995" title="All 2 branches missed.">        for (TopicPartition partition : partitions) {</span>
+            // by the time the request failed, the assignment may no longer
+            // contain this partition any more, in which case we would just ignore.
+<span class="nc" id="L998">            final TopicPartitionState state = assignedStateOrNull(partition);</span>
+<span class="nc bnc" id="L999" title="All 2 branches missed.">            if (state != null)</span>
+<span class="nc" id="L1000">                state.requestFailed(nextRetryTimeMs);</span>
+<span class="nc" id="L1001">        }</span>
+<span class="nc" id="L1002">    }</span>
+
+    synchronized void movePartitionToEnd(TopicPartition tp) {
+<span class="nc" id="L1005">        assignment.moveToEnd(tp);</span>
+<span class="nc" id="L1006">    }</span>
+
+    public synchronized Optional&lt;ConsumerRebalanceListener&gt; rebalanceListener() {
+<span class="nc" id="L1009">        return rebalanceListener;</span>
+    }
+
+    private static class TopicPartitionState {
+
+        private FetchState fetchState;
+        private FetchPosition position; // last consumed position
+
+        private Long highWatermark; // the high watermark from last fetch
+        private Long logStartOffset; // the log start offset
+        private Long lastStableOffset;
+        private boolean paused;  // whether this partition has been paused by the user
+        private boolean pendingRevocation;
+        private boolean pendingOnAssignedCallback;
+        private AutoOffsetResetStrategy resetStrategy;  // the strategy to use if the offset needs resetting
+        private Long nextRetryTimeMs;
+        private Integer preferredReadReplica;
+        private Long preferredReadReplicaExpireTimeMs;
+        private boolean endOffsetRequested;
+        
+<span class="nc" id="L1029">        TopicPartitionState() {</span>
+<span class="nc" id="L1030">            this.paused = false;</span>
+<span class="nc" id="L1031">            this.pendingRevocation = false;</span>
+<span class="nc" id="L1032">            this.pendingOnAssignedCallback = false;</span>
+<span class="nc" id="L1033">            this.endOffsetRequested = false;</span>
+<span class="nc" id="L1034">            this.fetchState = FetchStates.INITIALIZING;</span>
+<span class="nc" id="L1035">            this.position = null;</span>
+<span class="nc" id="L1036">            this.highWatermark = null;</span>
+<span class="nc" id="L1037">            this.logStartOffset = null;</span>
+<span class="nc" id="L1038">            this.lastStableOffset = null;</span>
+<span class="nc" id="L1039">            this.resetStrategy = null;</span>
+<span class="nc" id="L1040">            this.nextRetryTimeMs = null;</span>
+<span class="nc" id="L1041">            this.preferredReadReplica = null;</span>
+<span class="nc" id="L1042">        }</span>
+
+        public boolean endOffsetRequested() {
+<span class="nc" id="L1045">            return endOffsetRequested;</span>
+        }
+
+        public void requestEndOffset() {
+<span class="nc" id="L1049">            endOffsetRequested = true;</span>
+<span class="nc" id="L1050">        }</span>
+
+        public void clearEndOffset() {
+<span class="nc" id="L1053">            endOffsetRequested = false;</span>
+<span class="nc" id="L1054">        }</span>
+
+        private void transitionState(FetchState newState, Runnable runIfTransitioned) {
+<span class="nc" id="L1057">            FetchState nextState = this.fetchState.transitionTo(newState);</span>
+<span class="nc bnc" id="L1058" title="All 2 branches missed.">            if (nextState.equals(newState)) {</span>
+<span class="nc" id="L1059">                this.fetchState = nextState;</span>
+<span class="nc" id="L1060">                runIfTransitioned.run();</span>
+<span class="nc bnc" id="L1061" title="All 4 branches missed.">                if (this.position == null &amp;&amp; nextState.requiresPosition()) {</span>
+<span class="nc" id="L1062">                    throw new IllegalStateException(&quot;Transitioned subscription state to &quot; + nextState + &quot;, but position is null&quot;);</span>
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">                } else if (!nextState.requiresPosition()) {</span>
+<span class="nc" id="L1064">                    this.position = null;</span>
+                }
+            }
+<span class="nc" id="L1067">        }</span>
+
+        private Optional&lt;Integer&gt; preferredReadReplica(long timeMs) {
+<span class="nc bnc" id="L1070" title="All 4 branches missed.">            if (preferredReadReplicaExpireTimeMs != null &amp;&amp; timeMs &gt; preferredReadReplicaExpireTimeMs) {</span>
+<span class="nc" id="L1071">                preferredReadReplica = null;</span>
+<span class="nc" id="L1072">                return Optional.empty();</span>
+            } else {
+<span class="nc" id="L1074">                return Optional.ofNullable(preferredReadReplica);</span>
+            }
+        }
+
+        private void updatePreferredReadReplica(int preferredReadReplica, LongSupplier timeMs) {
+<span class="nc bnc" id="L1079" title="All 4 branches missed.">            if (this.preferredReadReplica == null || preferredReadReplica != this.preferredReadReplica) {</span>
+<span class="nc" id="L1080">                this.preferredReadReplica = preferredReadReplica;</span>
+<span class="nc" id="L1081">                this.preferredReadReplicaExpireTimeMs = timeMs.getAsLong();</span>
+            }
+<span class="nc" id="L1083">        }</span>
+
+        private Optional&lt;Integer&gt; clearPreferredReadReplica() {
+<span class="nc bnc" id="L1086" title="All 2 branches missed.">            if (preferredReadReplica != null) {</span>
+<span class="nc" id="L1087">                int removedReplicaId = this.preferredReadReplica;</span>
+<span class="nc" id="L1088">                this.preferredReadReplica = null;</span>
+<span class="nc" id="L1089">                this.preferredReadReplicaExpireTimeMs = null;</span>
+<span class="nc" id="L1090">                return Optional.of(removedReplicaId);</span>
+            } else {
+<span class="nc" id="L1092">                return Optional.empty();</span>
+            }
+        }
+
+        private void reset(AutoOffsetResetStrategy strategy) {
+<span class="nc" id="L1097">            transitionState(FetchStates.AWAIT_RESET, () -&gt; {</span>
+<span class="nc" id="L1098">                this.resetStrategy = strategy;</span>
+<span class="nc" id="L1099">                this.nextRetryTimeMs = null;</span>
+<span class="nc" id="L1100">            });</span>
+<span class="nc" id="L1101">        }</span>
+
+        /**
+         * Check if the position exists and needs to be validated. If so, enter the AWAIT_VALIDATION state. This method
+         * also will update the position with the current leader and epoch.
+         *
+         * @param currentLeaderAndEpoch leader and epoch to compare the offset with
+         * @return true if the position is now awaiting validation
+         */
+        private boolean maybeValidatePosition(Metadata.LeaderAndEpoch currentLeaderAndEpoch) {
+<span class="nc bnc" id="L1111" title="All 2 branches missed.">            if (this.fetchState.equals(FetchStates.AWAIT_RESET)) {</span>
+<span class="nc" id="L1112">                return false;</span>
+            }
+
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">            if (currentLeaderAndEpoch.leader.isEmpty()) {</span>
+<span class="nc" id="L1116">                return false;</span>
+            }
+
+<span class="nc bnc" id="L1119" title="All 4 branches missed.">            if (position != null &amp;&amp; !position.currentLeader.equals(currentLeaderAndEpoch)) {</span>
+<span class="nc" id="L1120">                FetchPosition newPosition = new FetchPosition(position.offset, position.offsetEpoch, currentLeaderAndEpoch);</span>
+<span class="nc" id="L1121">                validatePosition(newPosition);</span>
+<span class="nc" id="L1122">                preferredReadReplica = null;</span>
+            }
+<span class="nc" id="L1124">            return this.fetchState.equals(FetchStates.AWAIT_VALIDATION);</span>
+        }
+
+        /**
+         * For older versions of the API, we cannot perform offset validation so we simply transition directly to FETCHING
+         */
+        private void updatePositionLeaderNoValidation(Metadata.LeaderAndEpoch currentLeaderAndEpoch) {
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">            if (position != null) {</span>
+<span class="nc" id="L1132">                transitionState(FetchStates.FETCHING, () -&gt; {</span>
+<span class="nc" id="L1133">                    this.position = new FetchPosition(position.offset, position.offsetEpoch, currentLeaderAndEpoch);</span>
+<span class="nc" id="L1134">                    this.nextRetryTimeMs = null;</span>
+<span class="nc" id="L1135">                });</span>
+            }
+<span class="nc" id="L1137">        }</span>
+
+        private void validatePosition(FetchPosition position) {
+<span class="nc bnc" id="L1140" title="All 4 branches missed.">            if (position.offsetEpoch.isPresent() &amp;&amp; position.currentLeader.epoch.isPresent()) {</span>
+<span class="nc" id="L1141">                transitionState(FetchStates.AWAIT_VALIDATION, () -&gt; {</span>
+<span class="nc" id="L1142">                    this.position = position;</span>
+<span class="nc" id="L1143">                    this.nextRetryTimeMs = null;</span>
+<span class="nc" id="L1144">                });</span>
+            } else {
+                // If we have no epoch information for the current position, then we can skip validation
+<span class="nc" id="L1147">                transitionState(FetchStates.FETCHING, () -&gt; {</span>
+<span class="nc" id="L1148">                    this.position = position;</span>
+<span class="nc" id="L1149">                    this.nextRetryTimeMs = null;</span>
+<span class="nc" id="L1150">                });</span>
+            }
+<span class="nc" id="L1152">        }</span>
+
+        /**
+         * Clear the awaiting validation state and enter fetching.
+         */
+        private void completeValidation() {
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">            if (hasPosition()) {</span>
+<span class="nc" id="L1159">                transitionState(FetchStates.FETCHING, () -&gt; this.nextRetryTimeMs = null);</span>
+            }
+<span class="nc" id="L1161">        }</span>
+
+        private boolean awaitingValidation() {
+<span class="nc" id="L1164">            return fetchState.equals(FetchStates.AWAIT_VALIDATION);</span>
+        }
+
+        private boolean awaitingRetryBackoff(long nowMs) {
+<span class="nc bnc" id="L1168" title="All 4 branches missed.">            return nextRetryTimeMs != null &amp;&amp; nowMs &lt; nextRetryTimeMs;</span>
+        }
+
+        private boolean awaitingReset() {
+<span class="nc" id="L1172">            return fetchState.equals(FetchStates.AWAIT_RESET);</span>
+        }
+
+        private void setNextAllowedRetry(long nextAllowedRetryTimeMs) {
+<span class="nc" id="L1176">            this.nextRetryTimeMs = nextAllowedRetryTimeMs;</span>
+<span class="nc" id="L1177">        }</span>
+
+        private void requestFailed(long nextAllowedRetryTimeMs) {
+<span class="nc" id="L1180">            this.nextRetryTimeMs = nextAllowedRetryTimeMs;</span>
+<span class="nc" id="L1181">        }</span>
+
+        private boolean hasValidPosition() {
+<span class="nc" id="L1184">            return fetchState.hasValidPosition();</span>
+        }
+
+        private boolean hasPosition() {
+<span class="nc bnc" id="L1188" title="All 2 branches missed.">            return position != null;</span>
+        }
+
+        private boolean isPaused() {
+<span class="nc" id="L1192">            return paused;</span>
+        }
+
+        private void seekValidated(FetchPosition position) {
+<span class="nc" id="L1196">            transitionState(FetchStates.FETCHING, () -&gt; {</span>
+<span class="nc" id="L1197">                this.position = position;</span>
+<span class="nc" id="L1198">                this.resetStrategy = null;</span>
+<span class="nc" id="L1199">                this.nextRetryTimeMs = null;</span>
+<span class="nc" id="L1200">            });</span>
+<span class="nc" id="L1201">        }</span>
+
+        private void seekUnvalidated(FetchPosition fetchPosition) {
+<span class="nc" id="L1204">            seekValidated(fetchPosition);</span>
+<span class="nc" id="L1205">            validatePosition(fetchPosition);</span>
+<span class="nc" id="L1206">        }</span>
+
+        private void position(FetchPosition position) {
+<span class="nc bnc" id="L1209" title="All 2 branches missed.">            if (!hasValidPosition())</span>
+<span class="nc" id="L1210">                throw new IllegalStateException(&quot;Cannot set a new position without a valid current position&quot;);</span>
+<span class="nc" id="L1211">            this.position = position;</span>
+<span class="nc" id="L1212">        }</span>
+
+        private FetchPosition validPosition() {
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">            if (hasValidPosition()) {</span>
+<span class="nc" id="L1216">                return position;</span>
+            } else {
+<span class="nc" id="L1218">                return null;</span>
+            }
+        }
+
+        private void pause() {
+<span class="nc" id="L1223">            this.paused = true;</span>
+<span class="nc" id="L1224">        }</span>
+
+        private void markPendingRevocation() {
+<span class="nc" id="L1227">            this.pendingRevocation = true;</span>
+<span class="nc" id="L1228">        }</span>
+
+        private void markPendingOnAssignedCallback(boolean pendingOnAssignedCallback) {
+<span class="nc" id="L1231">            this.pendingOnAssignedCallback = pendingOnAssignedCallback;</span>
+<span class="nc" id="L1232">        }</span>
+
+        private void resume() {
+<span class="nc" id="L1235">            this.paused = false;</span>
+<span class="nc" id="L1236">        }</span>
+
+        /**
+         * Check if we need to retrieve a fetch position for the given partition.
+         * True if the partition state is {@link FetchStates#INITIALIZING}, and the partition is not being revoked.
+         * &lt;p/&gt;
+         * While in this state, a position for the partition will be retrieved (based on committed offsets or
+         * partitions offsets).
+         * Note that retrieving a position does not mean that we can start fetching from the
+         * partition (see {@link #isFetchable()})
+         */
+        private boolean shouldInitialize() {
+<span class="nc bnc" id="L1248" title="All 4 branches missed.">            return fetchState.equals(FetchStates.INITIALIZING) &amp;&amp; !pendingRevocation;</span>
+        }
+
+        private boolean isFetchable() {
+<span class="nc bnc" id="L1252" title="All 8 branches missed.">            return !paused &amp;&amp; !pendingRevocation &amp;&amp; !pendingOnAssignedCallback &amp;&amp; hasValidPosition();</span>
+        }
+
+        private void highWatermark(Long highWatermark) {
+<span class="nc" id="L1256">            this.highWatermark = highWatermark;</span>
+<span class="nc" id="L1257">            this.endOffsetRequested = false;</span>
+<span class="nc" id="L1258">        }</span>
+
+        private void logStartOffset(Long logStartOffset) {
+<span class="nc" id="L1261">            this.logStartOffset = logStartOffset;</span>
+<span class="nc" id="L1262">        }</span>
+
+        private void lastStableOffset(Long lastStableOffset) {
+<span class="nc" id="L1265">            this.lastStableOffset = lastStableOffset;</span>
+<span class="nc" id="L1266">            this.endOffsetRequested = false;</span>
+<span class="nc" id="L1267">        }</span>
+
+        private AutoOffsetResetStrategy resetStrategy() {
+<span class="nc" id="L1270">            return resetStrategy;</span>
+        }
+    }
+
+    /**
+     * The fetch state of a partition. This class is used to determine valid state transitions and expose the some of
+     * the behavior of the current fetch state. Actual state variables are stored in the {@link TopicPartitionState}.
+     */
+    interface FetchState {
+        default FetchState transitionTo(FetchState newState) {
+<span class="nc bnc" id="L1280" title="All 2 branches missed.">            if (validTransitions().contains(newState)) {</span>
+<span class="nc" id="L1281">                return newState;</span>
+            } else {
+<span class="nc" id="L1283">                return this;</span>
+            }
+        }
+
+        /**
+         * Return the valid states which this state can transition to
+         */
+        Collection&lt;FetchState&gt; validTransitions();
+
+        /**
+         * Test if this state requires a position to be set
+         */
+        boolean requiresPosition();
+
+        /**
+         * Test if this state is considered to have a valid position which can be used for fetching
+         */
+        boolean hasValidPosition();
+    }
+
+    /**
+     * An enumeration of all the possible fetch states. The state transitions are encoded in the values returned by
+     * {@link FetchState#validTransitions}.
+     */
+<span class="nc" id="L1307">    enum FetchStates implements FetchState {</span>
+<span class="nc" id="L1308">        INITIALIZING() {</span>
+            @Override
+            public Collection&lt;FetchState&gt; validTransitions() {
+<span class="nc" id="L1311">                return Arrays.asList(FetchStates.FETCHING, FetchStates.AWAIT_RESET, FetchStates.AWAIT_VALIDATION);</span>
+            }
+
+            @Override
+            public boolean requiresPosition() {
+<span class="nc" id="L1316">                return false;</span>
+            }
+
+            @Override
+            public boolean hasValidPosition() {
+<span class="nc" id="L1321">                return false;</span>
+            }
+        },
+
+<span class="nc" id="L1325">        FETCHING() {</span>
+            @Override
+            public Collection&lt;FetchState&gt; validTransitions() {
+<span class="nc" id="L1328">                return Arrays.asList(FetchStates.FETCHING, FetchStates.AWAIT_RESET, FetchStates.AWAIT_VALIDATION);</span>
+            }
+
+            @Override
+            public boolean requiresPosition() {
+<span class="nc" id="L1333">                return true;</span>
+            }
+
+            @Override
+            public boolean hasValidPosition() {
+<span class="nc" id="L1338">                return true;</span>
+            }
+        },
+
+<span class="nc" id="L1342">        AWAIT_RESET() {</span>
+            @Override
+            public Collection&lt;FetchState&gt; validTransitions() {
+<span class="nc" id="L1345">                return Arrays.asList(FetchStates.FETCHING, FetchStates.AWAIT_RESET);</span>
+            }
+
+            @Override
+            public boolean requiresPosition() {
+<span class="nc" id="L1350">                return false;</span>
+            }
+
+            @Override
+            public boolean hasValidPosition() {
+<span class="nc" id="L1355">                return false;</span>
+            }
+        },
+
+<span class="nc" id="L1359">        AWAIT_VALIDATION() {</span>
+            @Override
+            public Collection&lt;FetchState&gt; validTransitions() {
+<span class="nc" id="L1362">                return Arrays.asList(FetchStates.FETCHING, FetchStates.AWAIT_RESET, FetchStates.AWAIT_VALIDATION);</span>
+            }
+
+            @Override
+            public boolean requiresPosition() {
+<span class="nc" id="L1367">                return true;</span>
+            }
+
+            @Override
+            public boolean hasValidPosition() {
+<span class="nc" id="L1372">                return false;</span>
+            }
+        }
+    }
+
+    /**
+     * Represents the position of a partition subscription.
+     *
+     * This includes the offset and epoch from the last record in
+     * the batch from a FetchResponse. It also includes the leader epoch at the time the batch was consumed.
+     */
+    public static class FetchPosition {
+        public final long offset;
+        final Optional&lt;Integer&gt; offsetEpoch;
+        final Metadata.LeaderAndEpoch currentLeader;
+
+        FetchPosition(long offset) {
+<span class="nc" id="L1389">            this(offset, Optional.empty(), Metadata.LeaderAndEpoch.noLeaderOrEpoch());</span>
+<span class="nc" id="L1390">        }</span>
+
+<span class="nc" id="L1392">        public FetchPosition(long offset, Optional&lt;Integer&gt; offsetEpoch, Metadata.LeaderAndEpoch currentLeader) {</span>
+<span class="nc" id="L1393">            this.offset = offset;</span>
+<span class="nc" id="L1394">            this.offsetEpoch = Objects.requireNonNull(offsetEpoch);</span>
+<span class="nc" id="L1395">            this.currentLeader = Objects.requireNonNull(currentLeader);</span>
+<span class="nc" id="L1396">        }</span>
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L1400" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L1401" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L1402">            FetchPosition that = (FetchPosition) o;</span>
+<span class="nc bnc" id="L1403" title="All 2 branches missed.">            return offset == that.offset &amp;&amp;</span>
+<span class="nc bnc" id="L1404" title="All 2 branches missed.">                    offsetEpoch.equals(that.offsetEpoch) &amp;&amp;</span>
+<span class="nc bnc" id="L1405" title="All 2 branches missed.">                    currentLeader.equals(that.currentLeader);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L1410">            return Objects.hash(offset, offsetEpoch, currentLeader);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1415">            return &quot;FetchPosition{&quot; +</span>
+                    &quot;offset=&quot; + offset +
+                    &quot;, offsetEpoch=&quot; + offsetEpoch +
+                    &quot;, currentLeader=&quot; + currentLeader +
+                    '}';
+        }
+    }
+
+    public static class LogTruncation {
+        public final TopicPartition topicPartition;
+        public final FetchPosition fetchPosition;
+        public final Optional&lt;OffsetAndMetadata&gt; divergentOffsetOpt;
+
+        public LogTruncation(TopicPartition topicPartition,
+                             FetchPosition fetchPosition,
+<span class="nc" id="L1430">                             Optional&lt;OffsetAndMetadata&gt; divergentOffsetOpt) {</span>
+<span class="nc" id="L1431">            this.topicPartition = topicPartition;</span>
+<span class="nc" id="L1432">            this.fetchPosition = fetchPosition;</span>
+<span class="nc" id="L1433">            this.divergentOffsetOpt = divergentOffsetOpt;</span>
+<span class="nc" id="L1434">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1438">            StringBuilder bldr = new StringBuilder()</span>
+<span class="nc" id="L1439">                .append(&quot;(partition=&quot;)</span>
+<span class="nc" id="L1440">                .append(topicPartition)</span>
+<span class="nc" id="L1441">                .append(&quot;, fetchOffset=&quot;)</span>
+<span class="nc" id="L1442">                .append(fetchPosition.offset)</span>
+<span class="nc" id="L1443">                .append(&quot;, fetchEpoch=&quot;)</span>
+<span class="nc" id="L1444">                .append(fetchPosition.offsetEpoch);</span>
+
+<span class="nc bnc" id="L1446" title="All 2 branches missed.">            if (divergentOffsetOpt.isPresent()) {</span>
+<span class="nc" id="L1447">                OffsetAndMetadata divergentOffset = divergentOffsetOpt.get();</span>
+<span class="nc" id="L1448">                bldr.append(&quot;, divergentOffset=&quot;)</span>
+<span class="nc" id="L1449">                    .append(divergentOffset.offset())</span>
+<span class="nc" id="L1450">                    .append(&quot;, divergentEpoch=&quot;)</span>
+<span class="nc" id="L1451">                    .append(divergentOffset.leaderEpoch());</span>
+<span class="nc" id="L1452">            } else {</span>
+<span class="nc" id="L1453">                bldr.append(&quot;, divergentOffset=unknown&quot;)</span>
+<span class="nc" id="L1454">                    .append(&quot;, divergentEpoch=unknown&quot;);</span>
+            }
+
+<span class="nc" id="L1457">            return bldr.append(&quot;)&quot;).toString();</span>
+
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

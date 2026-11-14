@@ -1,0 +1,1064 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SslTransportLayer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.network</a> &gt; <span class="el_source">SslTransportLayer.java</span></div><h1>SslTransportLayer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.network;
+
+import org.apache.kafka.common.errors.SslAuthenticationException;
+import org.apache.kafka.common.security.auth.KafkaPrincipal;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.ByteBufferUnmapper;
+import org.apache.kafka.common.utils.internals.ByteUtils;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.io.EOFException;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.CancelledKeyException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.SocketChannel;
+import java.security.Principal;
+
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLEngineResult.HandshakeStatus;
+import javax.net.ssl.SSLEngineResult.Status;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLKeyException;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLProtocolException;
+import javax.net.ssl.SSLSession;
+
+/*
+ * Transport layer for SSL communication
+ *
+ *
+ * TLS v1.3 notes:
+ *   https://tools.ietf.org/html/rfc8446#section-4.6 : Post-Handshake Messages
+ *   &quot;TLS also allows other messages to be sent after the main handshake.
+ *   These messages use a handshake content type and are encrypted under
+ *   the appropriate application traffic key.&quot;
+ */
+public class SslTransportLayer implements TransportLayer {
+<span class="nc" id="L59">    private enum State {</span>
+        // Initial state
+<span class="nc" id="L61">        NOT_INITIALIZED,</span>
+        // SSLEngine is in handshake mode
+<span class="nc" id="L63">        HANDSHAKE,</span>
+        // SSL handshake failed, connection will be terminated
+<span class="nc" id="L65">        HANDSHAKE_FAILED,</span>
+        // SSLEngine has completed handshake, post-handshake messages may be pending for TLSv1.3
+<span class="nc" id="L67">        POST_HANDSHAKE,</span>
+        // SSLEngine has completed handshake, any post-handshake messages have been processed for TLSv1.3
+        // For TLSv1.3, we move the channel to READY state when incoming data is processed after handshake
+<span class="nc" id="L70">        READY,</span>
+        // Channel is being closed
+<span class="nc" id="L72">        CLOSING</span>
+    }
+
+    private static final String TLS13 = &quot;TLSv1.3&quot;;
+
+    private final String channelId;
+    private final SSLEngine sslEngine;
+    private final SelectionKey key;
+    private final SocketChannel socketChannel;
+    private final ChannelMetadataRegistry metadataRegistry;
+    private final Logger log;
+
+    private HandshakeStatus handshakeStatus;
+    private SSLEngineResult handshakeResult;
+    private State state;
+    private SslAuthenticationException handshakeException;
+    private ByteBuffer netReadBuffer;
+    private ByteBuffer netWriteBuffer;
+    private ByteBuffer appReadBuffer;
+    private ByteBuffer fileChannelBuffer;
+    private boolean hasBytesBuffered;
+
+    public static SslTransportLayer create(String channelId, SelectionKey key, SSLEngine sslEngine,
+                                           ChannelMetadataRegistry metadataRegistry) throws IOException {
+<span class="nc" id="L96">        return new SslTransportLayer(channelId, key, sslEngine, metadataRegistry);</span>
+    }
+
+    // Prefer `create`, only use this in tests
+    SslTransportLayer(String channelId, SelectionKey key, SSLEngine sslEngine,
+<span class="nc" id="L101">                      ChannelMetadataRegistry metadataRegistry) {</span>
+<span class="nc" id="L102">        this.channelId = channelId;</span>
+<span class="nc" id="L103">        this.key = key;</span>
+<span class="nc" id="L104">        this.socketChannel = (SocketChannel) key.channel();</span>
+<span class="nc" id="L105">        this.sslEngine = sslEngine;</span>
+<span class="nc" id="L106">        this.state = State.NOT_INITIALIZED;</span>
+<span class="nc" id="L107">        this.metadataRegistry = metadataRegistry;</span>
+
+<span class="nc" id="L109">        final LogContext logContext = new LogContext(String.format(&quot;[SslTransportLayer channelId=%s key=%s] &quot;, channelId, key));</span>
+<span class="nc" id="L110">        this.log = logContext.logger(getClass());</span>
+<span class="nc" id="L111">    }</span>
+
+    // Visible for testing
+    protected void startHandshake() throws IOException {
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        if (state != State.NOT_INITIALIZED)</span>
+<span class="nc" id="L116">            throw new IllegalStateException(&quot;startHandshake() can only be called once, state &quot; + state);</span>
+
+<span class="nc" id="L118">        this.netReadBuffer = ByteBuffer.allocate(netReadBufferSize());</span>
+<span class="nc" id="L119">        this.netWriteBuffer = ByteBuffer.allocate(netWriteBufferSize());</span>
+<span class="nc" id="L120">        this.appReadBuffer = ByteBuffer.allocate(applicationBufferSize());</span>
+<span class="nc" id="L121">        netWriteBuffer.limit(0);</span>
+<span class="nc" id="L122">        netReadBuffer.limit(0);</span>
+
+<span class="nc" id="L124">        state = State.HANDSHAKE;</span>
+        //initiate handshake
+<span class="nc" id="L126">        sslEngine.beginHandshake();</span>
+<span class="nc" id="L127">        handshakeStatus = sslEngine.getHandshakeStatus();</span>
+<span class="nc" id="L128">    }</span>
+
+    @Override
+    public boolean ready() {
+<span class="nc bnc" id="L132" title="All 4 branches missed.">        return state == State.POST_HANDSHAKE || state == State.READY;</span>
+    }
+
+    /**
+     * does socketChannel.finishConnect()
+     */
+    @Override
+    public boolean finishConnect() throws IOException {
+<span class="nc" id="L140">        boolean connected = socketChannel.finishConnect();</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        if (connected)</span>
+<span class="nc" id="L142">            key.interestOps(key.interestOps() &amp; ~SelectionKey.OP_CONNECT | SelectionKey.OP_READ);</span>
+<span class="nc" id="L143">        return connected;</span>
+    }
+
+    /**
+     * disconnects selectionKey.
+     */
+    @Override
+    public void disconnect() {
+<span class="nc" id="L151">        key.cancel();</span>
+<span class="nc" id="L152">    }</span>
+
+    @Override
+    public SocketChannel socketChannel() {
+<span class="nc" id="L156">        return socketChannel;</span>
+    }
+
+    @Override
+    public SelectionKey selectionKey() {
+<span class="nc" id="L161">        return key;</span>
+    }
+
+    @Override
+    public boolean isOpen() {
+<span class="nc" id="L166">        return socketChannel.isOpen();</span>
+    }
+
+    @Override
+    public boolean isConnected() {
+<span class="nc" id="L171">        return socketChannel.isConnected();</span>
+    }
+
+    /**
+    * Sends an SSL close message and closes socketChannel.
+    */
+    @Override
+    public void close() throws IOException {
+<span class="nc" id="L179">        State prevState = state;</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">        if (state == State.CLOSING) return;</span>
+<span class="nc" id="L181">        state = State.CLOSING;</span>
+<span class="nc" id="L182">        sslEngine.closeOutbound();</span>
+        try {
+<span class="nc bnc" id="L184" title="All 4 branches missed.">            if (prevState != State.NOT_INITIALIZED &amp;&amp; isConnected()) {</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">                if (!flush(netWriteBuffer)) {</span>
+<span class="nc" id="L186">                    throw new IOException(&quot;Remaining data in the network buffer, can't send SSL close message.&quot;);</span>
+                }
+                //prep the buffer for the close message
+<span class="nc" id="L189">                netWriteBuffer.clear();</span>
+                //perform the close, since we called sslEngine.closeOutbound
+<span class="nc" id="L191">                SSLEngineResult wrapResult = sslEngine.wrap(ByteUtils.EMPTY_BUF, netWriteBuffer);</span>
+                //we should be in a close state
+<span class="nc bnc" id="L193" title="All 2 branches missed.">                if (wrapResult.getStatus() != SSLEngineResult.Status.CLOSED) {</span>
+<span class="nc" id="L194">                    throw new IOException(&quot;Unexpected status returned by SSLEngine.wrap, expected CLOSED, received &quot; +</span>
+<span class="nc" id="L195">                            wrapResult.getStatus() + &quot;. Will not send close message to peer.&quot;);</span>
+                }
+<span class="nc" id="L197">                netWriteBuffer.flip();</span>
+<span class="nc" id="L198">                flush(netWriteBuffer);</span>
+            }
+<span class="nc" id="L200">        } catch (IOException ie) {</span>
+<span class="nc" id="L201">            log.debug(&quot;Failed to send SSL Close message&quot;, ie);</span>
+        } finally {
+            try {
+<span class="nc" id="L204">                sslEngine.closeInbound();</span>
+<span class="nc" id="L205">            } catch (SSLException e) {</span>
+                // This log is for debugging purposes as an exception might occur frequently
+                // at this point due to peers not following the TLS specs and failing to send a close_notify alert. 
+                // Even if they do, currently, we do not read data from the socket after invoking close().
+<span class="nc" id="L209">                log.debug(&quot;SSLEngine.closeInBound() raised an exception.&quot;, e);</span>
+<span class="nc" id="L210">            }</span>
+<span class="nc" id="L211">            socketChannel.socket().close();</span>
+<span class="nc" id="L212">            socketChannel.close();</span>
+<span class="nc" id="L213">            netReadBuffer = null;</span>
+<span class="nc" id="L214">            netWriteBuffer = null;</span>
+<span class="nc" id="L215">            appReadBuffer = null;</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            if (fileChannelBuffer != null) {</span>
+<span class="nc" id="L217">                ByteBufferUnmapper.unmap(&quot;fileChannelBuffer&quot;, fileChannelBuffer);</span>
+<span class="nc" id="L218">                fileChannelBuffer = null;</span>
+            }
+        }
+<span class="nc" id="L221">    }</span>
+
+    /**
+     * returns true if there are any pending contents in netWriteBuffer
+     */
+    @Override
+    public boolean hasPendingWrites() {
+<span class="nc" id="L228">        return netWriteBuffer.hasRemaining();</span>
+    }
+
+    /**
+     * Reads available bytes from socket channel to `netReadBuffer`.
+     * Visible for testing.
+     * @return  number of bytes read
+     */
+    protected int readFromSocketChannel() throws IOException {
+<span class="nc" id="L237">        return socketChannel.read(netReadBuffer);</span>
+    }
+
+    /**
+    * Flushes the buffer to the network, non blocking.
+    * Visible for testing.
+    * @param buf ByteBuffer
+    * @return boolean true if the buffer has been emptied out, false otherwise
+    * @throws IOException
+    */
+    protected boolean flush(ByteBuffer buf) throws IOException {
+<span class="nc" id="L248">        int remaining = buf.remaining();</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        if (remaining &gt; 0) {</span>
+<span class="nc" id="L250">            int written = socketChannel.write(buf);</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">            return written &gt;= remaining;</span>
+        }
+<span class="nc" id="L253">        return true;</span>
+    }
+
+    /**
+    * Performs SSL handshake, non blocking.
+    * Before application data (kafka protocols) can be sent client &amp; kafka broker must
+    * perform ssl handshake.
+    * During the handshake SSLEngine generates encrypted data that will be transported over socketChannel.
+    * Each SSLEngine operation generates SSLEngineResult , of which SSLEngineResult.handshakeStatus field is used to
+    * determine what operation needs to occur to move handshake along.
+    * A typical handshake might look like this.
+    * +-------------+----------------------------------+-------------+
+    * |  client     |  SSL/TLS message                 | HSStatus    |
+    * +-------------+----------------------------------+-------------+
+    * | wrap()      | ClientHello                      | NEED_UNWRAP |
+    * | unwrap()    | ServerHello/Cert/ServerHelloDone | NEED_WRAP   |
+    * | wrap()      | ClientKeyExchange                | NEED_WRAP   |
+    * | wrap()      | ChangeCipherSpec                 | NEED_WRAP   |
+    * | wrap()      | Finished                         | NEED_UNWRAP |
+    * | unwrap()    | ChangeCipherSpec                 | NEED_UNWRAP |
+    * | unwrap()    | Finished                         | FINISHED    |
+    * +-------------+----------------------------------+-------------+
+    *
+    * @throws IOException if read/write fails
+    * @throws SslAuthenticationException if handshake fails with an {@link SSLException}
+    */
+    @Override
+    public void handshake() throws IOException {
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        if (state == State.NOT_INITIALIZED) {</span>
+            try {
+<span class="nc" id="L283">                startHandshake();</span>
+<span class="nc" id="L284">            } catch (SSLException e) {</span>
+<span class="nc" id="L285">                maybeProcessHandshakeFailure(e, false, null);</span>
+<span class="nc" id="L286">            }</span>
+        }
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        if (ready())</span>
+<span class="nc" id="L289">            throw renegotiationException();</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        if (state == State.CLOSING)</span>
+<span class="nc" id="L291">            throw closingException();</span>
+
+<span class="nc" id="L293">        int read = 0;</span>
+<span class="nc" id="L294">        boolean readable = key.isReadable();</span>
+        try {
+            // Read any available bytes before attempting any writes to ensure that handshake failures
+            // reported by the peer are processed even if writes fail (since peer closes connection
+            // if handshake fails)
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (readable)</span>
+<span class="nc" id="L300">                read = readFromSocketChannel();</span>
+
+<span class="nc" id="L302">            doHandshake();</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            if (ready())</span>
+<span class="nc" id="L304">                updateBytesBuffered(true);</span>
+<span class="nc" id="L305">        } catch (SSLException e) {</span>
+<span class="nc" id="L306">            maybeProcessHandshakeFailure(e, true, null);</span>
+<span class="nc" id="L307">        } catch (IOException e) {</span>
+<span class="nc" id="L308">            maybeThrowSslAuthenticationException();</span>
+
+            // This exception could be due to a write. If there is data available to unwrap in the buffer, or data available
+            // in the socket channel to read and unwrap, process the data so that any SSL handshake exceptions are reported.
+            try {
+                do {
+<span class="nc" id="L314">                    log.trace(&quot;Process any available bytes from peer, netReadBuffer {} netWriterBuffer {} handshakeStatus {} readable? {}&quot;,</span>
+<span class="nc" id="L315">                        netReadBuffer, netWriteBuffer, handshakeStatus, readable);</span>
+<span class="nc" id="L316">                    handshakeWrapAfterFailure(false);</span>
+<span class="nc" id="L317">                    handshakeUnwrap(false, true);</span>
+<span class="nc bnc" id="L318" title="All 4 branches missed.">                } while (readable &amp;&amp; readFromSocketChannel() &gt; 0);</span>
+<span class="nc" id="L319">            } catch (SSLException e1) {</span>
+<span class="nc" id="L320">                maybeProcessHandshakeFailure(e1, false, e);</span>
+<span class="nc" id="L321">            }</span>
+
+            // If we get here, this is not a handshake failure, throw the original IOException
+<span class="nc" id="L324">            throw e;</span>
+<span class="nc" id="L325">        }</span>
+
+        // Read from socket failed, so throw any pending handshake exception or EOF exception.
+<span class="nc bnc" id="L328" title="All 2 branches missed.">        if (read == -1) {</span>
+<span class="nc" id="L329">            maybeThrowSslAuthenticationException();</span>
+<span class="nc" id="L330">            throw new EOFException(&quot;EOF during handshake, handshake status is &quot; + handshakeStatus);</span>
+        }
+<span class="nc" id="L332">    }</span>
+
+    @SuppressWarnings(&quot;fallthrough&quot;)
+    private void doHandshake() throws IOException {
+<span class="nc" id="L336">        boolean read = key.isReadable();</span>
+<span class="nc" id="L337">        boolean write = key.isWritable();</span>
+<span class="nc" id="L338">        handshakeStatus = sslEngine.getHandshakeStatus();</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (!flush(netWriteBuffer)) {</span>
+<span class="nc" id="L340">            key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);</span>
+<span class="nc" id="L341">            return;</span>
+        }
+        // Throw any pending handshake exception since `netWriteBuffer` has been flushed
+<span class="nc" id="L344">        maybeThrowSslAuthenticationException();</span>
+
+<span class="nc bnc" id="L346" title="All 6 branches missed.">        switch (handshakeStatus) {</span>
+            case NEED_TASK:
+<span class="nc" id="L348">                log.trace(&quot;SSLHandshake NEED_TASK channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}&quot;,</span>
+<span class="nc" id="L349">                          channelId, appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());</span>
+<span class="nc" id="L350">                handshakeStatus = runDelegatedTasks();</span>
+<span class="nc" id="L351">                break;</span>
+            case NEED_WRAP:
+<span class="nc" id="L353">                log.trace(&quot;SSLHandshake NEED_WRAP channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}&quot;,</span>
+<span class="nc" id="L354">                          channelId, appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());</span>
+<span class="nc" id="L355">                handshakeResult = handshakeWrap(write);</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">                if (handshakeResult.getStatus() == Status.BUFFER_OVERFLOW) {</span>
+<span class="nc" id="L357">                    int currentNetWriteBufferSize = netWriteBufferSize();</span>
+<span class="nc" id="L358">                    netWriteBuffer.compact();</span>
+<span class="nc" id="L359">                    netWriteBuffer = Utils.ensureCapacity(netWriteBuffer, currentNetWriteBufferSize);</span>
+<span class="nc" id="L360">                    netWriteBuffer.flip();</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                    if (netWriteBuffer.limit() &gt;= currentNetWriteBufferSize) {</span>
+<span class="nc" id="L362">                        throw new IllegalStateException(&quot;Buffer overflow when available data size (&quot; + netWriteBuffer.limit() +</span>
+                                                        &quot;) &gt;= network buffer size (&quot; + currentNetWriteBufferSize + &quot;)&quot;);
+                    }
+<span class="nc bnc" id="L365" title="All 2 branches missed.">                } else if (handshakeResult.getStatus() == Status.BUFFER_UNDERFLOW) {</span>
+<span class="nc" id="L366">                    throw new IllegalStateException(&quot;Should not have received BUFFER_UNDERFLOW during handshake WRAP.&quot;);</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">                } else if (handshakeResult.getStatus() == Status.CLOSED) {</span>
+<span class="nc" id="L368">                    throw new EOFException();</span>
+                }
+<span class="nc" id="L370">                log.trace(&quot;SSLHandshake NEED_WRAP channelId {}, handshakeResult {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}&quot;,</span>
+<span class="nc" id="L371">                       channelId, handshakeResult, appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());</span>
+                //if handshake status is not NEED_UNWRAP or unable to flush netWriteBuffer contents
+                //we will break here otherwise we can do need_unwrap in the same call.
+<span class="nc bnc" id="L374" title="All 4 branches missed.">                if (handshakeStatus != HandshakeStatus.NEED_UNWRAP || !flush(netWriteBuffer)) {</span>
+<span class="nc" id="L375">                    key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);</span>
+<span class="nc" id="L376">                    break;</span>
+                }
+            case NEED_UNWRAP:
+<span class="nc" id="L379">                log.trace(&quot;SSLHandshake NEED_UNWRAP channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}&quot;,</span>
+<span class="nc" id="L380">                          channelId, appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());</span>
+                do {
+<span class="nc" id="L382">                    handshakeResult = handshakeUnwrap(read, false);</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">                    if (handshakeResult.getStatus() == Status.BUFFER_OVERFLOW) {</span>
+<span class="nc" id="L384">                        int currentAppBufferSize = applicationBufferSize();</span>
+<span class="nc" id="L385">                        appReadBuffer = Utils.ensureCapacity(appReadBuffer, currentAppBufferSize);</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">                        if (appReadBuffer.position() &gt; currentAppBufferSize) {</span>
+<span class="nc" id="L387">                            throw new IllegalStateException(&quot;Buffer underflow when available data size (&quot; + appReadBuffer.position() +</span>
+                                                           &quot;) &gt; packet buffer size (&quot; + currentAppBufferSize + &quot;)&quot;);
+                        }
+                    }
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                } while (handshakeResult.getStatus() == Status.BUFFER_OVERFLOW);</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">                if (handshakeResult.getStatus() == Status.BUFFER_UNDERFLOW) {</span>
+<span class="nc" id="L393">                    int currentNetReadBufferSize = netReadBufferSize();</span>
+<span class="nc" id="L394">                    netReadBuffer = Utils.ensureCapacity(netReadBuffer, currentNetReadBufferSize);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">                    if (netReadBuffer.position() &gt;= currentNetReadBufferSize) {</span>
+<span class="nc" id="L396">                        throw new IllegalStateException(&quot;Buffer underflow when there is available data&quot;);</span>
+                    }
+<span class="nc bnc" id="L398" title="All 2 branches missed.">                } else if (handshakeResult.getStatus() == Status.CLOSED) {</span>
+<span class="nc" id="L399">                    throw new EOFException(&quot;SSL handshake status CLOSED during handshake UNWRAP&quot;);</span>
+                }
+<span class="nc" id="L401">                log.trace(&quot;SSLHandshake NEED_UNWRAP channelId {}, handshakeResult {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}&quot;,</span>
+<span class="nc" id="L402">                          channelId, handshakeResult, appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());</span>
+
+                //if handshakeStatus completed than fall-through to finished status.
+                //after handshake is finished there is no data left to read/write in socketChannel.
+                //so the selector won't invoke this channel if we don't go through the handshakeFinished here.
+<span class="nc bnc" id="L407" title="All 2 branches missed.">                if (handshakeStatus != HandshakeStatus.FINISHED) {</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">                    if (handshakeStatus == HandshakeStatus.NEED_WRAP) {</span>
+<span class="nc" id="L409">                        key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">                    } else if (handshakeStatus == HandshakeStatus.NEED_UNWRAP) {</span>
+<span class="nc" id="L411">                        key.interestOps(key.interestOps() &amp; ~SelectionKey.OP_WRITE);</span>
+                    }
+                    break;
+                }
+            case FINISHED:
+<span class="nc" id="L416">                handshakeFinished();</span>
+<span class="nc" id="L417">                break;</span>
+            case NOT_HANDSHAKING:
+<span class="nc" id="L419">                handshakeFinished();</span>
+<span class="nc" id="L420">                break;</span>
+            default:
+<span class="nc" id="L422">                throw new IllegalStateException(String.format(&quot;Unexpected status [%s]&quot;, handshakeStatus));</span>
+        }
+<span class="nc" id="L424">    }</span>
+
+    private SSLHandshakeException renegotiationException() {
+<span class="nc" id="L427">        return new SSLHandshakeException(&quot;Renegotiation is not supported&quot;);</span>
+    }
+
+    private IllegalStateException closingException() {
+<span class="nc" id="L431">        throw new IllegalStateException(&quot;Channel is in closing state&quot;);</span>
+    }
+
+    /**
+     * Executes the SSLEngine tasks needed.
+     * @return HandshakeStatus
+     */
+    private HandshakeStatus runDelegatedTasks() {
+        for (;;) {
+<span class="nc" id="L440">            Runnable task = delegatedTask();</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (task == null) {</span>
+<span class="nc" id="L442">                break;</span>
+            }
+<span class="nc" id="L444">            task.run();</span>
+<span class="nc" id="L445">        }</span>
+<span class="nc" id="L446">        return sslEngine.getHandshakeStatus();</span>
+    }
+
+    /**
+     * Checks if the handshake status is finished
+     * Sets the interestOps for the selectionKey.
+     */
+    private void handshakeFinished() throws IOException {
+        // SSLEngine.getHandshakeStatus is transient and it doesn't record FINISHED status properly.
+        // It can move from FINISHED status to NOT_HANDSHAKING after the handshake is completed.
+        // Hence we also need to check handshakeResult.getHandshakeStatus() if the handshake finished or not
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        if (handshakeResult.getHandshakeStatus() == HandshakeStatus.FINISHED) {</span>
+            //we are complete if we have delivered the last packet
+            //remove OP_WRITE if we are complete, otherwise we still have data to write
+<span class="nc bnc" id="L460" title="All 2 branches missed.">            if (netWriteBuffer.hasRemaining())</span>
+<span class="nc" id="L461">                key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);</span>
+            else {
+<span class="nc" id="L463">                SSLSession session = sslEngine.getSession();</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">                state = session.getProtocol().equals(TLS13) ? State.POST_HANDSHAKE : State.READY;</span>
+<span class="nc" id="L465">                key.interestOps(key.interestOps() &amp; ~SelectionKey.OP_WRITE);</span>
+<span class="nc" id="L466">                log.debug(&quot;SSL handshake completed successfully with peerHost '{}' peerPort {} peerPrincipal '{}' protocol '{}' cipherSuite '{}'&quot;,</span>
+<span class="nc" id="L467">                        session.getPeerHost(), session.getPeerPort(), peerPrincipal(), session.getProtocol(), session.getCipherSuite());</span>
+<span class="nc" id="L468">                metadataRegistry.registerCipherInformation(</span>
+<span class="nc" id="L469">                    new CipherInformation(session.getCipherSuite(),  session.getProtocol()));</span>
+            }
+
+<span class="nc" id="L472">            log.trace(&quot;SSLHandshake FINISHED channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {} &quot;,</span>
+<span class="nc" id="L473">                      channelId, appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());</span>
+        } else {
+<span class="nc" id="L475">            throw new IOException(&quot;NOT_HANDSHAKING during handshake&quot;);</span>
+        }
+<span class="nc" id="L477">    }</span>
+
+    /**
+    * Performs the WRAP function
+    * @param doWrite boolean
+    * @return SSLEngineResult
+    * @throws IOException
+    */
+    private SSLEngineResult handshakeWrap(boolean doWrite) throws IOException {
+<span class="nc" id="L486">        log.trace(&quot;SSLHandshake handshakeWrap {}&quot;, channelId);</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        if (netWriteBuffer.hasRemaining())</span>
+<span class="nc" id="L488">            throw new IllegalStateException(&quot;handshakeWrap called with netWriteBuffer not empty&quot;);</span>
+        //this should never be called with a network buffer that contains data
+        //so we can clear it here.
+<span class="nc" id="L491">        netWriteBuffer.clear();</span>
+        SSLEngineResult result;
+        try {
+<span class="nc" id="L494">            result = sslEngine.wrap(ByteUtils.EMPTY_BUF, netWriteBuffer);</span>
+        } finally {
+            //prepare the results to be written
+<span class="nc" id="L497">            netWriteBuffer.flip();</span>
+        }
+<span class="nc" id="L499">        handshakeStatus = result.getHandshakeStatus();</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">        if (result.getStatus() == SSLEngineResult.Status.OK &amp;&amp;</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">            result.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {</span>
+<span class="nc" id="L502">            handshakeStatus = runDelegatedTasks();</span>
+        }
+
+<span class="nc bnc" id="L505" title="All 2 branches missed.">        if (doWrite) flush(netWriteBuffer);</span>
+<span class="nc" id="L506">        return result;</span>
+    }
+
+    /**
+     * Perform handshake unwrap.
+     * Visible for testing.
+     * @param doRead boolean If true, read more from the socket channel
+     * @param ignoreHandshakeStatus If true, continue to unwrap if data available regardless of handshake status
+     * @return SSLEngineResult
+     * @throws IOException
+     */
+    SSLEngineResult handshakeUnwrap(boolean doRead, boolean ignoreHandshakeStatus) throws IOException {
+<span class="nc" id="L518">        log.trace(&quot;SSLHandshake handshakeUnwrap {}&quot;, channelId);</span>
+        SSLEngineResult result;
+<span class="nc" id="L520">        int read = 0;</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (doRead)</span>
+<span class="nc" id="L522">            read = readFromSocketChannel();</span>
+        boolean cont;
+        do {
+            //prepare the buffer with the incoming data
+<span class="nc" id="L526">            int position = netReadBuffer.position();</span>
+<span class="nc" id="L527">            netReadBuffer.flip();</span>
+<span class="nc" id="L528">            result = sslEngine.unwrap(netReadBuffer, appReadBuffer);</span>
+<span class="nc" id="L529">            netReadBuffer.compact();</span>
+<span class="nc" id="L530">            handshakeStatus = result.getHandshakeStatus();</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">            if (result.getStatus() == SSLEngineResult.Status.OK &amp;&amp;</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">                result.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {</span>
+<span class="nc" id="L533">                handshakeStatus = runDelegatedTasks();</span>
+            }
+<span class="nc bnc" id="L535" title="All 6 branches missed.">            cont = (result.getStatus() == SSLEngineResult.Status.OK &amp;&amp;</span>
+                    handshakeStatus == HandshakeStatus.NEED_UNWRAP) ||
+<span class="nc bnc" id="L537" title="All 2 branches missed.">                    (ignoreHandshakeStatus &amp;&amp; netReadBuffer.position() != position);</span>
+<span class="nc" id="L538">            log.trace(&quot;SSLHandshake handshakeUnwrap: handshakeStatus {} status {}&quot;, handshakeStatus, result.getStatus());</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        } while (cont);</span>
+
+        // Throw EOF exception for failed read after processing already received data
+        // so that handshake failures are reported correctly
+<span class="nc bnc" id="L543" title="All 2 branches missed.">        if (read == -1)</span>
+<span class="nc" id="L544">            throw new EOFException(&quot;EOF during handshake, handshake status is &quot; + handshakeStatus);</span>
+
+<span class="nc" id="L546">        return result;</span>
+    }
+
+
+    /**
+    * Reads a sequence of bytes from this channel into the given buffer. Reads as much as possible
+    * until either the dst buffer is full or there is no more data in the socket.
+    *
+    * @param dst The buffer into which bytes are to be transferred
+    * @return The number of bytes read, possible zero or -1 if the channel has reached end-of-stream
+    *         and no more data is available
+    * @throws IOException if some other I/O error occurs
+    */
+    @Override
+    public int read(ByteBuffer dst) throws IOException {
+<span class="nc bnc" id="L561" title="All 2 branches missed.">        if (state == State.CLOSING) return -1;</span>
+<span class="nc bnc" id="L562" title="All 2 branches missed.">        else if (!ready()) return 0;</span>
+
+        //if we have unread decrypted data in appReadBuffer read that into dst buffer.
+<span class="nc" id="L565">        int read = 0;</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">        if (appReadBuffer.position() &gt; 0) {</span>
+<span class="nc" id="L567">            read = readFromAppBuffer(dst);</span>
+        }
+
+<span class="nc" id="L570">        boolean readFromNetwork = false;</span>
+<span class="nc" id="L571">        boolean isClosed = false;</span>
+        // Each loop reads at most once from the socket.
+<span class="nc bnc" id="L573" title="All 2 branches missed.">        while (dst.remaining() &gt; 0) {</span>
+<span class="nc" id="L574">            int netread = 0;</span>
+<span class="nc" id="L575">            netReadBuffer = Utils.ensureCapacity(netReadBuffer, netReadBufferSize());</span>
+<span class="nc bnc" id="L576" title="All 2 branches missed.">            if (netReadBuffer.remaining() &gt; 0) {</span>
+<span class="nc" id="L577">                netread = readFromSocketChannel();</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">                if (netread &gt; 0)</span>
+<span class="nc" id="L579">                    readFromNetwork = true;</span>
+            }
+
+<span class="nc bnc" id="L582" title="All 2 branches missed.">            while (netReadBuffer.position() &gt; 0) {</span>
+<span class="nc" id="L583">                netReadBuffer.flip();</span>
+                SSLEngineResult unwrapResult;
+                try {
+<span class="nc" id="L586">                    unwrapResult = sslEngine.unwrap(netReadBuffer, appReadBuffer);</span>
+<span class="nc bnc" id="L587" title="All 4 branches missed.">                    if (state == State.POST_HANDSHAKE &amp;&amp; appReadBuffer.position() != 0) {</span>
+                        // For TLSv1.3, we have finished processing post-handshake messages since we are now processing data
+<span class="nc" id="L589">                        state = State.READY;</span>
+                    }
+<span class="nc" id="L591">                } catch (SSLException e) {</span>
+                    // For TLSv1.3, handle SSL exceptions while processing post-handshake messages as authentication exceptions
+<span class="nc bnc" id="L593" title="All 2 branches missed.">                    if (state == State.POST_HANDSHAKE) {</span>
+<span class="nc" id="L594">                        state = State.HANDSHAKE_FAILED;</span>
+<span class="nc" id="L595">                        throw new SslAuthenticationException(&quot;Failed to process post-handshake messages&quot;, e);</span>
+                    } else
+<span class="nc" id="L597">                        throw e;</span>
+<span class="nc" id="L598">                }</span>
+<span class="nc" id="L599">                netReadBuffer.compact();</span>
+                // reject renegotiation if TLS &lt; 1.3, key updates for TLS 1.3 are allowed
+<span class="nc bnc" id="L601" title="All 2 branches missed.">                if (unwrapResult.getHandshakeStatus() != HandshakeStatus.NOT_HANDSHAKING &amp;&amp;</span>
+<span class="nc bnc" id="L602" title="All 2 branches missed.">                        unwrapResult.getHandshakeStatus() != HandshakeStatus.FINISHED &amp;&amp;</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">                        unwrapResult.getStatus() == Status.OK &amp;&amp;</span>
+<span class="nc bnc" id="L604" title="All 2 branches missed.">                        !sslEngine.getSession().getProtocol().equals(TLS13)) {</span>
+<span class="nc" id="L605">                    log.error(&quot;Renegotiation requested, but it is not supported, channelId {}, &quot; +</span>
+                        &quot;appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {} handshakeStatus {}&quot;, channelId,
+<span class="nc" id="L607">                        appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position(), unwrapResult.getHandshakeStatus());</span>
+<span class="nc" id="L608">                    throw renegotiationException();</span>
+                }
+
+<span class="nc bnc" id="L611" title="All 2 branches missed.">                if (unwrapResult.getStatus() == Status.OK) {</span>
+<span class="nc" id="L612">                    read += readFromAppBuffer(dst);</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">                } else if (unwrapResult.getStatus() == Status.BUFFER_OVERFLOW) {</span>
+<span class="nc" id="L614">                    int currentApplicationBufferSize = applicationBufferSize();</span>
+<span class="nc" id="L615">                    appReadBuffer = Utils.ensureCapacity(appReadBuffer, currentApplicationBufferSize);</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">                    if (appReadBuffer.position() &gt;= currentApplicationBufferSize) {</span>
+<span class="nc" id="L617">                        throw new IllegalStateException(&quot;Buffer overflow when available data size (&quot; + appReadBuffer.position() +</span>
+                                                        &quot;) &gt;= application buffer size (&quot; + currentApplicationBufferSize + &quot;)&quot;);
+                    }
+
+                    // appReadBuffer will extended upto currentApplicationBufferSize
+                    // we need to read the existing content into dst before we can do unwrap again. If there are no space in dst
+                    // we can break here.
+<span class="nc bnc" id="L624" title="All 2 branches missed.">                    if (dst.hasRemaining())</span>
+<span class="nc" id="L625">                        read += readFromAppBuffer(dst);</span>
+                    else
+                        break;
+<span class="nc bnc" id="L628" title="All 2 branches missed.">                } else if (unwrapResult.getStatus() == Status.BUFFER_UNDERFLOW) {</span>
+<span class="nc" id="L629">                    int currentNetReadBufferSize = netReadBufferSize();</span>
+<span class="nc" id="L630">                    netReadBuffer = Utils.ensureCapacity(netReadBuffer, currentNetReadBufferSize);</span>
+<span class="nc bnc" id="L631" title="All 2 branches missed.">                    if (netReadBuffer.position() &gt;= currentNetReadBufferSize) {</span>
+<span class="nc" id="L632">                        throw new IllegalStateException(&quot;Buffer underflow when available data size (&quot; + netReadBuffer.position() +</span>
+                                                        &quot;) &gt; packet buffer size (&quot; + currentNetReadBufferSize + &quot;)&quot;);
+                    }
+                    break;
+<span class="nc bnc" id="L636" title="All 2 branches missed.">                } else if (unwrapResult.getStatus() == Status.CLOSED) {</span>
+                    // If data has been read and unwrapped, return the data. Close will be handled on the next poll.
+<span class="nc bnc" id="L638" title="All 4 branches missed.">                    if (appReadBuffer.position() == 0 &amp;&amp; read == 0)</span>
+<span class="nc" id="L639">                        throw new EOFException();</span>
+                    else {
+<span class="nc" id="L641">                        isClosed = true;</span>
+<span class="nc" id="L642">                        break;</span>
+                    }
+                }
+<span class="nc" id="L645">            }</span>
+<span class="nc bnc" id="L646" title="All 4 branches missed.">            if (read == 0 &amp;&amp; netread &lt; 0)</span>
+<span class="nc" id="L647">                throw new EOFException(&quot;EOF during read&quot;);</span>
+<span class="nc bnc" id="L648" title="All 4 branches missed.">            if (netread &lt;= 0 || isClosed)</span>
+<span class="nc" id="L649">                break;</span>
+<span class="nc" id="L650">        }</span>
+<span class="nc bnc" id="L651" title="All 4 branches missed.">        updateBytesBuffered(readFromNetwork || read &gt; 0);</span>
+        // If data has been read and unwrapped, return the data even if end-of-stream, channel will be closed
+        // on a subsequent poll.
+<span class="nc" id="L654">        return read;</span>
+    }
+
+
+    /**
+     * Reads a sequence of bytes from this channel into the given buffers.
+     *
+     * @param dsts - The buffers into which bytes are to be transferred.
+     * @return The number of bytes read, possibly zero, or -1 if the channel has reached end-of-stream.
+     * @throws IOException if some other I/O error occurs
+     */
+    @Override
+    public long read(ByteBuffer[] dsts) throws IOException {
+<span class="nc" id="L667">        return read(dsts, 0, dsts.length);</span>
+    }
+
+
+    /**
+     * Reads a sequence of bytes from this channel into a subsequence of the given buffers.
+     * @param dsts - The buffers into which bytes are to be transferred
+     * @param offset - The offset within the buffer array of the first buffer into which bytes are to be transferred; must be non-negative and no larger than dsts.length.
+     * @param length - The maximum number of buffers to be accessed; must be non-negative and no larger than dsts.length - offset
+     * @return The number of bytes read, possibly zero, or -1 if the channel has reached end-of-stream.
+     * @throws IOException if some other I/O error occurs
+     */
+    @Override
+    public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
+<span class="nc bnc" id="L681" title="All 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; dsts.length - length))</span>
+<span class="nc" id="L682">            throw new IndexOutOfBoundsException();</span>
+
+<span class="nc" id="L684">        int totalRead = 0;</span>
+<span class="nc" id="L685">        int i = offset;</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">        while (i &lt; offset + length) {</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            if (dsts[i].hasRemaining()) {</span>
+<span class="nc" id="L688">                int read = read(dsts[i]);</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">                if (read &gt; 0)</span>
+<span class="nc" id="L690">                    totalRead += read;</span>
+                else
+                    break;
+            }
+<span class="nc bnc" id="L694" title="All 2 branches missed.">            if (!dsts[i].hasRemaining()) {</span>
+<span class="nc" id="L695">                i++;</span>
+            }
+        }
+<span class="nc" id="L698">        return totalRead;</span>
+    }
+
+
+    /**
+    * Writes a sequence of bytes to this channel from the given buffer.
+    *
+    * @param src The buffer from which bytes are to be retrieved
+    * @return The number of bytes read from src, possibly zero, or -1 if the channel has reached end-of-stream
+    * @throws IOException If some other I/O error occurs
+    */
+    @Override
+    public int write(ByteBuffer src) throws IOException {
+<span class="nc bnc" id="L711" title="All 2 branches missed.">        if (state == State.CLOSING)</span>
+<span class="nc" id="L712">            throw closingException();</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        if (!ready())</span>
+<span class="nc" id="L714">            return 0;</span>
+
+<span class="nc" id="L716">        int written = 0;</span>
+<span class="nc bnc" id="L717" title="All 4 branches missed.">        while (flush(netWriteBuffer) &amp;&amp; src.hasRemaining()) {</span>
+<span class="nc" id="L718">            netWriteBuffer.clear();</span>
+<span class="nc" id="L719">            SSLEngineResult wrapResult = sslEngine.wrap(src, netWriteBuffer);</span>
+<span class="nc" id="L720">            netWriteBuffer.flip();</span>
+
+            // reject renegotiation if TLS &lt; 1.3, key updates for TLS 1.3 are allowed
+<span class="nc bnc" id="L723" title="All 2 branches missed.">            if (wrapResult.getHandshakeStatus() != HandshakeStatus.NOT_HANDSHAKING &amp;&amp;</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">                    wrapResult.getStatus() == Status.OK &amp;&amp;</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">                    !sslEngine.getSession().getProtocol().equals(TLS13)) {</span>
+<span class="nc" id="L726">                throw renegotiationException();</span>
+            }
+
+<span class="nc bnc" id="L729" title="All 2 branches missed.">            if (wrapResult.getStatus() == Status.OK) {</span>
+<span class="nc" id="L730">                written += wrapResult.bytesConsumed();</span>
+<span class="nc bnc" id="L731" title="All 2 branches missed.">            } else if (wrapResult.getStatus() == Status.BUFFER_OVERFLOW) {</span>
+                // BUFFER_OVERFLOW means that the last `wrap` call had no effect, so we expand the buffer and try again
+<span class="nc" id="L733">                netWriteBuffer = Utils.ensureCapacity(netWriteBuffer, netWriteBufferSize());</span>
+<span class="nc" id="L734">                netWriteBuffer.position(netWriteBuffer.limit());</span>
+<span class="nc bnc" id="L735" title="All 2 branches missed.">            } else if (wrapResult.getStatus() == Status.BUFFER_UNDERFLOW) {</span>
+<span class="nc" id="L736">                throw new IllegalStateException(&quot;SSL BUFFER_UNDERFLOW during write&quot;);</span>
+<span class="nc bnc" id="L737" title="All 2 branches missed.">            } else if (wrapResult.getStatus() == Status.CLOSED) {</span>
+<span class="nc" id="L738">                throw new EOFException();</span>
+            }
+<span class="nc" id="L740">        }</span>
+<span class="nc" id="L741">        return written;</span>
+    }
+
+    /**
+    * Writes a sequence of bytes to this channel from the subsequence of the given buffers.
+    *
+    * @param srcs The buffers from which bytes are to be retrieved
+    * @param offset The offset within the buffer array of the first buffer from which bytes are to be retrieved; must be non-negative and no larger than srcs.length.
+    * @param length - The maximum number of buffers to be accessed; must be non-negative and no larger than srcs.length - offset.
+    * @return returns no.of bytes written , possibly zero.
+    * @throws IOException If some other I/O error occurs
+    */
+    @Override
+    public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+<span class="nc bnc" id="L755" title="All 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; srcs.length - length))</span>
+<span class="nc" id="L756">            throw new IndexOutOfBoundsException();</span>
+<span class="nc" id="L757">        int totalWritten = 0;</span>
+<span class="nc" id="L758">        int i = offset;</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">        while (i &lt; offset + length) {</span>
+<span class="nc bnc" id="L760" title="All 4 branches missed.">            if (srcs[i].hasRemaining() || hasPendingWrites()) {</span>
+<span class="nc" id="L761">                int written = write(srcs[i]);</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">                if (written &gt; 0) {</span>
+<span class="nc" id="L763">                    totalWritten += written;</span>
+                }
+            }
+<span class="nc bnc" id="L766" title="All 4 branches missed.">            if (!srcs[i].hasRemaining() &amp;&amp; !hasPendingWrites()) {</span>
+<span class="nc" id="L767">                i++;</span>
+            } else {
+                // if we are unable to write the current buffer to socketChannel we should break,
+                // as we might have reached max socket send buffer size.
+                break;
+            }
+        }
+<span class="nc" id="L774">        return totalWritten;</span>
+    }
+
+    /**
+    * Writes a sequence of bytes to this channel from the given buffers.
+    *
+    * @param srcs The buffers from which bytes are to be retrieved
+    * @return returns no.of bytes consumed by SSLEngine.wrap , possibly zero.
+    * @throws IOException If some other I/O error occurs
+    */
+    @Override
+    public long write(ByteBuffer[] srcs) throws IOException {
+<span class="nc" id="L786">        return write(srcs, 0, srcs.length);</span>
+    }
+
+
+    /**
+     * SSLSession's peerPrincipal for the remote host.
+     * @return Principal
+     */
+    public Principal peerPrincipal() {
+        try {
+<span class="nc" id="L796">            return sslEngine.getSession().getPeerPrincipal();</span>
+<span class="nc" id="L797">        } catch (SSLPeerUnverifiedException se) {</span>
+<span class="nc" id="L798">            log.debug(&quot;SSL peer is not authenticated, returning ANONYMOUS instead&quot;);</span>
+<span class="nc" id="L799">            return KafkaPrincipal.ANONYMOUS;</span>
+        }
+    }
+
+    /**
+     * returns an SSL Session after the handshake is established
+     * throws IllegalStateException if the handshake is not established
+     */
+    public SSLSession sslSession() throws IllegalStateException {
+<span class="nc" id="L808">        return sslEngine.getSession();</span>
+    }
+
+    /**
+     * Adds interestOps to SelectionKey of the TransportLayer
+     * @param ops SelectionKey interestOps
+     */
+    @Override
+    public void addInterestOps(int ops) {
+<span class="nc bnc" id="L817" title="All 2 branches missed.">        if (!key.isValid())</span>
+<span class="nc" id="L818">            throw new CancelledKeyException();</span>
+<span class="nc bnc" id="L819" title="All 2 branches missed.">        else if (!ready())</span>
+<span class="nc" id="L820">            throw new IllegalStateException(&quot;handshake is not completed&quot;);</span>
+
+<span class="nc" id="L822">        key.interestOps(key.interestOps() | ops);</span>
+<span class="nc" id="L823">    }</span>
+
+    /**
+     * removes interestOps to SelectionKey of the TransportLayer
+     * @param ops SelectionKey interestOps
+     */
+    @Override
+    public void removeInterestOps(int ops) {
+<span class="nc bnc" id="L831" title="All 2 branches missed.">        if (!key.isValid())</span>
+<span class="nc" id="L832">            throw new CancelledKeyException();</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">        else if (!ready())</span>
+<span class="nc" id="L834">            throw new IllegalStateException(&quot;handshake is not completed&quot;);</span>
+
+<span class="nc" id="L836">        key.interestOps(key.interestOps() &amp; ~ops);</span>
+<span class="nc" id="L837">    }</span>
+
+
+    /**
+     * returns delegatedTask for the SSLEngine.
+     */
+    protected Runnable delegatedTask() {
+<span class="nc" id="L844">        return sslEngine.getDelegatedTask();</span>
+    }
+
+    /**
+     * transfers appReadBuffer contents (decrypted data) into dst bytebuffer
+     * @param dst ByteBuffer
+     */
+    private int readFromAppBuffer(ByteBuffer dst) {
+<span class="nc" id="L852">        appReadBuffer.flip();</span>
+<span class="nc" id="L853">        int remaining = Math.min(appReadBuffer.remaining(), dst.remaining());</span>
+<span class="nc bnc" id="L854" title="All 2 branches missed.">        if (remaining &gt; 0) {</span>
+<span class="nc" id="L855">            int limit = appReadBuffer.limit();</span>
+<span class="nc" id="L856">            appReadBuffer.limit(appReadBuffer.position() + remaining);</span>
+<span class="nc" id="L857">            dst.put(appReadBuffer);</span>
+<span class="nc" id="L858">            appReadBuffer.limit(limit);</span>
+        }
+<span class="nc" id="L860">        appReadBuffer.compact();</span>
+<span class="nc" id="L861">        return remaining;</span>
+    }
+
+    protected int netReadBufferSize() {
+<span class="nc" id="L865">        return sslEngine.getSession().getPacketBufferSize();</span>
+    }
+
+    protected int netWriteBufferSize() {
+<span class="nc" id="L869">        return sslEngine.getSession().getPacketBufferSize();</span>
+    }
+
+    protected int applicationBufferSize() {
+<span class="nc" id="L873">        return sslEngine.getSession().getApplicationBufferSize();</span>
+    }
+
+    protected ByteBuffer netReadBuffer() {
+<span class="nc" id="L877">        return netReadBuffer;</span>
+    }
+
+    // Visibility for testing
+    protected ByteBuffer appReadBuffer() {
+<span class="nc" id="L882">        return appReadBuffer;</span>
+    }
+
+    /**
+     * SSL exceptions are propagated as authentication failures so that clients can avoid
+     * retries and report the failure. If `flush` is true, exceptions are propagated after
+     * any pending outgoing bytes are flushed to ensure that the peer is notified of the failure.
+     */
+    private void handshakeFailure(SSLException sslException, boolean flush) {
+        //Release all resources such as internal buffers that SSLEngine is managing
+<span class="nc" id="L892">        log.debug(&quot;SSL Handshake failed&quot;, sslException);</span>
+<span class="nc" id="L893">        sslEngine.closeOutbound();</span>
+        try {
+<span class="nc" id="L895">            sslEngine.closeInbound();</span>
+<span class="nc" id="L896">        } catch (SSLException e) {</span>
+<span class="nc" id="L897">            log.debug(&quot;SSLEngine.closeInBound() raised an exception.&quot;, e);</span>
+<span class="nc" id="L898">        }</span>
+
+<span class="nc" id="L900">        state = State.HANDSHAKE_FAILED;</span>
+<span class="nc" id="L901">        handshakeException = new SslAuthenticationException(&quot;SSL handshake failed&quot;, sslException);</span>
+
+        // Attempt to flush any outgoing bytes. If flush doesn't complete, delay exception handling until outgoing bytes
+        // are flushed. If write fails because remote end has closed the channel, log the I/O exception and  continue to
+        // handle the handshake failure as an authentication exception.
+<span class="nc bnc" id="L906" title="All 4 branches missed.">        if (!flush || handshakeWrapAfterFailure(flush))</span>
+<span class="nc" id="L907">            throw handshakeException;</span>
+        else
+<span class="nc" id="L909">            log.debug(&quot;Delay propagation of handshake exception till {} bytes remaining are flushed&quot;, netWriteBuffer.remaining());</span>
+<span class="nc" id="L910">    }</span>
+
+    // SSL handshake failures are typically thrown as SSLHandshakeException, SSLProtocolException,
+    // SSLPeerUnverifiedException or SSLKeyException if the cause is known. These exceptions indicate
+    // authentication failures (e.g. configuration errors) which should not be retried. But the SSL engine
+    // may also throw exceptions using the base class SSLException in a few cases:
+    //   a) If there are no matching ciphers or TLS version or the private key is invalid, client will be
+    //      unable to process the server message and an SSLException is thrown:
+    //      javax.net.ssl.SSLException: Unrecognized SSL message, plaintext connection?
+    //   b) If server closes the connection gracefully during handshake, client may receive close_notify
+    //      and and an SSLException is thrown:
+    //      javax.net.ssl.SSLException: Received close_notify during handshake
+    // We want to handle a) as a non-retriable SslAuthenticationException and b) as a retriable IOException.
+    // To do this we need to rely on the exception string. Since it is safer to throw a retriable exception
+    // when we are not sure, we will treat only the first exception string as a handshake exception.
+    private void maybeProcessHandshakeFailure(SSLException sslException, boolean flush, IOException ioException) throws IOException {
+<span class="nc bnc" id="L926" title="All 8 branches missed.">        if (sslException instanceof SSLHandshakeException || sslException instanceof SSLProtocolException ||</span>
+                sslException instanceof SSLPeerUnverifiedException || sslException instanceof SSLKeyException ||
+<span class="nc bnc" id="L928" title="All 2 branches missed.">                sslException.getMessage().contains(&quot;Unrecognized SSL message&quot;) ||</span>
+<span class="nc bnc" id="L929" title="All 2 branches missed.">                sslException.getMessage().contains(&quot;Received fatal alert: &quot;))</span>
+<span class="nc" id="L930">            handshakeFailure(sslException, flush);</span>
+<span class="nc bnc" id="L931" title="All 2 branches missed.">        else if (ioException == null)</span>
+<span class="nc" id="L932">            throw sslException;</span>
+        else {
+<span class="nc" id="L934">            log.debug(&quot;SSLException while unwrapping data after IOException, original IOException will be propagated&quot;, sslException);</span>
+<span class="nc" id="L935">            throw ioException;</span>
+        }
+<span class="nc" id="L937">    }</span>
+
+    // If handshake has already failed, throw the authentication exception.
+    private void maybeThrowSslAuthenticationException() {
+<span class="nc bnc" id="L941" title="All 2 branches missed.">        if (handshakeException != null)</span>
+<span class="nc" id="L942">            throw handshakeException;</span>
+<span class="nc" id="L943">    }</span>
+
+    /**
+     * Perform handshake wrap after an SSLException or any IOException.
+     *
+     * If `doWrite=false`, we are processing IOException after peer has disconnected, so we
+     * cannot send any more data. We perform any pending wraps so that we can unwrap any
+     * peer data that is already available.
+     *
+     * If `doWrite=true`, we are processing SSLException, we perform wrap and flush
+     * any data to notify the peer of the handshake failure.
+     *
+     * Returns true if no more wrap is required and any data is flushed or discarded.
+     */
+    private boolean handshakeWrapAfterFailure(boolean doWrite) {
+        try {
+<span class="nc" id="L959">            log.trace(&quot;handshakeWrapAfterFailure status {} doWrite {}&quot;, handshakeStatus, doWrite);</span>
+<span class="nc bnc" id="L960" title="All 6 branches missed.">            while (handshakeStatus == HandshakeStatus.NEED_WRAP &amp;&amp; (!doWrite || flush(netWriteBuffer))) {</span>
+<span class="nc bnc" id="L961" title="All 2 branches missed.">                if (!doWrite)</span>
+<span class="nc" id="L962">                    clearWriteBuffer();</span>
+<span class="nc" id="L963">                handshakeWrap(doWrite);</span>
+            }
+<span class="nc" id="L965">        } catch (Exception e) {</span>
+<span class="nc" id="L966">            log.debug(&quot;Failed to wrap and flush all bytes before closing channel&quot;, e);</span>
+<span class="nc" id="L967">            clearWriteBuffer();</span>
+<span class="nc" id="L968">        }</span>
+<span class="nc bnc" id="L969" title="All 2 branches missed.">        if (!doWrite)</span>
+<span class="nc" id="L970">            clearWriteBuffer();</span>
+<span class="nc bnc" id="L971" title="All 2 branches missed.">        return !netWriteBuffer.hasRemaining();</span>
+    }
+
+    private void clearWriteBuffer() {
+<span class="nc bnc" id="L975" title="All 2 branches missed.">        if (netWriteBuffer.hasRemaining())</span>
+<span class="nc" id="L976">            log.debug(&quot;Discarding write buffer {} since peer has disconnected&quot;, netWriteBuffer);</span>
+<span class="nc" id="L977">        netWriteBuffer.position(0);</span>
+<span class="nc" id="L978">        netWriteBuffer.limit(0);</span>
+<span class="nc" id="L979">    }</span>
+
+    @Override
+    public boolean isMute() {
+<span class="nc bnc" id="L983" title="All 4 branches missed.">        return key.isValid() &amp;&amp; (key.interestOps() &amp; SelectionKey.OP_READ) == 0;</span>
+    }
+
+    @Override
+    public boolean hasBytesBuffered() {
+<span class="nc" id="L988">        return hasBytesBuffered;</span>
+    }
+
+    // Update `hasBytesBuffered` status. If any bytes were read from the network or
+    // if data was returned from read, `hasBytesBuffered` is set to true if any buffered
+    // data is still remaining. If not, `hasBytesBuffered` is set to false since no progress
+    // can be made until more data is available to read from the network.
+    private void updateBytesBuffered(boolean madeProgress) {
+<span class="nc bnc" id="L996" title="All 2 branches missed.">        if (madeProgress)</span>
+<span class="nc bnc" id="L997" title="All 4 branches missed.">            hasBytesBuffered = netReadBuffer.position() != 0 || appReadBuffer.position() != 0;</span>
+        else
+<span class="nc" id="L999">            hasBytesBuffered = false;</span>
+<span class="nc" id="L1000">    }</span>
+
+    @Override
+    public long transferFrom(FileChannel fileChannel, long position, long count) throws IOException {
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">        if (state == State.CLOSING)</span>
+<span class="nc" id="L1005">            throw closingException();</span>
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">        if (state != State.READY)</span>
+<span class="nc" id="L1007">            return 0;</span>
+
+<span class="nc bnc" id="L1009" title="All 2 branches missed.">        if (!flush(netWriteBuffer))</span>
+<span class="nc" id="L1010">            return 0;</span>
+
+<span class="nc" id="L1012">        long channelSize = fileChannel.size();</span>
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">        if (position &gt; channelSize)</span>
+<span class="nc" id="L1014">            return 0;</span>
+<span class="nc" id="L1015">        int totalBytesToWrite = (int) Math.min(Math.min(count, channelSize - position), Integer.MAX_VALUE);</span>
+
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">        if (fileChannelBuffer == null) {</span>
+            // Pick a size that allows for reasonably efficient disk reads, keeps the memory overhead per connection
+            // manageable and can typically be drained in a single `write` call. The `netWriteBuffer` is typically 16k
+            // and the socket send buffer is 100k by default, so 32k is a good number given the mentioned trade-offs.
+<span class="nc" id="L1021">            int transferSize = 32768;</span>
+            // Allocate a direct buffer to avoid one heap to heap buffer copy. SSLEngine copies the source
+            // buffer (fileChannelBuffer) to the destination buffer (netWriteBuffer) and then encrypts in-place.
+            // FileChannel.read() to a heap buffer requires a copy from a direct buffer to a heap buffer, which is not
+            // useful here.
+<span class="nc" id="L1026">            fileChannelBuffer = ByteBuffer.allocateDirect(transferSize);</span>
+            // The loop below drains any remaining bytes from the buffer before reading from disk, so we ensure there
+            // are no remaining bytes in the empty buffer
+<span class="nc" id="L1029">            fileChannelBuffer.position(fileChannelBuffer.limit());</span>
+        }
+
+<span class="nc" id="L1032">        int totalBytesWritten = 0;</span>
+<span class="nc" id="L1033">        long pos = position;</span>
+        try {
+<span class="nc bnc" id="L1035" title="All 2 branches missed.">            while (totalBytesWritten &lt; totalBytesToWrite) {</span>
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">                if (!fileChannelBuffer.hasRemaining()) {</span>
+<span class="nc" id="L1037">                    fileChannelBuffer.clear();</span>
+<span class="nc" id="L1038">                    int bytesRemaining = totalBytesToWrite - totalBytesWritten;</span>
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">                    if (bytesRemaining &lt; fileChannelBuffer.limit())</span>
+<span class="nc" id="L1040">                        fileChannelBuffer.limit(bytesRemaining);</span>
+<span class="nc" id="L1041">                    int bytesRead = fileChannel.read(fileChannelBuffer, pos);</span>
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">                    if (bytesRead &lt;= 0)</span>
+<span class="nc" id="L1043">                        break;</span>
+<span class="nc" id="L1044">                    fileChannelBuffer.flip();</span>
+                }
+<span class="nc" id="L1046">                int networkBytesWritten = write(fileChannelBuffer);</span>
+<span class="nc" id="L1047">                totalBytesWritten += networkBytesWritten;</span>
+                // In the case of a partial write we only return the written bytes to the caller. As a result, the
+                // `position` passed in the next `transferFrom` call won't include the bytes remaining in
+                // `fileChannelBuffer`. By draining `fileChannelBuffer` first, we ensure we update `pos` before
+                // we invoke `fileChannel.read`.
+<span class="nc bnc" id="L1052" title="All 2 branches missed.">                if (fileChannelBuffer.hasRemaining())</span>
+<span class="nc" id="L1053">                    break;</span>
+<span class="nc" id="L1054">                pos += networkBytesWritten;</span>
+<span class="nc" id="L1055">            }</span>
+<span class="nc" id="L1056">            return totalBytesWritten;</span>
+<span class="nc" id="L1057">        } catch (IOException e) {</span>
+<span class="nc bnc" id="L1058" title="All 2 branches missed.">            if (totalBytesWritten &gt; 0)</span>
+<span class="nc" id="L1059">                return totalBytesWritten;</span>
+<span class="nc" id="L1060">            throw e;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

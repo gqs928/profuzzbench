@@ -1,0 +1,688 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClientMetricsManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server</a> &gt; <span class="el_source">ClientMetricsManager.java</span></div><h1>ClientMetricsManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server;
+
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.errors.InvalidRequestException;
+import org.apache.kafka.common.errors.TelemetryTooLargeException;
+import org.apache.kafka.common.errors.ThrottlingQuotaExceededException;
+import org.apache.kafka.common.errors.UnknownSubscriptionIdException;
+import org.apache.kafka.common.errors.UnsupportedCompressionTypeException;
+import org.apache.kafka.common.message.GetTelemetrySubscriptionsResponseData;
+import org.apache.kafka.common.message.PushTelemetryResponseData;
+import org.apache.kafka.common.metrics.Measurable;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.metrics.stats.Meter;
+import org.apache.kafka.common.metrics.stats.SampledStat;
+import org.apache.kafka.common.metrics.stats.WindowedCount;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.CompressionType;
+import org.apache.kafka.common.requests.GetTelemetrySubscriptionsRequest;
+import org.apache.kafka.common.requests.GetTelemetrySubscriptionsResponse;
+import org.apache.kafka.common.requests.PushTelemetryRequest;
+import org.apache.kafka.common.requests.PushTelemetryResponse;
+import org.apache.kafka.common.requests.RequestContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.Crc32C;
+import org.apache.kafka.server.metrics.ClientMetricsConfigs;
+import org.apache.kafka.server.metrics.ClientMetricsInstance;
+import org.apache.kafka.server.metrics.ClientMetricsInstanceMetadata;
+import org.apache.kafka.server.metrics.ClientTelemetryExporterPlugin;
+import org.apache.kafka.server.network.ConnectionDisconnectListener;
+import org.apache.kafka.server.util.timer.SystemTimer;
+import org.apache.kafka.server.util.timer.SystemTimerReaper;
+import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.server.util.timer.TimerTask;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+/**
+ * Handles client telemetry metrics requests/responses, subscriptions and instance information.
+ */
+public class ClientMetricsManager implements AutoCloseable {
+    public static final String CLIENT_METRICS_REAPER_THREAD_NAME = &quot;client-metrics-reaper&quot;;
+
+<span class="nc" id="L86">    private static final Logger log = LoggerFactory.getLogger(ClientMetricsManager.class);</span>
+<span class="nc" id="L87">    private static final List&lt;Byte&gt; SUPPORTED_COMPRESSION_TYPES = List.of(CompressionType.ZSTD.id, CompressionType.LZ4.id,</span>
+<span class="nc" id="L88">        CompressionType.GZIP.id, CompressionType.SNAPPY.id);</span>
+    // Max cache size (16k active client connections per broker)
+    private static final int CACHE_MAX_SIZE = 16384;
+    private static final int DEFAULT_CACHE_EXPIRY_MS = 60 * 1000;
+
+    private final ClientTelemetryExporterPlugin clientTelemetryExporterPlugin;
+    private final Cache&lt;Uuid, ClientMetricsInstance&gt; clientInstanceCache;
+    private final Map&lt;String, Uuid&gt; clientConnectionIdMap;
+    private final Timer expirationTimer;
+    private final Map&lt;String, SubscriptionInfo&gt; subscriptionMap;
+    private final int clientTelemetryMaxBytes;
+    private final Time time;
+    private final int cacheExpiryMs;
+    private final AtomicLong lastCacheErrorLogMs;
+    private final Metrics metrics;
+    private final ClientMetricsStats clientMetricsStats;
+    private final ConnectionDisconnectListener connectionDisconnectListener;
+
+    // The latest subscription version is used to determine if subscription has changed and needs
+    // to re-evaluate the client instance subscription id as per changed subscriptions.
+    private final AtomicInteger subscriptionUpdateVersion;
+
+    public ClientMetricsManager(ClientTelemetryExporterPlugin clientTelemetryExporterPlugin, int clientTelemetryMaxBytes, Time time, Metrics metrics) {
+<span class="nc" id="L111">        this(clientTelemetryExporterPlugin, clientTelemetryMaxBytes, time, DEFAULT_CACHE_EXPIRY_MS, metrics);</span>
+<span class="nc" id="L112">    }</span>
+
+    // Visible for testing
+<span class="nc" id="L115">    ClientMetricsManager(ClientTelemetryExporterPlugin clientTelemetryExporterPlugin, int clientTelemetryMaxBytes, Time time, int cacheExpiryMs, Metrics metrics) {</span>
+<span class="nc" id="L116">        this.clientTelemetryExporterPlugin = clientTelemetryExporterPlugin;</span>
+<span class="nc" id="L117">        this.subscriptionMap = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L118">        this.subscriptionUpdateVersion = new AtomicInteger(0);</span>
+<span class="nc" id="L119">        this.clientInstanceCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(CACHE_MAX_SIZE));</span>
+<span class="nc" id="L120">        this.clientConnectionIdMap = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L121">        this.expirationTimer = new SystemTimerReaper(CLIENT_METRICS_REAPER_THREAD_NAME, new SystemTimer(&quot;client-metrics&quot;));</span>
+<span class="nc" id="L122">        this.clientTelemetryMaxBytes = clientTelemetryMaxBytes;</span>
+<span class="nc" id="L123">        this.time = time;</span>
+<span class="nc" id="L124">        this.cacheExpiryMs = cacheExpiryMs;</span>
+<span class="nc" id="L125">        this.lastCacheErrorLogMs = new AtomicLong(0);</span>
+<span class="nc" id="L126">        this.metrics = metrics;</span>
+<span class="nc" id="L127">        this.clientMetricsStats = new ClientMetricsStats();</span>
+<span class="nc" id="L128">        this.connectionDisconnectListener = new ClientConnectionDisconnectListener();</span>
+<span class="nc" id="L129">    }</span>
+
+    public Set&lt;String&gt; listClientMetricsResources() {
+<span class="nc" id="L132">        return subscriptionMap.keySet();</span>
+    }
+
+    public void updateSubscription(String subscriptionName, Properties properties) {
+        // Validate the subscription properties.
+<span class="nc" id="L137">        ClientMetricsConfigs.validate(subscriptionName, properties);</span>
+        // IncrementalAlterConfigs API will send empty configs when all the configs are deleted
+        // for respective subscription. In that case, we need to remove the subscription from the map.
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (properties.isEmpty()) {</span>
+            // Remove the subscription from the map if it exists, else ignore the config update.
+<span class="nc bnc" id="L142" title="All 2 branches missed.">            if (subscriptionMap.containsKey(subscriptionName)) {</span>
+<span class="nc" id="L143">                log.info(&quot;Removing subscription [{}] from the subscription map&quot;, subscriptionName);</span>
+<span class="nc" id="L144">                subscriptionMap.remove(subscriptionName);</span>
+<span class="nc" id="L145">                subscriptionUpdateVersion.incrementAndGet();</span>
+            }
+<span class="nc" id="L147">            return;</span>
+        }
+
+<span class="nc" id="L150">        updateClientSubscription(subscriptionName, new ClientMetricsConfigs(properties));</span>
+        /*
+         Increment subscription update version to indicate that there is a change in the subscription. This will
+         be used to determine if the next telemetry request needs to re-evaluate the subscription id
+         as per the changed subscriptions.
+        */
+<span class="nc" id="L156">        subscriptionUpdateVersion.incrementAndGet();</span>
+<span class="nc" id="L157">    }</span>
+
+    public GetTelemetrySubscriptionsResponse processGetTelemetrySubscriptionRequest(
+        GetTelemetrySubscriptionsRequest request, RequestContext requestContext) {
+
+<span class="nc" id="L162">        long now = time.milliseconds();</span>
+<span class="nc" id="L163">        Uuid clientInstanceId = Optional.ofNullable(request.data().clientInstanceId())</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            .filter(id -&gt; !id.equals(Uuid.ZERO_UUID))</span>
+<span class="nc" id="L165">            .orElseGet(this::generateNewClientId);</span>
+
+        /*
+         Get the client instance from the cache or create a new one. If subscription has changed
+         since the last request, then the client instance will be re-evaluated. Validation of the
+         request will be done after the client instance is created. If client issues another get
+         telemetry request prior to push interval, then the client should get a throttle error but if
+         the subscription has changed since the last request then the client should get the updated
+         subscription immediately.
+        */
+<span class="nc" id="L175">        ClientMetricsInstance clientInstance = clientInstance(clientInstanceId, requestContext);</span>
+
+        try {
+            // Validate the get request parameters for the client instance.
+<span class="nc" id="L179">            validateGetRequest(request, clientInstance, now);</span>
+<span class="nc" id="L180">        } catch (ApiException exception) {</span>
+<span class="nc" id="L181">            return request.getErrorResponse(0, exception);</span>
+<span class="nc" id="L182">        }</span>
+
+<span class="nc" id="L184">        clientInstance.lastKnownError(Errors.NONE);</span>
+<span class="nc" id="L185">        return createGetSubscriptionResponse(clientInstanceId, clientInstance);</span>
+    }
+
+    public PushTelemetryResponse processPushTelemetryRequest(PushTelemetryRequest request, RequestContext requestContext) {
+
+<span class="nc" id="L190">        Uuid clientInstanceId = request.data().clientInstanceId();</span>
+<span class="nc bnc" id="L191" title="All 4 branches missed.">        if (clientInstanceId == null || Uuid.RESERVED.contains(clientInstanceId)) {</span>
+<span class="nc" id="L192">            String msg = String.format(&quot;Invalid request from the client [%s], invalid client instance id&quot;,</span>
+                clientInstanceId);
+<span class="nc" id="L194">            return request.getErrorResponse(0, new InvalidRequestException(msg));</span>
+        }
+
+<span class="nc" id="L197">        long now = time.milliseconds();</span>
+<span class="nc" id="L198">        ClientMetricsInstance clientInstance = clientInstance(clientInstanceId, requestContext);</span>
+
+        try {
+            // Validate the push request parameters for the client instance.
+<span class="nc" id="L202">            validatePushRequest(request, clientInstance, now);</span>
+<span class="nc" id="L203">        } catch (ApiException exception) {</span>
+<span class="nc" id="L204">            log.debug(&quot;Error validating push telemetry request from client [{}]&quot;, clientInstanceId, exception);</span>
+<span class="nc" id="L205">            clientInstance.lastKnownError(Errors.forException(exception));</span>
+<span class="nc" id="L206">            return request.getErrorResponse(0, exception);</span>
+        } finally {
+            // Update the client instance with the latest push request parameters.
+<span class="nc" id="L209">            clientInstance.terminating(request.data().terminating());</span>
+        }
+
+        // Push the metrics to the external client receiver plugin.
+<span class="nc" id="L213">        ByteBuffer metrics = request.data().metrics();</span>
+<span class="nc bnc" id="L214" title="All 4 branches missed.">        if (metrics != null &amp;&amp; metrics.limit() &gt; 0) {</span>
+            try {
+<span class="nc" id="L216">                long exportTimeStartMs = time.hiResClockMs();</span>
+<span class="nc" id="L217">                clientTelemetryExporterPlugin.exportMetrics(requestContext, request, clientInstance.pushIntervalMs(), clientTelemetryMaxBytes);</span>
+<span class="nc" id="L218">                clientMetricsStats.recordPluginExport(clientInstanceId, time.hiResClockMs() - exportTimeStartMs);</span>
+<span class="nc" id="L219">            } catch (Throwable exception) {</span>
+<span class="nc" id="L220">                clientMetricsStats.recordPluginErrorCount(clientInstanceId);</span>
+<span class="nc" id="L221">                clientInstance.lastKnownError(Errors.INVALID_RECORD);</span>
+<span class="nc" id="L222">                log.error(&quot;Error exporting client metrics to the plugin for client instance id: {}&quot;, clientInstanceId, exception);</span>
+<span class="nc" id="L223">                return request.errorResponse(0, Errors.INVALID_RECORD);</span>
+<span class="nc" id="L224">            }</span>
+        }
+
+<span class="nc" id="L227">        clientInstance.lastKnownError(Errors.NONE);</span>
+<span class="nc" id="L228">        return new PushTelemetryResponse(new PushTelemetryResponseData());</span>
+    }
+
+    public boolean isTelemetryExporterConfigured() {
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        return !clientTelemetryExporterPlugin.isEmpty();</span>
+    }
+
+    public ConnectionDisconnectListener connectionDisconnectListener() {
+<span class="nc" id="L236">        return connectionDisconnectListener;</span>
+    }
+
+    @Override
+    public void close() throws Exception {
+<span class="nc" id="L241">        subscriptionMap.clear();</span>
+<span class="nc" id="L242">        expirationTimer.close();</span>
+<span class="nc" id="L243">        clientMetricsStats.unregisterMetrics();</span>
+<span class="nc" id="L244">    }</span>
+
+    private void updateClientSubscription(String subscriptionName, ClientMetricsConfigs configs) {
+<span class="nc" id="L247">        List&lt;String&gt; metrics = configs.getList(ClientMetricsConfigs.METRICS_CONFIG);</span>
+<span class="nc" id="L248">        int pushInterval = configs.getInt(ClientMetricsConfigs.INTERVAL_MS_CONFIG);</span>
+<span class="nc" id="L249">        List&lt;String&gt; clientMatchPattern = configs.getList(ClientMetricsConfigs.MATCH_CONFIG);</span>
+
+<span class="nc" id="L251">        SubscriptionInfo newSubscription =</span>
+            new SubscriptionInfo(subscriptionName, metrics, pushInterval,
+<span class="nc" id="L253">                ClientMetricsConfigs.parseMatchingPatterns(clientMatchPattern));</span>
+
+<span class="nc" id="L255">        subscriptionMap.put(subscriptionName, newSubscription);</span>
+<span class="nc" id="L256">    }</span>
+
+    private Uuid generateNewClientId() {
+<span class="nc" id="L259">        Uuid id = Uuid.randomUuid();</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        while (clientInstanceCache.get(id) != null) {</span>
+<span class="nc" id="L261">            id = Uuid.randomUuid();</span>
+        }
+<span class="nc" id="L263">        return id;</span>
+    }
+
+    private ClientMetricsInstance clientInstance(Uuid clientInstanceId, RequestContext requestContext) {
+<span class="nc" id="L267">        ClientMetricsInstance clientInstance = clientInstanceCache.get(clientInstanceId);</span>
+
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        if (clientInstance == null) {</span>
+            /*
+             If the client instance is not present in the cache, then create a new client instance
+             and update the cache. This can also happen when the telemetry request is received by
+             the separate broker instance.
+             Though cache is synchronized, but it is possible that concurrent calls can create the same
+             client instance. Hence, safeguard the client instance creation with a double-checked lock
+             to ensure that only one instance is created.
+            */
+<span class="nc" id="L278">            synchronized (this) {</span>
+<span class="nc" id="L279">                clientInstance = clientInstanceCache.get(clientInstanceId);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">                if (clientInstance != null) {</span>
+<span class="nc" id="L281">                    return clientInstance;</span>
+                }
+
+<span class="nc" id="L284">                ClientMetricsInstanceMetadata instanceMetadata = new ClientMetricsInstanceMetadata(</span>
+                    clientInstanceId, requestContext);
+<span class="nc" id="L286">                clientInstance = createClientInstanceAndUpdateCache(clientInstanceId, instanceMetadata, requestContext.connectionId());</span>
+<span class="nc" id="L287">            }</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        } else if (clientInstance.subscriptionVersion() &lt; subscriptionUpdateVersion.get()) {</span>
+            /*
+             If the last subscription update version for client instance is older than the subscription
+             updated version, then re-evaluate the subscription information for the client as per the
+             updated subscriptions. This is to ensure that the client instance is always in sync with
+             the latest subscription information.
+             Though cache is synchronized, but it is possible that concurrent calls can create the same
+             client instance. Hence, safeguard the client instance update with a double-checked lock
+              to ensure that only one instance is created.
+            */
+<span class="nc" id="L298">            synchronized (this) {</span>
+<span class="nc" id="L299">                clientInstance = clientInstanceCache.get(clientInstanceId);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">                if (clientInstance.subscriptionVersion() &gt;= subscriptionUpdateVersion.get()) {</span>
+<span class="nc" id="L301">                    return clientInstance;</span>
+                }
+                // Cancel the existing expiration timer task for the old client instance.
+<span class="nc" id="L304">                clientInstance.cancelExpirationTimerTask();</span>
+<span class="nc" id="L305">                clientInstance = createClientInstanceAndUpdateCache(clientInstanceId, clientInstance.instanceMetadata(), requestContext.connectionId());</span>
+<span class="nc" id="L306">            }</span>
+        }
+
+        // Update the expiration timer task for the client instance.
+<span class="nc" id="L310">        long expirationTimeMs = Math.max(cacheExpiryMs, clientInstance.pushIntervalMs() * 3);</span>
+<span class="nc" id="L311">        TimerTask timerTask = new ExpirationTimerTask(clientInstanceId, requestContext.connectionId(), expirationTimeMs);</span>
+<span class="nc" id="L312">        clientInstance.updateExpirationTimerTask(timerTask);</span>
+<span class="nc" id="L313">        expirationTimer.add(timerTask);</span>
+
+<span class="nc" id="L315">        return clientInstance;</span>
+    }
+
+    private ClientMetricsInstance createClientInstanceAndUpdateCache(Uuid clientInstanceId,
+        ClientMetricsInstanceMetadata instanceMetadata, String connectionId) {
+
+<span class="nc" id="L321">        ClientMetricsInstance clientInstance = createClientInstance(clientInstanceId, instanceMetadata);</span>
+        // Maybe add client metrics, if metrics not already added. Metrics might be already added
+        // if the client instance was evicted from the cache because of size limit.
+<span class="nc" id="L324">        clientMetricsStats.maybeAddClientInstanceMetrics(clientInstanceId);</span>
+<span class="nc" id="L325">        clientInstanceCache.put(clientInstanceId, clientInstance);</span>
+<span class="nc" id="L326">        clientConnectionIdMap.put(connectionId, clientInstanceId);</span>
+<span class="nc" id="L327">        return clientInstance;</span>
+    }
+
+    private ClientMetricsInstance createClientInstance(Uuid clientInstanceId, ClientMetricsInstanceMetadata instanceMetadata) {
+
+<span class="nc" id="L332">        int pushIntervalMs = ClientMetricsConfigs.INTERVAL_MS_DEFAULT;</span>
+        // Keep a set of metrics to avoid duplicates in case of overlapping subscriptions.
+<span class="nc" id="L334">        Set&lt;String&gt; subscribedMetrics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L335">        boolean allMetricsSubscribed = false;</span>
+
+<span class="nc" id="L337">        int currentSubscriptionVersion = subscriptionUpdateVersion.get();</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        for (SubscriptionInfo info : subscriptionMap.values()) {</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">            if (instanceMetadata.isMatch(info.matchPattern())) {</span>
+<span class="nc bnc" id="L340" title="All 4 branches missed.">                allMetricsSubscribed = allMetricsSubscribed || info.metrics().contains(</span>
+                    ClientMetricsConfigs.ALL_SUBSCRIBED_METRICS);
+<span class="nc" id="L342">                subscribedMetrics.addAll(info.metrics());</span>
+<span class="nc" id="L343">                pushIntervalMs = Math.min(pushIntervalMs, info.intervalMs());</span>
+            }
+<span class="nc" id="L345">        }</span>
+
+        /*
+         If client matches with any subscription that has * metrics string, then it means that client
+         is subscribed to all the metrics, so just send the * string as the subscribed metrics.
+        */
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (allMetricsSubscribed) {</span>
+            // Only add an * to indicate that all metrics are subscribed.
+<span class="nc" id="L353">            subscribedMetrics.clear();</span>
+<span class="nc" id="L354">            subscribedMetrics.add(ClientMetricsConfigs.ALL_SUBSCRIBED_METRICS);</span>
+        }
+
+<span class="nc" id="L357">        int subscriptionId = computeSubscriptionId(subscribedMetrics, pushIntervalMs, clientInstanceId);</span>
+
+<span class="nc" id="L359">        return new ClientMetricsInstance(clientInstanceId, instanceMetadata, subscriptionId,</span>
+            currentSubscriptionVersion, subscribedMetrics, pushIntervalMs);
+    }
+
+    /**
+     * Computes the SubscriptionId as a unique identifier for a client instance's subscription set,
+     * the id is generated by calculating a CRC32C of the configured metrics subscriptions including
+     * the PushIntervalMs, XORed with the ClientInstanceId.
+     */
+    private int computeSubscriptionId(Set&lt;String&gt; metrics, int pushIntervalMs, Uuid clientInstanceId) {
+<span class="nc" id="L369">        byte[] metricsBytes = (metrics.toString() + pushIntervalMs).getBytes(StandardCharsets.UTF_8);</span>
+<span class="nc" id="L370">        long computedCrc = Crc32C.compute(metricsBytes, 0, metricsBytes.length);</span>
+<span class="nc" id="L371">        return (int) computedCrc ^ clientInstanceId.hashCode();</span>
+    }
+
+    private GetTelemetrySubscriptionsResponse createGetSubscriptionResponse(Uuid clientInstanceId,
+        ClientMetricsInstance clientInstance) {
+
+<span class="nc" id="L377">        GetTelemetrySubscriptionsResponseData data = new GetTelemetrySubscriptionsResponseData()</span>
+<span class="nc" id="L378">            .setClientInstanceId(clientInstanceId)</span>
+<span class="nc" id="L379">            .setSubscriptionId(clientInstance.subscriptionId())</span>
+<span class="nc" id="L380">            .setRequestedMetrics(new ArrayList&lt;&gt;(clientInstance.metrics()))</span>
+<span class="nc" id="L381">            .setAcceptedCompressionTypes(SUPPORTED_COMPRESSION_TYPES)</span>
+<span class="nc" id="L382">            .setPushIntervalMs(clientInstance.pushIntervalMs())</span>
+<span class="nc" id="L383">            .setTelemetryMaxBytes(clientTelemetryMaxBytes)</span>
+<span class="nc" id="L384">            .setDeltaTemporality(true)</span>
+<span class="nc" id="L385">            .setErrorCode(Errors.NONE.code());</span>
+
+<span class="nc" id="L387">        return new GetTelemetrySubscriptionsResponse(data);</span>
+    }
+
+    private void validateGetRequest(GetTelemetrySubscriptionsRequest request,
+        ClientMetricsInstance clientInstance, long timestamp) {
+
+<span class="nc bnc" id="L393" title="All 4 branches missed.">        if (!clientInstance.maybeUpdateGetRequestTimestamp(timestamp) &amp;&amp; (clientInstance.lastKnownError() != Errors.UNKNOWN_SUBSCRIPTION_ID</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">            &amp;&amp; clientInstance.lastKnownError() != Errors.UNSUPPORTED_COMPRESSION_TYPE)) {</span>
+<span class="nc" id="L395">            clientMetricsStats.recordThrottleCount(clientInstance.clientInstanceId());</span>
+<span class="nc" id="L396">            String msg = String.format(&quot;Request from the client [%s] arrived before the next push interval time&quot;,</span>
+<span class="nc" id="L397">                request.data().clientInstanceId());</span>
+<span class="nc" id="L398">            throw new ThrottlingQuotaExceededException(msg);</span>
+        }
+<span class="nc" id="L400">    }</span>
+
+    private void validatePushRequest(PushTelemetryRequest request, ClientMetricsInstance clientInstance, long timestamp) {
+
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        if (clientInstance.terminating()) {</span>
+<span class="nc" id="L405">            String msg = String.format(</span>
+                &quot;Client [%s] sent the previous request with state terminating to TRUE, can not accept&quot;
+<span class="nc" id="L407">                    + &quot;any requests after that&quot;, request.data().clientInstanceId());</span>
+<span class="nc" id="L408">            throw new InvalidRequestException(msg);</span>
+        }
+
+<span class="nc bnc" id="L411" title="All 4 branches missed.">        if (!clientInstance.maybeUpdatePushRequestTimestamp(timestamp) &amp;&amp; !request.data().terminating()) {</span>
+<span class="nc" id="L412">            clientMetricsStats.recordThrottleCount(clientInstance.clientInstanceId());</span>
+<span class="nc" id="L413">            String msg = String.format(&quot;Request from the client [%s] arrived before the next push interval time&quot;,</span>
+<span class="nc" id="L414">                request.data().clientInstanceId());</span>
+<span class="nc" id="L415">            throw new ThrottlingQuotaExceededException(msg);</span>
+        }
+
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        if (request.data().subscriptionId() != clientInstance.subscriptionId()) {</span>
+<span class="nc" id="L419">            clientMetricsStats.recordUnknownSubscriptionCount();</span>
+<span class="nc" id="L420">            String msg = String.format(&quot;Unknown client subscription id for the client [%s]&quot;,</span>
+<span class="nc" id="L421">                request.data().clientInstanceId());</span>
+<span class="nc" id="L422">            throw new UnknownSubscriptionIdException(msg);</span>
+        }
+
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        if (!isSupportedCompressionType(request.data().compressionType())) {</span>
+<span class="nc" id="L426">            String msg = String.format(&quot;Unknown compression type [%s] is received in telemetry request from [%s]&quot;,</span>
+<span class="nc" id="L427">                request.data().compressionType(), request.data().clientInstanceId());</span>
+<span class="nc" id="L428">            throw new UnsupportedCompressionTypeException(msg);</span>
+        }
+
+<span class="nc bnc" id="L431" title="All 4 branches missed.">        if (request.data().metrics() != null &amp;&amp; request.data().metrics().limit() &gt; clientTelemetryMaxBytes) {</span>
+<span class="nc" id="L432">            String msg = String.format(&quot;Telemetry request from [%s] is larger than the maximum allowed size [%s]&quot;,</span>
+<span class="nc" id="L433">                request.data().clientInstanceId(), clientTelemetryMaxBytes);</span>
+<span class="nc" id="L434">            throw new TelemetryTooLargeException(msg);</span>
+        }
+<span class="nc" id="L436">    }</span>
+
+    private static boolean isSupportedCompressionType(int id) {
+        try {
+<span class="nc" id="L440">            CompressionType.forId(id);</span>
+<span class="nc" id="L441">            return true;</span>
+<span class="nc" id="L442">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L443">            return false;</span>
+        }
+    }
+
+    // Visible for testing
+    SubscriptionInfo subscriptionInfo(String subscriptionName) {
+<span class="nc" id="L449">        return subscriptionMap.get(subscriptionName);</span>
+    }
+
+    // Visible for testing
+    Collection&lt;SubscriptionInfo&gt; subscriptions() {
+<span class="nc" id="L454">        return Collections.unmodifiableCollection(subscriptionMap.values());</span>
+    }
+
+    // Visible for testing
+    ClientMetricsInstance clientInstance(Uuid clientInstanceId) {
+<span class="nc" id="L459">        return clientInstanceCache.get(clientInstanceId);</span>
+    }
+
+    // Visible for testing
+    int subscriptionUpdateVersion() {
+<span class="nc" id="L464">        return subscriptionUpdateVersion.get();</span>
+    }
+
+    // Visible for testing
+    Timer expirationTimer() {
+<span class="nc" id="L469">        return expirationTimer;</span>
+    }
+
+    // Visible for testing
+    Map&lt;String, Uuid&gt; clientConnectionIdMap() {
+<span class="nc" id="L474">        return clientConnectionIdMap;</span>
+    }
+
+<span class="nc" id="L477">    private final class ClientConnectionDisconnectListener implements ConnectionDisconnectListener {</span>
+
+        @Override
+        public void onDisconnect(String connectionId) {
+<span class="nc" id="L481">            log.trace(&quot;Removing client connection id [{}] from the client instance cache&quot;, connectionId);</span>
+
+<span class="nc" id="L483">            Uuid clientInstanceId = clientConnectionIdMap.remove(connectionId);</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">            if (clientInstanceId == null) {</span>
+<span class="nc" id="L485">                log.trace(&quot;Client connection id [{}] is not found in the client instance cache&quot;, connectionId);</span>
+<span class="nc" id="L486">                return;</span>
+            }
+
+            // Unregister the client instance metrics from the broker metrics.
+<span class="nc" id="L490">            clientMetricsStats.unregisterClientInstanceMetrics(clientInstanceId);</span>
+
+<span class="nc" id="L492">            ClientMetricsInstance clientInstance = clientInstanceCache.get(clientInstanceId);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">            if (clientInstance != null) {</span>
+<span class="nc" id="L494">                clientInstance.cancelExpirationTimerTask();</span>
+<span class="nc" id="L495">                clientInstanceCache.remove(clientInstanceId);</span>
+            }
+<span class="nc" id="L497">        }</span>
+    }
+
+    public static class SubscriptionInfo {
+
+        private final String name;
+        private final Set&lt;String&gt; metrics;
+        private final int intervalMs;
+        private final Map&lt;String, Pattern&gt; matchPattern;
+
+        public SubscriptionInfo(String name, List&lt;String&gt; metrics, int intervalMs,
+<span class="nc" id="L508">            Map&lt;String, Pattern&gt; matchPattern) {</span>
+<span class="nc" id="L509">            this.name = name;</span>
+<span class="nc" id="L510">            this.metrics = new HashSet&lt;&gt;(metrics);</span>
+<span class="nc" id="L511">            this.intervalMs = intervalMs;</span>
+<span class="nc" id="L512">            this.matchPattern = matchPattern;</span>
+<span class="nc" id="L513">        }</span>
+
+        public String name() {
+<span class="nc" id="L516">            return name;</span>
+        }
+
+        public Set&lt;String&gt; metrics() {
+<span class="nc" id="L520">            return metrics;</span>
+        }
+
+        public int intervalMs() {
+<span class="nc" id="L524">            return intervalMs;</span>
+        }
+
+        public Map&lt;String, Pattern&gt; matchPattern() {
+<span class="nc" id="L528">            return matchPattern;</span>
+        }
+    }
+
+    private final class ExpirationTimerTask extends TimerTask {
+
+        private static final long CACHE_ERROR_LOG_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+        private final Uuid clientInstanceId;
+        private final String connectionId;
+
+<span class="nc" id="L539">        private ExpirationTimerTask(Uuid clientInstanceId, String connectionId, long delayMs) {</span>
+<span class="nc" id="L540">            super(delayMs);</span>
+<span class="nc" id="L541">            this.clientInstanceId = clientInstanceId;</span>
+<span class="nc" id="L542">            this.connectionId = connectionId;</span>
+<span class="nc" id="L543">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc" id="L547">            log.trace(&quot;Expiration timer task run for client instance id: {}, after delay ms: {}&quot;, clientInstanceId, delayMs);</span>
+<span class="nc" id="L548">            clientMetricsStats.unregisterClientInstanceMetrics(clientInstanceId);</span>
+<span class="nc" id="L549">            clientConnectionIdMap.remove(connectionId);</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">            if (!clientInstanceCache.remove(clientInstanceId)) {</span>
+                /*
+                 This can only happen if the client instance is removed from the cache by the LRU
+                 eviction policy before the expiration timer task is executed. Log a warning as broker
+                 cache is not able to hold all the client instances. Log only once every CACHE_ERROR_LOG_INTERVAL_MS
+                 to avoid flooding the logs.
+                */
+<span class="nc" id="L557">                long lastErrorMs = lastCacheErrorLogMs.get();</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">                if (time.milliseconds() - lastErrorMs &gt; CACHE_ERROR_LOG_INTERVAL_MS &amp;&amp;</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">                    lastCacheErrorLogMs.compareAndSet(lastErrorMs, time.milliseconds())) {</span>
+<span class="nc" id="L560">                    log.warn(&quot;Client metrics instance cache cannot find the client instance id: {}. The cache&quot;</span>
+                            + &quot; must be at capacity, size: {}. Connection map size: {}&quot;,
+<span class="nc" id="L562">                            clientInstanceId, clientInstanceCache.size(), clientConnectionIdMap.size());</span>
+                }
+            }
+<span class="nc" id="L565">        }</span>
+    }
+
+    // Visible for testing
+    final class ClientMetricsStats {
+
+        private static final String GROUP_NAME = &quot;client-metrics&quot;;
+
+        // Visible for testing
+        static final String INSTANCE_COUNT = &quot;instance-count&quot;;
+        static final String UNKNOWN_SUBSCRIPTION_REQUEST = &quot;unknown-subscription-request&quot;;
+        static final String THROTTLE = &quot;throttle&quot;;
+        static final String PLUGIN_EXPORT = &quot;plugin-export&quot;;
+        static final String PLUGIN_ERROR = &quot;plugin-error&quot;;
+        static final String PLUGIN_EXPORT_TIME = &quot;plugin-export-time&quot;;
+
+        // Names of registered sensors either globally or per client instance.
+<span class="nc" id="L582">        private final Set&lt;String&gt; sensorsName = ConcurrentHashMap.newKeySet();</span>
+        // List of metric names which are not specific to a client instance. Do not require thread
+        // safe structure as it will be populated only in constructor.
+<span class="nc" id="L585">        private final List&lt;MetricName&gt; registeredMetricNames = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L587">        private final Set&lt;String&gt; instanceSensors = Stream.of(THROTTLE, PLUGIN_EXPORT, PLUGIN_ERROR).collect(Collectors.toSet());</span>
+
+<span class="nc" id="L589">        ClientMetricsStats() {</span>
+<span class="nc" id="L590">            Measurable instanceCount = (config, now) -&gt; clientInstanceCache.size();</span>
+<span class="nc" id="L591">            MetricName instanceCountMetric = metrics.metricName(INSTANCE_COUNT, GROUP_NAME,</span>
+                &quot;The current number of client metrics instances being managed by the broker&quot;);
+<span class="nc" id="L593">            metrics.addMetric(instanceCountMetric, instanceCount);</span>
+<span class="nc" id="L594">            registeredMetricNames.add(instanceCountMetric);</span>
+
+<span class="nc" id="L596">            Sensor unknownSubscriptionRequestCountSensor = metrics.sensor(</span>
+                ClientMetricsStats.UNKNOWN_SUBSCRIPTION_REQUEST);
+<span class="nc" id="L598">            unknownSubscriptionRequestCountSensor.add(createMeter(metrics, new WindowedCount(),</span>
+<span class="nc" id="L599">                ClientMetricsStats.UNKNOWN_SUBSCRIPTION_REQUEST, Map.of()));</span>
+<span class="nc" id="L600">            sensorsName.add(unknownSubscriptionRequestCountSensor.name());</span>
+<span class="nc" id="L601">        }</span>
+
+        public void maybeAddClientInstanceMetrics(Uuid clientInstanceId) {
+            // If one sensor of the metrics has been registered for the client instance,
+            // then all other sensors should have been registered; and vice versa.
+<span class="nc bnc" id="L606" title="All 2 branches missed.">            if (metrics.getSensor(PLUGIN_EXPORT + &quot;-&quot; + clientInstanceId) != null) {</span>
+<span class="nc" id="L607">                return;</span>
+            }
+
+<span class="nc" id="L610">            Map&lt;String, String&gt; tags = Map.of(ClientMetricsConfigs.CLIENT_INSTANCE_ID, clientInstanceId.toString());</span>
+
+<span class="nc" id="L612">            Sensor throttleCount = metrics.sensor(ClientMetricsStats.THROTTLE + &quot;-&quot; + clientInstanceId);</span>
+<span class="nc" id="L613">            throttleCount.add(createMeter(metrics, new WindowedCount(), ClientMetricsStats.THROTTLE, tags));</span>
+<span class="nc" id="L614">            sensorsName.add(throttleCount.name());</span>
+
+<span class="nc" id="L616">            Sensor pluginExport = metrics.sensor(ClientMetricsStats.PLUGIN_EXPORT + &quot;-&quot; + clientInstanceId);</span>
+<span class="nc" id="L617">            pluginExport.add(createMeter(metrics, new WindowedCount(), ClientMetricsStats.PLUGIN_EXPORT, tags));</span>
+<span class="nc" id="L618">            pluginExport.add(metrics.metricName(ClientMetricsStats.PLUGIN_EXPORT_TIME + &quot;-avg&quot;,</span>
+                ClientMetricsStats.GROUP_NAME, &quot;Average time broker spent in invoking plugin exportMetrics call&quot;, tags), new Avg());
+<span class="nc" id="L620">            pluginExport.add(metrics.metricName(ClientMetricsStats.PLUGIN_EXPORT_TIME + &quot;-max&quot;,</span>
+                ClientMetricsStats.GROUP_NAME, &quot;Maximum time broker spent in invoking plugin exportMetrics call&quot;, tags), new Max());
+<span class="nc" id="L622">            sensorsName.add(pluginExport.name());</span>
+
+<span class="nc" id="L624">            Sensor pluginErrorCount = metrics.sensor(ClientMetricsStats.PLUGIN_ERROR + &quot;-&quot; + clientInstanceId);</span>
+<span class="nc" id="L625">            pluginErrorCount.add(createMeter(metrics, new WindowedCount(), ClientMetricsStats.PLUGIN_ERROR, tags));</span>
+<span class="nc" id="L626">            sensorsName.add(pluginErrorCount.name());</span>
+<span class="nc" id="L627">        }</span>
+
+        public void recordUnknownSubscriptionCount() {
+<span class="nc" id="L630">            record(UNKNOWN_SUBSCRIPTION_REQUEST);</span>
+<span class="nc" id="L631">        }</span>
+
+        public void recordThrottleCount(Uuid clientInstanceId) {
+<span class="nc" id="L634">            record(THROTTLE, clientInstanceId);</span>
+<span class="nc" id="L635">        }</span>
+
+        public void recordPluginExport(Uuid clientInstanceId, long timeMs) {
+<span class="nc" id="L638">            record(PLUGIN_EXPORT, clientInstanceId, timeMs);</span>
+<span class="nc" id="L639">        }</span>
+
+        public void recordPluginErrorCount(Uuid clientInstanceId) {
+<span class="nc" id="L642">            record(PLUGIN_ERROR, clientInstanceId);</span>
+<span class="nc" id="L643">        }</span>
+
+        public void unregisterClientInstanceMetrics(Uuid clientInstanceId) {
+<span class="nc bnc" id="L646" title="All 2 branches missed.">            for (String name : instanceSensors) {</span>
+<span class="nc" id="L647">                String sensorName = name + &quot;-&quot; + clientInstanceId;</span>
+<span class="nc" id="L648">                metrics.removeSensor(sensorName);</span>
+<span class="nc" id="L649">                sensorsName.remove(sensorName);</span>
+<span class="nc" id="L650">            }</span>
+<span class="nc" id="L651">        }</span>
+
+        public void unregisterMetrics() {
+<span class="nc bnc" id="L654" title="All 2 branches missed.">            for (MetricName metricName : registeredMetricNames) {</span>
+<span class="nc" id="L655">                metrics.removeMetric(metricName);</span>
+<span class="nc" id="L656">            }</span>
+<span class="nc bnc" id="L657" title="All 2 branches missed.">            for (String name : sensorsName) {</span>
+<span class="nc" id="L658">                metrics.removeSensor(name);</span>
+<span class="nc" id="L659">            }</span>
+<span class="nc" id="L660">            sensorsName.clear();</span>
+<span class="nc" id="L661">        }</span>
+
+        private Meter createMeter(Metrics metrics, SampledStat stat, String name, Map&lt;String, String&gt; metricTags) {
+<span class="nc" id="L664">            MetricName rateMetricName = metrics.metricName(name + &quot;-rate&quot;, ClientMetricsStats.GROUP_NAME,</span>
+<span class="nc" id="L665">                String.format(&quot;The number of %s per second&quot;, name), metricTags);</span>
+<span class="nc" id="L666">            MetricName totalMetricName = metrics.metricName(name + &quot;-count&quot;, ClientMetricsStats.GROUP_NAME,</span>
+<span class="nc" id="L667">                String.format(&quot;The total number of %s&quot;, name), metricTags);</span>
+<span class="nc" id="L668">            return new Meter(stat, rateMetricName, totalMetricName);</span>
+        }
+
+        private void record(String metricName) {
+<span class="nc" id="L672">            record(metricName, null, 1);</span>
+<span class="nc" id="L673">        }</span>
+
+        private void record(String metricName, Uuid clientInstanceId) {
+<span class="nc" id="L676">            record(metricName, clientInstanceId, 1);</span>
+<span class="nc" id="L677">        }</span>
+
+        private void record(String metricName, Uuid clientInstanceId, long value) {
+<span class="nc bnc" id="L680" title="All 2 branches missed.">            String sensorName = clientInstanceId != null ? metricName + &quot;-&quot; + clientInstanceId : metricName;</span>
+<span class="nc" id="L681">            Sensor sensor = metrics.getSensor(sensorName);</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">            if (sensor != null) {</span>
+<span class="nc" id="L683">                sensor.record(value);</span>
+            }
+<span class="nc" id="L685">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

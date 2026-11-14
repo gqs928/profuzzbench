@@ -1,0 +1,571 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractHeartbeatRequestManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">AbstractHeartbeatRequestManager.java</span></div><h1>AbstractHeartbeatRequestManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.PollResult;
+import org.apache.kafka.clients.consumer.internals.events.ApplicationEventProcessor;
+import org.apache.kafka.clients.consumer.internals.events.AsyncPollEvent;
+import org.apache.kafka.clients.consumer.internals.events.BackgroundEventHandler;
+import org.apache.kafka.clients.consumer.internals.events.ErrorEvent;
+import org.apache.kafka.clients.consumer.internals.metrics.HeartbeatMetricsManager;
+import org.apache.kafka.common.errors.GroupAuthorizationException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.util.Collections;
+
+import static org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.PollResult.EMPTY;
+import static org.apache.kafka.clients.consumer.internals.RequestState.RETRY_BACKOFF_JITTER;
+
+/**
+ * &lt;p&gt;Manages the request creation and response handling for the heartbeat. The module creates a
+ * heartbeat request using the state stored in the membership manager and enqueues it to
+ * the network queue to be sent out. Once the response is received, it updates the state in the
+ * membership manager and handles any errors.
+ *
+ * &lt;p&gt;The heartbeat manager generates heartbeat requests based on the member state. It's also responsible
+ * for the timing of the heartbeat requests to ensure they are sent according to the heartbeat interval
+ * (while the member state is stable) or on demand (while the member is acknowledging an assignment or
+ * leaving the group).
+ *
+ * &lt;p&gt;If the member got kicked out of a group, it will try to give up the current assignment by invoking {@code
+ * OnPartitionsLost} before attempting to join again with a zero epoch.
+ *
+ * &lt;p&gt;If the coordinator is not found, we will skip sending the heartbeat and try to find a coordinator first.
+ *
+ * &lt;p&gt;When the member completes the assignment reconciliation, the {@link HeartbeatRequestState} will be reset so
+ * that a heartbeat will be sent in the next event loop.
+ *
+ * &lt;p&gt;The class variable R is the response for the specific group's heartbeat RPC.
+ */
+public abstract class AbstractHeartbeatRequestManager&lt;R extends AbstractResponse&gt; implements RequestManager {
+
+    protected final Logger logger;
+
+    /**
+     * Max time allowed between invocations of poll, defined in the {@link ConsumerConfig#MAX_POLL_INTERVAL_MS_CONFIG} config.
+     * This is sent to the coordinator in the first heartbeat to join a group, to be used as rebalance timeout.
+     * Also, the consumer will proactively rejoin the group on a call to poll if this time has expired.
+     */
+    protected final int maxPollIntervalMs;
+
+    /**
+     * CoordinatorRequestManager manages the connection to the group coordinator
+     */
+    protected final CoordinatorRequestManager coordinatorRequestManager;
+
+    /**
+     * HeartbeatRequestState manages heartbeat request timing and retries
+     */
+    private final HeartbeatRequestState heartbeatRequestState;
+
+    /**
+     * ErrorEventHandler allows the background thread to propagate errors back to the user
+     */
+    private final BackgroundEventHandler backgroundEventHandler;
+
+    /**
+     * Timer for tracking the time since the last consumer poll.  If the timer expires, the consumer will stop
+     * sending heartbeat until the next poll.
+     */
+    private final Timer pollTimer;
+
+    /**
+     * Holding the heartbeat sensor to measure heartbeat timing and response latency
+     */
+    private final HeartbeatMetricsManager metricsManager;
+
+    public static final String CONSUMER_PROTOCOL_NOT_SUPPORTED_MSG = &quot;The cluster does not support the new CONSUMER &quot; +
+        &quot;group protocol. Set group.protocol=classic on the consumer configs to revert to the CLASSIC protocol &quot; +
+        &quot;until the cluster is upgraded.&quot;;
+
+    AbstractHeartbeatRequestManager(
+            final LogContext logContext,
+            final Time time,
+            final ConsumerConfig config,
+            final CoordinatorRequestManager coordinatorRequestManager,
+            final BackgroundEventHandler backgroundEventHandler,
+<span class="nc" id="L110">            final HeartbeatMetricsManager metricsManager) {</span>
+<span class="nc" id="L111">        this.coordinatorRequestManager = coordinatorRequestManager;</span>
+<span class="nc" id="L112">        this.logger = logContext.logger(getClass());</span>
+<span class="nc" id="L113">        this.backgroundEventHandler = backgroundEventHandler;</span>
+<span class="nc" id="L114">        this.maxPollIntervalMs = config.getInt(CommonClientConfigs.MAX_POLL_INTERVAL_MS_CONFIG);</span>
+<span class="nc" id="L115">        long retryBackoffMs = config.getLong(ConsumerConfig.RETRY_BACKOFF_MS_CONFIG);</span>
+<span class="nc" id="L116">        long retryBackoffMaxMs = config.getLong(ConsumerConfig.RETRY_BACKOFF_MAX_MS_CONFIG);</span>
+<span class="nc" id="L117">        this.heartbeatRequestState = new HeartbeatRequestState(logContext, time, 0, retryBackoffMs,</span>
+                retryBackoffMaxMs, RETRY_BACKOFF_JITTER);
+<span class="nc" id="L119">        this.pollTimer = time.timer(maxPollIntervalMs);</span>
+<span class="nc" id="L120">        this.metricsManager = metricsManager;</span>
+<span class="nc" id="L121">    }</span>
+
+    AbstractHeartbeatRequestManager(
+            final LogContext logContext,
+            final Timer timer,
+            final ConsumerConfig config,
+            final CoordinatorRequestManager coordinatorRequestManager,
+            final HeartbeatRequestState heartbeatRequestState,
+            final BackgroundEventHandler backgroundEventHandler,
+<span class="nc" id="L130">            final HeartbeatMetricsManager metricsManager) {</span>
+<span class="nc" id="L131">        this.logger = logContext.logger(this.getClass());</span>
+<span class="nc" id="L132">        this.maxPollIntervalMs = config.getInt(CommonClientConfigs.MAX_POLL_INTERVAL_MS_CONFIG);</span>
+<span class="nc" id="L133">        this.coordinatorRequestManager = coordinatorRequestManager;</span>
+<span class="nc" id="L134">        this.heartbeatRequestState = heartbeatRequestState;</span>
+<span class="nc" id="L135">        this.backgroundEventHandler = backgroundEventHandler;</span>
+<span class="nc" id="L136">        this.pollTimer = timer;</span>
+<span class="nc" id="L137">        this.metricsManager = metricsManager;</span>
+<span class="nc" id="L138">    }</span>
+
+    /**
+     * This will build a heartbeat request if one must be sent, determined based on the member
+     * state. A heartbeat is sent in the following situations:
+     * &lt;ol&gt;
+     *     &lt;li&gt;Member is part of the consumer group or wants to join it.&lt;/li&gt;
+     *     &lt;li&gt;The heartbeat interval has expired, or the member is in a state that indicates
+     *     that it should heartbeat without waiting for the interval.&lt;/li&gt;
+     * &lt;/ol&gt;
+     * This will also determine the maximum wait time until the next poll based on the member's
+     * state.
+     * &lt;ol&gt;
+     *     &lt;li&gt;If the member is without a coordinator or is in a failed state, the timer is set
+     *     to Long.MAX_VALUE, as there's no need to send a heartbeat.&lt;/li&gt;
+     *     &lt;li&gt;If the member cannot send a heartbeat due to either exponential backoff, it will
+     *     return the remaining time left on the backoff timer.&lt;/li&gt;
+     *     &lt;li&gt;If the member's heartbeat timer has not expired, It will return the remaining time
+     *     left on the heartbeat timer.&lt;/li&gt;
+     *     &lt;li&gt;If the member can send a heartbeat, the timer is set to the current heartbeat interval.&lt;/li&gt;
+     * &lt;/ol&gt;
+     *
+     * @return {@link PollResult} that includes a heartbeat request if one must be sent, and the
+     * time to wait until the next poll.
+     */
+    @Override
+    public NetworkClientDelegate.PollResult poll(long currentTimeMs) {
+<span class="nc bnc" id="L165" title="All 4 branches missed.">        if (coordinatorRequestManager.coordinator().isEmpty() || membershipManager().shouldSkipHeartbeat()) {</span>
+<span class="nc" id="L166">            membershipManager().onHeartbeatRequestSkipped();</span>
+<span class="nc" id="L167">            maybePropagateCoordinatorFatalErrorEvent();</span>
+<span class="nc" id="L168">            return NetworkClientDelegate.PollResult.EMPTY;</span>
+        }
+<span class="nc" id="L170">        pollTimer.update(currentTimeMs);</span>
+<span class="nc bnc" id="L171" title="All 4 branches missed.">        if (pollTimer.isExpired() &amp;&amp; !membershipManager().isLeavingGroup()) {</span>
+<span class="nc" id="L172">            logger.warn(&quot;Consumer poll timeout has expired. This means the time between &quot; +</span>
+                &quot;subsequent calls to poll() was longer than the configured max.poll.interval.ms, &quot; +
+                &quot;which typically implies that the poll loop is spending too much time processing &quot; +
+                &quot;messages. You can address this either by increasing max.poll.interval.ms or by &quot; +
+                &quot;reducing the maximum size of batches returned in poll() with max.poll.records.&quot;);
+
+<span class="nc" id="L178">            membershipManager().transitionToSendingLeaveGroup(true);</span>
+<span class="nc" id="L179">            NetworkClientDelegate.UnsentRequest leaveHeartbeat = makeHeartbeatRequest(currentTimeMs, true);</span>
+
+            // We can ignore the leave response because we can join before or after receiving the response.
+<span class="nc" id="L182">            heartbeatRequestState.reset();</span>
+<span class="nc" id="L183">            resetHeartbeatState();</span>
+<span class="nc" id="L184">            return new NetworkClientDelegate.PollResult(heartbeatRequestState.heartbeatIntervalMs(), Collections.singletonList(leaveHeartbeat));</span>
+        }
+
+        // Case 1: The member state is LEAVING - if the member is a share consumer, we should immediately send leave;
+        // if the member is an async consumer, this will also depend on leavingGroupOperation.
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        boolean heartbeatNow = shouldSendLeaveHeartbeatNow() ||</span>
+            // Case 2: The member state indicates it should send a heartbeat without waiting for the interval,
+            // and there is no heartbeat request currently in-flight
+<span class="nc bnc" id="L192" title="All 4 branches missed.">            (membershipManager().shouldHeartbeatNow() &amp;&amp; !heartbeatRequestState.requestInFlight());</span>
+
+<span class="nc bnc" id="L194" title="All 4 branches missed.">        if (!heartbeatRequestState.canSendRequest(currentTimeMs) &amp;&amp; !heartbeatNow) {</span>
+<span class="nc" id="L195">            return new NetworkClientDelegate.PollResult(heartbeatRequestState.timeToNextHeartbeatMs(currentTimeMs));</span>
+        }
+
+<span class="nc" id="L198">        NetworkClientDelegate.UnsentRequest request = makeHeartbeatRequest(currentTimeMs, false);</span>
+<span class="nc" id="L199">        return new NetworkClientDelegate.PollResult(heartbeatRequestState.heartbeatIntervalMs(), Collections.singletonList(request));</span>
+    }
+
+    /**
+     * Returns the {@link AbstractMembershipManager} that this request manager is using to track the state of the group.
+     * This is provided so that the {@link ApplicationEventProcessor} can access the state for querying or updating.
+     */
+    public abstract AbstractMembershipManager&lt;R&gt; membershipManager();
+
+    /**
+     * @return the member should send leave heartbeat immediately or not
+     */
+    protected abstract boolean shouldSendLeaveHeartbeatNow();
+
+    /**
+     * Generate a heartbeat request to leave the group if the state is still LEAVING when this is
+     * called to close the consumer.
+     * &lt;p/&gt;
+     * Note that when closing the consumer, even though an event to Unsubscribe is generated
+     * (triggers callbacks and sends leave group), it could be the case that the Unsubscribe event
+     * processing does not complete in time and moves on to close the managers (ex. calls to
+     * close with zero timeout). So we could end up on this pollOnClose with the member in
+     * {@link MemberState#PREPARE_LEAVING} (ex. app thread did not have the time to process the
+     * event to execute callbacks), or {@link MemberState#LEAVING} (ex. the leave request could
+     * not be sent due to coordinator not available at that time). In all cases, the pollOnClose
+     * will be triggered right before sending the final requests, so we ensure that we generate
+     * the request to leave if needed.
+     *
+     * @param currentTimeMs The current system time in milliseconds at which the method was called
+     * @return PollResult containing the request to send
+     */
+    @Override
+    public PollResult pollOnClose(long currentTimeMs) {
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        if (membershipManager().isLeavingGroup()) {</span>
+<span class="nc" id="L233">            NetworkClientDelegate.UnsentRequest request = makeHeartbeatRequest(currentTimeMs, true);</span>
+<span class="nc" id="L234">            return new NetworkClientDelegate.PollResult(heartbeatRequestState.heartbeatIntervalMs(), Collections.singletonList(request));</span>
+        }
+<span class="nc" id="L236">        return EMPTY;</span>
+    }
+
+    /**
+     * Returns the delay for which the application thread can safely wait before it should be responsive
+     * to results from the request managers. For example, the subscription state can change when heartbeats
+     * are sent, so blocking for longer than the heartbeat interval might mean the application thread is not
+     * responsive to changes.
+     *
+     * &lt;p&gt;Similarly, we may have to unblock the application thread to send a {@link AsyncPollEvent} to make sure
+     * our poll timer will not expire while we are polling.
+     *
+     * &lt;p&gt;When the member is {@link MemberState#UNSUBSCRIBED} or in the terminal {@link MemberState#FATAL} state,
+     * this returns {@code Long.MAX_VALUE} to indicate there is no next heartbeat to wait for, allowing the application
+     * thread to block for the full user-specified poll timeout rather than spinning in a busy loop.
+     */
+    @Override
+    public long maximumTimeToWait(long currentTimeMs) {
+<span class="nc" id="L254">        pollTimer.update(currentTimeMs);</span>
+<span class="nc" id="L255">        MemberState state = membershipManager().state();</span>
+        // No heartbeat can be sent in these states: UNSUBSCRIBED has nothing to heartbeat for,
+        // and FATAL is terminal. The fatal error has already been propagated to the
+        // application thread, so there is no need to wake it before its poll timeout expires.
+<span class="nc bnc" id="L259" title="All 4 branches missed.">        if (state == MemberState.UNSUBSCRIBED || state == MemberState.FATAL) {</span>
+<span class="nc" id="L260">            return Long.MAX_VALUE;</span>
+        }
+        // Unblock the application thread so STALE/FENCED members can run
+        // assignment-release callbacks and rejoin during the next poll.
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        if (pollTimer.isExpired()) {</span>
+<span class="nc" id="L265">            return 0L;</span>
+        }
+        // Mirror the guard in poll(). A heartbeat is only sent when the coordinator is known and the
+        // member is in a state that can send heartbeats. This covers cases such as:
+        // - The coordinator is unavailable (for example, during bootstrap DNS resolution or after a
+        //   re-authentication failure).
+        // - The member is FENCED (or STALE with the poll timer already reset) and waiting for the
+        //   application thread to run assignment-release callbacks before rejoining.
+        // Return retryBackoffMs rather than the heartbeat interval, since the interval remains 0 until
+        // the first heartbeat response is received, which would also lead to busy-spinning.
+<span class="nc bnc" id="L275" title="All 4 branches missed.">        if (coordinatorRequestManager.coordinator().isEmpty() || membershipManager().shouldSkipHeartbeat()) {</span>
+<span class="nc" id="L276">            return heartbeatRequestState.retryBackoffMs();</span>
+        }
+<span class="nc bnc" id="L278" title="All 4 branches missed.">        if (membershipManager().shouldHeartbeatNow() &amp;&amp; !heartbeatRequestState.requestInFlight()) {</span>
+<span class="nc" id="L279">            return 0L;</span>
+        }
+<span class="nc" id="L281">        return Math.min(pollTimer.remainingMs() / 2, heartbeatRequestState.timeToNextHeartbeatMs(currentTimeMs));</span>
+    }
+
+    /**
+     * Reset the poll timer, indicating that the user has called consumer.poll(). If the member
+     * is in {@link MemberState#STALE} state due to expired poll timer, this will transition the
+     * member to {@link MemberState#JOINING}, so that it rejoins the group.
+     */
+    public void resetPollTimer(final long pollMs) {
+<span class="nc" id="L290">        pollTimer.update(pollMs);</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (pollTimer.isExpired()) {</span>
+<span class="nc" id="L292">            logger.warn(&quot;Time between subsequent calls to poll() was longer than the configured &quot; +</span>
+                &quot;max.poll.interval.ms, exceeded approximately by {} ms. Member {} will rejoin the group now.&quot;,
+<span class="nc" id="L294">                pollTimer.isExpiredBy(), membershipManager().memberId());</span>
+<span class="nc" id="L295">            membershipManager().maybeRejoinStaleMember();</span>
+        }
+<span class="nc" id="L297">        pollTimer.reset(maxPollIntervalMs);</span>
+<span class="nc" id="L298">    }</span>
+
+    private void maybePropagateCoordinatorFatalErrorEvent() {
+<span class="nc" id="L301">        coordinatorRequestManager.getAndClearFatalError()</span>
+<span class="nc" id="L302">                .ifPresent(fatalError -&gt; backgroundEventHandler.add(new ErrorEvent(fatalError)));</span>
+<span class="nc" id="L303">    }</span>
+
+    private NetworkClientDelegate.UnsentRequest makeHeartbeatRequest(final long currentTimeMs, final boolean ignoreResponse) {
+<span class="nc" id="L306">        NetworkClientDelegate.UnsentRequest request = makeHeartbeatRequest(ignoreResponse);</span>
+<span class="nc" id="L307">        heartbeatRequestState.onSendAttempt(currentTimeMs);</span>
+<span class="nc" id="L308">        membershipManager().onHeartbeatRequestGenerated();</span>
+<span class="nc" id="L309">        metricsManager.recordHeartbeatSentMs(currentTimeMs);</span>
+<span class="nc" id="L310">        heartbeatRequestState.resetTimer();</span>
+<span class="nc" id="L311">        return request;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private NetworkClientDelegate.UnsentRequest makeHeartbeatRequest(final boolean ignoreResponse) {
+<span class="nc" id="L316">        NetworkClientDelegate.UnsentRequest request = buildHeartbeatRequest();</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (ignoreResponse)</span>
+<span class="nc" id="L318">            return logResponse(request);</span>
+        else
+<span class="nc" id="L320">            return request.whenComplete((response, exception) -&gt; {</span>
+<span class="nc" id="L321">                long completionTimeMs = request.handler().completionTimeMs();</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">                if (response != null) {</span>
+<span class="nc" id="L323">                    metricsManager.recordRequestLatency(response.requestLatencyMs());</span>
+<span class="nc" id="L324">                    onResponse((R) response.responseBody(), completionTimeMs);</span>
+                } else {
+<span class="nc" id="L326">                    onFailure(exception, completionTimeMs);</span>
+                }
+<span class="nc" id="L328">            });</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private NetworkClientDelegate.UnsentRequest logResponse(final NetworkClientDelegate.UnsentRequest request) {
+<span class="nc" id="L333">        return request.whenComplete((response, exception) -&gt; {</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">            if (response != null) {</span>
+<span class="nc" id="L335">                metricsManager.recordRequestLatency(response.requestLatencyMs());</span>
+<span class="nc" id="L336">                Errors error = errorForResponse((R) response.responseBody());</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                if (error == Errors.NONE)</span>
+<span class="nc" id="L338">                    logger.debug(&quot;{} responded successfully: {}&quot;, heartbeatRequestName(), response);</span>
+                else
+<span class="nc" id="L340">                    logger.error(&quot;{} failed because of {}: {}&quot;, heartbeatRequestName(), error, response);</span>
+<span class="nc" id="L341">            } else {</span>
+<span class="nc" id="L342">                logger.error(&quot;{} failed because of unexpected exception.&quot;, heartbeatRequestName(), exception);</span>
+            }
+<span class="nc" id="L344">        });</span>
+    }
+
+    private void onFailure(final Throwable exception, final long responseTimeMs) {
+<span class="nc" id="L348">        this.heartbeatRequestState.onFailedAttempt(responseTimeMs);</span>
+<span class="nc" id="L349">        resetHeartbeatState();</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (exception instanceof RetriableException) {</span>
+<span class="nc" id="L351">            coordinatorRequestManager.handleCoordinatorDisconnect(exception, responseTimeMs);</span>
+<span class="nc" id="L352">            String message = String.format(&quot;%s failed because of the retriable exception. Will retry in %s ms: %s&quot;,</span>
+<span class="nc" id="L353">                heartbeatRequestName(),</span>
+<span class="nc" id="L354">                heartbeatRequestState.remainingBackoffMs(responseTimeMs),</span>
+<span class="nc" id="L355">                exception.getMessage());</span>
+<span class="nc" id="L356">            logger.debug(message);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        } else if (!handleSpecificFailure(exception)) {</span>
+<span class="nc" id="L358">            logger.error(&quot;{} failed due to fatal error: {}&quot;, heartbeatRequestName(), exception.getMessage());</span>
+<span class="nc" id="L359">            handleFatalFailure(exception);</span>
+        }
+        // Notify the group manager about the failure after all errors have been handled and propagated.
+<span class="nc" id="L362">        membershipManager().onHeartbeatFailure(exception instanceof RetriableException);</span>
+<span class="nc" id="L363">    }</span>
+
+    private void onResponse(final R response, final long currentTimeMs) {
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        if (errorForResponse(response) == Errors.NONE) {</span>
+<span class="nc" id="L367">            long previousHeartbeatIntervalMs = heartbeatRequestState.heartbeatIntervalMs();</span>
+<span class="nc" id="L368">            long heartbeatIntervalMs = heartbeatIntervalForResponse(response);</span>
+            // The heartbeat interval is a group config owned by the broker, so log it when it changes to give
+            // visibility into the value the coordinator is applying (it is not derivable from client config).
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            if (heartbeatIntervalMs != previousHeartbeatIntervalMs) {</span>
+<span class="nc" id="L372">                logger.info(&quot;Member {} received heartbeat interval {}ms from the group coordinator&quot;, membershipManager().memberId(), heartbeatIntervalMs);</span>
+            }
+<span class="nc" id="L374">            heartbeatRequestState.updateHeartbeatIntervalMs(heartbeatIntervalMs);</span>
+<span class="nc" id="L375">            heartbeatRequestState.onSuccessfulAttempt(currentTimeMs);</span>
+<span class="nc" id="L376">            membershipManager().onHeartbeatSuccess(response);</span>
+<span class="nc" id="L377">            return;</span>
+        }
+<span class="nc" id="L379">        onErrorResponse(response, currentTimeMs);</span>
+<span class="nc" id="L380">    }</span>
+
+    private void onErrorResponse(final R response, final long currentTimeMs) {
+<span class="nc" id="L383">        Errors error = errorForResponse(response);</span>
+<span class="nc" id="L384">        String errorMessage = errorMessageForResponse(response);</span>
+        String message;
+
+<span class="nc" id="L387">        resetHeartbeatState();</span>
+<span class="nc" id="L388">        this.heartbeatRequestState.onFailedAttempt(currentTimeMs);</span>
+
+<span class="nc bnc" id="L390" title="All 11 branches missed.">        switch (error) {</span>
+            case NOT_COORDINATOR:
+                // the manager should retry immediately when the coordinator node becomes available again
+<span class="nc" id="L393">                message = String.format(&quot;%s failed because the group coordinator %s is incorrect. &quot; +</span>
+                                &quot;Will attempt to find the coordinator again and retry&quot;,
+<span class="nc" id="L395">                        heartbeatRequestName(), coordinatorRequestManager.coordinator());</span>
+<span class="nc" id="L396">                logInfo(message, response, currentTimeMs);</span>
+<span class="nc" id="L397">                coordinatorRequestManager.markCoordinatorUnknown(errorMessage, currentTimeMs);</span>
+                // Skip backoff so that the next HB is sent as soon as the new coordinator is discovered
+<span class="nc" id="L399">                heartbeatRequestState.reset();</span>
+<span class="nc" id="L400">                break;</span>
+
+            case COORDINATOR_NOT_AVAILABLE:
+<span class="nc" id="L403">                message = String.format(&quot;%s failed because the group coordinator %s is not available. &quot; +</span>
+                                &quot;Will attempt to find the coordinator again and retry&quot;,
+<span class="nc" id="L405">                        heartbeatRequestName(), coordinatorRequestManager.coordinator());</span>
+<span class="nc" id="L406">                logInfo(message, response, currentTimeMs);</span>
+<span class="nc" id="L407">                coordinatorRequestManager.markCoordinatorUnknown(errorMessage, currentTimeMs);</span>
+                // Skip backoff so that the next HB is sent as soon as the new coordinator is discovered
+<span class="nc" id="L409">                heartbeatRequestState.reset();</span>
+<span class="nc" id="L410">                break;</span>
+
+            case COORDINATOR_LOAD_IN_PROGRESS:
+                // the manager will backoff and retry
+<span class="nc" id="L414">                message = String.format(&quot;%s failed because the group coordinator %s is still loading. Will retry&quot;,</span>
+<span class="nc" id="L415">                        heartbeatRequestName(), coordinatorRequestManager.coordinator());</span>
+<span class="nc" id="L416">                logInfo(message, response, currentTimeMs);</span>
+<span class="nc" id="L417">                break;</span>
+
+            case GROUP_AUTHORIZATION_FAILED:
+<span class="nc" id="L420">                GroupAuthorizationException exception =</span>
+<span class="nc" id="L421">                        GroupAuthorizationException.forGroupId(membershipManager().groupId());</span>
+<span class="nc" id="L422">                logger.error(&quot;{} failed due to group authorization failure: {}&quot;,</span>
+<span class="nc" id="L423">                        heartbeatRequestName(), exception.getMessage());</span>
+<span class="nc" id="L424">                handleFatalFailure(error.exception(exception.getMessage()));</span>
+<span class="nc" id="L425">                break;</span>
+
+            case TOPIC_AUTHORIZATION_FAILED:
+<span class="nc" id="L428">                logger.error(&quot;{} failed for member {} with state {} due to {}: {}&quot;, heartbeatRequestName(),</span>
+<span class="nc" id="L429">                        membershipManager().memberId, membershipManager().state, error, errorMessage);</span>
+                // Propagate auth error received in HB so that it's returned on poll.
+                // Member should stay in its current state so it can recover if ever the missing ACLs are added.
+<span class="nc" id="L432">                backgroundEventHandler.add(new ErrorEvent(error.exception()));</span>
+<span class="nc" id="L433">                break;</span>
+
+            case INVALID_REQUEST:
+            case GROUP_MAX_SIZE_REACHED:
+            case UNSUPPORTED_ASSIGNOR:
+<span class="nc" id="L438">                logger.error(&quot;{} failed due to {}: {}&quot;, heartbeatRequestName(), error, errorMessage);</span>
+<span class="nc" id="L439">                handleFatalFailure(error.exception(errorMessage));</span>
+<span class="nc" id="L440">                break;</span>
+
+            case FENCED_MEMBER_EPOCH:
+<span class="nc" id="L443">                message = String.format(&quot;%s failed for member %s because epoch %s is fenced.&quot;,</span>
+<span class="nc" id="L444">                        heartbeatRequestName(), membershipManager().memberId(), membershipManager().memberEpoch());</span>
+<span class="nc" id="L445">                logInfo(message, response, currentTimeMs);</span>
+<span class="nc" id="L446">                membershipManager().transitionToFenced();</span>
+                // Skip backoff so that a next HB to rejoin is sent as soon as the fenced member releases its assignment
+<span class="nc" id="L448">                heartbeatRequestState.reset();</span>
+<span class="nc" id="L449">                break;</span>
+
+            case UNKNOWN_MEMBER_ID:
+<span class="nc" id="L452">                message = String.format(&quot;%s failed because member %s is unknown.&quot;,</span>
+<span class="nc" id="L453">                        heartbeatRequestName(), membershipManager().memberId());</span>
+<span class="nc" id="L454">                logInfo(message, response, currentTimeMs);</span>
+<span class="nc" id="L455">                membershipManager().transitionToFenced();</span>
+                // Skip backoff so that a next HB to rejoin is sent as soon as the fenced member releases its assignment
+<span class="nc" id="L457">                heartbeatRequestState.reset();</span>
+<span class="nc" id="L458">                break;</span>
+
+            case INVALID_REGULAR_EXPRESSION:
+<span class="nc" id="L461">                logger.error(&quot;{} failed due to {}: {}&quot;, heartbeatRequestName(), error, errorMessage);</span>
+<span class="nc" id="L462">                handleFatalFailure(error.exception(&quot;Invalid RE2J SubscriptionPattern provided in the call to &quot; +</span>
+                    &quot;subscribe. &quot; + errorMessage));
+<span class="nc" id="L464">                break;</span>
+
+            case GROUP_ID_NOT_FOUND:
+                // If the group doesn't exist (e.g., member never joined due to InvalidTopicException),
+                // GROUP_ID_NOT_FOUND should be ignored - the leave is effectively complete.
+                // When a leave heartbeat (epoch=-1) is sent, the state transitions synchronously
+                // from LEAVING to UNSUBSCRIBED in onHeartbeatRequestGenerated() before the request is sent.
+<span class="nc bnc" id="L471" title="All 2 branches missed.">                if (membershipManager().state() == MemberState.UNSUBSCRIBED) {</span>
+<span class="nc" id="L472">                    logger.info(&quot;{} received GROUP_ID_NOT_FOUND for group {} while unsubscribed. &quot;,</span>
+<span class="nc" id="L473">                            heartbeatRequestName(), membershipManager().groupId());</span>
+                } else {
+                    // Else, this is a fatal error, we should throw it and transition to fatal state.
+<span class="nc" id="L476">                    logger.error(&quot;{} failed due to unexpected error {}: {}&quot;, heartbeatRequestName(), error, errorMessage);</span>
+<span class="nc" id="L477">                    handleFatalFailure(error.exception(errorMessage));</span>
+                }
+<span class="nc" id="L479">                break;</span>
+
+            default:
+<span class="nc bnc" id="L482" title="All 2 branches missed.">                if (!handleSpecificExceptionInResponse(response, currentTimeMs)) {</span>
+                    // If the manager receives an unknown error - there could be a bug in the code or a new error code
+<span class="nc" id="L484">                    logger.error(&quot;{} failed due to unexpected error {}: {}&quot;, heartbeatRequestName(), error, errorMessage);</span>
+<span class="nc" id="L485">                    handleFatalFailure(error.exception(errorMessage));</span>
+                }
+                break;
+        }
+
+        // Notify the group manager about the failure after all errors have been handled and propagated.
+<span class="nc" id="L491">        membershipManager().onHeartbeatFailure(false);</span>
+<span class="nc" id="L492">    }</span>
+
+    protected void logInfo(final String message, final R response, final long currentTimeMs) {
+<span class="nc" id="L495">        logger.info(&quot;{} in {}ms: {}&quot;,</span>
+            message,
+<span class="nc" id="L497">            heartbeatRequestState.remainingBackoffMs(currentTimeMs),</span>
+<span class="nc" id="L498">            errorMessageForResponse(response));</span>
+<span class="nc" id="L499">    }</span>
+
+    protected void handleFatalFailure(Throwable error) {
+<span class="nc" id="L502">        backgroundEventHandler.add(new ErrorEvent(error));</span>
+<span class="nc" id="L503">        membershipManager().transitionToFatal();</span>
+<span class="nc" id="L504">    }</span>
+
+    /**
+     * Error handling specific failure to a group type when sending the request
+     * and no response has been received.
+     *
+     * @param exception The exception thrown building the request
+     * @return true if the error was handled, else false
+     */
+    public boolean handleSpecificFailure(Throwable exception) {
+<span class="nc" id="L514">        return false;</span>
+    }
+
+    /**
+     * Error handling specific response exception to a group type.
+     *
+     * @param response The heartbeat response
+     * @param currentTimeMs Current time
+     * @return true if the error was handled, else false
+     */
+    public boolean handleSpecificExceptionInResponse(final R response, final long currentTimeMs) {
+<span class="nc" id="L525">        return false;</span>
+    }
+
+    /**
+     * Resets the heartbeat state.
+     */
+    public abstract void resetHeartbeatState();
+
+    /**
+     * Builds a heartbeat request using the heartbeat state to follow the protocol faithfully.
+     *
+     * @return The heartbeat request
+     */
+    public abstract NetworkClientDelegate.UnsentRequest buildHeartbeatRequest();
+
+    /**
+     * Returns the heartbeat RPC request name to be used for logging.
+     *
+     * @return The heartbeat RPC request name
+     */
+    public abstract String heartbeatRequestName();
+
+    /**
+     * Returns the error for the response.
+     *
+     * @param response The heartbeat response
+     * @return The error {@link Errors}
+     */
+    public abstract Errors errorForResponse(R response);
+
+    /**
+     * Returns the error message for the response.
+     *
+     * @param response The heartbeat response
+     * @return The error message
+     */
+    public abstract String errorMessageForResponse(R response);
+
+    /**
+     * Returns the heartbeat interval for the response.
+     *
+     * @param response The heartbeat response
+     * @return The heartbeat interval
+     */
+    public abstract long heartbeatIntervalForResponse(R response);
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

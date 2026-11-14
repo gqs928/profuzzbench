@@ -1,0 +1,265 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "mycrypt.h"
+#include "password-scheme.h"
+#include "password-scheme-private.h"
+#include "crypt-blowfish.h"
+#include "randgen.h"
+
+/* Lengths and limits for some crypt() algorithms. */
+#define CRYPT_BLF_ROUNDS_DEFAULT 5
+#define CRYPT_BLF_ROUNDS_MIN 4
+#define CRYPT_BLF_ROUNDS_MAX 31
+#define CRYPT_BLF_SALT_LEN 16 /* raw salt */
+#define CRYPT_BLF_PREFIX_LEN (7+22+1) /* $2.$nn$ + salt */
+#define CRYPT_BLF_BUFFER_LEN 128
+#define CRYPT_BLF_PREFIX "$2y"
+#define CRYPT_SHA2_ROUNDS_DEFAULT 5000
+#define CRYPT_SHA2_ROUNDS_MIN 1000
+#define CRYPT_SHA2_ROUNDS_MAX 999999999
+#define CRYPT_SHA2_SALT_LEN 16
+
+static int crypt_verify(const char *plaintext, const struct password_generate_params *params ATTR_UNUSED,
+		 const unsigned char *raw_password, size_t size,
+		 const char **error_r)
+{
+	const char *password, *crypted;
+
+	if (size > 4 && raw_password[0] == '$' && raw_password[1] == '2' &&
+	    raw_password[3] == '$')
+		return password_verify(plaintext, params, "BLF-CRYPT",
+				       raw_password, size, error_r);
+
+	if (size == 0) {
+		/* the default mycrypt() handler would return match */
+		return 0;
+	}
+
+	if (size > 1 && !password_schemes_weak_allowed()) {
+		if (raw_password[0] != '$') {
+			*error_r = "Weak password scheme 'DES-CRYPT' used and refused";
+			return -1;
+		} else if (raw_password[1] == '1') {
+			*error_r = "Weak password scheme 'MD5-CRYPT' used and refused";
+			return -1;
+		}
+	}
+
+	password = t_strndup(raw_password, size);
+	crypted = mycrypt(plaintext, password);
+	if (crypted == NULL) {
+		/* really shouldn't happen unless the system is broken */
+		*error_r = t_strdup_printf("crypt() failed: %m");
+		return -1;
+	}
+
+	return str_equals_timing_almost_safe(crypted, password) ? 1 : 0;
+}
+
+static void
+crypt_generate_des(const char *plaintext, const struct password_generate_params *params ATTR_UNUSED,
+		   const unsigned char **raw_password_r, size_t *size_r)
+{
+#define CRYPT_SALT_LEN 2
+	const char *password, *salt;
+
+	salt = password_generate_salt(CRYPT_SALT_LEN);
+	password = t_strdup(mycrypt(plaintext, salt));
+	*raw_password_r = (const unsigned char *)password;
+	*size_r = strlen(password);
+}
+
+static void
+crypt_generate_blowfish(const char *plaintext, const struct password_generate_params *params,
+			 const unsigned char **raw_password_r, size_t *size_r)
+{
+	char salt[CRYPT_BLF_SALT_LEN];
+	char password[CRYPT_BLF_BUFFER_LEN];
+	char magic_salt[CRYPT_BLF_PREFIX_LEN];
+	unsigned int rounds = params->rounds;
+
+	if (rounds == 0)
+		rounds = CRYPT_BLF_ROUNDS_DEFAULT;
+	else if (rounds < CRYPT_BLF_ROUNDS_MIN)
+		rounds = CRYPT_BLF_ROUNDS_MIN;
+	else if (rounds > CRYPT_BLF_ROUNDS_MAX)
+		rounds = CRYPT_BLF_ROUNDS_MAX;
+
+	random_fill(salt, CRYPT_BLF_SALT_LEN);
+	if (crypt_gensalt_blowfish_rn(CRYPT_BLF_PREFIX, rounds,
+				      salt, CRYPT_BLF_SALT_LEN,
+				      magic_salt, CRYPT_BLF_PREFIX_LEN) == NULL)
+		i_fatal("crypt_gensalt_blowfish_rn failed: %m");
+
+	if (crypt_blowfish_rn(plaintext, magic_salt, password,
+			       CRYPT_BLF_BUFFER_LEN) == NULL)
+		i_fatal("crypt_blowfish_rn failed: %m");
+
+	*raw_password_r = (const unsigned char *)t_strdup(password);
+	*size_r = strlen(password);
+}
+
+static int
+crypt_verify_blowfish(const char *plaintext, const struct password_generate_params *params ATTR_UNUSED,
+		      const unsigned char *raw_password, size_t size,
+		      const char **error_r)
+{
+	const char *password;
+	const char *salt;
+	char crypted[CRYPT_BLF_BUFFER_LEN];
+
+	if (size == 0) {
+		/* the default mycrypt() handler would return match */
+		return 0;
+	}
+	password = t_strndup(raw_password, size);
+
+	if (size < CRYPT_BLF_PREFIX_LEN ||
+	    password[0] != '$' || password[1] != '2' ||
+	    password[2] < 'a' || password[2] > 'z' ||
+	    password[3] != '$') {
+		*error_r = "Password is not blowfish password";
+		return -1;
+	}
+
+	salt = t_strndup(password, CRYPT_BLF_PREFIX_LEN);
+	if (crypt_blowfish_rn(plaintext, salt, crypted, CRYPT_BLF_BUFFER_LEN) == NULL) {
+		/* really shouldn't happen unless the system is broken */
+		*error_r = t_strdup_printf("crypt_blowfish_rn failed: %m");
+		return -1;
+	}
+
+	return str_equals_timing_almost_safe(crypted, password) ? 1 : 0;
+}
+
+static void
+crypt_generate_sha256(const char *plaintext, const struct password_generate_params *params,
+		      const unsigned char **raw_password_r, size_t *size_r)
+{
+	const char *password, *salt, *magic_salt;
+	unsigned int rounds = params->rounds;
+
+	if (rounds == 0)
+		rounds = CRYPT_SHA2_ROUNDS_DEFAULT;
+	else if (rounds < CRYPT_SHA2_ROUNDS_MIN)
+		rounds = CRYPT_SHA2_ROUNDS_MIN;
+	else if (rounds > CRYPT_SHA2_ROUNDS_MAX)
+		rounds = CRYPT_SHA2_ROUNDS_MAX;
+
+	salt = password_generate_salt(CRYPT_SHA2_SALT_LEN);
+	if (rounds == CRYPT_SHA2_ROUNDS_DEFAULT)
+		magic_salt = t_strdup_printf("$5$%s", salt);
+	else
+		magic_salt = t_strdup_printf("$5$rounds=%u$%s", rounds, salt);
+	password = t_strdup(mycrypt(plaintext, magic_salt));
+	*raw_password_r = (const unsigned char *)password;
+	*size_r = strlen(password);
+}
+
+static void
+crypt_generate_sha512(const char *plaintext, const struct password_generate_params *params,
+		      const unsigned char **raw_password_r, size_t *size_r)
+{
+	const char *password, *salt, *magic_salt;
+	unsigned int rounds = params->rounds;
+
+	if (rounds == 0)
+		rounds = CRYPT_SHA2_ROUNDS_DEFAULT;
+	else if (rounds < CRYPT_SHA2_ROUNDS_MIN)
+		rounds = CRYPT_SHA2_ROUNDS_MIN;
+	else if (rounds > CRYPT_SHA2_ROUNDS_MAX)
+		rounds = CRYPT_SHA2_ROUNDS_MAX;
+
+	salt = password_generate_salt(CRYPT_SHA2_SALT_LEN);
+	if (rounds == CRYPT_SHA2_ROUNDS_DEFAULT)
+		magic_salt = t_strdup_printf("$6$%s", salt);
+	else
+		magic_salt = t_strdup_printf("$6$rounds=%u$%s", rounds, salt);
+	password = t_strdup(mycrypt(plaintext, magic_salt));
+	*raw_password_r = (const unsigned char *)password;
+	*size_r = strlen(password);
+}
+
+/* keep in sync with the crypt_schemes struct below */
+static const struct {
+	const char *key;
+	const char *salt;
+	const char *expected;
+} sample[] = {
+	{ "08/15!test~4711", "JB", "JBOZ0DgmtucwE" },
+	{ "08/15!test~4711", "$5$rounds=1000$0123456789abcdef",
+	  "$5$rounds=1000$0123456789abcdef$K/DksR0DT01hGc8g/kt"
+	  "9McEgrbFMKi9qrb1jehe7hn4" },
+	{ "08/15!test~4711", "$6$rounds=1000$0123456789abcdef",
+	  "$6$rounds=1000$0123456789abcdef$ZIAd5WqfyLkpvsVCVUU1GrvqaZTq"
+	  "vhJoouxdSqJO71l9Ld3tVrfOatEjarhghvEYADkq//LpDnTeO90tcbtHR1" }
+};
+
+/* keep in sync with the sample struct above */
+static const struct password_scheme crypt_schemes[] = {
+	{
+		.name = "DES-CRYPT",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.weak = TRUE,
+		.password_verify = crypt_verify,
+		.password_generate = crypt_generate_des,
+	},
+	{
+		.name = "SHA256-CRYPT",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = crypt_verify,
+		.password_generate = crypt_generate_sha256,
+	},
+	{
+		.name = "SHA512-CRYPT",
+		.default_encoding = PW_ENCODING_NONE,
+		.raw_password_len = 0,
+		.password_verify = crypt_verify,
+		.password_generate = crypt_generate_sha512,
+	},
+};
+
+static const struct password_scheme blf_crypt_scheme = {
+	.name = "BLF-CRYPT",
+	.default_encoding = PW_ENCODING_NONE,
+	.raw_password_len = 0,
+	.password_verify = crypt_verify_blowfish,
+	.password_generate = crypt_generate_blowfish,
+};
+
+static const struct password_scheme default_crypt_scheme = {
+	.name = "CRYPT",
+	.default_encoding = PW_ENCODING_NONE,
+	.raw_password_len = 0,
+	.password_verify = crypt_verify,
+	.password_generate = crypt_generate_blowfish,
+};
+
+void password_scheme_register_crypt(void)
+{
+	unsigned int i;
+	const char *crypted;
+
+	i_assert(N_ELEMENTS(crypt_schemes) == N_ELEMENTS(sample));
+
+	for (i = 0; i < N_ELEMENTS(crypt_schemes); i++) {
+		crypted = mycrypt(sample[i].key, sample[i].salt);
+		if (crypted != NULL &&
+		   (strcmp(crypted, sample[i].expected) == 0))
+			password_scheme_register(&crypt_schemes[i]);
+	}
+	password_scheme_register(&blf_crypt_scheme);
+	password_scheme_register(&default_crypt_scheme);
+}
+
+void password_schemes_register_all(void)
+{
+	password_schemes_init();
+	password_scheme_register_crypt();
+#ifdef HAVE_LIBSODIUM
+	password_scheme_register_sodium();
+#endif
+}

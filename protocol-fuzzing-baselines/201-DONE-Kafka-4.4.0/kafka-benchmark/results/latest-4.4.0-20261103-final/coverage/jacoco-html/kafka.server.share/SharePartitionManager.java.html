@@ -1,0 +1,992 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SharePartitionManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">kafka.server.share</a> &gt; <span class="el_source">SharePartitionManager.java</span></div><h1>SharePartitionManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.server.share;
+
+import kafka.server.ReplicaManager;
+
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.FencedStateEpochException;
+import org.apache.kafka.common.errors.GroupIdNotFoundException;
+import org.apache.kafka.common.errors.LeaderNotAvailableException;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.message.ShareAcknowledgeResponseData;
+import org.apache.kafka.common.message.ShareFetchResponseData.PartitionData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.ShareRequestMetadata;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.ImplicitLinkedHashCollection;
+import org.apache.kafka.coordinator.group.modern.share.ShareGroupConfigProvider;
+import org.apache.kafka.server.common.ShareVersion;
+import org.apache.kafka.server.partition.PartitionListener;
+import org.apache.kafka.server.share.CachedSharePartition;
+import org.apache.kafka.server.share.LogReader;
+import org.apache.kafka.server.share.PartitionMetadataProvider;
+import org.apache.kafka.server.share.ShareGroupListener;
+import org.apache.kafka.server.share.SharePartitionKey;
+import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch;
+import org.apache.kafka.server.share.context.FinalContext;
+import org.apache.kafka.server.share.context.ShareFetchContext;
+import org.apache.kafka.server.share.context.ShareSessionContext;
+import org.apache.kafka.server.share.dlq.ShareGroupDLQManager;
+import org.apache.kafka.server.share.fetch.DelayedShareFetchGroupKey;
+import org.apache.kafka.server.share.fetch.DelayedShareFetchKey;
+import org.apache.kafka.server.share.fetch.DelayedShareFetchPartitionKey;
+import org.apache.kafka.server.share.fetch.PartitionRotateStrategy;
+import org.apache.kafka.server.share.fetch.PartitionRotateStrategy.PartitionRotateMetadata;
+import org.apache.kafka.server.share.fetch.ShareFetch;
+import org.apache.kafka.server.share.metrics.ShareGroupMetrics;
+import org.apache.kafka.server.share.persister.Persister;
+import org.apache.kafka.server.share.session.ShareSession;
+import org.apache.kafka.server.share.session.ShareSessionCache;
+import org.apache.kafka.server.share.session.ShareSessionKey;
+import org.apache.kafka.server.storage.log.FetchParams;
+import org.apache.kafka.server.util.timer.SystemTimer;
+import org.apache.kafka.server.util.timer.SystemTimerReaper;
+import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.server.util.timer.TimerTask;
+import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+/**
+ * The SharePartitionManager is responsible for managing the SharePartitions and ShareSessions.
+ * It is responsible for fetching messages from the log and acknowledging the messages.
+ */
+public class SharePartitionManager implements AutoCloseable {
+
+<span class="nc" id="L88">    private static final Logger log = LoggerFactory.getLogger(SharePartitionManager.class);</span>
+
+    /**
+     * The partition cache is used to store the SharePartition objects for each share group topic-partition.
+     */
+    private final SharePartitionCache partitionCache;
+
+    /**
+     * The replica manager is used to fetch messages from the log.
+     */
+    private final ReplicaManager replicaManager;
+
+    /**
+     * The log reader is used to read records from the log.
+     */
+    private final LogReader logReader;
+
+    /**
+     * The metadata provider is used to resolve metadata for partition.
+     */
+    private final PartitionMetadataProvider metadataProvider;
+
+    /**
+     * The delayed request notifier is used to complete delayed share fetch requests.
+     */
+    private final Consumer&lt;DelayedShareFetchKey&gt; delayedRequestNotifier;
+
+    /**
+     * The time instance is used to get the current time.
+     */
+    private final Time time;
+
+    /**
+     * The share session cache stores the share sessions.
+     */
+    private final ShareSessionCache cache;
+
+    /**
+     * The provider used to retrieve share group dynamic configuration values.
+     */
+    private final ShareGroupConfigProvider configProvider;
+
+    /**
+     * The default record lock duration is the time in milliseconds that a record lock is held for.
+     * This default value can be overridden by a group-specific configuration.
+     */
+    private final int defaultRecordLockDurationMs;
+
+    /**
+     * The timer is used to schedule the records lock timeout.
+     */
+    private final Timer timer;
+
+    /**
+     * The max in flight records is the maximum number of records that can be in flight at any one time per share-partition.
+     */
+    private final int maxInFlightRecords;
+
+    /**
+     * The max delivery count is the maximum number of times a message can be delivered before it is considered to be archived.
+     */
+    private final int maxDeliveryCount;
+    /**
+     * The max wait time for a share fetch request having remote storage fetch.
+     */
+    private final long remoteFetchMaxWaitMs;
+
+    /**
+     * The persister is used to persist the share partition state.
+     */
+    private final Persister persister;
+
+    /**
+     * Class with methods to record share group metrics.
+     */
+    private final ShareGroupMetrics shareGroupMetrics;
+
+    /**
+     * The broker topic stats is used to record the broker topic metrics for share group.
+     */
+    private final BrokerTopicStats brokerTopicStats;
+
+    /**
+     * Supplier indicating whether DLQ support is enabled.
+     */
+    private final Supplier&lt;Boolean&gt; shareGroupDlqEnableSupplier;
+
+    /**
+     * Reference to the DLQ manager implementation.
+     */
+    private final ShareGroupDLQManager shareGroupDLQManager;
+
+    @SuppressWarnings(&quot;ParameterNumber&quot;)
+    public SharePartitionManager(
+        ReplicaManager replicaManager,
+        LogReader logReader,
+        PartitionMetadataProvider metadataProvider,
+        Consumer&lt;DelayedShareFetchKey&gt; delayedRequestNotifier,
+        Time time,
+        ShareSessionCache cache,
+        int defaultRecordLockDurationMs,
+        int maxDeliveryCount,
+        int maxInFlightRecords,
+        long remoteFetchMaxWaitMs,
+        Persister persister,
+        ShareGroupConfigProvider configProvider,
+        ShareGroupMetrics shareGroupMetrics,
+        BrokerTopicStats brokerTopicStats,
+        Supplier&lt;Boolean&gt; shareGroupDlqEnableSupplier,
+        ShareGroupDLQManager shareGroupDLQManager
+    ) {
+<span class="nc" id="L199">        this(replicaManager,</span>
+            logReader,
+            metadataProvider,
+            delayedRequestNotifier,
+            time,
+            cache,
+            new SharePartitionCache(),
+            defaultRecordLockDurationMs,
+            maxDeliveryCount,
+            maxInFlightRecords,
+            remoteFetchMaxWaitMs,
+            persister,
+            configProvider,
+            shareGroupMetrics,
+            brokerTopicStats,
+            shareGroupDlqEnableSupplier,
+            shareGroupDLQManager
+        );
+<span class="nc" id="L217">    }</span>
+
+    @SuppressWarnings(&quot;ParameterNumber&quot;)
+    private SharePartitionManager(
+        ReplicaManager replicaManager,
+        LogReader logReader,
+        PartitionMetadataProvider metadataProvider,
+        Consumer&lt;DelayedShareFetchKey&gt; delayedRequestNotifier,
+        Time time,
+        ShareSessionCache cache,
+        SharePartitionCache partitionCache,
+        int defaultRecordLockDurationMs,
+        int maxDeliveryCount,
+        int maxInFlightRecords,
+        long remoteFetchMaxWaitMs,
+        Persister persister,
+        ShareGroupConfigProvider configProvider,
+        ShareGroupMetrics shareGroupMetrics,
+        BrokerTopicStats brokerTopicStats,
+        Supplier&lt;Boolean&gt; shareGroupDlqEnableSupplier,
+        ShareGroupDLQManager shareGroupDLQManager
+    ) {
+<span class="nc" id="L239">        this(replicaManager,</span>
+            logReader,
+            metadataProvider,
+            delayedRequestNotifier,
+            time,
+            cache,
+            partitionCache,
+            defaultRecordLockDurationMs,
+            new SystemTimerReaper(&quot;share-group-lock-timeout-reaper&quot;,
+                new SystemTimer(&quot;share-group-lock-timeout&quot;)),
+            maxDeliveryCount,
+            maxInFlightRecords,
+            remoteFetchMaxWaitMs,
+            persister,
+            configProvider,
+            shareGroupMetrics,
+            brokerTopicStats,
+            shareGroupDlqEnableSupplier,
+            shareGroupDLQManager
+        );
+<span class="nc" id="L259">    }</span>
+
+    // Visible for testing.
+    @SuppressWarnings(&quot;ParameterNumber&quot;)
+    SharePartitionManager(
+            ReplicaManager replicaManager,
+            LogReader logReader,
+            PartitionMetadataProvider metadataProvider,
+            Consumer&lt;DelayedShareFetchKey&gt; delayedRequestNotifier,
+            Time time,
+            ShareSessionCache cache,
+            SharePartitionCache partitionCache,
+            int defaultRecordLockDurationMs,
+            Timer timer,
+            int maxDeliveryCount,
+            int maxInFlightRecords,
+            long remoteFetchMaxWaitMs,
+            Persister persister,
+            ShareGroupConfigProvider configProvider,
+            ShareGroupMetrics shareGroupMetrics,
+            BrokerTopicStats brokerTopicStats,
+            Supplier&lt;Boolean&gt; shareGroupDlqEnableSupplier,
+            ShareGroupDLQManager shareGroupDLQManager
+<span class="nc" id="L282">    ) {</span>
+<span class="nc" id="L283">        this.replicaManager = replicaManager;</span>
+<span class="nc" id="L284">        this.logReader = logReader;</span>
+<span class="nc" id="L285">        this.metadataProvider = metadataProvider;</span>
+<span class="nc" id="L286">        this.delayedRequestNotifier = delayedRequestNotifier;</span>
+<span class="nc" id="L287">        this.time = time;</span>
+<span class="nc" id="L288">        this.cache = cache;</span>
+<span class="nc" id="L289">        this.partitionCache = partitionCache;</span>
+<span class="nc" id="L290">        this.defaultRecordLockDurationMs = defaultRecordLockDurationMs;</span>
+<span class="nc" id="L291">        this.timer = timer;</span>
+<span class="nc" id="L292">        this.maxDeliveryCount = maxDeliveryCount;</span>
+<span class="nc" id="L293">        this.maxInFlightRecords = maxInFlightRecords;</span>
+<span class="nc" id="L294">        this.remoteFetchMaxWaitMs = remoteFetchMaxWaitMs;</span>
+<span class="nc" id="L295">        this.persister = persister;</span>
+<span class="nc" id="L296">        this.configProvider = configProvider;</span>
+<span class="nc" id="L297">        this.shareGroupMetrics = shareGroupMetrics;</span>
+<span class="nc" id="L298">        this.brokerTopicStats = brokerTopicStats;</span>
+<span class="nc" id="L299">        this.cache.registerShareGroupListener(new ShareGroupListenerImpl());</span>
+<span class="nc" id="L300">        this.shareGroupDlqEnableSupplier = shareGroupDlqEnableSupplier;</span>
+<span class="nc" id="L301">        this.shareGroupDLQManager = shareGroupDLQManager;</span>
+<span class="nc" id="L302">    }</span>
+
+    /**
+     * The fetch messages method is used to fetch messages from the log for the specified topic-partitions.
+     * The method returns a future that will be completed with the fetched messages.
+     *
+     * @param groupId The group id, this is used to identify the share group.
+     * @param memberId The member id, generated by the group-coordinator, this is used to identify the client.
+     * @param shareAcquireMode The share acquire mode from the share fetch request.
+     * @param fetchParams The fetch parameters from the share fetch request.
+     * @param sessionEpoch The session epoch for the member.
+     * @param maxFetchRecords The maximum number of records to fetch.
+     * @param batchSize The number of records per acquired records batch.
+     * @param topicIdPartitions The topic partitions to fetch for.
+     *
+     * @return A future that will be completed with the fetched messages.
+     */
+    public CompletableFuture&lt;Map&lt;TopicIdPartition, PartitionData&gt;&gt; fetchMessages(
+        String groupId,
+        String memberId,
+        FetchParams fetchParams,
+        byte shareAcquireMode,
+        int sessionEpoch,
+        int maxFetchRecords,
+        int batchSize,
+        List&lt;TopicIdPartition&gt; topicIdPartitions
+    ) {
+<span class="nc" id="L329">        log.trace(&quot;Fetch request for topicIdPartitions: {} with groupId: {} fetch params: {}&quot;,</span>
+            topicIdPartitions, groupId, fetchParams);
+
+<span class="nc" id="L332">        List&lt;TopicIdPartition&gt; rotatedTopicIdPartitions = PartitionRotateStrategy</span>
+<span class="nc" id="L333">            .type(PartitionRotateStrategy.StrategyType.ROUND_ROBIN)</span>
+<span class="nc" id="L334">            .rotate(topicIdPartitions, new PartitionRotateMetadata(sessionEpoch));</span>
+
+<span class="nc" id="L336">        CompletableFuture&lt;Map&lt;TopicIdPartition, PartitionData&gt;&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L337">        processShareFetch(new ShareFetch(fetchParams, groupId, memberId, future, rotatedTopicIdPartitions, shareAcquireMode, batchSize, maxFetchRecords, brokerTopicStats));</span>
+
+<span class="nc" id="L339">        return future;</span>
+    }
+
+    /**
+     * The acknowledge method is used to acknowledge the messages that have been fetched.
+     * The method returns a future that will be completed with the acknowledge response.
+     *
+     * @param memberId The member id, generated by the group-coordinator, this is used to identify the client.
+     * @param groupId The group id, this is used to identify the share group.
+     * @param acknowledgeTopics The acknowledge topics and their corresponding acknowledge batches.
+     *
+     * @return A future that will be completed with the acknowledge response.
+     */
+    public CompletableFuture&lt;Map&lt;TopicIdPartition, ShareAcknowledgeResponseData.PartitionData&gt;&gt; acknowledge(
+        String memberId,
+        String groupId,
+        Map&lt;TopicIdPartition, List&lt;ShareAcknowledgementBatch&gt;&gt; acknowledgeTopics
+    ) {
+<span class="nc" id="L357">        log.trace(&quot;Acknowledge request for topicIdPartitions: {} with groupId: {}&quot;,</span>
+<span class="nc" id="L358">            acknowledgeTopics.keySet(), groupId);</span>
+<span class="nc" id="L359">        Map&lt;TopicIdPartition, CompletableFuture&lt;Throwable&gt;&gt; futures = new HashMap&lt;&gt;();</span>
+        // Track the topics for which we have received an acknowledgement for metrics.
+<span class="nc" id="L361">        Set&lt;String&gt; topics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L362">        acknowledgeTopics.forEach((topicIdPartition, acknowledgePartitionBatches) -&gt; {</span>
+<span class="nc" id="L363">            topics.add(topicIdPartition.topic());</span>
+<span class="nc" id="L364">            SharePartitionKey sharePartitionKey = sharePartitionKey(groupId, topicIdPartition);</span>
+<span class="nc" id="L365">            SharePartition sharePartition = partitionCache.get(sharePartitionKey);</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">            if (sharePartition != null) {</span>
+<span class="nc" id="L367">                CompletableFuture&lt;Throwable&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L368">                sharePartition.acknowledge(memberId, acknowledgePartitionBatches).whenComplete((result, throwable) -&gt; {</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">                    if (throwable != null) {</span>
+<span class="nc" id="L370">                        fencedSharePartitionHandler().accept(sharePartitionKey, throwable);</span>
+<span class="nc" id="L371">                        future.complete(throwable);</span>
+<span class="nc" id="L372">                        return;</span>
+                    }
+<span class="nc" id="L374">                    acknowledgePartitionBatches.forEach(batch -&gt; {</span>
+                        // Client can either send a single entry in acknowledgeTypes which represents
+                        // the state of the complete batch or can send individual offsets state.
+<span class="nc bnc" id="L377" title="All 2 branches missed.">                        if (batch.acknowledgeTypes().size() == 1) {</span>
+<span class="nc" id="L378">                            shareGroupMetrics.recordAcknowledgement(batch.acknowledgeTypes().get(0), batch.lastOffset() - batch.firstOffset() + 1);</span>
+                        } else {
+<span class="nc" id="L380">                            batch.acknowledgeTypes().forEach(shareGroupMetrics::recordAcknowledgement);</span>
+                        }
+<span class="nc" id="L382">                    });</span>
+<span class="nc" id="L383">                    future.complete(null);</span>
+<span class="nc" id="L384">                });</span>
+
+                // If we have an acknowledgement completed for a topic-partition, then we should check if
+                // there is a pending share fetch request for the topic-partition and complete it.
+<span class="nc" id="L388">                DelayedShareFetchKey delayedShareFetchKey = new DelayedShareFetchGroupKey(groupId, topicIdPartition.topicId(), topicIdPartition.partition());</span>
+<span class="nc" id="L389">                delayedRequestNotifier.accept(delayedShareFetchKey);</span>
+
+<span class="nc" id="L391">                futures.put(topicIdPartition, future);</span>
+<span class="nc" id="L392">            } else {</span>
+<span class="nc" id="L393">                futures.put(topicIdPartition, CompletableFuture.completedFuture(Errors.UNKNOWN_TOPIC_OR_PARTITION.exception()));</span>
+            }
+<span class="nc" id="L395">        });</span>
+
+        // Update the metrics for the topics for which we have received an acknowledgement.
+<span class="nc" id="L398">        topics.forEach(topic -&gt; {</span>
+<span class="nc" id="L399">            brokerTopicStats.allTopicsStats().totalShareAcknowledgementRequestRate().mark();</span>
+<span class="nc" id="L400">            brokerTopicStats.topicStats(topic).totalShareAcknowledgementRequestRate().mark();</span>
+<span class="nc" id="L401">        });</span>
+
+<span class="nc" id="L403">        return mapAcknowledgementFutures(futures, Optional.of(failedShareAcknowledgeMetricsHandler()));</span>
+    }
+
+    /**
+     * The release session method is used to release the session for the memberId of respective group.
+     * The method post removing session also releases acquired records for the respective member.
+     * The method returns a future that will be completed with the release response.
+     *
+     * @param groupId The group id, this is used to identify the share group.
+     * @param memberId The member id is used to identify the client.
+     *
+     * @return A future that will be completed with the release response.
+     */
+    public CompletableFuture&lt;Map&lt;TopicIdPartition, ShareAcknowledgeResponseData.PartitionData&gt;&gt; releaseSession(
+        String groupId,
+        String memberId
+    ) {
+<span class="nc" id="L420">        log.trace(&quot;Release session request for groupId: {}, memberId: {}&quot;, groupId, memberId);</span>
+<span class="nc" id="L421">        List&lt;TopicIdPartition&gt; topicIdPartitions = cachedTopicIdPartitionsInShareSession(</span>
+            groupId, memberId);
+        // Remove the share session from the cache.
+<span class="nc" id="L424">        ShareSessionKey key = shareSessionKey(groupId, memberId);</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        if (cache.remove(key) == null) {</span>
+<span class="nc" id="L426">            log.error(&quot;Share session error for {}: no such share session found&quot;, key);</span>
+<span class="nc" id="L427">            return CompletableFuture.failedFuture(Errors.SHARE_SESSION_NOT_FOUND.exception());</span>
+        } else {
+<span class="nc" id="L429">            log.debug(&quot;Removed share session with key {}&quot;, key);</span>
+        }
+
+        // Additionally release the acquired records for the respective member.
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        if (topicIdPartitions.isEmpty()) {</span>
+<span class="nc" id="L434">            return CompletableFuture.completedFuture(Map.of());</span>
+        }
+
+<span class="nc" id="L437">        Map&lt;TopicIdPartition, CompletableFuture&lt;Throwable&gt;&gt; futuresMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L438">        topicIdPartitions.forEach(topicIdPartition -&gt; {</span>
+<span class="nc" id="L439">            SharePartitionKey sharePartitionKey = sharePartitionKey(groupId, topicIdPartition);</span>
+<span class="nc" id="L440">            SharePartition sharePartition = partitionCache.get(sharePartitionKey);</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (sharePartition == null) {</span>
+<span class="nc" id="L442">                log.error(&quot;No share partition found for groupId {} topicPartition {} while releasing acquired topic partitions&quot;, groupId, topicIdPartition);</span>
+<span class="nc" id="L443">                futuresMap.put(topicIdPartition, CompletableFuture.completedFuture(Errors.UNKNOWN_TOPIC_OR_PARTITION.exception()));</span>
+            } else {
+<span class="nc" id="L445">                CompletableFuture&lt;Throwable&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L446">                sharePartition.releaseAcquiredRecords(memberId).whenComplete((result, throwable) -&gt; {</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">                    if (throwable != null) {</span>
+<span class="nc" id="L448">                        fencedSharePartitionHandler().accept(sharePartitionKey, throwable);</span>
+<span class="nc" id="L449">                        future.complete(throwable);</span>
+<span class="nc" id="L450">                        return;</span>
+                    }
+<span class="nc" id="L452">                    future.complete(null);</span>
+<span class="nc" id="L453">                });</span>
+                // If we have a release acquired request completed for a topic-partition, then we should check if
+                // there is a pending share fetch request for the topic-partition and complete it.
+<span class="nc" id="L456">                DelayedShareFetchKey delayedShareFetchKey = new DelayedShareFetchGroupKey(groupId, topicIdPartition.topicId(), topicIdPartition.partition());</span>
+<span class="nc" id="L457">                delayedRequestNotifier.accept(delayedShareFetchKey);</span>
+
+<span class="nc" id="L459">                futuresMap.put(topicIdPartition, future);</span>
+            }
+<span class="nc" id="L461">        });</span>
+
+<span class="nc" id="L463">        return mapAcknowledgementFutures(futuresMap, Optional.empty());</span>
+    }
+
+    /**
+     * The method creates a timer task to delay the share fetch request for maxWaitMs duration.
+     * A future is created and returned which will be completed when the timer task is completed.
+     *
+     * @param maxWaitMs The duration after which the timer task will be completed.
+     *
+     * @return A future that will be completed when the timer task is completed.
+     */
+    public CompletableFuture&lt;Void&gt; createIdleShareFetchTimerTask(long maxWaitMs) {
+<span class="nc" id="L475">        CompletableFuture&lt;Void&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L476">        TimerTask idleShareFetchTimerTask = new IdleShareFetchTimerTask(maxWaitMs, future);</span>
+<span class="nc" id="L477">        replicaManager.addShareFetchTimerRequest(idleShareFetchTimerTask);</span>
+<span class="nc" id="L478">        return future;</span>
+    }
+
+    private CompletableFuture&lt;Map&lt;TopicIdPartition, ShareAcknowledgeResponseData.PartitionData&gt;&gt; mapAcknowledgementFutures(
+        Map&lt;TopicIdPartition, CompletableFuture&lt;Throwable&gt;&gt; futuresMap,
+        Optional&lt;Consumer&lt;Set&lt;String&gt;&gt;&gt; failedMetricsHandler
+    ) {
+<span class="nc" id="L485">        CompletableFuture&lt;Void&gt; allFutures = CompletableFuture.allOf(</span>
+<span class="nc" id="L486">            futuresMap.values().toArray(new CompletableFuture&lt;?&gt;[0]));</span>
+<span class="nc" id="L487">        return allFutures.thenApply(v -&gt; {</span>
+<span class="nc" id="L488">            Map&lt;TopicIdPartition, ShareAcknowledgeResponseData.PartitionData&gt; result = new HashMap&lt;&gt;();</span>
+            // Keep the set as same topic might appear multiple times. Multiple partitions can fail for same topic.
+<span class="nc" id="L490">            Set&lt;String&gt; failedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L491">            futuresMap.forEach((topicIdPartition, future) -&gt; {</span>
+<span class="nc" id="L492">                ShareAcknowledgeResponseData.PartitionData partitionData = new ShareAcknowledgeResponseData.PartitionData()</span>
+<span class="nc" id="L493">                    .setPartitionIndex(topicIdPartition.partition());</span>
+<span class="nc" id="L494">                Throwable t = future.join();</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">                if (t != null) {</span>
+<span class="nc" id="L496">                    partitionData.setErrorCode(Errors.forException(t).code())</span>
+<span class="nc" id="L497">                        .setErrorMessage(t.getMessage());</span>
+<span class="nc" id="L498">                    failedTopics.add(topicIdPartition.topic());</span>
+                }
+<span class="nc" id="L500">                result.put(topicIdPartition, partitionData);</span>
+<span class="nc" id="L501">            });</span>
+<span class="nc" id="L502">            failedMetricsHandler.ifPresent(handler -&gt; handler.accept(failedTopics));</span>
+<span class="nc" id="L503">            return result;</span>
+        });
+    }
+
+    /**
+     * The newContext method is used to create a new share fetch context for every share fetch request.
+     * @param groupId The group id in the share fetch request.
+     * @param shareFetchData The topic-partitions in the share fetch request.
+     * @param toForget The topic-partitions to forget present in the share fetch request.
+     * @param memberId The member id in the share fetch request.
+     * @param shareSessionEpoch The epoch of share session utilized in the share fetch request.
+     * @param isAcknowledgeDataPresent This tells whether the fetch request received includes piggybacked acknowledgements or not.
+     * @param clientConnectionId The client connection id.
+     * @return The new share fetch context object
+     */
+    public ShareFetchContext newContext(
+        String groupId,
+        List&lt;TopicIdPartition&gt; shareFetchData,
+        List&lt;TopicIdPartition&gt; toForget,
+        String memberId,
+        int shareSessionEpoch,
+        Boolean isAcknowledgeDataPresent,
+        String clientConnectionId
+    ) {
+        ShareFetchContext context;
+        // If the request's epoch is FINAL_EPOCH or INITIAL_EPOCH, we should remove the existing sessions. Also, start a
+        // new session in case it is INITIAL_EPOCH. Hence, we need to treat them as special cases.
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        if (isFull(shareSessionEpoch)) {</span>
+<span class="nc" id="L531">            ShareSessionKey key = shareSessionKey(groupId, memberId);</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">            if (shareSessionEpoch == ShareRequestMetadata.FINAL_EPOCH) {</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">                if (cache.get(key) == null) {</span>
+<span class="nc" id="L534">                    log.error(&quot;Share session error for {}: no such share session found&quot;, key);</span>
+<span class="nc" id="L535">                    throw Errors.SHARE_SESSION_NOT_FOUND.exception();</span>
+                }
+<span class="nc" id="L537">                context = new FinalContext();</span>
+            } else {
+<span class="nc bnc" id="L539" title="All 2 branches missed.">                if (isAcknowledgeDataPresent) {</span>
+<span class="nc" id="L540">                    log.error(&quot;Acknowledge data present in Initial Fetch Request for group {} member {}&quot;, groupId, memberId);</span>
+<span class="nc" id="L541">                    throw Errors.INVALID_REQUEST.exception();</span>
+                }
+                // The remove and the subsequent create must happen atomically under the cache's lock.
+                ShareSessionKey responseShareSessionKey;
+<span class="nc" id="L545">                synchronized (cache) {</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">                    if (cache.remove(key) != null) {</span>
+<span class="nc" id="L547">                        log.debug(&quot;Removed share session with key {}&quot;, key);</span>
+                    }
+<span class="nc" id="L549">                    ImplicitLinkedHashCollection&lt;CachedSharePartition&gt; cachedSharePartitions = new</span>
+<span class="nc" id="L550">                            ImplicitLinkedHashCollection&lt;&gt;(shareFetchData.size());</span>
+<span class="nc" id="L551">                    shareFetchData.forEach(topicIdPartition -&gt;</span>
+<span class="nc" id="L552">                        cachedSharePartitions.mustAdd(new CachedSharePartition(topicIdPartition, false)));</span>
+<span class="nc" id="L553">                    responseShareSessionKey = cache.maybeCreateSession(groupId, memberId,</span>
+                        cachedSharePartitions, clientConnectionId);
+<span class="nc" id="L555">                }</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">                if (responseShareSessionKey == null) {</span>
+<span class="nc" id="L557">                    log.error(&quot;Could not create a share session for group {} member {}&quot;, groupId, memberId);</span>
+<span class="nc" id="L558">                    throw Errors.SHARE_SESSION_LIMIT_REACHED.exception();</span>
+                }
+
+<span class="nc" id="L561">                context = new ShareSessionContext(shareSessionEpoch, shareFetchData);</span>
+<span class="nc" id="L562">                log.debug(&quot;Created a new ShareSessionContext with key {} isSubsequent {} returning {}. A new share &quot; +</span>
+<span class="nc" id="L563">                        &quot;session will be started.&quot;, responseShareSessionKey, false,</span>
+<span class="nc" id="L564">                        partitionsToLogString(shareFetchData));</span>
+            }
+<span class="nc" id="L566">        } else {</span>
+            // We update the already existing share session.
+<span class="nc" id="L568">            synchronized (cache) {</span>
+<span class="nc" id="L569">                ShareSessionKey key = shareSessionKey(groupId, memberId);</span>
+<span class="nc" id="L570">                ShareSession shareSession = cache.get(key);</span>
+<span class="nc bnc" id="L571" title="All 2 branches missed.">                if (shareSession == null) {</span>
+<span class="nc" id="L572">                    log.error(&quot;Share session error for {}: no such share session found&quot;, key);</span>
+<span class="nc" id="L573">                    throw Errors.SHARE_SESSION_NOT_FOUND.exception();</span>
+                }
+<span class="nc bnc" id="L575" title="All 2 branches missed.">                if (shareSession.epoch != shareSessionEpoch) {</span>
+<span class="nc" id="L576">                    log.debug(&quot;Share session error for {}: expected epoch {}, but got {} instead&quot;, key,</span>
+<span class="nc" id="L577">                            shareSession.epoch, shareSessionEpoch);</span>
+<span class="nc" id="L578">                    throw Errors.INVALID_SHARE_SESSION_EPOCH.exception();</span>
+                }
+<span class="nc" id="L580">                Map&lt;ShareSession.ModifiedTopicIdPartitionType, List&lt;TopicIdPartition&gt;&gt; modifiedTopicIdPartitions = shareSession.update(</span>
+                    shareFetchData, toForget);
+<span class="nc" id="L582">                cache.updateNumPartitions(shareSession);</span>
+<span class="nc" id="L583">                shareSession.epoch = ShareRequestMetadata.nextEpoch(shareSession.epoch);</span>
+<span class="nc" id="L584">                log.debug(&quot;Created a new ShareSessionContext for session key {}, epoch {}: &quot; +</span>
+<span class="nc" id="L585">                                &quot;added {}, updated {}, removed {}&quot;, shareSession.key(), shareSession.epoch,</span>
+<span class="nc" id="L586">                        partitionsToLogString(modifiedTopicIdPartitions.get(</span>
+                                ShareSession.ModifiedTopicIdPartitionType.ADDED)),
+<span class="nc" id="L588">                        partitionsToLogString(modifiedTopicIdPartitions.get(ShareSession.ModifiedTopicIdPartitionType.UPDATED)),</span>
+<span class="nc" id="L589">                        partitionsToLogString(modifiedTopicIdPartitions.get(ShareSession.ModifiedTopicIdPartitionType.REMOVED))</span>
+                );
+<span class="nc" id="L591">                context = new ShareSessionContext(shareSessionEpoch, shareSession);</span>
+<span class="nc" id="L592">            }</span>
+        }
+<span class="nc" id="L594">        return context;</span>
+    }
+
+    /**
+     * The acknowledgeSessionUpdate method is used to update the request epoch and lastUsed time of the share session.
+     * @param groupId The group id in the share fetch request.
+     * @param memberId The member id in the share fetch request.
+     * @param shareSessionEpoch The epoch of share session utilized in the share fetch request.
+     */
+    public void acknowledgeSessionUpdate(String groupId, String memberId, int shareSessionEpoch) {
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        if (shareSessionEpoch == ShareRequestMetadata.INITIAL_EPOCH) {</span>
+            // ShareAcknowledge Request cannot have epoch as INITIAL_EPOCH (0)
+<span class="nc" id="L606">            throw Errors.INVALID_SHARE_SESSION_EPOCH.exception();</span>
+        } else {
+<span class="nc" id="L608">            synchronized (cache) {</span>
+<span class="nc" id="L609">                ShareSessionKey key = shareSessionKey(groupId, memberId);</span>
+<span class="nc" id="L610">                ShareSession shareSession = cache.get(key);</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">                if (shareSession == null) {</span>
+<span class="nc" id="L612">                    log.debug(&quot;Share session error for {}: no such share session found&quot;, key);</span>
+<span class="nc" id="L613">                    throw Errors.SHARE_SESSION_NOT_FOUND.exception();</span>
+                }
+
+<span class="nc bnc" id="L616" title="All 2 branches missed.">                if (shareSessionEpoch == ShareRequestMetadata.FINAL_EPOCH) {</span>
+                    // If the epoch is FINAL_EPOCH, then return. Do not update the cache.
+<span class="nc" id="L618">                    return;</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">                } else if (shareSession.epoch != shareSessionEpoch) {</span>
+<span class="nc" id="L620">                    log.debug(&quot;Share session error for {}: expected epoch {}, but got {} instead&quot;, key,</span>
+<span class="nc" id="L621">                            shareSession.epoch, shareSessionEpoch);</span>
+<span class="nc" id="L622">                    throw Errors.INVALID_SHARE_SESSION_EPOCH.exception();</span>
+                }
+<span class="nc" id="L624">                cache.updateNumPartitions(shareSession);</span>
+<span class="nc" id="L625">                shareSession.epoch = ShareRequestMetadata.nextEpoch(shareSession.epoch);</span>
+<span class="nc" id="L626">            }</span>
+        }
+<span class="nc" id="L628">    }</span>
+
+    /**
+     * The handler for share version feature metadata changes.
+     * @param shareVersion the new share version feature
+     */
+    public void onShareVersionToggle(ShareVersion shareVersion) {
+        // Clear the cache and remove all share partitions from the cache if the share version does
+        // not support share groups.
+<span class="nc bnc" id="L637" title="All 2 branches missed.">        if (!shareVersion.supportsShareGroups()) {</span>
+<span class="nc" id="L638">            cache.removeAllSessions();</span>
+<span class="nc" id="L639">            Set&lt;SharePartitionKey&gt; sharePartitionKeys = partitionCache.cachedSharePartitionKeys();</span>
+            // Remove all share partitions from partition cache.
+<span class="nc" id="L641">            sharePartitionKeys.forEach(sharePartitionKey -&gt;</span>
+<span class="nc" id="L642">                removeSharePartitionFromCache(sharePartitionKey, partitionCache, metadataProvider, delayedRequestNotifier)</span>
+            );
+        }
+<span class="nc" id="L645">    }</span>
+
+    /**
+     * The cachedTopicIdPartitionsInShareSession method is used to get the cached topic-partitions in the share session.
+     *
+     * @param groupId The group id in the share fetch request.
+     * @param memberId The member id in the share fetch request.
+     *
+     * @return The list of cached topic-partitions in the share session if present, otherwise an empty list.
+     */
+    // Visible for testing.
+    List&lt;TopicIdPartition&gt; cachedTopicIdPartitionsInShareSession(String groupId, String memberId) {
+<span class="nc" id="L657">        ShareSessionKey key = shareSessionKey(groupId, memberId);</span>
+<span class="nc" id="L658">        ShareSession shareSession = cache.get(key);</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">        if (shareSession == null) {</span>
+<span class="nc" id="L660">            return List.of();</span>
+        }
+<span class="nc" id="L662">        List&lt;TopicIdPartition&gt; cachedTopicIdPartitions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L663">        shareSession.partitionMap().forEach(cachedSharePartition -&gt; cachedTopicIdPartitions.add(</span>
+<span class="nc" id="L664">            new TopicIdPartition(cachedSharePartition.topicId(), new TopicPartition(cachedSharePartition.topic(), cachedSharePartition.partition()</span>
+            ))));
+<span class="nc" id="L666">        return cachedTopicIdPartitions;</span>
+    }
+
+    // Add the share fetch request to the delayed share fetch purgatory to process the fetch request if it can be
+    // completed else watch until it can be completed/timeout.
+    private void addDelayedShareFetch(DelayedShareFetch delayedShareFetch, List&lt;DelayedShareFetchKey&gt; keys) {
+<span class="nc" id="L672">        replicaManager.addDelayedShareFetchRequest(delayedShareFetch, keys);</span>
+<span class="nc" id="L673">    }</span>
+
+    @Override
+    public void close() throws Exception {
+<span class="nc" id="L677">        this.timer.close();</span>
+<span class="nc" id="L678">    }</span>
+
+    private ShareSessionKey shareSessionKey(String groupId, String memberId) {
+<span class="nc" id="L681">        return new ShareSessionKey(groupId, memberId);</span>
+    }
+
+    private static String partitionsToLogString(Collection&lt;TopicIdPartition&gt; partitions) {
+<span class="nc" id="L685">        return ShareSession.partitionsToLogString(partitions, log.isTraceEnabled());</span>
+    }
+
+    // Visible for testing.
+    void processShareFetch(ShareFetch shareFetch) {
+<span class="nc bnc" id="L690" title="All 6 branches missed.">        if (shareFetch.topicIdPartitions().isEmpty() || shareFetch.maxFetchRecords() == 0 || shareFetch.fetchParams().maxBytes == 0) {</span>
+            // If there are no partitions or no data requested to fetch then complete the future with an empty map.
+<span class="nc" id="L692">            shareFetch.maybeComplete(Map.of());</span>
+<span class="nc" id="L693">            return;</span>
+        }
+
+<span class="nc" id="L696">        List&lt;DelayedShareFetchKey&gt; delayedShareFetchWatchKeys = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L697">        LinkedHashMap&lt;TopicIdPartition, SharePartition&gt; sharePartitions = new LinkedHashMap&lt;&gt;();</span>
+        // Track the topics for which we have received a share fetch request for metrics.
+<span class="nc" id="L699">        Set&lt;String&gt; topics = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">        for (TopicIdPartition topicIdPartition : shareFetch.topicIdPartitions()) {</span>
+<span class="nc" id="L701">            topics.add(topicIdPartition.topic());</span>
+<span class="nc" id="L702">            SharePartitionKey sharePartitionKey = sharePartitionKey(</span>
+<span class="nc" id="L703">                shareFetch.groupId(),</span>
+                topicIdPartition
+            );
+
+            SharePartition sharePartition;
+            try {
+<span class="nc" id="L709">                sharePartition = getOrCreateSharePartition(sharePartitionKey);</span>
+<span class="nc" id="L710">            } catch (Exception e) {</span>
+<span class="nc" id="L711">                log.debug(&quot;Error processing share fetch request&quot;, e);</span>
+<span class="nc" id="L712">                shareFetch.addErroneous(topicIdPartition, e);</span>
+                // Continue iteration for other partitions in the request.
+<span class="nc" id="L714">                continue;</span>
+<span class="nc" id="L715">            }</span>
+
+            // We add a key corresponding to each share partition in the request in the group so that when there are
+            // acknowledgements/acquisition lock timeout etc., we have a way to perform checkAndComplete for all
+            // such requests which are delayed because of lack of data to acquire for the share partition.
+<span class="nc" id="L720">            DelayedShareFetchKey delayedShareFetchKey = new DelayedShareFetchGroupKey(shareFetch.groupId(),</span>
+<span class="nc" id="L721">                topicIdPartition.topicId(), topicIdPartition.partition());</span>
+<span class="nc" id="L722">            delayedShareFetchWatchKeys.add(delayedShareFetchKey);</span>
+            // We add a key corresponding to each topic partition in the request so that when the HWM is updated
+            // for any topic partition, we have a way to perform checkAndComplete for all such requests which are
+            // delayed because of lack of data to acquire for the topic partition.
+<span class="nc" id="L726">            delayedShareFetchWatchKeys.add(new DelayedShareFetchPartitionKey(topicIdPartition.topicId(), topicIdPartition.partition()));</span>
+
+<span class="nc" id="L728">            CompletableFuture&lt;Void&gt; initializationFuture = sharePartition.maybeInitialize();</span>
+<span class="nc" id="L729">            final boolean initialized = initializationFuture.isDone();</span>
+<span class="nc" id="L730">            initializationFuture.whenComplete((result, throwable) -&gt; {</span>
+<span class="nc bnc" id="L731" title="All 2 branches missed.">                if (throwable != null) {</span>
+<span class="nc" id="L732">                    handleInitializationException(sharePartitionKey, shareFetch, throwable);</span>
+                }
+                // Though the share partition is initialized asynchronously, but if already initialized or
+                // errored then future should be completed immediately. If the initialization is not completed
+                // immediately then the requests might be waiting in purgatory until the share partition
+                // is initialized. Hence, trigger the completion of all pending delayed share fetch requests
+                // for the share partition.
+<span class="nc bnc" id="L739" title="All 2 branches missed.">                if (!initialized) {</span>
+<span class="nc" id="L740">                    shareGroupMetrics.partitionLoadTime(sharePartition.loadStartTimeMs());</span>
+<span class="nc" id="L741">                    delayedRequestNotifier.accept(delayedShareFetchKey);</span>
+                }
+<span class="nc" id="L743">            });</span>
+<span class="nc" id="L744">            sharePartitions.put(topicIdPartition, sharePartition);</span>
+<span class="nc" id="L745">        }</span>
+
+        // Update the metrics for the topics for which we have received a share fetch request.
+<span class="nc" id="L748">        topics.forEach(topic -&gt; {</span>
+<span class="nc" id="L749">            brokerTopicStats.allTopicsStats().totalShareFetchRequestRate().mark();</span>
+<span class="nc" id="L750">            brokerTopicStats.topicStats(topic).totalShareFetchRequestRate().mark();</span>
+<span class="nc" id="L751">        });</span>
+
+        // If all the partitions in the request errored out, then complete the fetch request with an exception.
+<span class="nc bnc" id="L754" title="All 2 branches missed.">        if (shareFetch.errorInAllPartitions()) {</span>
+<span class="nc" id="L755">            shareFetch.maybeComplete(Map.of());</span>
+            // Do not proceed with share fetch processing as all the partitions errored out.
+<span class="nc" id="L757">            return;</span>
+        }
+
+        // Add the share fetch to the delayed share fetch purgatory to process the fetch request.
+        // The request will be added irrespective of whether the share partition is initialized or not.
+        // Once the share partition is initialized, the delayed share fetch will be completed.
+<span class="nc" id="L763">        addDelayedShareFetch(new DelayedShareFetch(shareFetch, replicaManager, logReader, metadataProvider, fencedSharePartitionHandler(), sharePartitions, shareGroupMetrics, time, remoteFetchMaxWaitMs), delayedShareFetchWatchKeys);</span>
+<span class="nc" id="L764">    }</span>
+
+    private SharePartition getOrCreateSharePartition(SharePartitionKey sharePartitionKey) {
+<span class="nc" id="L767">        return partitionCache.computeIfAbsent(sharePartitionKey,</span>
+                k -&gt; {
+<span class="nc" id="L769">                    int leaderEpoch = metadataProvider.leaderEpoch(sharePartitionKey.topicIdPartition());</span>
+                    // Attach listener to Partition which shall invoke partition change handlers.
+                    // However, as there could be multiple share partitions (per group name) for a single topic-partition,
+                    // hence create separate listeners per share partition which holds the share partition key
+                    // to identify the respective share partition.
+<span class="nc" id="L774">                    SharePartitionListener listener = new SharePartitionListener(sharePartitionKey, metadataProvider, delayedRequestNotifier, partitionCache);</span>
+<span class="nc" id="L775">                    metadataProvider.addPartitionListener(sharePartitionKey.topicIdPartition(), listener);</span>
+<span class="nc" id="L776">                    return new SharePartition(</span>
+<span class="nc" id="L777">                            sharePartitionKey.groupId(),</span>
+<span class="nc" id="L778">                            sharePartitionKey.topicIdPartition(),</span>
+                            leaderEpoch,
+                            maxInFlightRecords,
+                            maxDeliveryCount,
+                            defaultRecordLockDurationMs,
+                            timer,
+                            time,
+                            persister,
+                            metadataProvider,
+                            delayedRequestNotifier,
+                            configProvider,
+                            listener,
+                            shareGroupDlqEnableSupplier,
+                            shareGroupDLQManager
+                    );
+                });
+    }
+
+    private void handleInitializationException(
+            SharePartitionKey sharePartitionKey,
+            ShareFetch shareFetch,
+            Throwable throwable) {
+<span class="nc bnc" id="L800" title="All 2 branches missed.">        if (throwable instanceof LeaderNotAvailableException) {</span>
+<span class="nc" id="L801">            log.debug(&quot;The share partition with key {} is not initialized yet&quot;, sharePartitionKey);</span>
+            // Skip any handling for this error as the share partition is still loading. The request
+            // to fetch will be added in purgatory and will be completed once either timed out
+            // or the share partition initialization completes.
+<span class="nc" id="L805">            return;</span>
+        }
+
+        // Remove the partition from the cache as it's failed to initialize.
+<span class="nc" id="L809">        removeSharePartitionFromCache(sharePartitionKey, partitionCache, metadataProvider, delayedRequestNotifier);</span>
+        // The partition initialization failed, so add the partition to the erroneous partitions.
+<span class="nc" id="L811">        log.debug(&quot;Error initializing share partition with key {}&quot;, sharePartitionKey, throwable);</span>
+<span class="nc" id="L812">        shareFetch.addErroneous(sharePartitionKey.topicIdPartition(), throwable);</span>
+<span class="nc" id="L813">    }</span>
+
+    /**
+     * The method returns a BiConsumer that handles share partition exceptions. The BiConsumer accepts
+     * a share partition key and a throwable which specifies the exception.
+     *
+     * @return A BiConsumer that handles share partition exceptions.
+     */
+    private BiConsumer&lt;SharePartitionKey, Throwable&gt; fencedSharePartitionHandler() {
+<span class="nc" id="L822">        return (sharePartitionKey, throwable) -&gt; {</span>
+<span class="nc bnc" id="L823" title="All 8 branches missed.">            if (throwable instanceof NotLeaderOrFollowerException || throwable instanceof FencedStateEpochException ||</span>
+                throwable instanceof GroupIdNotFoundException || throwable instanceof UnknownTopicOrPartitionException) {
+<span class="nc" id="L825">                log.info(&quot;The share partition with key {} is fenced: {}&quot;, sharePartitionKey, throwable.getMessage());</span>
+                // The share partition is fenced hence remove the partition from map and let the client retry.
+                // But surface the error to the client so client might take some action i.e. re-fetch
+                // the metadata and retry the fetch on new leader.
+<span class="nc" id="L829">                removeSharePartitionFromCache(sharePartitionKey, partitionCache, metadataProvider, delayedRequestNotifier);</span>
+            }
+<span class="nc" id="L831">        };</span>
+    }
+
+    private SharePartitionKey sharePartitionKey(String groupId, TopicIdPartition topicIdPartition) {
+<span class="nc" id="L835">        return new SharePartitionKey(groupId, topicIdPartition);</span>
+    }
+
+    /**
+     * Returns true if this is a full share fetch request.
+     */
+    private boolean isFull(int epoch) {
+<span class="nc bnc" id="L842" title="All 4 branches missed.">        return (epoch == ShareRequestMetadata.INITIAL_EPOCH) || (epoch == ShareRequestMetadata.FINAL_EPOCH);</span>
+    }
+
+    private static void removeSharePartitionFromCache(
+        SharePartitionKey sharePartitionKey,
+        SharePartitionCache partitionCache,
+        PartitionMetadataProvider metadataProvider,
+        Consumer&lt;DelayedShareFetchKey&gt; delayedRequestNotifier
+    ) {
+<span class="nc" id="L851">        SharePartition sharePartition = partitionCache.remove(sharePartitionKey);</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">        if (sharePartition != null) {</span>
+<span class="nc" id="L853">            sharePartition.markFenced();</span>
+<span class="nc" id="L854">            metadataProvider.removePartitionListener(sharePartitionKey.topicIdPartition(), sharePartition.listener());</span>
+<span class="nc" id="L855">            delayedRequestNotifier.accept(new DelayedShareFetchGroupKey(sharePartitionKey.groupId(), sharePartitionKey.topicIdPartition()));</span>
+            // Close the share partition to release any resources held by it.
+<span class="nc" id="L857">            sharePartition.close();</span>
+        }
+<span class="nc" id="L859">    }</span>
+
+    /**
+     * The handler to update the failed share acknowledge request metrics.
+     *
+     * @return A Consumer that updates the failed share acknowledge request metrics.
+     */
+    private Consumer&lt;Set&lt;String&gt;&gt; failedShareAcknowledgeMetricsHandler() {
+<span class="nc" id="L867">        return failedTopics -&gt; {</span>
+            // Update failed share acknowledge request metric.
+<span class="nc" id="L869">            failedTopics.forEach(topic -&gt; {</span>
+<span class="nc" id="L870">                brokerTopicStats.allTopicsStats().failedShareAcknowledgementRequestRate().mark();</span>
+<span class="nc" id="L871">                brokerTopicStats.topicStats(topic).failedShareAcknowledgementRequestRate().mark();</span>
+<span class="nc" id="L872">            });</span>
+<span class="nc" id="L873">        };</span>
+    }
+
+    /**
+     * The SharePartitionListener is used to listen for partition events. The share partition is associated with
+     * the topic-partition, we need to handle the partition events for the share partition.
+     * &lt;p&gt;
+     * The partition cache map stores share partitions against share partition key which comprises
+     * group and topic-partition. Instead of maintaining a separate map for topic-partition to share partitions,
+     * we can maintain the share partition key in the listener and create a new listener for each share partition.
+     */
+    static class SharePartitionListener implements PartitionListener {
+
+        private final SharePartitionKey sharePartitionKey;
+        private final PartitionMetadataProvider metadataProvider;
+        private final Consumer&lt;DelayedShareFetchKey&gt; delayedRequestNotifier;
+        private final SharePartitionCache partitionCache;
+
+        SharePartitionListener(
+            SharePartitionKey sharePartitionKey,
+            PartitionMetadataProvider metadataProvider,
+            Consumer&lt;DelayedShareFetchKey&gt; delayedRequestNotifier,
+            SharePartitionCache partitionCache
+<span class="nc" id="L896">        ) {</span>
+<span class="nc" id="L897">            this.sharePartitionKey = sharePartitionKey;</span>
+<span class="nc" id="L898">            this.metadataProvider = metadataProvider;</span>
+<span class="nc" id="L899">            this.delayedRequestNotifier = delayedRequestNotifier;</span>
+<span class="nc" id="L900">            this.partitionCache = partitionCache;</span>
+<span class="nc" id="L901">        }</span>
+
+        @Override
+        public void onFailed(TopicPartition topicPartition) {
+<span class="nc" id="L905">            log.debug(&quot;The share partition failed listener is invoked for the topic-partition: {}, share-partition: {}&quot;,</span>
+                topicPartition, sharePartitionKey);
+<span class="nc" id="L907">            onUpdate(topicPartition);</span>
+<span class="nc" id="L908">        }</span>
+
+        @Override
+        public void onDeleted(TopicPartition topicPartition) {
+<span class="nc" id="L912">            log.debug(&quot;The share partition delete listener is invoked for the topic-partition: {}, share-partition: {}&quot;,</span>
+                topicPartition, sharePartitionKey);
+<span class="nc" id="L914">            onUpdate(topicPartition);</span>
+<span class="nc" id="L915">        }</span>
+
+        @Override
+        public void onBecomingFollower(TopicPartition topicPartition) {
+<span class="nc" id="L919">            log.debug(&quot;The share partition becoming follower listener is invoked for the topic-partition: {}, share-partition: {}&quot;,</span>
+                topicPartition, sharePartitionKey);
+<span class="nc" id="L921">            onUpdate(topicPartition);</span>
+<span class="nc" id="L922">        }</span>
+
+        private void onUpdate(TopicPartition topicPartition) {
+<span class="nc bnc" id="L925" title="All 2 branches missed.">            if (!sharePartitionKey.topicIdPartition().topicPartition().equals(topicPartition)) {</span>
+<span class="nc" id="L926">                log.error(&quot;The share partition listener is invoked for the wrong topic-partition: {}, share-partition: {}&quot;,</span>
+                    topicPartition, sharePartitionKey);
+<span class="nc" id="L928">                return;</span>
+            }
+<span class="nc" id="L930">            removeSharePartitionFromCache(sharePartitionKey, partitionCache, metadataProvider, delayedRequestNotifier);</span>
+<span class="nc" id="L931">        }</span>
+    }
+
+    /**
+     * The ShareGroupListenerImpl is used to listen for group events. The share group is associated
+     * with the group id, need to handle the group events for the share group.
+     */
+<span class="nc" id="L938">    private class ShareGroupListenerImpl implements ShareGroupListener {</span>
+
+        @Override
+        public void onMemberLeave(String groupId, String memberId) {
+<span class="nc" id="L942">            releaseSession(groupId, memberId);</span>
+<span class="nc" id="L943">        }</span>
+
+        @Override
+        public void onGroupEmpty(String groupId) {
+            // Remove all share partitions from the cache. Instead of defining an API in SharePartitionCache
+            // for removing all share partitions for a group, share partitions are removed after fetching
+            // associated topic-partitions from the cache. This is done to mark the share partitions fenced
+            // and remove the listeners from the replica manager.
+<span class="nc" id="L951">            Set&lt;TopicIdPartition&gt; topicIdPartitions = partitionCache.topicIdPartitionsForGroup(groupId);</span>
+<span class="nc bnc" id="L952" title="All 2 branches missed.">            if (topicIdPartitions != null) {</span>
+                // Remove all share partitions from partition cache.
+<span class="nc" id="L954">                topicIdPartitions.forEach(topicIdPartition -&gt;</span>
+<span class="nc" id="L955">                    removeSharePartitionFromCache(new SharePartitionKey(groupId, topicIdPartition), partitionCache, metadataProvider, delayedRequestNotifier)</span>
+                );
+            }
+<span class="nc" id="L958">        }</span>
+    }
+
+    /**
+     * The IdleShareFetchTimerTask creates a timer task for a share fetch request which tries to initialize a new share
+     * session when the share session cache is full. Such a request is delayed for maxWaitMs by passing the corresponding
+     * IdleShareFetchTimerTask to {@link ReplicaManager#delayedShareFetchTimer}.
+     */
+    private static class IdleShareFetchTimerTask extends TimerTask {
+
+        /**
+         * This future is used to complete the share fetch request when the timer task is completed.
+         */
+        private final CompletableFuture&lt;Void&gt; future;
+
+        public IdleShareFetchTimerTask(
+            long delayMs,
+            CompletableFuture&lt;Void&gt; future
+        ) {
+<span class="nc" id="L977">            super(delayMs);</span>
+<span class="nc" id="L978">            this.future = future;</span>
+<span class="nc" id="L979">        }</span>
+
+        /**
+         * The run method which is executed when the timer task expires. This completes the future indicating that the
+         * delay for the corresponding share fetch request is over.
+         */
+        @Override
+        public void run() {
+<span class="nc" id="L987">            future.complete(null);</span>
+<span class="nc" id="L988">        }</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

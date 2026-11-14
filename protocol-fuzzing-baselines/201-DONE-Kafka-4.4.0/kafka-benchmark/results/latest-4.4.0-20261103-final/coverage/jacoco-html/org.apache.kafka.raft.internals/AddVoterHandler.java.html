@@ -1,0 +1,366 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AddVoterHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.raft.internals</a> &gt; <span class="el_source">AddVoterHandler.java</span></div><h1>AddVoterHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.raft.internals;
+
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.feature.SupportedVersionRange;
+import org.apache.kafka.common.message.AddRaftVoterResponseData;
+import org.apache.kafka.common.message.ApiVersionsRequestData;
+import org.apache.kafka.common.message.ApiVersionsResponseData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.ApiVersionsRequest;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.raft.Endpoints;
+import org.apache.kafka.raft.LeaderState;
+import org.apache.kafka.raft.LogOffsetMetadata;
+import org.apache.kafka.raft.RaftUtil;
+import org.apache.kafka.raft.ReplicaKey;
+import org.apache.kafka.raft.VoterSet;
+import org.apache.kafka.server.common.KRaftVersion;
+
+import org.slf4j.Logger;
+
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+
+/**
+ * This type implements the protocol for adding a voter to a KRaft partition.
+ *
+ * The general algorithm for adding a voter to the voter set is:
+ *
+ * 1. Check that the leader has fenced the previous leader(s) by checking that the HWM is known,
+ *    otherwise return the REQUEST_TIMED_OUT error.
+ * 2. Check that the cluster supports kraft.version 1, otherwise return the UNSUPPORTED_VERSION error.
+ * 3. Check that there are no uncommitted voter changes, otherwise return the REQUEST_TIMED_OUT error.
+ * 4. Check that the new voter's id is not part of the existing voter set, otherwise return the
+ *    DUPLICATE_VOTER error.
+ * 5. Send an API_VERSIONS RPC to the first (default) listener to discover the supported
+ *    kraft.version of the new voter.
+ * 6. Check that the new voter supports the current kraft.version, otherwise return the
+ *    INVALID_REQUEST error.
+ * 7. Check that the new voter is caught up to the log end offset of the leader, otherwise return
+ *    a REQUEST_TIMED_OUT error.
+ * 8. Append the updated VotersRecord to the log. The KRaft internal listener will read this
+ *    uncommitted record from the log and add the new voter to the set of voters.
+ * 9. Wait for the VotersRecord to commit using the majority of the new set of voters. Return a
+ *    REQUEST_TIMED_OUT error if it doesn't commit in time.
+ * 10. Send the AddVoter successful response to the client.
+ *
+ * The algorithm above could be improved as part of KAFKA-17147. Instead of returning an error
+ * immediately for 1., 2. and 7., KRaft can wait with a timeout until those invariants are true.
+ */
+public final class AddVoterHandler {
+    private final KRaftControlRecordStateMachine partitionState;
+    private final RequestSender requestSender;
+    private final Time time;
+    private final Logger logger;
+
+    public AddVoterHandler(
+        KRaftControlRecordStateMachine partitionState,
+        RequestSender requestSender,
+        Time time,
+        LogContext logContext
+<span class="nc" id="L80">    ) {</span>
+<span class="nc" id="L81">        this.partitionState = partitionState;</span>
+<span class="nc" id="L82">        this.requestSender = requestSender;</span>
+<span class="nc" id="L83">        this.time = time;</span>
+<span class="nc" id="L84">        this.logger = logContext.logger(AddVoterHandler.class);</span>
+<span class="nc" id="L85">    }</span>
+
+    public CompletionStage&lt;AddRaftVoterResponseData&gt; handleAddVoterRequest(
+        LeaderState&lt;?&gt; leaderState,
+        ReplicaKey voterKey,
+        Endpoints voterEndpoints,
+        boolean ackWhenCommitted,
+        long currentTimeMs
+    ) {
+<span class="nc" id="L94">        var changeVoterState = leaderState.changeVoterState();</span>
+        // Check if there are any pending voter change requests
+<span class="nc bnc" id="L96" title="All 2 branches missed.">        if (changeVoterState.isOperationPending(currentTimeMs)) {</span>
+<span class="nc" id="L97">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L98">                RaftUtil.addVoterResponse(</span>
+                    Errors.REQUEST_TIMED_OUT,
+                    &quot;Request timed out waiting for leader to handle previous voter change request&quot;
+                )
+            );
+        }
+
+        // Check that the leader has established a HWM and committed the current epoch
+<span class="nc" id="L106">        Optional&lt;Long&gt; highWatermark = leaderState.highWatermark().map(LogOffsetMetadata::offset);</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        if (highWatermark.isEmpty()) {</span>
+<span class="nc" id="L108">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L109">                RaftUtil.addVoterResponse(</span>
+                    Errors.REQUEST_TIMED_OUT,
+                    &quot;Request timed out waiting for leader to establish HWM and fence previous voter changes&quot;
+                )
+            );
+        }
+
+        // Check that the cluster supports kraft.version &gt;= 1
+<span class="nc" id="L117">        KRaftVersion kraftVersion = partitionState.lastKraftVersion();</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        if (!kraftVersion.isReconfigSupported()) {</span>
+<span class="nc" id="L119">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L120">                RaftUtil.addVoterResponse(</span>
+                    Errors.UNSUPPORTED_VERSION,
+<span class="nc" id="L122">                    String.format(</span>
+                        &quot;Cluster doesn't support adding voter because the %s feature is %s&quot;,
+<span class="nc" id="L124">                        kraftVersion.featureName(),</span>
+<span class="nc" id="L125">                        kraftVersion.featureLevel()</span>
+                    )
+                )
+            );
+        }
+
+        // Check that there are no uncommitted VotersRecord
+<span class="nc" id="L132">        Optional&lt;LogHistory.Entry&lt;VoterSet&gt;&gt; votersEntry = partitionState.lastVoterSetEntry();</span>
+<span class="nc bnc" id="L133" title="All 4 branches missed.">        if (votersEntry.isEmpty() || votersEntry.get().offset() &gt;= highWatermark.get()) {</span>
+<span class="nc" id="L134">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L135">                RaftUtil.addVoterResponse(</span>
+                    Errors.REQUEST_TIMED_OUT,
+<span class="nc" id="L137">                    String.format(</span>
+                        &quot;Request timed out waiting for voters to commit the latest voter change at %s with HWM %d&quot;,
+<span class="nc" id="L139">                        votersEntry.map(LogHistory.Entry::offset),</span>
+<span class="nc" id="L140">                        highWatermark.get()</span>
+                    )
+                )
+            );
+        }
+
+        // Check that the new voter id is not part of the current voter set
+<span class="nc" id="L147">        VoterSet voters = votersEntry.get().value();</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (voters.voterIds().contains(voterKey.id())) {</span>
+<span class="nc" id="L149">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L150">                RaftUtil.addVoterResponse(</span>
+                    Errors.DUPLICATE_VOTER,
+<span class="nc" id="L152">                    String.format(</span>
+                        &quot;The voter id for %s is already part of the set of voters %s.&quot;,
+                        voterKey,
+<span class="nc" id="L155">                        voters.voterKeys()</span>
+                    )
+                )
+            );
+        }
+
+        // Send API_VERSIONS request to new voter to discover their supported kraft.version range
+<span class="nc" id="L162">        OptionalLong timeout = requestSender.send(</span>
+            voterEndpoints
+<span class="nc" id="L164">                .address(requestSender.listenerName())</span>
+<span class="nc" id="L165">                .map(address -&gt; new Node(voterKey.id(), address.getHostName(), address.getPort()))</span>
+<span class="nc" id="L166">                .orElseThrow(</span>
+<span class="nc" id="L167">                    () -&gt; new IllegalArgumentException(</span>
+<span class="nc" id="L168">                        String.format(</span>
+                            &quot;Provided listeners %s do not contain a listener for %s&quot;,
+                            voterEndpoints,
+<span class="nc" id="L171">                            requestSender.listenerName()</span>
+                        )
+                    )
+                ),
+            this::buildApiVersionsRequest,
+            currentTimeMs
+        );
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        if (timeout.isEmpty()) {</span>
+<span class="nc" id="L179">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L180">                RaftUtil.addVoterResponse(</span>
+                    Errors.REQUEST_TIMED_OUT,
+<span class="nc" id="L182">                    String.format(&quot;New voter %s is not ready to receive requests&quot;, voterKey)</span>
+                )
+            );
+        }
+
+<span class="nc" id="L187">        AddVoterHandlerState state = new AddVoterHandlerState(</span>
+            voterKey,
+            voterEndpoints,
+            ackWhenCommitted,
+<span class="nc" id="L191">            time.timer(timeout.getAsLong())</span>
+        );
+<span class="nc" id="L193">        changeVoterState.resetAddVoterHandlerState(</span>
+            Errors.UNKNOWN_SERVER_ERROR,
+            null,
+<span class="nc" id="L196">            Optional.of(state)</span>
+        );
+
+<span class="nc" id="L199">        return state.future();</span>
+    }
+
+    public boolean handleApiVersionsResponse(
+        LeaderState&lt;?&gt; leaderState,
+        Node source,
+        Errors error,
+        Optional&lt;ApiVersionsResponseData.SupportedFeatureKey&gt; supportedKraftVersions,
+        long currentTimeMs
+    ) {
+<span class="nc" id="L209">        var changeVoterState = leaderState.changeVoterState();</span>
+<span class="nc" id="L210">        var handlerState = changeVoterState.addVoterHandlerState();</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        if (handlerState.isEmpty()) {</span>
+            // There are no pending add operation just ignore the api response
+<span class="nc" id="L213">            return true;</span>
+        }
+
+        // Check that the API_VERSIONS response matches the id of the voter getting added
+<span class="nc" id="L217">        AddVoterHandlerState current = handlerState.get();</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        if (!current.expectingApiResponse(source.id())) {</span>
+<span class="nc" id="L219">            logger.info(</span>
+                &quot;API_VERSIONS response is not expected from {}: voterKey is {}, lastOffset is {}&quot;,
+                source,
+<span class="nc" id="L222">                current.voterKey(),</span>
+<span class="nc" id="L223">                current.lastOffset()</span>
+            );
+
+<span class="nc" id="L226">            return true;</span>
+        }
+
+        // Abort operation if the API_VERSIONS returned an error
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        if (error != Errors.NONE) {</span>
+<span class="nc" id="L231">            logger.info(</span>
+                &quot;Aborting add voter operation for {} at {} since API_VERSIONS returned an error {}&quot;,
+<span class="nc" id="L233">                current.voterKey(),</span>
+<span class="nc" id="L234">                current.voterEndpoints(),</span>
+                error
+            );
+
+<span class="nc" id="L238">            changeVoterState.resetAddVoterHandlerState(</span>
+                Errors.REQUEST_TIMED_OUT,
+<span class="nc" id="L240">                String.format(</span>
+                    &quot;Aborted add voter operation for since API_VERSIONS returned an error %s&quot;,
+                    error
+                ),
+<span class="nc" id="L244">                Optional.empty()</span>
+            );
+
+<span class="nc" id="L247">            return false;</span>
+        }
+
+        // Check that the new voter supports the kraft.version for reconfiguration
+<span class="nc" id="L251">        KRaftVersion kraftVersion = partitionState.lastKraftVersion();</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        if (!validVersionRange(kraftVersion, supportedKraftVersions)) {</span>
+<span class="nc" id="L253">            logger.info(</span>
+                &quot;Aborting add voter operation for {} at {} since kraft.version range {} doesn't &quot; +
+                &quot;support reconfiguration&quot;,
+<span class="nc" id="L256">                current.voterKey(),</span>
+<span class="nc" id="L257">                current.voterEndpoints(),</span>
+                supportedKraftVersions
+            );
+
+<span class="nc" id="L261">            changeVoterState.resetAddVoterHandlerState(</span>
+                Errors.INVALID_REQUEST,
+<span class="nc" id="L263">                String.format(</span>
+                    &quot;Aborted add voter operation for %s since the %s range %s doesn't &quot; +
+                    &quot;support the finalized version %s&quot;,
+<span class="nc" id="L266">                    current.voterKey(),</span>
+                    KRaftVersion.FEATURE_NAME,
+                    supportedKraftVersions
+<span class="nc" id="L269">                        .map(</span>
+<span class="nc" id="L270">                            range -&gt; String.format(</span>
+                                &quot;(min: %s, max: %s&quot;,
+<span class="nc" id="L272">                                range.minVersion(),</span>
+<span class="nc" id="L273">                                range.maxVersion()</span>
+                            )
+                        )
+<span class="nc" id="L276">                        .orElse(&quot;(min: 0, max: 0)&quot;),</span>
+<span class="nc" id="L277">                    kraftVersion.featureLevel()</span>
+                ),
+<span class="nc" id="L279">                Optional.empty()</span>
+            );
+
+<span class="nc" id="L282">            return true;</span>
+        }
+
+        // Check that the new voter is caught up to the LEO to avoid delays in HWM increases
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        if (!leaderState.isReplicaCaughtUp(current.voterKey(), currentTimeMs)) {</span>
+<span class="nc" id="L287">            logger.info(</span>
+                &quot;Aborting add voter operation for {} at {} since it is lagging behind: {}&quot;,
+<span class="nc" id="L289">                current.voterKey(),</span>
+<span class="nc" id="L290">                current.voterEndpoints(),</span>
+<span class="nc" id="L291">                leaderState.getReplicaState(current.voterKey())</span>
+            );
+
+<span class="nc" id="L294">            changeVoterState.resetAddVoterHandlerState(</span>
+                Errors.REQUEST_TIMED_OUT,
+<span class="nc" id="L296">                String.format(</span>
+                    &quot;Aborted add voter operation for %s since it is lagging behind&quot;,
+<span class="nc" id="L298">                    current.voterKey()</span>
+                ),
+<span class="nc" id="L300">                Optional.empty()</span>
+            );
+
+<span class="nc" id="L303">            return true;</span>
+        }
+
+        // Add the new voter to the set of voters and append the record to the log
+<span class="nc" id="L307">        VoterSet newVoters = partitionState</span>
+<span class="nc" id="L308">            .lastVoterSet()</span>
+<span class="nc" id="L309">            .addVoter(</span>
+<span class="nc" id="L310">                VoterSet.VoterNode.of(</span>
+<span class="nc" id="L311">                    current.voterKey(),</span>
+<span class="nc" id="L312">                    current.voterEndpoints(),</span>
+                    new SupportedVersionRange(
+<span class="nc" id="L314">                        supportedKraftVersions.get().minVersion(),</span>
+<span class="nc" id="L315">                        supportedKraftVersions.get().maxVersion()</span>
+                    )
+                )
+            )
+<span class="nc" id="L319">            .orElseThrow(() -&gt;</span>
+<span class="nc" id="L320">                new IllegalStateException(</span>
+<span class="nc" id="L321">                    String.format(</span>
+                        &quot;Unable to add %s to the set of voters %s&quot;,
+<span class="nc" id="L323">                        current.voterKey(),</span>
+<span class="nc" id="L324">                        partitionState.lastVoterSet()</span>
+                    )
+                )
+            );
+<span class="nc" id="L328">        current.setLastOffset(leaderState.appendVotersRecord(newVoters, currentTimeMs));</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        if (!current.ackWhenCommitted()) {</span>
+            // complete the future to send response, but do not reset the state,
+            // since the new voter set is not yet committed
+<span class="nc" id="L332">            current.future().complete(RaftUtil.addVoterResponse(Errors.NONE, null));</span>
+        }
+<span class="nc" id="L334">        return true;</span>
+    }
+
+    public void highWatermarkUpdated(LeaderState&lt;?&gt; leaderState, long highWatermark) {
+<span class="nc" id="L338">        var changeVoterState = leaderState.changeVoterState();</span>
+
+<span class="nc" id="L340">        changeVoterState</span>
+<span class="nc" id="L341">            .addVoterHandlerState()</span>
+<span class="nc" id="L342">            .ifPresent(current -&gt;</span>
+<span class="nc" id="L343">                current.lastOffset().ifPresent(lastOffset -&gt; {</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">                    if (highWatermark &gt; lastOffset) {</span>
+                        // VotersRecord with the added voter was committed; complete the RPC
+<span class="nc" id="L346">                        changeVoterState</span>
+<span class="nc" id="L347">                            .resetAddVoterHandlerState(Errors.NONE, null, Optional.empty());</span>
+                    }
+<span class="nc" id="L349">                })</span>
+            );
+<span class="nc" id="L351">    }</span>
+
+    private ApiVersionsRequestData buildApiVersionsRequest() {
+<span class="nc" id="L354">        return new ApiVersionsRequest.Builder().build().data();</span>
+    }
+
+    private boolean validVersionRange(
+        KRaftVersion finalizedVersion,
+        Optional&lt;ApiVersionsResponseData.SupportedFeatureKey&gt; supportedKraftVersions
+    ) {
+<span class="nc bnc" id="L361" title="All 2 branches missed.">        return supportedKraftVersions.isPresent() &amp;&amp;</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            (supportedKraftVersions.get().minVersion() &lt;= finalizedVersion.featureLevel() &amp;&amp;</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">             supportedKraftVersions.get().maxVersion() &gt;= finalizedVersion.featureLevel());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

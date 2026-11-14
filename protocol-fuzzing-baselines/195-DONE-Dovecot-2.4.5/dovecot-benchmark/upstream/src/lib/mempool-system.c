@@ -1,0 +1,157 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+/* @UNSAFE: whole file */
+
+#include "lib.h"
+#include "safe-memset.h"
+#include "mempool.h"
+
+/*
+ * The system pool is a thin wrapper around calloc() and free().  It exists
+ * to allow direct heap usage via the pool API.
+ *
+ * Implementation
+ * ==============
+ *
+ * Creation
+ * --------
+ *
+ * The system pool is created statically and therefore is available at any
+ * time.
+ *
+ * Allocation, Reallocation & Freeing
+ * ----------------------------------
+ *
+ * The p_malloc(), p_realloc(), and p_free() calls get directed to calloc(),
+ * realloc(), and free().  There is no additional per-allocation information
+ * to track.
+ *
+ * Clearing
+ * --------
+ *
+ * Not supported.  Attempting to clear the system pool will result in a
+ * panic.
+ *
+ * Destruction
+ * -----------
+ *
+ * It is not possible to destroy the system pool.  Any attempt to unref the
+ * pool is a no-op.
+ */
+
+#ifndef HAVE_MALLOC_USABLE_SIZE
+/* no extra includes needed */
+#elif defined (HAVE_MALLOC_NP_H)
+#  include <malloc_np.h> /* FreeBSD */
+#elif defined (HAVE_MALLOC_H)
+#  include <malloc.h> /* Linux */
+#endif
+
+#define CLEAR_CHR 0xde
+
+static const char *pool_system_get_name(pool_t pool);
+static void pool_system_ref(pool_t pool);
+static void pool_system_unref(pool_t *pool);
+static void *pool_system_malloc(pool_t pool, size_t size);
+static void *pool_system_realloc(pool_t pool, void *mem,
+				 size_t old_size, size_t new_size);
+static void pool_system_clear(pool_t pool);
+static size_t pool_system_get_max_easy_alloc_size(pool_t pool);
+
+static struct pool_vfuncs static_system_pool_vfuncs = {
+	pool_system_get_name,
+
+	pool_system_ref,
+	pool_system_unref,
+
+	pool_system_malloc,
+	pool_system_free,
+
+	pool_system_realloc,
+
+	pool_system_clear,
+	pool_system_get_max_easy_alloc_size
+};
+
+struct pool static_system_pool = {
+	.v = &static_system_pool_vfuncs,
+
+	.alloconly_pool = FALSE,
+	.datastack_pool = FALSE
+};
+
+pool_t system_pool = &static_system_pool;
+
+static const char *pool_system_get_name(pool_t pool ATTR_UNUSED)
+{
+	return "system";
+}
+
+static void pool_system_ref(pool_t pool ATTR_UNUSED)
+{
+}
+
+static void pool_system_unref(pool_t *pool ATTR_UNUSED)
+{
+}
+
+static void *pool_system_malloc(pool_t pool ATTR_UNUSED, size_t size)
+{
+	int old_errno = errno;
+	void *mem;
+
+	mem = calloc(size, 1);
+	if (unlikely(mem == NULL)) {
+		i_fatal_status(FATAL_OUTOFMEM, "pool_system_malloc(%zu): "
+			       "Out of memory", size);
+	}
+	errno = old_errno;
+	return mem;
+}
+
+void pool_system_free(pool_t pool ATTR_UNUSED, void *mem)
+{
+	int old_errno = errno;
+
+#if defined(HAVE_MALLOC_USABLE_SIZE) && defined(DEBUG)
+	if (mem != NULL)
+		safe_memset(mem, CLEAR_CHR, malloc_usable_size(mem));
+#endif
+	free(mem);
+	errno = old_errno;
+}
+
+static void *pool_system_realloc(pool_t pool ATTR_UNUSED, void *mem,
+				 size_t old_size, size_t new_size)
+{
+#if defined(HAVE_MALLOC_USABLE_SIZE)
+	i_assert(old_size == SIZE_MAX || mem == NULL ||
+		 old_size <= malloc_usable_size(mem));
+#endif
+
+	int old_errno = errno;
+	mem = realloc(mem, new_size);
+	if (unlikely(mem == NULL)) {
+		i_fatal_status(FATAL_OUTOFMEM, "pool_system_realloc(%zu): "
+			       "Out of memory", new_size);
+	}
+	errno = old_errno;
+
+	if (old_size < new_size) {
+		/* clear new data */
+		memset((char *) mem + old_size, 0, new_size - old_size);
+	}
+
+	return mem;
+}
+
+static void ATTR_NORETURN
+pool_system_clear(pool_t pool ATTR_UNUSED)
+{
+	i_panic("pool_system_clear() must not be called");
+}
+
+static size_t pool_system_get_max_easy_alloc_size(pool_t pool ATTR_UNUSED)
+{
+	return 0;
+}

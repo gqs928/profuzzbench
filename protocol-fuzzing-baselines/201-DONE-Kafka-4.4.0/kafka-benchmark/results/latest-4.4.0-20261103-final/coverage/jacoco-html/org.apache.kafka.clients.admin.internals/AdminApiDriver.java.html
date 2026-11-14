@@ -1,0 +1,562 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AdminApiDriver.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.admin.internals</a> &gt; <span class="el_source">AdminApiDriver.java</span></div><h1>AdminApiDriver.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.admin.internals;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.errors.DisconnectException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.requests.FindCoordinatorRequest.NoBatchedFindCoordinatorsException;
+import org.apache.kafka.common.requests.OffsetFetchRequest.NoBatchedOffsetFetchRequestException;
+import org.apache.kafka.common.utils.internals.ExponentialBackoff;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
+import java.util.function.BiFunction;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * The `KafkaAdminClient`'s internal `Call` primitive is not a good fit for multi-stage
+ * request workflows such as we see with the group coordinator APIs or any request which
+ * needs to be sent to a partition leader. Typically these APIs have two concrete stages:
+ *
+ * 1. Lookup: Find the broker that can fulfill the request (e.g. partition leader or group
+ *            coordinator)
+ * 2. Fulfillment: Send the request to the broker found in the first step
+ *
+ * This is complicated by the fact that `Admin` APIs are typically batched, which
+ * means the Lookup stage may result in a set of brokers. For example, take a `ListOffsets`
+ * request for a set of topic partitions. In the Lookup stage, we will find the partition
+ * leaders for this set of partitions; in the Fulfillment stage, we will group together
+ * partition according to the IDs of the discovered leaders.
+ *
+ * Additionally, the flow between these two stages is bi-directional. We may find after
+ * sending a `ListOffsets` request to an expected leader that there was a leader change.
+ * This would result in a topic partition being sent back to the Lookup stage.
+ *
+ * Managing this complexity by chaining together `Call` implementations is challenging
+ * and messy, so instead we use this class to do the bookkeeping. It handles both the
+ * batching aspect as well as the transitions between the Lookup and Fulfillment stages.
+ *
+ * Note that the interpretation of the `retries` configuration becomes ambiguous
+ * for this kind of pipeline. We could treat it as an overall limit on the number
+ * of requests that can be sent, but that is not very useful because each pipeline
+ * has a minimum number of requests that need to be sent in order to satisfy the request.
+ * Instead, we treat this number of retries independently at each stage so that each
+ * stage has at least one opportunity to complete. So if a user sets `retries=1`, then
+ * the full pipeline can still complete as long as there are no request failures.
+ *
+ * @param &lt;K&gt; The key type, which is also the granularity of the request routing (e.g.
+ *            this could be `TopicPartition` in the case of requests intended for a partition
+ *            leader or the `GroupId` in the case of consumer group requests intended for
+ *            the group coordinator)
+ * @param &lt;V&gt; The fulfillment type for each key (e.g. this could be consumer group state
+ *            when the key type is a consumer `GroupId`)
+ */
+public class AdminApiDriver&lt;K, V&gt; {
+    private final Logger log;
+    private final ExponentialBackoff retryBackoff;
+    private final long deadlineMs;
+    private final AdminApiHandler&lt;K, V&gt; handler;
+    private final AdminApiFuture&lt;K, V&gt; future;
+
+<span class="nc" id="L92">    private final BiMultimap&lt;ApiRequestScope, K&gt; lookupMap = new BiMultimap&lt;&gt;();</span>
+<span class="nc" id="L93">    private final BiMultimap&lt;FulfillmentScope, K&gt; fulfillmentMap = new BiMultimap&lt;&gt;();</span>
+<span class="nc" id="L94">    private final Map&lt;ApiRequestScope, RequestState&gt; requestStates = new HashMap&lt;&gt;();</span>
+
+    public AdminApiDriver(
+        AdminApiHandler&lt;K, V&gt; handler,
+        AdminApiFuture&lt;K, V&gt; future,
+        long deadlineMs,
+        long retryBackoffMs,
+        long retryBackoffMaxMs,
+        LogContext logContext
+<span class="nc" id="L103">    ) {</span>
+<span class="nc" id="L104">        this.handler = handler;</span>
+<span class="nc" id="L105">        this.future = future;</span>
+<span class="nc" id="L106">        this.deadlineMs = deadlineMs;</span>
+<span class="nc" id="L107">        this.retryBackoff = new ExponentialBackoff(</span>
+            retryBackoffMs,
+            CommonClientConfigs.RETRY_BACKOFF_EXP_BASE,
+            retryBackoffMaxMs,
+            CommonClientConfigs.RETRY_BACKOFF_JITTER);
+<span class="nc" id="L112">        this.log = logContext.logger(AdminApiDriver.class);</span>
+
+        // For any lookup keys for which we do not have cached information, we will need to look up
+        // metadata. For all cached keys, they can proceed straight to the fulfillment map.
+        // Note that the cache is only used on the initial calls, and any errors that result
+        // in additional lookups use the full set of lookup keys.
+<span class="nc" id="L118">        future.cachedKeyBrokerIdMapping().forEach((key, brokerId) -&gt; {</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">            if (AdminApiFuture.UNKNOWN_BROKER_ID.equals(brokerId)) {</span>
+<span class="nc" id="L120">                unmap(key);</span>
+            } else {
+<span class="nc" id="L122">                fulfillmentMap.put(new FulfillmentScope(brokerId), key);</span>
+            }
+<span class="nc" id="L124">        });</span>
+<span class="nc" id="L125">    }</span>
+
+    /**
+     * Associate a key with a brokerId. This is called after a response in the Lookup
+     * stage reveals the mapping (e.g. when the `FindCoordinator` tells us the group
+     * coordinator for a specific consumer group).
+     */
+    private void map(K key, Integer brokerId) {
+<span class="nc" id="L133">        lookupMap.remove(key);</span>
+<span class="nc" id="L134">        fulfillmentMap.put(new FulfillmentScope(brokerId), key);</span>
+<span class="nc" id="L135">    }</span>
+
+    /**
+     * Disassociate a key from the currently mapped brokerId. This will send the key
+     * back to the Lookup stage, which will allow us to attempt lookup again.
+     */
+    private void unmap(K key) {
+<span class="nc" id="L142">        fulfillmentMap.remove(key);</span>
+
+<span class="nc" id="L144">        ApiRequestScope lookupScope = handler.lookupStrategy().lookupScope(key);</span>
+<span class="nc" id="L145">        OptionalInt destinationBrokerId = lookupScope.destinationBrokerId();</span>
+
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (destinationBrokerId.isPresent()) {</span>
+<span class="nc" id="L148">            fulfillmentMap.put(new FulfillmentScope(destinationBrokerId.getAsInt()), key);</span>
+        } else {
+<span class="nc" id="L150">            lookupMap.put(handler.lookupStrategy().lookupScope(key), key);</span>
+        }
+<span class="nc" id="L152">    }</span>
+
+    private void clear(Collection&lt;K&gt; keys) {
+<span class="nc" id="L155">        keys.forEach(key -&gt; {</span>
+<span class="nc" id="L156">            lookupMap.remove(key);</span>
+<span class="nc" id="L157">            fulfillmentMap.remove(key);</span>
+<span class="nc" id="L158">        });</span>
+<span class="nc" id="L159">    }</span>
+
+    OptionalInt keyToBrokerId(K key) {
+<span class="nc" id="L162">        Optional&lt;FulfillmentScope&gt; scope = fulfillmentMap.getKey(key);</span>
+<span class="nc" id="L163">        return scope</span>
+<span class="nc" id="L164">            .map(fulfillmentScope -&gt; OptionalInt.of(fulfillmentScope.destinationBrokerId))</span>
+<span class="nc" id="L165">            .orElseGet(OptionalInt::empty);</span>
+    }
+
+    /**
+     * Complete the future associated with the given key exceptionally. After is called,
+     * the key will be taken out of both the Lookup and Fulfillment stages so that request
+     * are not retried.
+     */
+    private void completeExceptionally(Map&lt;K, Throwable&gt; errors) {
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (!errors.isEmpty()) {</span>
+<span class="nc" id="L175">            future.completeExceptionally(errors);</span>
+<span class="nc" id="L176">            clear(errors.keySet());</span>
+        }
+<span class="nc" id="L178">    }</span>
+
+    private void completeLookupExceptionally(Map&lt;K, Throwable&gt; errors) {
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (!errors.isEmpty()) {</span>
+<span class="nc" id="L182">            future.completeLookupExceptionally(errors);</span>
+<span class="nc" id="L183">            clear(errors.keySet());</span>
+        }
+<span class="nc" id="L185">    }</span>
+
+    private void retryLookup(Collection&lt;K&gt; keys) {
+<span class="nc" id="L188">        keys.forEach(this::unmap);</span>
+<span class="nc" id="L189">    }</span>
+
+    /**
+     * Send the keys of a fulfillment request back to the Lookup stage. This is invoked when a
+     * fulfillment request cannot be routed because its target broker is no longer present in the
+     * cluster metadata, for example when a stale entry in the partition leader cache pointed at a
+     * broker that has since left the cluster. Re-running the lookup gives us a chance to discover
+     * the current leader. Without this, such a request would remain unassignable until the request
+     * deadline expires.
+     *
+     * &lt;p&gt;This is a no-op for lookup strategies that target a fixed broker (i.e. the lookup scope
+     * carries a destination broker id, as with {@link StaticBrokerStrategy}), since {@link #unmap}
+     * would simply remap the keys straight back to the same fulfillment broker without making any
+     * progress. In that case this returns {@code false} and the request is left untouched, so the
+     * caller can leave it pending rather than retrying in a loop and exhausting the retry budget.
+     *
+     * @return true if the keys were moved back to the Lookup stage, false if no lookup is possible
+     */
+    public boolean maybeRetryLookup(long currentTimeMs, RequestSpec&lt;K&gt; spec) {
+<span class="nc" id="L208">        boolean canLookup = spec.keys.stream()</span>
+<span class="nc" id="L209">            .anyMatch(key -&gt; handler.lookupStrategy().lookupScope(key).destinationBrokerId().isEmpty());</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        if (!canLookup) {</span>
+<span class="nc" id="L211">            return false;</span>
+        }
+<span class="nc" id="L213">        clearInflightRequest(currentTimeMs, spec);</span>
+<span class="nc" id="L214">        retryLookup(spec.keys);</span>
+<span class="nc" id="L215">        return true;</span>
+    }
+
+    /**
+     * Complete the future associated with the given key. After this is called, all keys will
+     * be taken out of both the Lookup and Fulfillment stages so that request are not retried.
+     */
+    private void complete(Map&lt;K, V&gt; values) {
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (!values.isEmpty()) {</span>
+<span class="nc" id="L224">            future.complete(values);</span>
+<span class="nc" id="L225">            clear(values.keySet());</span>
+        }
+<span class="nc" id="L227">    }</span>
+
+    private void completeLookup(Map&lt;K, Integer&gt; brokerIdMapping) {
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        if (!brokerIdMapping.isEmpty()) {</span>
+<span class="nc" id="L231">            future.completeLookup(brokerIdMapping);</span>
+<span class="nc" id="L232">            brokerIdMapping.forEach(this::map);</span>
+        }
+<span class="nc" id="L234">    }</span>
+
+    /**
+     * Check whether any requests need to be sent. This should be called immediately
+     * after the driver is constructed and then again after each request returns
+     * (i.e. after {@link #onFailure(long, RequestSpec, Throwable)} or
+     * {@link #onResponse(long, RequestSpec, AbstractResponse, Node)}).
+     *
+     * @return A list of requests that need to be sent
+     */
+    public List&lt;RequestSpec&lt;K&gt;&gt; poll() {
+<span class="nc" id="L245">        List&lt;RequestSpec&lt;K&gt;&gt; requests = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L246">        collectLookupRequests(requests);</span>
+<span class="nc" id="L247">        collectFulfillmentRequests(requests);</span>
+<span class="nc" id="L248">        return requests;</span>
+    }
+
+    /**
+     * Callback that is invoked when a `Call` returns a response successfully.
+     */
+    public void onResponse(
+        long currentTimeMs,
+        RequestSpec&lt;K&gt; spec,
+        AbstractResponse response,
+        Node node
+    ) {
+<span class="nc" id="L260">        clearInflightRequest(currentTimeMs, spec);</span>
+
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        if (spec.scope instanceof FulfillmentScope) {</span>
+<span class="nc" id="L263">            AdminApiHandler.ApiResult&lt;K, V&gt; result = handler.handleResponse(</span>
+                node,
+                spec.keys,
+                response
+            );
+<span class="nc" id="L268">            complete(result.completedKeys);</span>
+<span class="nc" id="L269">            completeExceptionally(result.failedKeys);</span>
+<span class="nc" id="L270">            retryLookup(result.unmappedKeys);</span>
+<span class="nc" id="L271">        } else {</span>
+<span class="nc" id="L272">            AdminApiLookupStrategy.LookupResult&lt;K&gt; result = handler.lookupStrategy().handleResponse(</span>
+                spec.keys,
+                response
+            );
+
+<span class="nc" id="L277">            result.completedKeys.forEach(lookupMap::remove);</span>
+<span class="nc" id="L278">            completeLookup(result.mappedKeys);</span>
+<span class="nc" id="L279">            completeLookupExceptionally(result.failedKeys);</span>
+        }
+<span class="nc" id="L281">    }</span>
+
+    /**
+     * Callback that is invoked when a `Call` is failed.
+     */
+    public void onFailure(
+        long currentTimeMs,
+        RequestSpec&lt;K&gt; spec,
+        Throwable t
+    ) {
+<span class="nc" id="L291">        clearInflightRequest(currentTimeMs, spec);</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        if (t instanceof DisconnectException) {</span>
+<span class="nc" id="L293">            log.debug(&quot;Node disconnected before response could be received for request {}. &quot; +</span>
+                &quot;Will attempt retry&quot;, spec.request);
+
+            // After a disconnect, we want the driver to attempt to lookup the key
+            // again. This gives us a chance to find a new coordinator or partition
+            // leader for example.
+<span class="nc" id="L299">            Set&lt;K&gt; keysToUnmap = spec.keys.stream()</span>
+<span class="nc" id="L300">                .filter(future.lookupKeys()::contains)</span>
+<span class="nc" id="L301">                .collect(Collectors.toSet());</span>
+<span class="nc" id="L302">            retryLookup(keysToUnmap);</span>
+
+<span class="nc bnc" id="L304" title="All 4 branches missed.">        } else if (t instanceof NoBatchedFindCoordinatorsException || t instanceof NoBatchedOffsetFetchRequestException) {</span>
+<span class="nc" id="L305">            ((CoordinatorStrategy) handler.lookupStrategy()).disableBatch();</span>
+<span class="nc" id="L306">            Set&lt;K&gt; keysToUnmap = spec.keys.stream()</span>
+<span class="nc" id="L307">                .filter(future.lookupKeys()::contains)</span>
+<span class="nc" id="L308">                .collect(Collectors.toSet());</span>
+<span class="nc" id="L309">            retryLookup(keysToUnmap);</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        } else if (t instanceof UnsupportedVersionException) {</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">            if (spec.scope instanceof FulfillmentScope) {</span>
+<span class="nc" id="L312">                int brokerId = ((FulfillmentScope) spec.scope).destinationBrokerId;</span>
+<span class="nc" id="L313">                Map&lt;K, Throwable&gt; unrecoverableFailures =</span>
+<span class="nc" id="L314">                    handler.handleUnsupportedVersionException(</span>
+                        brokerId,
+                        (UnsupportedVersionException) t,
+                        spec.keys);
+<span class="nc" id="L318">                completeExceptionally(unrecoverableFailures);</span>
+<span class="nc" id="L319">            } else {</span>
+<span class="nc" id="L320">                Map&lt;K, Throwable&gt; unrecoverableLookupFailures =</span>
+<span class="nc" id="L321">                    handler.lookupStrategy().handleUnsupportedVersionException(</span>
+                        (UnsupportedVersionException) t,
+                        spec.keys);
+<span class="nc" id="L324">                completeLookupExceptionally(unrecoverableLookupFailures);</span>
+<span class="nc" id="L325">                Set&lt;K&gt; keysToUnmap = spec.keys.stream()</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                    .filter(k -&gt; !unrecoverableLookupFailures.containsKey(k))</span>
+<span class="nc" id="L327">                    .collect(Collectors.toSet());</span>
+<span class="nc" id="L328">                retryLookup(keysToUnmap);</span>
+<span class="nc" id="L329">            }</span>
+        } else {
+<span class="nc" id="L331">            Map&lt;K, Throwable&gt; errors = spec.keys.stream().collect(Collectors.toMap(</span>
+<span class="nc" id="L332">                Function.identity(),</span>
+<span class="nc" id="L333">                key -&gt; t</span>
+            ));
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (spec.scope instanceof FulfillmentScope) {</span>
+<span class="nc" id="L336">                completeExceptionally(errors);</span>
+            } else {
+<span class="nc" id="L338">                completeLookupExceptionally(errors);</span>
+            }
+        }
+<span class="nc" id="L341">    }</span>
+
+    private void clearInflightRequest(long currentTimeMs, RequestSpec&lt;K&gt; spec) {
+<span class="nc" id="L344">        RequestState requestState = requestStates.get(spec.scope);</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        if (requestState != null) {</span>
+            // Only apply backoff if it's not a retry of a lookup request
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            if (spec.scope instanceof FulfillmentScope) {</span>
+<span class="nc" id="L348">                requestState.clearInflightAndBackoff(currentTimeMs);</span>
+            } else {
+<span class="nc" id="L350">                requestState.clearInflight(currentTimeMs);</span>
+            }
+        }
+<span class="nc" id="L353">    }</span>
+
+    private &lt;T extends ApiRequestScope&gt; void collectRequests(
+        List&lt;RequestSpec&lt;K&gt;&gt; requests,
+        BiMultimap&lt;T, K&gt; multimap,
+        BiFunction&lt;Set&lt;K&gt;, T, Collection&lt;AdminApiHandler.RequestAndKeys&lt;K&gt;&gt;&gt; buildRequest
+    ) {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        for (Map.Entry&lt;T, Set&lt;K&gt;&gt; entry : multimap.entrySet()) {</span>
+<span class="nc" id="L361">            T scope = entry.getKey();</span>
+
+<span class="nc" id="L363">            Set&lt;K&gt; keys = entry.getValue();</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">            if (keys.isEmpty()) {</span>
+<span class="nc" id="L365">                continue;</span>
+            }
+
+<span class="nc" id="L368">            RequestState requestState = requestStates.computeIfAbsent(scope, c -&gt; new RequestState());</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            if (requestState.hasInflight()) {</span>
+<span class="nc" id="L370">                continue;</span>
+            }
+
+            // Copy the keys to avoid exposing the underlying mutable set
+<span class="nc" id="L374">            Set&lt;K&gt; copyKeys = Set.copyOf(keys);</span>
+
+<span class="nc" id="L376">            Collection&lt;AdminApiHandler.RequestAndKeys&lt;K&gt;&gt; newRequests = buildRequest.apply(copyKeys, scope);</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            if (newRequests.isEmpty()) {</span>
+<span class="nc" id="L378">                return;</span>
+            }
+
+            // Only process the first request; all the remaining requests will be targeted at the same broker
+            // and we don't want to issue more than one fulfillment request per broker at a time
+<span class="nc" id="L383">            AdminApiHandler.RequestAndKeys&lt;K&gt; newRequest = newRequests.iterator().next();</span>
+<span class="nc" id="L384">            RequestSpec&lt;K&gt; spec = new RequestSpec&lt;&gt;(</span>
+<span class="nc" id="L385">                handler.apiName() + &quot;(api=&quot; + newRequest.request.apiKey() + &quot;)&quot;,</span>
+                scope,
+                newRequest.keys,
+                newRequest.request,
+                requestState.nextAllowedRetryMs,
+                deadlineMs,
+                requestState.tries
+            );
+
+<span class="nc" id="L394">            requestState.setInflight(spec);</span>
+<span class="nc" id="L395">            requests.add(spec);</span>
+<span class="nc" id="L396">        }</span>
+<span class="nc" id="L397">    }</span>
+
+    private void collectLookupRequests(List&lt;RequestSpec&lt;K&gt;&gt; requests) {
+<span class="nc" id="L400">        collectRequests(</span>
+            requests,
+            lookupMap,
+<span class="nc" id="L403">            (keys, scope) -&gt; Collections.singletonList(new AdminApiHandler.RequestAndKeys&lt;&gt;(handler.lookupStrategy().buildRequest(keys), keys))</span>
+        );
+<span class="nc" id="L405">    }</span>
+
+    private void collectFulfillmentRequests(List&lt;RequestSpec&lt;K&gt;&gt; requests) {
+<span class="nc" id="L408">        collectRequests(</span>
+            requests,
+            fulfillmentMap,
+<span class="nc" id="L411">            (keys, scope) -&gt; handler.buildRequest(scope.destinationBrokerId, keys)</span>
+        );
+<span class="nc" id="L413">    }</span>
+
+    /**
+     * This is a helper class which helps us to map requests that need to be sent
+     * to the internal `Call` implementation that is used internally in
+     * {@link org.apache.kafka.clients.admin.KafkaAdminClient}.
+     */
+    public static class RequestSpec&lt;K&gt; {
+        public final String name;
+        public final ApiRequestScope scope;
+        public final Set&lt;K&gt; keys;
+        public final AbstractRequest.Builder&lt;?&gt; request;
+        public final long nextAllowedTryMs;
+        public final long deadlineMs;
+        public final int tries;
+
+        public RequestSpec(
+            String name,
+            ApiRequestScope scope,
+            Set&lt;K&gt; keys,
+            AbstractRequest.Builder&lt;?&gt; request,
+            long nextAllowedTryMs,
+            long deadlineMs,
+            int tries
+<span class="nc" id="L437">        ) {</span>
+<span class="nc" id="L438">            this.name = name;</span>
+<span class="nc" id="L439">            this.scope = scope;</span>
+<span class="nc" id="L440">            this.keys = keys;</span>
+<span class="nc" id="L441">            this.request = request;</span>
+<span class="nc" id="L442">            this.nextAllowedTryMs = nextAllowedTryMs;</span>
+<span class="nc" id="L443">            this.deadlineMs = deadlineMs;</span>
+<span class="nc" id="L444">            this.tries = tries;</span>
+<span class="nc" id="L445">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L449">            return &quot;RequestSpec(&quot; +</span>
+                &quot;name=&quot; + name +
+                &quot;, scope=&quot; + scope +
+                &quot;, keys=&quot; + keys +
+                &quot;, request=&quot; + request +
+                &quot;, nextAllowedTryMs=&quot; + nextAllowedTryMs +
+                &quot;, deadlineMs=&quot; + deadlineMs +
+                &quot;, tries=&quot; + tries +
+                ')';
+        }
+    }
+
+    /**
+     * Helper class used to track the request state within each request scope.
+     * This class enforces a maximum number of inflight request and keeps track
+     * of backoff/retry state.
+     */
+<span class="nc" id="L466">    private class RequestState {</span>
+<span class="nc" id="L467">        private Optional&lt;RequestSpec&lt;K&gt;&gt; inflightRequest = Optional.empty();</span>
+<span class="nc" id="L468">        private int tries = 0;</span>
+<span class="nc" id="L469">        private long nextAllowedRetryMs = 0;</span>
+
+        boolean hasInflight() {
+<span class="nc" id="L472">            return inflightRequest.isPresent();</span>
+        }
+
+        public void clearInflight(long currentTimeMs) {
+<span class="nc" id="L476">            this.inflightRequest = Optional.empty();</span>
+<span class="nc" id="L477">            this.nextAllowedRetryMs = currentTimeMs;</span>
+<span class="nc" id="L478">        }</span>
+
+        public void clearInflightAndBackoff(long currentTimeMs) {
+<span class="nc bnc" id="L481" title="All 2 branches missed.">            clearInflight(currentTimeMs + retryBackoff.backoff(tries &gt;= 1 ? tries - 1 : 0));</span>
+<span class="nc" id="L482">        }</span>
+
+        public void setInflight(RequestSpec&lt;K&gt; spec) {
+<span class="nc" id="L485">            this.inflightRequest = Optional.of(spec);</span>
+<span class="nc" id="L486">            this.tries++;</span>
+<span class="nc" id="L487">        }</span>
+    }
+
+    /**
+     * Completion of the Lookup stage results in a destination broker to send the
+     * fulfillment request to. Each destination broker in the Fulfillment stage
+     * gets its own request scope.
+     */
+    private static class FulfillmentScope implements ApiRequestScope {
+        public final int destinationBrokerId;
+
+<span class="nc" id="L498">        private FulfillmentScope(int destinationBrokerId) {</span>
+<span class="nc" id="L499">            this.destinationBrokerId = destinationBrokerId;</span>
+<span class="nc" id="L500">        }</span>
+
+        @Override
+        public OptionalInt destinationBrokerId() {
+<span class="nc" id="L504">            return OptionalInt.of(destinationBrokerId);</span>
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L509" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L510" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L511">            FulfillmentScope that = (FulfillmentScope) o;</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">            return destinationBrokerId == that.destinationBrokerId;</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L517">            return Objects.hash(destinationBrokerId);</span>
+        }
+    }
+
+    /**
+     * Helper class which maintains a bi-directional mapping from a key to a set of values.
+     * Each value can map to one and only one key, but many values can be associated with
+     * a single key.
+     *
+     * @param &lt;K&gt; The key type
+     * @param &lt;V&gt; The value type
+     */
+<span class="nc" id="L529">    private static class BiMultimap&lt;K, V&gt; {</span>
+<span class="nc" id="L530">        private final Map&lt;V, K&gt; reverseMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L531">        private final Map&lt;K, Set&lt;V&gt;&gt; map = new HashMap&lt;&gt;();</span>
+
+        void put(K key, V value) {
+<span class="nc" id="L534">            remove(value);</span>
+<span class="nc" id="L535">            reverseMap.put(value, key);</span>
+<span class="nc" id="L536">            map.computeIfAbsent(key, k -&gt; new HashSet&lt;&gt;()).add(value);</span>
+<span class="nc" id="L537">        }</span>
+
+        void remove(V value) {
+<span class="nc" id="L540">            K key = reverseMap.remove(value);</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">            if (key != null) {</span>
+<span class="nc" id="L542">                Set&lt;V&gt; set = map.get(key);</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">                if (set != null) {</span>
+<span class="nc" id="L544">                    set.remove(value);</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">                    if (set.isEmpty()) {</span>
+<span class="nc" id="L546">                        map.remove(key);</span>
+                    }
+                }
+            }
+<span class="nc" id="L550">        }</span>
+
+        Optional&lt;K&gt; getKey(V value) {
+<span class="nc" id="L553">            return Optional.ofNullable(reverseMap.get(value));</span>
+        }
+
+        Set&lt;Map.Entry&lt;K, Set&lt;V&gt;&gt;&gt; entrySet() {
+<span class="nc" id="L557">            return map.entrySet();</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

@@ -1,0 +1,376 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AdminMetadataManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.admin.internals</a> &gt; <span class="el_source">AdminMetadataManager.java</span></div><h1>AdminMetadataManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.clients.admin.internals;
+
+import org.apache.kafka.clients.MetadataUpdater;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.errors.AuthenticationException;
+import org.apache.kafka.common.errors.BootstrapResolutionException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.requests.MetadataResponse;
+import org.apache.kafka.common.requests.RequestHeader;
+import org.apache.kafka.common.requests.RequestUtils;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.net.InetSocketAddress;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * Manages the metadata for KafkaAdminClient.
+ *
+ * This class is not thread-safe.  It is only accessed from the AdminClient
+ * service thread (which also uses the NetworkClient).
+ */
+public class AdminMetadataManager {
+    private final Logger log;
+
+    /**
+     * The minimum amount of time that we should wait between subsequent
+     * retries, when fetching metadata.
+     */
+    private final long refreshBackoffMs;
+
+    /**
+     * The minimum amount of time that we should wait before triggering an
+     * automatic metadata refresh.
+     */
+    private final long metadataExpireMs;
+
+    /**
+     * True if we are communicating directly with the controller quorum as specified by KIP-919.
+     */
+    private final boolean usingBootstrapControllers;
+
+    /**
+     * Used to update the NetworkClient metadata.
+     */
+    private final AdminMetadataUpdater updater;
+
+    /**
+     * The current metadata state.
+     */
+<span class="nc" id="L74">    private State state = State.QUIESCENT;</span>
+
+    /**
+     * The time in wall-clock milliseconds when we last updated the metadata.
+     */
+<span class="nc" id="L79">    private long lastMetadataUpdateMs = 0;</span>
+
+    /**
+     * The time in wall-clock milliseconds when we last attempted to fetch new
+     * metadata.
+     */
+<span class="nc" id="L85">    private long lastMetadataFetchAttemptMs = 0;</span>
+
+    /**
+     * The time in wall-clock milliseconds when we started attempts to fetch metadata. If empty,
+     * metadata has not been requested. This is the start time based on which rebootstrap is
+     * triggered if metadata is not obtained for the configured rebootstrap trigger interval.
+     * Set to Optional.of(0L) to force rebootstrap immediately.
+     */
+<span class="nc" id="L93">    private Optional&lt;Long&gt; metadataAttemptStartMs = Optional.empty();</span>
+
+
+    /**
+     * The current cluster information.
+     */
+<span class="nc" id="L99">    private Cluster cluster = Cluster.empty();</span>
+
+    /**
+     * If this is non-null, it is a fatal exception that will terminate all attempts at communication.
+     */
+<span class="nc" id="L104">    private ApiException fatalException = null;</span>
+
+    /**
+     * If this is non-null, bootstrap DNS resolution permanently failed. Unlike
+     * {@link #fatalException}, this is never cleared so all subsequent API calls see it.
+     * Volatile because it is written by the I/O thread (via the network client) and read by
+     * both the I/O thread and the app thread (via {@link KafkaAdminClient#enqueue}).
+     */
+<span class="nc" id="L112">    private volatile BootstrapResolutionException bootstrapFatalException = null;</span>
+
+    /**
+     * The cluster with which the metadata was bootstrapped.
+     */
+    private Cluster bootstrapCluster;
+
+<span class="nc" id="L119">    public class AdminMetadataUpdater implements MetadataUpdater {</span>
+        @Override
+        public List&lt;Node&gt; fetchNodes() {
+<span class="nc" id="L122">            return cluster.nodes();</span>
+        }
+
+        @Override
+        public boolean isUpdateDue(long now) {
+<span class="nc" id="L127">            return false;</span>
+        }
+
+        @Override
+        public long maybeUpdate(long now) {
+<span class="nc" id="L132">            return Long.MAX_VALUE;</span>
+        }
+
+        @Override
+        public void handleServerDisconnect(long now, String destinationId, Optional&lt;AuthenticationException&gt; maybeFatalException) {
+<span class="nc" id="L137">            maybeFatalException.ifPresent(AdminMetadataManager.this::updateFailed);</span>
+<span class="nc" id="L138">            AdminMetadataManager.this.requestUpdate();</span>
+<span class="nc" id="L139">        }</span>
+
+        @Override
+        public void handleFailedRequest(long now, Optional&lt;KafkaException&gt; maybeFatalException) {
+            // Do nothing
+<span class="nc" id="L144">        }</span>
+
+        @Override
+        public void handleSuccessfulResponse(RequestHeader requestHeader, long now, MetadataResponse metadataResponse) {
+            // Do nothing
+<span class="nc" id="L149">        }</span>
+
+        @Override
+        public boolean needsRebootstrap(long now, long rebootstrapTriggerMs) {
+<span class="nc" id="L153">            return AdminMetadataManager.this.needsRebootstrap(now, rebootstrapTriggerMs);</span>
+        }
+
+        @Override
+        public void rebootstrap(long now) {
+<span class="nc" id="L158">            AdminMetadataManager.this.rebootstrap(now);</span>
+<span class="nc" id="L159">        }</span>
+
+        @Override
+        public void bootstrapFailed(org.apache.kafka.common.KafkaException exception) {
+<span class="nc bnc" id="L163" title="All 2 branches missed.">            if (exception instanceof BootstrapResolutionException) {</span>
+<span class="nc" id="L164">                AdminMetadataManager.this.recordBootstrapFatalException((BootstrapResolutionException) exception);</span>
+            }
+<span class="nc" id="L166">        }</span>
+
+        @Override
+        public boolean isBootstrapped() {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            return bootstrapCluster != null;</span>
+        }
+
+        @Override
+        public void bootstrap(List&lt;InetSocketAddress&gt; addresses) {
+            // The `now` argument is unused when the incoming cluster is bootstrap-configured
+            // (see AdminMetadataManager#update), so we pass 0 rather than plumbing a clock through
+            // the MetadataUpdater interface for a value that would be ignored.
+<span class="nc" id="L178">            AdminMetadataManager.this.update(Cluster.bootstrap(addresses), 0);</span>
+<span class="nc" id="L179">        }</span>
+
+        @Override
+        public void close() {
+<span class="nc" id="L183">        }</span>
+    }
+
+    /**
+     * The current AdminMetadataManager state.
+     */
+<span class="nc" id="L189">    enum State {</span>
+<span class="nc" id="L190">        QUIESCENT,</span>
+<span class="nc" id="L191">        UPDATE_REQUESTED,</span>
+<span class="nc" id="L192">        UPDATE_PENDING</span>
+    }
+
+    public AdminMetadataManager(
+        LogContext logContext,
+        long refreshBackoffMs,
+        long metadataExpireMs,
+        boolean usingBootstrapControllers
+<span class="nc" id="L200">    ) {</span>
+<span class="nc" id="L201">        this.log = logContext.logger(AdminMetadataManager.class);</span>
+<span class="nc" id="L202">        this.refreshBackoffMs = refreshBackoffMs;</span>
+<span class="nc" id="L203">        this.metadataExpireMs = metadataExpireMs;</span>
+<span class="nc" id="L204">        this.usingBootstrapControllers = usingBootstrapControllers;</span>
+<span class="nc" id="L205">        this.updater = new AdminMetadataUpdater();</span>
+<span class="nc" id="L206">    }</span>
+
+    public boolean usingBootstrapControllers() {
+<span class="nc" id="L209">        return usingBootstrapControllers;</span>
+    }
+
+    public AdminMetadataUpdater updater() {
+<span class="nc" id="L213">        return updater;</span>
+    }
+
+    public boolean isBootstrapped() {
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        return bootstrapCluster != null;</span>
+    }
+
+    public BootstrapResolutionException bootstrapFatalException() {
+<span class="nc" id="L221">        return bootstrapFatalException;</span>
+    }
+
+    void recordBootstrapFatalException(BootstrapResolutionException exception) {
+<span class="nc" id="L225">        this.bootstrapFatalException = exception;</span>
+<span class="nc" id="L226">    }</span>
+
+    public boolean isReady() {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (fatalException != null) {</span>
+<span class="nc" id="L230">            log.debug(&quot;Metadata is not usable: failed to get metadata.&quot;, fatalException);</span>
+<span class="nc" id="L231">            throw fatalException;</span>
+        }
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if (cluster.nodes().isEmpty()) {</span>
+<span class="nc" id="L234">            log.trace(&quot;Metadata is not ready: bootstrap nodes have not been &quot; +</span>
+                &quot;initialized yet.&quot;);
+<span class="nc" id="L236">            return false;</span>
+        }
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        if (cluster.isBootstrapConfigured()) {</span>
+<span class="nc" id="L239">            log.trace(&quot;Metadata is not ready: we have not fetched metadata from &quot; +</span>
+                &quot;the bootstrap nodes yet.&quot;);
+<span class="nc" id="L241">            return false;</span>
+        }
+<span class="nc" id="L243">        log.trace(&quot;Metadata is ready to use.&quot;);</span>
+<span class="nc" id="L244">        return true;</span>
+    }
+
+    public Node controller() {
+<span class="nc" id="L248">        return cluster.controller();</span>
+    }
+
+    public Node nodeById(int nodeId) {
+<span class="nc" id="L252">        return cluster.nodeById(nodeId);</span>
+    }
+
+    public void requestUpdate() {
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        if (state == State.QUIESCENT) {</span>
+<span class="nc" id="L257">            state = State.UPDATE_REQUESTED;</span>
+<span class="nc" id="L258">            log.debug(&quot;Requesting metadata update.&quot;);</span>
+        }
+<span class="nc" id="L260">    }</span>
+
+    public void clearController() {
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (cluster.controller() != null) {</span>
+<span class="nc" id="L264">            log.trace(&quot;Clearing cached controller node {}.&quot;, cluster.controller());</span>
+<span class="nc" id="L265">            this.cluster = new Cluster(cluster.clusterResource().clusterId(),</span>
+<span class="nc" id="L266">                cluster.nodes(),</span>
+<span class="nc" id="L267">                Collections.emptySet(),</span>
+<span class="nc" id="L268">                Collections.emptySet(),</span>
+<span class="nc" id="L269">                Collections.emptySet(),</span>
+                null);
+        }
+<span class="nc" id="L272">    }</span>
+
+    /**
+     * Determine if the AdminClient should fetch new metadata.
+     */
+    public long metadataFetchDelayMs(long now) {
+<span class="nc bnc" id="L278" title="All 3 branches missed.">        switch (state) {</span>
+            case QUIESCENT:
+                // Calculate the time remaining until the next periodic update.
+                // We want to avoid making many metadata requests in a short amount of time,
+                // so there is a metadata refresh backoff period.
+<span class="nc" id="L283">                return Math.max(delayBeforeNextAttemptMs(now), delayBeforeNextExpireMs(now));</span>
+            case UPDATE_REQUESTED:
+                // Respect the backoff, even if an update has been requested
+<span class="nc" id="L286">                return delayBeforeNextAttemptMs(now);</span>
+            default:
+                // An update is already pending, so we don't need to initiate another one.
+<span class="nc" id="L289">                return Long.MAX_VALUE;</span>
+        }
+    }
+
+    private long delayBeforeNextExpireMs(long now) {
+<span class="nc" id="L294">        long timeSinceUpdate = now - lastMetadataUpdateMs;</span>
+<span class="nc" id="L295">        return Math.max(0, metadataExpireMs - timeSinceUpdate);</span>
+    }
+
+    private long delayBeforeNextAttemptMs(long now) {
+<span class="nc" id="L299">        long timeSinceAttempt = now - lastMetadataFetchAttemptMs;</span>
+<span class="nc" id="L300">        return Math.max(0, refreshBackoffMs - timeSinceAttempt);</span>
+    }
+
+    public boolean needsRebootstrap(long now, long rebootstrapTriggerMs) {
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        return metadataAttemptStartMs.filter(startMs -&gt; now - startMs &gt; rebootstrapTriggerMs).isPresent();</span>
+    }
+
+    /**
+     * Transition into the UPDATE_PENDING state.  Updates lastMetadataFetchAttemptMs.
+     */
+    public void transitionToUpdatePending(long now) {
+<span class="nc" id="L311">        this.state = State.UPDATE_PENDING;</span>
+<span class="nc" id="L312">        this.lastMetadataFetchAttemptMs = now;</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if (metadataAttemptStartMs.isEmpty())</span>
+<span class="nc" id="L314">            metadataAttemptStartMs = Optional.of(now);</span>
+<span class="nc" id="L315">    }</span>
+
+    public void updateFailed(Throwable exception) {
+        // We depend on pending calls to request another metadata update
+<span class="nc" id="L319">        this.state = State.QUIESCENT;</span>
+
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        if (RequestUtils.isFatalException(exception)) {</span>
+<span class="nc" id="L322">            log.warn(&quot;Fatal error during metadata update&quot;, exception);</span>
+            // avoid unchecked/unconfirmed cast to ApiException
+<span class="nc bnc" id="L324" title="All 2 branches missed.">            if (exception instanceof  ApiException) {</span>
+<span class="nc" id="L325">                this.fatalException = (ApiException) exception;</span>
+            }
+
+<span class="nc bnc" id="L328" title="All 2 branches missed.">            if (exception instanceof UnsupportedVersionException) {</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">                if (usingBootstrapControllers) {</span>
+<span class="nc" id="L330">                    log.warn(&quot;The remote node is not a CONTROLLER that supports the KIP-919 &quot; +</span>
+                        &quot;DESCRIBE_CLUSTER api.&quot;, exception);
+                } else {
+<span class="nc" id="L333">                    log.warn(&quot;The remote node is not a BROKER that supports the METADATA api.&quot;, exception);</span>
+                }
+            }
+        } else {
+<span class="nc" id="L337">            log.info(&quot;Metadata update failed&quot;, exception);</span>
+        }
+<span class="nc" id="L339">    }</span>
+
+    /**
+     * Receive new metadata, and transition into the QUIESCENT state.
+     * Updates lastMetadataUpdateMs, cluster, and authException.
+     */
+    public void update(Cluster cluster, long now) {
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (cluster.isBootstrapConfigured()) {</span>
+<span class="nc" id="L347">            log.debug(&quot;Setting bootstrap cluster metadata {}.&quot;, cluster);</span>
+<span class="nc" id="L348">            bootstrapCluster = cluster;</span>
+        } else {
+<span class="nc" id="L350">            log.debug(&quot;Updating cluster metadata to {}&quot;, cluster);</span>
+<span class="nc" id="L351">            this.lastMetadataUpdateMs = now;</span>
+        }
+
+<span class="nc" id="L354">        this.state = State.QUIESCENT;</span>
+<span class="nc" id="L355">        this.fatalException = null;</span>
+<span class="nc" id="L356">        this.metadataAttemptStartMs = Optional.empty();</span>
+
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        if (!cluster.nodes().isEmpty()) {</span>
+<span class="nc" id="L359">            this.cluster = cluster;</span>
+        }
+<span class="nc" id="L361">    }</span>
+
+    public void initiateRebootstrap() {
+<span class="nc" id="L364">        this.metadataAttemptStartMs = Optional.of(0L);</span>
+<span class="nc" id="L365">    }</span>
+
+    /**
+     * Rebootstrap metadata with the cluster previously used for bootstrapping.
+     */
+    public void rebootstrap(long now) {
+<span class="nc" id="L371">        log.info(&quot;Rebootstrapping with {}&quot;, this.bootstrapCluster);</span>
+<span class="nc" id="L372">        update(bootstrapCluster, now);</span>
+<span class="nc" id="L373">        this.metadataAttemptStartMs = Optional.of(now);</span>
+<span class="nc" id="L374">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

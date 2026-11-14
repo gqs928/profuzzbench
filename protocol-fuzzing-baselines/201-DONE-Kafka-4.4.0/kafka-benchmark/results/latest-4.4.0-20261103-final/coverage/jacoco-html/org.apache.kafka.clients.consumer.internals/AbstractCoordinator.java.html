@@ -1,0 +1,1692 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractCoordinator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">AbstractCoordinator.java</span></div><h1>AbstractCoordinator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.GroupRebalanceConfig;
+import org.apache.kafka.clients.consumer.CloseOptions;
+import org.apache.kafka.clients.consumer.internals.metrics.AbstractConsumerMetricsManager;
+import org.apache.kafka.clients.consumer.internals.metrics.MetricsLedger;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.errors.AuthenticationException;
+import org.apache.kafka.common.errors.DisconnectException;
+import org.apache.kafka.common.errors.FencedInstanceIdException;
+import org.apache.kafka.common.errors.GroupAuthorizationException;
+import org.apache.kafka.common.errors.GroupMaxSizeReachedException;
+import org.apache.kafka.common.errors.IllegalGenerationException;
+import org.apache.kafka.common.errors.InterruptException;
+import org.apache.kafka.common.errors.MemberIdRequiredException;
+import org.apache.kafka.common.errors.RebalanceInProgressException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.UnknownMemberIdException;
+import org.apache.kafka.common.message.FindCoordinatorRequestData;
+import org.apache.kafka.common.message.FindCoordinatorResponseData.Coordinator;
+import org.apache.kafka.common.message.HeartbeatRequestData;
+import org.apache.kafka.common.message.JoinGroupRequestData;
+import org.apache.kafka.common.message.JoinGroupResponseData;
+import org.apache.kafka.common.message.LeaveGroupRequestData.MemberIdentity;
+import org.apache.kafka.common.message.LeaveGroupResponseData.MemberResponse;
+import org.apache.kafka.common.message.SyncGroupRequestData;
+import org.apache.kafka.common.metrics.Measurable;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.CumulativeCount;
+import org.apache.kafka.common.metrics.stats.CumulativeSum;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.metrics.stats.Meter;
+import org.apache.kafka.common.metrics.stats.Rate;
+import org.apache.kafka.common.metrics.stats.WindowedCount;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.FindCoordinatorRequest;
+import org.apache.kafka.common.requests.FindCoordinatorRequest.CoordinatorType;
+import org.apache.kafka.common.requests.FindCoordinatorResponse;
+import org.apache.kafka.common.requests.HeartbeatRequest;
+import org.apache.kafka.common.requests.HeartbeatResponse;
+import org.apache.kafka.common.requests.JoinGroupRequest;
+import org.apache.kafka.common.requests.JoinGroupResponse;
+import org.apache.kafka.common.requests.LeaveGroupRequest;
+import org.apache.kafka.common.requests.LeaveGroupResponse;
+import org.apache.kafka.common.requests.OffsetCommitRequest;
+import org.apache.kafka.common.requests.SyncGroupRequest;
+import org.apache.kafka.common.requests.SyncGroupResponse;
+import org.apache.kafka.common.telemetry.internals.ClientTelemetryProvider;
+import org.apache.kafka.common.telemetry.internals.ClientTelemetryReporter;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.ExponentialBackoff;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.io.Closeable;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation.DEFAULT;
+import static org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation.LEAVE_GROUP;
+
+/**
+ * AbstractCoordinator implements group management for a single group member by interacting with
+ * a designated Kafka broker (the coordinator). Group semantics are provided by extending this class.
+ * See {@link ConsumerCoordinator} for example usage.
+ *
+ * From a high level, Kafka's group management protocol consists of the following sequence of actions:
+ *
+ * &lt;ol&gt;
+ *     &lt;li&gt;Group Registration: Group members register with the coordinator providing their own metadata
+ *         (such as the set of topics they are interested in).&lt;/li&gt;
+ *     &lt;li&gt;Group/Leader Selection: The coordinator select the members of the group and chooses one member
+ *         as the leader.&lt;/li&gt;
+ *     &lt;li&gt;State Assignment: The leader collects the metadata from all the members of the group and
+ *         assigns state.&lt;/li&gt;
+ *     &lt;li&gt;Group Stabilization: Each member receives the state assigned by the leader and begins
+ *         processing.&lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ * To leverage this protocol, an implementation must define the format of metadata provided by each
+ * member for group registration in {@link #metadata()} and the format of the state assignment provided
+ * by the leader in {@link #onLeaderElected(String, String, List, boolean)} and becomes available to members in
+ * {@link #onJoinComplete(int, String, String, ByteBuffer)}.
+ *
+ * Note on locking: this class shares state between the caller and a background thread which is
+ * used for sending heartbeats after the client has joined the group. All mutable state as well as
+ * state transitions are protected with the class's monitor. Generally this means acquiring the lock
+ * before reading or writing the state of the group (e.g. generation, memberId) and holding the lock
+ * when sending a request that affects the state of the group (e.g. JoinGroup, LeaveGroup).
+ */
+public abstract class AbstractCoordinator implements Closeable {
+    public static final String HEARTBEAT_THREAD_PREFIX = &quot;kafka-coordinator-heartbeat-thread&quot;;
+    public static final int JOIN_GROUP_TIMEOUT_LAPSE = 5000;
+
+<span class="nc" id="L127">    protected enum MemberState {</span>
+<span class="nc" id="L128">        UNJOINED,             // the client is not part of a group</span>
+<span class="nc" id="L129">        PREPARING_REBALANCE,  // the client has sent the join group request, but have not received response</span>
+<span class="nc" id="L130">        COMPLETING_REBALANCE, // the client has received join group response, but have not received assignment</span>
+<span class="nc" id="L131">        STABLE;               // the client has joined and is sending heartbeats</span>
+
+        public boolean hasNotJoinedGroup() {
+<span class="nc bnc" id="L134" title="All 4 branches missed.">            return equals(UNJOINED) || equals(PREPARING_REBALANCE);</span>
+        }
+    }
+
+    private final Logger log;
+    private final Heartbeat heartbeat;
+    private final GroupCoordinatorMetrics sensors;
+    private final GroupRebalanceConfig rebalanceConfig;
+    private final Optional&lt;ClientTelemetryReporter&gt; clientTelemetryReporter;
+    private final Optional&lt;Supplier&lt;BaseHeartbeatThread&gt;&gt; heartbeatThreadSupplier;
+
+    protected final Time time;
+    protected final ConsumerNetworkClient client;
+    protected final ExponentialBackoff retryBackoff;
+
+<span class="nc" id="L149">    private Node coordinator = null;</span>
+<span class="nc" id="L150">    private String rejoinReason = &quot;&quot;;</span>
+<span class="nc" id="L151">    private boolean rejoinNeeded = true;</span>
+<span class="nc" id="L152">    private boolean needsJoinPrepare = true;</span>
+<span class="nc" id="L153">    private BaseHeartbeatThread heartbeatThread = null;</span>
+<span class="nc" id="L154">    private RequestFuture&lt;ByteBuffer&gt; joinFuture = null;</span>
+<span class="nc" id="L155">    private RequestFuture&lt;Void&gt; findCoordinatorFuture = null;</span>
+<span class="nc" id="L156">    private volatile RuntimeException fatalFindCoordinatorException = null;</span>
+<span class="nc" id="L157">    private Generation generation = Generation.NO_GENERATION;</span>
+<span class="nc" id="L158">    private long lastRebalanceStartMs = -1L;</span>
+<span class="nc" id="L159">    private long lastRebalanceEndMs = -1L;</span>
+<span class="nc" id="L160">    private long lastTimeOfConnectionMs = -1L; // starting logging a warning only after unable to connect for a while</span>
+
+<span class="nc" id="L162">    protected MemberState state = MemberState.UNJOINED;</span>
+
+
+    /**
+     * Initialize the coordination manager.
+     */
+    public AbstractCoordinator(GroupRebalanceConfig rebalanceConfig,
+                               LogContext logContext,
+                               ConsumerNetworkClient client,
+                               Metrics metrics,
+                               String metricGrpPrefix,
+                               Time time) {
+<span class="nc" id="L174">        this(rebalanceConfig, logContext, client, metrics, metricGrpPrefix, time, Optional.empty(), Optional.empty());</span>
+<span class="nc" id="L175">    }</span>
+
+    public AbstractCoordinator(GroupRebalanceConfig rebalanceConfig,
+                               LogContext logContext,
+                               ConsumerNetworkClient client,
+                               Metrics metrics,
+                               String metricGrpPrefix,
+                               Time time,
+                               Optional&lt;ClientTelemetryReporter&gt; clientTelemetryReporter,
+<span class="nc" id="L184">                               Optional&lt;Supplier&lt;BaseHeartbeatThread&gt;&gt; heartbeatThreadSupplier) {</span>
+<span class="nc" id="L185">        Objects.requireNonNull(rebalanceConfig.groupId,</span>
+                               &quot;Expected a non-null group id for coordinator construction&quot;);
+<span class="nc" id="L187">        this.rebalanceConfig = rebalanceConfig;</span>
+<span class="nc" id="L188">        this.log = logContext.logger(this.getClass());</span>
+<span class="nc" id="L189">        this.client = client;</span>
+<span class="nc" id="L190">        this.time = time;</span>
+<span class="nc" id="L191">        this.retryBackoff = new ExponentialBackoff(</span>
+                rebalanceConfig.retryBackoffMs,
+                CommonClientConfigs.RETRY_BACKOFF_EXP_BASE,
+                rebalanceConfig.retryBackoffMaxMs,
+                CommonClientConfigs.RETRY_BACKOFF_JITTER);
+<span class="nc" id="L196">        this.heartbeat = new Heartbeat(rebalanceConfig, time);</span>
+<span class="nc" id="L197">        this.sensors = new GroupCoordinatorMetrics(metrics, metricGrpPrefix);</span>
+<span class="nc" id="L198">        this.clientTelemetryReporter = clientTelemetryReporter;</span>
+<span class="nc" id="L199">        this.heartbeatThreadSupplier = heartbeatThreadSupplier;</span>
+<span class="nc" id="L200">    }</span>
+
+    /**
+     * Unique identifier for the class of supported protocols (e.g. &quot;consumer&quot; or &quot;connect&quot;).
+     * @return Non-null protocol type name
+     */
+    protected abstract String protocolType();
+
+    /**
+     * Get the current list of protocols and their associated metadata supported
+     * by the local member. The order of the protocols in the list indicates the preference
+     * of the protocol (the first entry is the most preferred). The coordinator takes this
+     * preference into account when selecting the generation protocol (generally more preferred
+     * protocols will be selected as long as all members support them and there is no disagreement
+     * on the preference).
+     * @return Non-empty map of supported protocols and metadata
+     */
+    protected abstract JoinGroupRequestData.JoinGroupRequestProtocolCollection metadata();
+
+    /**
+     * Invoked prior to each group join or rejoin. This is typically used to perform any
+     * cleanup from the previous generation (such as committing offsets for the consumer)
+     * @param timer Timer bounding how long this method can block
+     * @param generation The previous generation or -1 if there was none
+     * @param memberId The identifier of this member in the previous group or &quot;&quot; if there was none
+     * @return true If onJoinPrepare async commit succeeded, false otherwise
+     */
+    protected abstract boolean onJoinPrepare(Timer timer, int generation, String memberId);
+
+    /**
+     * Invoked when the leader is elected. This is used by the leader to perform the assignment
+     * if necessary and to push state to all the members of the group (e.g. to push partition
+     * assignments in the case of the new consumer)
+     * @param leaderId The id of the leader (which is this member)
+     * @param protocol The protocol selected by the coordinator
+     * @param allMemberMetadata Metadata from all members of the group
+     * @param skipAssignment True if leader must skip running the assignor
+     * @return A map from each member to their state assignment
+     */
+    protected abstract Map&lt;String, ByteBuffer&gt; onLeaderElected(String leaderId,
+                                                               String protocol,
+                                                               List&lt;JoinGroupResponseData.JoinGroupResponseMember&gt; allMemberMetadata,
+                                                               boolean skipAssignment);
+
+    /**
+     * Invoked when a group member has successfully joined a group. If this call fails with an exception,
+     * then it will be retried using the same assignment state on the next call to {@link #ensureActiveGroup()}.
+     *
+     * @param generation The generation that was joined
+     * @param memberId The identifier for the local member in the group
+     * @param protocol The protocol selected by the coordinator
+     * @param memberAssignment The assignment propagated from the group leader
+     */
+    protected abstract void onJoinComplete(int generation,
+                                           String memberId,
+                                           String protocol,
+                                           ByteBuffer memberAssignment);
+
+    /**
+     * Invoked prior to each leave group event. This is typically used to cleanup assigned partitions;
+     * note it is triggered by the consumer's API caller thread (i.e. background heartbeat thread would
+     * not trigger it even if it tries to force leaving group upon heartbeat session expiration)
+     */
+<span class="nc" id="L263">    protected void onLeavePrepare() {}</span>
+
+    /**
+     * Ensure that the coordinator is ready to receive requests.
+     *
+     * @param timer Timer bounding how long this method can block
+     * @return true If coordinator discovery and initial connection succeeded, false otherwise
+     */
+    protected synchronized boolean ensureCoordinatorReady(final Timer timer) {
+<span class="nc" id="L272">        return ensureCoordinatorReady(timer, false);</span>
+    }
+
+    /**
+     * Ensure that the coordinator is ready to receive requests. This will return
+     * immediately without blocking. It is intended to be called in an asynchronous
+     * context when wakeups are not expected.
+     *
+     * @return true If coordinator discovery and initial connection succeeded, false otherwise
+     */
+    protected synchronized boolean ensureCoordinatorReadyAsync() {
+<span class="nc" id="L283">        return ensureCoordinatorReady(time.timer(0), true);</span>
+    }
+
+    private synchronized boolean ensureCoordinatorReady(final Timer timer, boolean disableWakeup) {
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        if (!coordinatorUnknown())</span>
+<span class="nc" id="L288">            return true;</span>
+
+<span class="nc" id="L290">        long attempts = 0L;</span>
+        do {
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            if (fatalFindCoordinatorException != null) {</span>
+<span class="nc" id="L293">                final RuntimeException fatalException = fatalFindCoordinatorException;</span>
+<span class="nc" id="L294">                fatalFindCoordinatorException = null;</span>
+<span class="nc" id="L295">                throw fatalException;</span>
+            }
+<span class="nc" id="L297">            final RequestFuture&lt;Void&gt; future = lookupCoordinator();</span>
+<span class="nc" id="L298">            client.poll(future, timer, disableWakeup);</span>
+
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            if (!future.isDone()) {</span>
+                // ran out of time
+<span class="nc" id="L302">                break;</span>
+            }
+
+<span class="nc" id="L305">            RuntimeException fatalException = null;</span>
+
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            if (future.failed()) {</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">                if (future.isRetriable()) {</span>
+<span class="nc" id="L309">                    log.debug(&quot;Coordinator discovery failed, refreshing metadata&quot;, future.exception());</span>
+<span class="nc" id="L310">                    timer.sleep(retryBackoff.backoff(attempts++));</span>
+<span class="nc" id="L311">                    client.awaitMetadataUpdate(timer, disableWakeup);</span>
+                } else {
+<span class="nc" id="L313">                    fatalException = future.exception();</span>
+<span class="nc" id="L314">                    log.info(&quot;FindCoordinator request hit fatal exception&quot;, fatalException);</span>
+                }
+<span class="nc bnc" id="L316" title="All 4 branches missed.">            } else if (coordinator != null &amp;&amp; client.isUnavailable(coordinator)) {</span>
+                // we found the coordinator, but the connection has failed, so mark
+                // it dead and backoff before retrying discovery
+<span class="nc" id="L319">                markCoordinatorUnknown(&quot;coordinator unavailable&quot;);</span>
+<span class="nc" id="L320">                timer.sleep(retryBackoff.backoff(attempts++));</span>
+            }
+
+<span class="nc" id="L323">            clearFindCoordinatorFuture();</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">            if (fatalException != null)</span>
+<span class="nc" id="L325">                throw fatalException;</span>
+<span class="nc bnc" id="L326" title="All 4 branches missed.">        } while (coordinatorUnknown() &amp;&amp; timer.notExpired());</span>
+
+<span class="nc bnc" id="L328" title="All 2 branches missed.">        return !coordinatorUnknown();</span>
+    }
+
+    protected synchronized RequestFuture&lt;Void&gt; lookupCoordinator() {
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        if (findCoordinatorFuture == null) {</span>
+            // find a node to ask about the coordinator
+<span class="nc" id="L334">            Node node = this.client.leastLoadedNode();</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (node == null) {</span>
+<span class="nc" id="L336">                log.debug(&quot;No broker available to send FindCoordinator request&quot;);</span>
+<span class="nc" id="L337">                return RequestFuture.noBrokersAvailable();</span>
+            } else {
+<span class="nc" id="L339">                findCoordinatorFuture = sendFindCoordinatorRequest(node);</span>
+            }
+        }
+<span class="nc" id="L342">        return findCoordinatorFuture;</span>
+    }
+
+    private synchronized void clearFindCoordinatorFuture() {
+<span class="nc" id="L346">        findCoordinatorFuture = null;</span>
+<span class="nc" id="L347">    }</span>
+
+    /**
+     * Check whether the group should be rejoined (e.g. if metadata changes) or whether a
+     * rejoin request is already in flight and needs to be completed.
+     *
+     * @return true if it should, false otherwise
+     */
+    protected synchronized boolean rejoinNeededOrPending() {
+        // if there's a pending joinFuture, we should try to complete handling it.
+<span class="nc bnc" id="L357" title="All 4 branches missed.">        return rejoinNeeded || joinFuture != null;</span>
+    }
+
+    /**
+     * Check the status of the heartbeat thread (if it is active) and indicate the liveness
+     * of the client. This must be called periodically after joining with {@link #ensureActiveGroup()}
+     * to ensure that the member stays in the group. If an interval of time longer than the
+     * provided rebalance timeout expires without calling this method, then the client will proactively
+     * leave the group.
+     *
+     * @param now current time in milliseconds
+     * @throws RuntimeException for unexpected errors raised from the heartbeat thread
+     */
+    protected synchronized void pollHeartbeat(long now) {
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        if (heartbeatThread != null) {</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">            if (heartbeatThread.isFailed()) {</span>
+                // set the heartbeat thread to null and raise an exception. If the user catches it,
+                // the next call to ensureActiveGroup() will spawn a new heartbeat thread.
+<span class="nc" id="L375">                RuntimeException cause = heartbeatThread.failureCause();</span>
+<span class="nc" id="L376">                heartbeatThread = null;</span>
+<span class="nc" id="L377">                throw cause;</span>
+            }
+            // Awake the heartbeat thread if needed
+<span class="nc bnc" id="L380" title="All 2 branches missed.">            if (heartbeat.shouldHeartbeat(now)) {</span>
+<span class="nc" id="L381">                notify();</span>
+            }
+<span class="nc" id="L383">            heartbeat.poll(now);</span>
+        }
+<span class="nc" id="L385">    }</span>
+
+    protected synchronized long timeToNextHeartbeat(long now) {
+        // if we have not joined the group or we are preparing rebalance,
+        // we don't need to send heartbeats
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (state.hasNotJoinedGroup())</span>
+<span class="nc" id="L391">            return Long.MAX_VALUE;</span>
+<span class="nc bnc" id="L392" title="All 4 branches missed.">        if (heartbeatThread != null &amp;&amp; heartbeatThread.isFailed()) {</span>
+            // if an exception occurs in the heartbeat thread, raise it.
+<span class="nc" id="L394">            throw heartbeatThread.failureCause();</span>
+        }
+<span class="nc" id="L396">        return heartbeat.timeToNextHeartbeat(now);</span>
+    }
+
+    /**
+     * Ensure that the group is active (i.e. joined and synced)
+     */
+    public void ensureActiveGroup() {
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        while (!ensureActiveGroup(time.timer(Long.MAX_VALUE))) {</span>
+<span class="nc" id="L404">            log.warn(&quot;still waiting to ensure active group&quot;);</span>
+        }
+<span class="nc" id="L406">    }</span>
+
+    /**
+     * Ensure the group is active (i.e., joined and synced)
+     *
+     * @param timer Timer bounding how long this method can block
+     * @throws KafkaException if the callback throws exception
+     * @return true iff the group is active
+     */
+    boolean ensureActiveGroup(final Timer timer) {
+        // always ensure that the coordinator is ready because we may have been disconnected
+        // when sending heartbeats and does not necessarily require us to rejoin the group.
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        if (!ensureCoordinatorReady(timer)) {</span>
+<span class="nc" id="L419">            return false;</span>
+        }
+
+<span class="nc" id="L422">        startHeartbeatThreadIfNeeded();</span>
+<span class="nc" id="L423">        return joinGroupIfNeeded(timer);</span>
+    }
+
+    private synchronized void startHeartbeatThreadIfNeeded() {
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        if (heartbeatThread == null) {</span>
+<span class="nc" id="L428">            heartbeatThread = heartbeatThreadSupplier.orElse(HeartbeatThread::new).get();</span>
+<span class="nc" id="L429">            heartbeatThread.start();</span>
+        }
+<span class="nc" id="L431">    }</span>
+
+    private void closeHeartbeatThread() {
+        BaseHeartbeatThread thread;
+<span class="nc" id="L435">        synchronized (this) {</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            if (heartbeatThread == null)</span>
+<span class="nc" id="L437">                return;</span>
+<span class="nc" id="L438">            heartbeatThread.close();</span>
+<span class="nc" id="L439">            thread = heartbeatThread;</span>
+<span class="nc" id="L440">            heartbeatThread = null;</span>
+<span class="nc" id="L441">        }</span>
+        try {
+<span class="nc" id="L443">            thread.join();</span>
+<span class="nc" id="L444">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L445">            log.warn(&quot;Interrupted while waiting for consumer heartbeat thread to close&quot;);</span>
+<span class="nc" id="L446">            throw new InterruptException(e);</span>
+<span class="nc" id="L447">        }</span>
+<span class="nc" id="L448">    }</span>
+
+    /**
+     * Joins the group without starting the heartbeat thread.
+     *
+     * If this function returns true, the state must always be in STABLE and heartbeat enabled.
+     * If this function returns false, the state can be in one of the following:
+     *  * UNJOINED: got error response but times out before being able to re-join, heartbeat disabled
+     *  * PREPARING_REBALANCE: not yet received join-group response before timeout, heartbeat disabled
+     *  * COMPLETING_REBALANCE: not yet received sync-group response before timeout, heartbeat enabled
+     *
+     * Visible for testing.
+     *
+     * @param timer Timer bounding how long this method can block
+     * @throws KafkaException if the callback throws exception
+     * @return true iff the operation succeeded
+     */
+    boolean joinGroupIfNeeded(final Timer timer) {
+<span class="nc bnc" id="L466" title="All 2 branches missed.">        while (rejoinNeededOrPending()) {</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">            if (!ensureCoordinatorReady(timer)) {</span>
+<span class="nc" id="L468">                return false;</span>
+            }
+
+            // call onJoinPrepare if needed. We set a flag to make sure that we do not call it a second
+            // time if the client is woken up before a pending rebalance completes. This must be called
+            // on each iteration of the loop because an event requiring a rebalance (such as a metadata
+            // refresh which changes the matched subscription set) can occur while another rebalance is
+            // still in progress.
+<span class="nc bnc" id="L476" title="All 2 branches missed.">            if (needsJoinPrepare) {</span>
+                // need to set the flag before calling onJoinPrepare since the user callback may throw
+                // exception, in which case upon retry we should not retry onJoinPrepare either.
+<span class="nc" id="L479">                needsJoinPrepare = false;</span>
+                // return false when onJoinPrepare is waiting for committing offset
+<span class="nc bnc" id="L481" title="All 2 branches missed.">                if (!onJoinPrepare(timer, generation.generationId, generation.memberId)) {</span>
+<span class="nc" id="L482">                    needsJoinPrepare = true;</span>
+                    //should not initiateJoinGroup if needsJoinPrepare still is true
+<span class="nc" id="L484">                    return false;</span>
+                }
+            }
+
+<span class="nc" id="L488">            final RequestFuture&lt;ByteBuffer&gt; future = initiateJoinGroup();</span>
+<span class="nc" id="L489">            client.poll(future, timer);</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">            if (!future.isDone()) {</span>
+                // we ran out of time
+<span class="nc" id="L492">                return false;</span>
+            }
+
+<span class="nc bnc" id="L495" title="All 2 branches missed.">            if (future.succeeded()) {</span>
+                Generation generationSnapshot;
+                MemberState stateSnapshot;
+
+                // Generation data maybe concurrently cleared by Heartbeat thread.
+                // Can't use synchronized for {@code onJoinComplete}, because it can be long enough
+                // and shouldn't block heartbeat thread.
+                // See {@link PlaintextConsumerTest#testMaxPollIntervalMsDelayInAssignment}
+<span class="nc" id="L503">                synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L504">                    generationSnapshot = this.generation;</span>
+<span class="nc" id="L505">                    stateSnapshot = this.state;</span>
+<span class="nc" id="L506">                }</span>
+
+<span class="nc bnc" id="L508" title="All 4 branches missed.">                if (!hasGenerationReset(generationSnapshot) &amp;&amp; stateSnapshot == MemberState.STABLE) {</span>
+                    // Duplicate the buffer in case `onJoinComplete` does not complete and needs to be retried.
+<span class="nc" id="L510">                    ByteBuffer memberAssignment = future.value().duplicate();</span>
+
+<span class="nc" id="L512">                    onJoinComplete(generationSnapshot.generationId, generationSnapshot.memberId, generationSnapshot.protocolName, memberAssignment);</span>
+
+                    // Generally speaking we should always resetJoinGroupFuture once the future is done, but here
+                    // we can only reset the join group future after the completion callback returns. This ensures
+                    // that if the callback is woken up, we will retry it on the next joinGroupIfNeeded.
+                    // And because of that we should explicitly trigger resetJoinGroupFuture in other conditions below.
+<span class="nc" id="L518">                    resetJoinGroupFuture();</span>
+<span class="nc" id="L519">                    needsJoinPrepare = true;</span>
+<span class="nc" id="L520">                } else {</span>
+<span class="nc" id="L521">                    final String reason = String.format(&quot;rebalance failed since the generation/state was &quot; +</span>
+                            &quot;modified by heartbeat thread to %s/%s before the rebalance callback triggered&quot;,
+                            generationSnapshot, stateSnapshot);
+
+<span class="nc" id="L525">                    resetStateAndRejoin(reason, true);</span>
+<span class="nc" id="L526">                    resetJoinGroupFuture();</span>
+                }
+<span class="nc" id="L528">            } else {</span>
+<span class="nc" id="L529">                final RuntimeException exception = future.exception();</span>
+
+<span class="nc" id="L531">                resetJoinGroupFuture();</span>
+<span class="nc" id="L532">                synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L533">                    final String simpleName = exception.getClass().getSimpleName();</span>
+<span class="nc" id="L534">                    final String shortReason = String.format(&quot;rebalance failed due to %s&quot;, simpleName);</span>
+<span class="nc" id="L535">                    final String fullReason = String.format(&quot;rebalance failed due to '%s' (%s)&quot;,</span>
+<span class="nc" id="L536">                        exception.getMessage(),</span>
+                        simpleName);
+                    // Don't need to request rejoin again for MemberIdRequiredException since we've done that in JoinGroupResponseHandler
+<span class="nc bnc" id="L539" title="All 2 branches missed.">                    if (!(exception instanceof MemberIdRequiredException)) {</span>
+<span class="nc" id="L540">                        requestRejoin(shortReason, fullReason);</span>
+                    }
+<span class="nc" id="L542">                }</span>
+
+<span class="nc bnc" id="L544" title="All 8 branches missed.">                if (exception instanceof UnknownMemberIdException ||</span>
+                        exception instanceof IllegalGenerationException ||
+                        exception instanceof RebalanceInProgressException ||
+                        exception instanceof MemberIdRequiredException)
+<span class="nc" id="L548">                    continue;</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">                else if (!future.isRetriable())</span>
+<span class="nc" id="L550">                    throw exception;</span>
+
+                // We need to return upon expired timer, in case if the client.poll returns immediately and the time
+                // has elapsed.
+<span class="nc bnc" id="L554" title="All 2 branches missed.">                if (timer.isExpired()) {</span>
+<span class="nc" id="L555">                    return false;</span>
+                }
+
+<span class="nc" id="L558">                timer.sleep(rebalanceConfig.retryBackoffMs);</span>
+            }
+<span class="nc" id="L560">        }</span>
+<span class="nc" id="L561">        return true;</span>
+    }
+
+    private synchronized void resetJoinGroupFuture() {
+<span class="nc" id="L565">        this.joinFuture = null;</span>
+<span class="nc" id="L566">    }</span>
+
+    private synchronized RequestFuture&lt;ByteBuffer&gt; initiateJoinGroup() {
+        // we store the join future in case we are woken up by the user after beginning the
+        // rebalance in the call to poll below. This ensures that we do not mistakenly attempt
+        // to rejoin before the pending rebalance has completed.
+<span class="nc bnc" id="L572" title="All 2 branches missed.">        if (joinFuture == null) {</span>
+<span class="nc" id="L573">            state = MemberState.PREPARING_REBALANCE;</span>
+            // a rebalance can be triggered consecutively if the previous one failed,
+            // in this case we would not update the start time.
+<span class="nc bnc" id="L576" title="All 2 branches missed.">            if (lastRebalanceStartMs == -1L)</span>
+<span class="nc" id="L577">                lastRebalanceStartMs = time.milliseconds();</span>
+<span class="nc" id="L578">            joinFuture = sendJoinGroupRequest();</span>
+<span class="nc" id="L579">            joinFuture.addListener(new RequestFutureListener&lt;&gt;() {</span>
+                @Override
+                public void onSuccess(ByteBuffer value) {
+                    // do nothing since all the handler logic are in SyncGroupResponseHandler already
+<span class="nc" id="L583">                }</span>
+
+                @Override
+                public void onFailure(RuntimeException e) {
+                    // we handle failures below after the request finishes. if the join completes
+                    // after having been woken up, the exception is ignored and we will rejoin;
+                    // this can be triggered when either join or sync request failed
+<span class="nc" id="L590">                    synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L591">                        sensors.failedRebalanceSensor.record();</span>
+<span class="nc" id="L592">                    }</span>
+<span class="nc" id="L593">                }</span>
+            });
+        }
+<span class="nc" id="L596">        return joinFuture;</span>
+    }
+
+    /**
+     * Join the group and return the assignment for the next generation. This function handles both
+     * JoinGroup and SyncGroup, delegating to {@link #onLeaderElected(String, String, List, boolean)} if
+     * elected leader by the coordinator.
+     *
+     * NOTE: This is visible only for testing
+     *
+     * @return A request future which wraps the assignment returned from the group leader
+     */
+    RequestFuture&lt;ByteBuffer&gt; sendJoinGroupRequest() {
+<span class="nc bnc" id="L609" title="All 2 branches missed.">        if (coordinatorUnknown())</span>
+<span class="nc" id="L610">            return RequestFuture.coordinatorNotAvailable();</span>
+
+        // send a join group request to the coordinator
+<span class="nc" id="L613">        log.info(&quot;(Re-)joining group&quot;);</span>
+<span class="nc" id="L614">        JoinGroupRequest.Builder requestBuilder = new JoinGroupRequest.Builder(</span>
+                new JoinGroupRequestData()
+<span class="nc" id="L616">                        .setGroupId(rebalanceConfig.groupId)</span>
+<span class="nc" id="L617">                        .setSessionTimeoutMs(this.rebalanceConfig.sessionTimeoutMs)</span>
+<span class="nc" id="L618">                        .setMemberId(this.generation.memberId)</span>
+<span class="nc" id="L619">                        .setGroupInstanceId(this.rebalanceConfig.groupInstanceId.orElse(null))</span>
+<span class="nc" id="L620">                        .setProtocolType(protocolType())</span>
+<span class="nc" id="L621">                        .setProtocols(metadata())</span>
+<span class="nc" id="L622">                        .setRebalanceTimeoutMs(this.rebalanceConfig.rebalanceTimeoutMs)</span>
+<span class="nc" id="L623">                        .setReason(JoinGroupRequest.maybeTruncateReason(this.rejoinReason))</span>
+        );
+
+<span class="nc" id="L626">        log.debug(&quot;Sending JoinGroup ({}) to coordinator {}&quot;, requestBuilder, this.coordinator);</span>
+
+        // Note that we override the request timeout using the rebalance timeout since that is the
+        // maximum time that it may block on the coordinator. We add an extra 5 seconds for small delays.
+<span class="nc" id="L630">        int joinGroupTimeoutMs = Math.max(</span>
+<span class="nc" id="L631">            client.defaultRequestTimeoutMs(),</span>
+<span class="nc" id="L632">            Math.max(</span>
+                rebalanceConfig.rebalanceTimeoutMs + JOIN_GROUP_TIMEOUT_LAPSE,
+                rebalanceConfig.rebalanceTimeoutMs) // guard against overflow since rebalance timeout can be MAX_VALUE
+            );
+<span class="nc" id="L636">        return client.send(coordinator, requestBuilder, joinGroupTimeoutMs)</span>
+<span class="nc" id="L637">                .compose(new JoinGroupResponseHandler(generation));</span>
+    }
+
+    private class JoinGroupResponseHandler extends CoordinatorResponseHandler&lt;JoinGroupResponse, ByteBuffer&gt; {
+<span class="nc" id="L641">        private JoinGroupResponseHandler(final Generation generation) {</span>
+<span class="nc" id="L642">            super(generation);</span>
+<span class="nc" id="L643">        }</span>
+
+        @Override
+        public void handle(JoinGroupResponse joinResponse, RequestFuture&lt;ByteBuffer&gt; future) {
+<span class="nc" id="L647">            Errors error = joinResponse.error();</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">                if (isProtocolTypeInconsistent(joinResponse.data().protocolType())) {</span>
+<span class="nc" id="L650">                    log.error(&quot;JoinGroup failed: Inconsistent Protocol Type, received {} but expected {}&quot;,</span>
+<span class="nc" id="L651">                        joinResponse.data().protocolType(), protocolType());</span>
+<span class="nc" id="L652">                    future.raise(Errors.INCONSISTENT_GROUP_PROTOCOL);</span>
+                } else {
+<span class="nc" id="L654">                    log.debug(&quot;Received successful JoinGroup response: {}&quot;, joinResponse);</span>
+<span class="nc" id="L655">                    sensors.joinSensor.record(response.requestLatencyMs());</span>
+
+<span class="nc" id="L657">                    synchronized (AbstractCoordinator.this) {</span>
+<span class="nc bnc" id="L658" title="All 2 branches missed.">                        if (state != MemberState.PREPARING_REBALANCE) {</span>
+                            // if the consumer was woken up before a rebalance completes, we may have already left
+                            // the group. In this case, we do not want to continue with the sync group.
+<span class="nc" id="L661">                            future.raise(new UnjoinedGroupException());</span>
+                        } else {
+<span class="nc" id="L663">                            state = MemberState.COMPLETING_REBALANCE;</span>
+
+                            // we only need to enable heartbeat thread whenever we transit to
+                            // COMPLETING_REBALANCE state since we always transit from this state to STABLE
+<span class="nc bnc" id="L667" title="All 2 branches missed.">                            if (heartbeatThread != null)</span>
+<span class="nc" id="L668">                                heartbeatThread.enable();</span>
+
+<span class="nc" id="L670">                            AbstractCoordinator.this.generation = new Generation(</span>
+<span class="nc" id="L671">                                joinResponse.data().generationId(),</span>
+<span class="nc" id="L672">                                joinResponse.data().memberId(), joinResponse.data().protocolName());</span>
+
+<span class="nc" id="L674">                            log.info(&quot;Successfully joined group with generation {}&quot;, AbstractCoordinator.this.generation);</span>
+<span class="nc" id="L675">                            clientTelemetryReporter.ifPresent(reporter -&gt; reporter.updateMetricsLabels(</span>
+<span class="nc" id="L676">                                Collections.singletonMap(ClientTelemetryProvider.GROUP_MEMBER_ID, joinResponse.data().memberId())));</span>
+
+<span class="nc bnc" id="L678" title="All 2 branches missed.">                            if (joinResponse.isLeader()) {</span>
+<span class="nc" id="L679">                                onLeaderElected(joinResponse).chain(future);</span>
+                            } else {
+<span class="nc" id="L681">                                onJoinFollower().chain(future);</span>
+                            }
+                        }
+<span class="nc" id="L684">                    }</span>
+                }
+<span class="nc bnc" id="L686" title="All 2 branches missed.">            } else if (error == Errors.COORDINATOR_LOAD_IN_PROGRESS) {</span>
+<span class="nc" id="L687">                log.info(&quot;JoinGroup failed: Coordinator {} is loading the group.&quot;, coordinator());</span>
+                // backoff and retry
+<span class="nc" id="L689">                future.raise(error);</span>
+<span class="nc bnc" id="L690" title="All 2 branches missed.">            } else if (error == Errors.UNKNOWN_MEMBER_ID) {</span>
+<span class="nc" id="L691">                log.info(&quot;JoinGroup failed: {} Need to re-join the group. Sent generation was {}&quot;,</span>
+<span class="nc" id="L692">                         error.message(), sentGeneration);</span>
+                // only need to reset the member id if generation has not been changed,
+                // then retry immediately
+<span class="nc bnc" id="L695" title="All 2 branches missed.">                if (generationUnchanged())</span>
+<span class="nc" id="L696">                    resetStateOnResponseError(ApiKeys.JOIN_GROUP, error, true);</span>
+
+<span class="nc" id="L698">                future.raise(error);</span>
+<span class="nc bnc" id="L699" title="All 4 branches missed.">            } else if (error == Errors.COORDINATOR_NOT_AVAILABLE</span>
+                    || error == Errors.NOT_COORDINATOR) {
+                // re-discover the coordinator and retry with backoff
+<span class="nc" id="L702">                markCoordinatorUnknown(error);</span>
+<span class="nc" id="L703">                log.info(&quot;JoinGroup failed: {} Marking coordinator unknown. Sent generation was {}&quot;,</span>
+<span class="nc" id="L704">                          error.message(), sentGeneration);</span>
+<span class="nc" id="L705">                future.raise(error);</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">            } else if (error == Errors.FENCED_INSTANCE_ID) {</span>
+                // for join-group request, even if the generation has changed we would not expect the instance id
+                // gets fenced, and hence we always treat this as a fatal error
+<span class="nc" id="L709">                log.error(&quot;JoinGroup failed: The group instance id {} has been fenced by another instance. &quot; +</span>
+                              &quot;Sent generation was {}&quot;, rebalanceConfig.groupInstanceId, sentGeneration);
+<span class="nc" id="L711">                future.raise(error);</span>
+<span class="nc bnc" id="L712" title="All 10 branches missed.">            } else if (error == Errors.INCONSISTENT_GROUP_PROTOCOL</span>
+                    || error == Errors.INVALID_SESSION_TIMEOUT
+                    || error == Errors.INVALID_GROUP_ID
+                    || error == Errors.GROUP_AUTHORIZATION_FAILED
+                    || error == Errors.GROUP_MAX_SIZE_REACHED) {
+                // log the error and re-throw the exception
+<span class="nc" id="L718">                log.error(&quot;JoinGroup failed due to fatal error: {}&quot;, error.message());</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">                if (error == Errors.GROUP_MAX_SIZE_REACHED) {</span>
+<span class="nc" id="L720">                    future.raise(new GroupMaxSizeReachedException(&quot;Consumer group &quot; + rebalanceConfig.groupId +</span>
+                            &quot; already has the configured maximum number of members.&quot;));
+<span class="nc bnc" id="L722" title="All 2 branches missed.">                } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L723">                    future.raise(GroupAuthorizationException.forGroupId(rebalanceConfig.groupId));</span>
+                } else {
+<span class="nc" id="L725">                    future.raise(error);</span>
+                }
+<span class="nc bnc" id="L727" title="All 2 branches missed.">            } else if (error == Errors.UNSUPPORTED_VERSION) {</span>
+<span class="nc" id="L728">                log.error(&quot;JoinGroup failed due to unsupported version error. Please unset field group.instance.id &quot; +</span>
+                          &quot;and retry to see if the problem resolves&quot;);
+<span class="nc" id="L730">                future.raise(error);</span>
+<span class="nc bnc" id="L731" title="All 2 branches missed.">            } else if (error == Errors.MEMBER_ID_REQUIRED) {</span>
+                // Broker requires a concrete member id to be allowed to join the group. Update member id
+                // and send another join group request in next cycle.
+<span class="nc" id="L734">                String memberId = joinResponse.data().memberId();</span>
+<span class="nc" id="L735">                log.debug(&quot;JoinGroup failed due to non-fatal error: {}. Will set the member id as {} and then rejoin. &quot; +</span>
+                              &quot;Sent generation was {}&quot;, error, memberId, sentGeneration);
+<span class="nc" id="L737">                synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L738">                    AbstractCoordinator.this.generation = new Generation(OffsetCommitRequest.DEFAULT_GENERATION_ID, memberId, null);</span>
+<span class="nc" id="L739">                }</span>
+<span class="nc" id="L740">                requestRejoin(&quot;need to re-join with the given member-id: &quot; + memberId);</span>
+
+<span class="nc" id="L742">                future.raise(error);</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">            } else if (error == Errors.REBALANCE_IN_PROGRESS) {</span>
+<span class="nc" id="L744">                log.info(&quot;JoinGroup failed due to non-fatal error: REBALANCE_IN_PROGRESS, &quot; +</span>
+                    &quot;which could indicate a replication timeout on the broker. Will retry.&quot;);
+<span class="nc" id="L746">                future.raise(error);</span>
+            } else {
+                // unexpected error, throw the exception
+<span class="nc" id="L749">                log.error(&quot;JoinGroup failed due to unexpected error: {}&quot;, error.message());</span>
+<span class="nc" id="L750">                future.raise(new KafkaException(&quot;Unexpected error in join group response: &quot; + error.message()));</span>
+            }
+<span class="nc" id="L752">        }</span>
+    }
+
+    private RequestFuture&lt;ByteBuffer&gt; onJoinFollower() {
+        // send follower's sync group with an empty assignment
+<span class="nc" id="L757">        SyncGroupRequest.Builder requestBuilder =</span>
+                new SyncGroupRequest.Builder(
+                        new SyncGroupRequestData()
+<span class="nc" id="L760">                                .setGroupId(rebalanceConfig.groupId)</span>
+<span class="nc" id="L761">                                .setMemberId(generation.memberId)</span>
+<span class="nc" id="L762">                                .setProtocolType(protocolType())</span>
+<span class="nc" id="L763">                                .setProtocolName(generation.protocolName)</span>
+<span class="nc" id="L764">                                .setGroupInstanceId(this.rebalanceConfig.groupInstanceId.orElse(null))</span>
+<span class="nc" id="L765">                                .setGenerationId(generation.generationId)</span>
+<span class="nc" id="L766">                                .setAssignments(Collections.emptyList())</span>
+                );
+<span class="nc" id="L768">        log.debug(&quot;Sending follower SyncGroup to coordinator {}: {}&quot;, this.coordinator, requestBuilder);</span>
+<span class="nc" id="L769">        return sendSyncGroupRequest(requestBuilder);</span>
+    }
+
+    private RequestFuture&lt;ByteBuffer&gt; onLeaderElected(JoinGroupResponse joinResponse) {
+        try {
+            // perform the leader synchronization and send back the assignment for the group
+<span class="nc" id="L775">            Map&lt;String, ByteBuffer&gt; groupAssignment = onLeaderElected(</span>
+<span class="nc" id="L776">                joinResponse.data().leader(),</span>
+<span class="nc" id="L777">                joinResponse.data().protocolName(),</span>
+<span class="nc" id="L778">                joinResponse.data().members(),</span>
+<span class="nc" id="L779">                joinResponse.data().skipAssignment()</span>
+            );
+
+<span class="nc" id="L782">            List&lt;SyncGroupRequestData.SyncGroupRequestAssignment&gt; groupAssignmentList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">            for (Map.Entry&lt;String, ByteBuffer&gt; assignment : groupAssignment.entrySet()) {</span>
+<span class="nc" id="L784">                groupAssignmentList.add(new SyncGroupRequestData.SyncGroupRequestAssignment()</span>
+<span class="nc" id="L785">                        .setMemberId(assignment.getKey())</span>
+<span class="nc" id="L786">                        .setAssignment(Utils.toArray(assignment.getValue()))</span>
+                );
+<span class="nc" id="L788">            }</span>
+
+<span class="nc" id="L790">            SyncGroupRequest.Builder requestBuilder =</span>
+                    new SyncGroupRequest.Builder(
+                            new SyncGroupRequestData()
+<span class="nc" id="L793">                                    .setGroupId(rebalanceConfig.groupId)</span>
+<span class="nc" id="L794">                                    .setMemberId(generation.memberId)</span>
+<span class="nc" id="L795">                                    .setProtocolType(protocolType())</span>
+<span class="nc" id="L796">                                    .setProtocolName(generation.protocolName)</span>
+<span class="nc" id="L797">                                    .setGroupInstanceId(this.rebalanceConfig.groupInstanceId.orElse(null))</span>
+<span class="nc" id="L798">                                    .setGenerationId(generation.generationId)</span>
+<span class="nc" id="L799">                                    .setAssignments(groupAssignmentList)</span>
+                    );
+<span class="nc" id="L801">            log.debug(&quot;Sending leader SyncGroup to coordinator {}: {}&quot;, this.coordinator, requestBuilder);</span>
+<span class="nc" id="L802">            return sendSyncGroupRequest(requestBuilder);</span>
+<span class="nc" id="L803">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L804">            return RequestFuture.failure(e);</span>
+        }
+    }
+
+    private RequestFuture&lt;ByteBuffer&gt; sendSyncGroupRequest(SyncGroupRequest.Builder requestBuilder) {
+<span class="nc bnc" id="L809" title="All 2 branches missed.">        if (coordinatorUnknown())</span>
+<span class="nc" id="L810">            return RequestFuture.coordinatorNotAvailable();</span>
+<span class="nc" id="L811">        return client.send(coordinator, requestBuilder)</span>
+<span class="nc" id="L812">                .compose(new SyncGroupResponseHandler(generation));</span>
+    }
+
+    private boolean hasGenerationReset(Generation gen) {
+        // the member ID might not be reset for ILLEGAL_GENERATION error, so only check generationID and protocol name here
+<span class="nc bnc" id="L817" title="All 4 branches missed.">        return gen.generationId == Generation.NO_GENERATION.generationId &amp;&amp; gen.protocolName == null;</span>
+    }
+
+    private class SyncGroupResponseHandler extends CoordinatorResponseHandler&lt;SyncGroupResponse, ByteBuffer&gt; {
+<span class="nc" id="L821">        private SyncGroupResponseHandler(final Generation generation) {</span>
+<span class="nc" id="L822">            super(generation);</span>
+<span class="nc" id="L823">        }</span>
+
+        @Override
+        public void handle(SyncGroupResponse syncResponse,
+                           RequestFuture&lt;ByteBuffer&gt; future) {
+<span class="nc" id="L828">            Errors error = syncResponse.error();</span>
+<span class="nc bnc" id="L829" title="All 2 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc bnc" id="L830" title="All 2 branches missed.">                if (isProtocolTypeInconsistent(syncResponse.data().protocolType())) {</span>
+<span class="nc" id="L831">                    log.error(&quot;SyncGroup failed due to inconsistent Protocol Type, received {} but expected {}&quot;,</span>
+<span class="nc" id="L832">                        syncResponse.data().protocolType(), protocolType());</span>
+<span class="nc" id="L833">                    future.raise(Errors.INCONSISTENT_GROUP_PROTOCOL);</span>
+                } else {
+<span class="nc" id="L835">                    log.debug(&quot;Received successful SyncGroup response: {}&quot;, syncResponse);</span>
+<span class="nc" id="L836">                    sensors.syncSensor.record(response.requestLatencyMs());</span>
+
+<span class="nc" id="L838">                    synchronized (AbstractCoordinator.this) {</span>
+<span class="nc bnc" id="L839" title="All 4 branches missed.">                        if (!hasGenerationReset(generation) &amp;&amp; state == MemberState.COMPLETING_REBALANCE) {</span>
+                            // check protocol name only if the generation is not reset
+<span class="nc" id="L841">                            final String protocolName = syncResponse.data().protocolName();</span>
+<span class="nc bnc" id="L842" title="All 2 branches missed.">                            final boolean protocolNameInconsistent = protocolName != null &amp;&amp;</span>
+<span class="nc bnc" id="L843" title="All 2 branches missed.">                                !protocolName.equals(generation.protocolName);</span>
+
+<span class="nc bnc" id="L845" title="All 2 branches missed.">                            if (protocolNameInconsistent) {</span>
+<span class="nc" id="L846">                                log.error(&quot;SyncGroup failed due to inconsistent Protocol Name, received {} but expected {}&quot;,</span>
+                                    protocolName, generation.protocolName);
+
+<span class="nc" id="L849">                                future.raise(Errors.INCONSISTENT_GROUP_PROTOCOL);</span>
+                            } else {
+<span class="nc" id="L851">                                log.info(&quot;Successfully synced group in generation {}&quot;, generation);</span>
+<span class="nc" id="L852">                                state = MemberState.STABLE;</span>
+<span class="nc" id="L853">                                rejoinReason = &quot;&quot;;</span>
+<span class="nc" id="L854">                                rejoinNeeded = false;</span>
+                                // record rebalance latency
+<span class="nc" id="L856">                                lastRebalanceEndMs = time.milliseconds();</span>
+<span class="nc" id="L857">                                sensors.successfulRebalanceSensor.record(lastRebalanceEndMs - lastRebalanceStartMs);</span>
+<span class="nc" id="L858">                                lastRebalanceStartMs = -1L;</span>
+
+<span class="nc" id="L860">                                future.complete(ByteBuffer.wrap(syncResponse.data().assignment()));</span>
+                            }
+<span class="nc" id="L862">                        } else {</span>
+<span class="nc" id="L863">                            log.info(&quot;Generation data was cleared by heartbeat thread to {} and state is now {} before &quot; +</span>
+                                &quot;receiving SyncGroup response, marking this rebalance as failed and retry&quot;,
+                                generation, state);
+                            // use ILLEGAL_GENERATION error code to let it retry immediately
+<span class="nc" id="L867">                            future.raise(Errors.ILLEGAL_GENERATION);</span>
+                        }
+<span class="nc" id="L869">                    }</span>
+                }
+            } else {
+<span class="nc bnc" id="L872" title="All 2 branches missed.">                if (error == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L873">                    future.raise(GroupAuthorizationException.forGroupId(rebalanceConfig.groupId));</span>
+<span class="nc bnc" id="L874" title="All 2 branches missed.">                } else if (error == Errors.REBALANCE_IN_PROGRESS) {</span>
+<span class="nc" id="L875">                    log.info(&quot;SyncGroup failed: The group began another rebalance. Need to re-join the group. &quot; +</span>
+                                 &quot;Sent generation was {}&quot;, sentGeneration);
+<span class="nc" id="L877">                    future.raise(error);</span>
+<span class="nc bnc" id="L878" title="All 2 branches missed.">                } else if (error == Errors.FENCED_INSTANCE_ID) {</span>
+                    // for sync-group request, even if the generation has changed we would not expect the instance id
+                    // gets fenced, and hence we always treat this as a fatal error
+<span class="nc" id="L881">                    log.error(&quot;SyncGroup failed: The group instance id {} has been fenced by another instance. &quot; +</span>
+                        &quot;Sent generation was {}&quot;, rebalanceConfig.groupInstanceId, sentGeneration);
+<span class="nc" id="L883">                    future.raise(error);</span>
+<span class="nc bnc" id="L884" title="All 4 branches missed.">                } else if (error == Errors.UNKNOWN_MEMBER_ID</span>
+                        || error == Errors.ILLEGAL_GENERATION) {
+<span class="nc" id="L886">                    log.info(&quot;SyncGroup failed: {} Need to re-join the group. Sent generation was {}&quot;,</span>
+<span class="nc" id="L887">                            error.message(), sentGeneration);</span>
+<span class="nc bnc" id="L888" title="All 2 branches missed.">                    if (generationUnchanged()) {</span>
+                        // don't reset generation member ID when ILLEGAL_GENERATION, since the member ID might still be valid
+<span class="nc bnc" id="L890" title="All 2 branches missed.">                        resetStateOnResponseError(ApiKeys.SYNC_GROUP, error, error != Errors.ILLEGAL_GENERATION);</span>
+                    }
+
+<span class="nc" id="L893">                    future.raise(error);</span>
+<span class="nc bnc" id="L894" title="All 4 branches missed.">                } else if (error == Errors.COORDINATOR_NOT_AVAILABLE</span>
+                        || error == Errors.NOT_COORDINATOR) {
+<span class="nc" id="L896">                    log.info(&quot;SyncGroup failed: {} Marking coordinator unknown. Sent generation was {}&quot;,</span>
+<span class="nc" id="L897">                             error.message(), sentGeneration);</span>
+<span class="nc" id="L898">                    markCoordinatorUnknown(error);</span>
+<span class="nc" id="L899">                    future.raise(error);</span>
+                } else {
+<span class="nc" id="L901">                    future.raise(new KafkaException(&quot;Unexpected error from SyncGroup: &quot; + error.message()));</span>
+                }
+            }
+<span class="nc" id="L904">        }</span>
+    }
+
+    /**
+     * Discover the current coordinator for the group. Sends a FindCoordinator request to
+     * the given broker node. The returned future should be polled to get the result of the request.
+     * @return A request future which indicates the completion of the metadata request
+     */
+    private RequestFuture&lt;Void&gt; sendFindCoordinatorRequest(Node node) {
+<span class="nc" id="L913">        log.debug(&quot;Sending FindCoordinator request to broker {}&quot;, node);</span>
+<span class="nc" id="L914">        FindCoordinatorRequestData data = new FindCoordinatorRequestData()</span>
+<span class="nc" id="L915">                .setKeyType(CoordinatorType.GROUP.id())</span>
+<span class="nc" id="L916">                .setKey(this.rebalanceConfig.groupId);</span>
+<span class="nc" id="L917">        FindCoordinatorRequest.Builder requestBuilder = new FindCoordinatorRequest.Builder(data);</span>
+<span class="nc" id="L918">        return client.send(node, requestBuilder)</span>
+<span class="nc" id="L919">                .compose(new FindCoordinatorResponseHandler());</span>
+    }
+
+<span class="nc" id="L922">    private class FindCoordinatorResponseHandler extends RequestFutureAdapter&lt;ClientResponse, Void&gt; {</span>
+
+        @Override
+        public void onSuccess(ClientResponse resp, RequestFuture&lt;Void&gt; future) {
+<span class="nc" id="L926">            log.debug(&quot;Received FindCoordinator response {}&quot;, resp);</span>
+
+<span class="nc" id="L928">            List&lt;Coordinator&gt; coordinators = ((FindCoordinatorResponse) resp.responseBody()).coordinators();</span>
+<span class="nc bnc" id="L929" title="All 2 branches missed.">            if (coordinators.size() != 1) {</span>
+<span class="nc" id="L930">                log.error(&quot;Group coordinator lookup failed: Invalid response containing more than a single coordinator&quot;);</span>
+<span class="nc" id="L931">                future.raise(new IllegalStateException(&quot;Group coordinator lookup failed: Invalid response containing more than a single coordinator&quot;));</span>
+            }
+<span class="nc" id="L933">            Coordinator coordinatorData = coordinators.get(0);</span>
+<span class="nc" id="L934">            Errors error = Errors.forCode(coordinatorData.errorCode());</span>
+<span class="nc bnc" id="L935" title="All 2 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc" id="L936">                synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L937">                    AbstractCoordinator.this.coordinator = new GroupCoordinatorNode(</span>
+<span class="nc" id="L938">                            coordinatorData.nodeId(),</span>
+<span class="nc" id="L939">                            coordinatorData.host(),</span>
+<span class="nc" id="L940">                            coordinatorData.port());</span>
+<span class="nc" id="L941">                    log.info(&quot;Discovered group coordinator {}&quot;, coordinator);</span>
+<span class="nc" id="L942">                    client.tryConnect(coordinator);</span>
+<span class="nc" id="L943">                    heartbeat.resetSessionTimeout();</span>
+<span class="nc" id="L944">                }</span>
+<span class="nc" id="L945">                future.complete(null);</span>
+<span class="nc bnc" id="L946" title="All 2 branches missed.">            } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L947">                future.raise(GroupAuthorizationException.forGroupId(rebalanceConfig.groupId));</span>
+            } else {
+<span class="nc" id="L949">                log.debug(&quot;Group coordinator lookup failed: {}&quot;, coordinatorData.errorMessage());</span>
+<span class="nc" id="L950">                future.raise(error);</span>
+            }
+<span class="nc" id="L952">        }</span>
+
+        @Override
+        public void onFailure(RuntimeException e, RequestFuture&lt;Void&gt; future) {
+<span class="nc" id="L956">            log.debug(&quot;FindCoordinator request failed due to {}&quot;, e.toString());</span>
+
+<span class="nc bnc" id="L958" title="All 2 branches missed.">            if (!(e instanceof RetriableException)) {</span>
+                // Remember the exception if fatal so we can ensure it gets thrown by the main thread
+<span class="nc" id="L960">                fatalFindCoordinatorException = e;</span>
+            }
+
+<span class="nc" id="L963">            super.onFailure(e, future);</span>
+<span class="nc" id="L964">        }</span>
+    }
+
+    /**
+     * Check if we know who the coordinator is and we have an active connection
+     * @return true if the coordinator is unknown
+     */
+    public boolean coordinatorUnknown() {
+<span class="nc bnc" id="L972" title="All 2 branches missed.">        return checkAndGetCoordinator() == null;</span>
+    }
+
+    /**
+     * Get the coordinator if its connection is still active. Otherwise mark it unknown and
+     * return null.
+     *
+     * @return the current coordinator or null if it is unknown
+     */
+    protected synchronized Node checkAndGetCoordinator() {
+<span class="nc bnc" id="L982" title="All 4 branches missed.">        if (coordinator != null &amp;&amp; client.isUnavailable(coordinator)) {</span>
+<span class="nc" id="L983">            markCoordinatorUnknown(true, &quot;coordinator unavailable&quot;);</span>
+<span class="nc" id="L984">            return null;</span>
+        }
+<span class="nc" id="L986">        return this.coordinator;</span>
+    }
+
+    private synchronized Node coordinator() {
+<span class="nc" id="L990">        return this.coordinator;</span>
+    }
+
+
+    protected synchronized void markCoordinatorUnknown(Errors error) {
+<span class="nc" id="L995">        markCoordinatorUnknown(false, &quot;error response &quot; + error.name());</span>
+<span class="nc" id="L996">    }</span>
+
+    protected synchronized void markCoordinatorUnknown(String cause) {
+<span class="nc" id="L999">        markCoordinatorUnknown(false, cause);</span>
+<span class="nc" id="L1000">    }</span>
+
+    protected synchronized void markCoordinatorUnknown(boolean isDisconnected, String cause) {
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">        if (this.coordinator != null) {</span>
+<span class="nc" id="L1004">            log.info(&quot;Group coordinator {} is unavailable or invalid due to cause: {}. &quot;</span>
+                    + &quot;isDisconnected: {}. Rediscovery will be attempted.&quot;, this.coordinator,
+<span class="nc" id="L1006">                    cause, isDisconnected);</span>
+<span class="nc" id="L1007">            Node oldCoordinator = this.coordinator;</span>
+
+            // Mark the coordinator dead before disconnecting requests since the callbacks for any pending
+            // requests may attempt to do likewise. This also prevents new requests from being sent to the
+            // coordinator while the disconnect is in progress.
+<span class="nc" id="L1012">            this.coordinator = null;</span>
+
+            // Disconnect from the coordinator to ensure that there are no in-flight requests remaining.
+            // Pending callbacks will be invoked with a DisconnectException on the next call to poll.
+<span class="nc bnc" id="L1016" title="All 2 branches missed.">            if (!isDisconnected) {</span>
+<span class="nc" id="L1017">                log.info(&quot;Requesting disconnect from last known coordinator {}&quot;, oldCoordinator);</span>
+<span class="nc" id="L1018">                client.disconnectAsync(oldCoordinator);</span>
+            }
+
+<span class="nc" id="L1021">            lastTimeOfConnectionMs = time.milliseconds();</span>
+<span class="nc" id="L1022">        } else {</span>
+<span class="nc" id="L1023">            long durationOfOngoingDisconnect = time.milliseconds() - lastTimeOfConnectionMs;</span>
+<span class="nc bnc" id="L1024" title="All 2 branches missed.">            if (durationOfOngoingDisconnect &gt; rebalanceConfig.rebalanceTimeoutMs)</span>
+<span class="nc" id="L1025">                log.warn(&quot;Consumer has been disconnected from the group coordinator for {}ms&quot;, durationOfOngoingDisconnect);</span>
+        }
+<span class="nc" id="L1027">    }</span>
+
+    /**
+     * Get the current generation state, regardless of whether it is currently stable.
+     * Note that the generation information can be updated while we are still in the middle
+     * of a rebalance, after the join-group response is received.
+     *
+     * @return the current generation
+     */
+    protected synchronized Generation generation() {
+<span class="nc" id="L1037">        return generation;</span>
+    }
+
+    /**
+     * Get the current generation state if the group is stable, otherwise return null
+     *
+     * @return the current generation or null
+     */
+    protected synchronized Generation generationIfStable() {
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">        if (this.state != MemberState.STABLE)</span>
+<span class="nc" id="L1047">            return null;</span>
+<span class="nc" id="L1048">        return generation;</span>
+    }
+
+    protected synchronized boolean rebalanceInProgress() {
+<span class="nc bnc" id="L1052" title="All 4 branches missed.">        return this.state == MemberState.PREPARING_REBALANCE || this.state == MemberState.COMPLETING_REBALANCE;</span>
+    }
+
+    protected synchronized String memberId() {
+<span class="nc" id="L1056">        return generation.memberId;</span>
+    }
+
+    private synchronized void resetStateAndGeneration(final String reason, final boolean shouldResetMemberId) {
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">        log.info(&quot;Resetting generation {}due to: {}&quot;, shouldResetMemberId ? &quot;and member id &quot; : &quot;&quot;, reason);</span>
+
+<span class="nc" id="L1062">        state = MemberState.UNJOINED;</span>
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">        if (shouldResetMemberId) {</span>
+<span class="nc" id="L1064">            generation = Generation.NO_GENERATION;</span>
+        } else {
+            // keep member id since it might be still valid, to avoid to wait for the old member id leaving group
+            // until rebalance timeout in next rebalance
+<span class="nc" id="L1068">            generation = new Generation(Generation.NO_GENERATION.generationId, generation.memberId, null);</span>
+        }
+<span class="nc" id="L1070">    }</span>
+
+    private synchronized void resetStateAndRejoin(final String reason, final boolean shouldResetMemberId) {
+<span class="nc" id="L1073">        resetStateAndGeneration(reason, shouldResetMemberId);</span>
+<span class="nc" id="L1074">        requestRejoin(reason);</span>
+<span class="nc" id="L1075">        needsJoinPrepare = true;</span>
+<span class="nc" id="L1076">    }</span>
+
+    synchronized void resetStateOnResponseError(ApiKeys api, Errors error, boolean shouldResetMemberId) {
+<span class="nc" id="L1079">        final String reason = String.format(&quot;encountered %s from %s response&quot;, error, api);</span>
+<span class="nc" id="L1080">        resetStateAndRejoin(reason, shouldResetMemberId);</span>
+<span class="nc" id="L1081">    }</span>
+
+    synchronized void resetGenerationOnLeaveGroup() {
+<span class="nc" id="L1084">        resetStateAndRejoin(&quot;consumer pro-actively leaving the group&quot;, true);</span>
+<span class="nc" id="L1085">    }</span>
+
+    public synchronized void requestRejoinIfNecessary(final String shortReason,
+                                                      final String fullReason) {
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">        if (!this.rejoinNeeded) {</span>
+<span class="nc" id="L1090">            requestRejoin(shortReason, fullReason);</span>
+        }
+<span class="nc" id="L1092">    }</span>
+
+    public synchronized void requestRejoin(final String shortReason) {
+<span class="nc" id="L1095">        requestRejoin(shortReason, shortReason);</span>
+<span class="nc" id="L1096">    }</span>
+
+    /**
+     * Request to rejoin the group.
+     *
+     * @param shortReason This is the reason passed up to the group coordinator. It must be
+     *                    reasonably small.
+     * @param fullReason This is the reason logged locally.
+     */
+    public synchronized void requestRejoin(final String shortReason,
+                                           final String fullReason) {
+<span class="nc" id="L1107">        log.info(&quot;Request joining group due to: {}&quot;, fullReason);</span>
+<span class="nc" id="L1108">        this.rejoinReason = shortReason;</span>
+<span class="nc" id="L1109">        this.rejoinNeeded = true;</span>
+<span class="nc" id="L1110">    }</span>
+
+    private boolean isProtocolTypeInconsistent(String protocolType) {
+<span class="nc bnc" id="L1113" title="All 4 branches missed.">        return protocolType != null &amp;&amp; !protocolType.equals(protocolType());</span>
+    }
+
+    /**
+     * Close the coordinator, waiting if needed to send LeaveGroup.
+     */
+    @Override
+    public final void close() {
+<span class="nc" id="L1121">        close(time.timer(0), DEFAULT);</span>
+<span class="nc" id="L1122">    }</span>
+
+    /**
+     * @throws KafkaException if the rebalance callback throws exception
+     */
+    protected void close(Timer timer, CloseOptions.GroupMembershipOperation membershipOperation) {
+        try {
+<span class="nc" id="L1129">            closeHeartbeatThread();</span>
+        } finally {
+            // Synchronize after closing the heartbeat thread since heartbeat thread
+            // needs this lock to complete and terminate after close flag is set.
+<span class="nc" id="L1133">            synchronized (this) {</span>
+<span class="nc" id="L1134">                onLeavePrepare();</span>
+<span class="nc" id="L1135">                maybeLeaveGroup(membershipOperation, &quot;the consumer is being closed&quot;);</span>
+
+                // At this point, there may be pending commits (async commits or sync commits that were
+                // interrupted using wakeup) and the leave group request which have been queued, but not
+                // yet sent to the broker. Wait up to close timeout for these pending requests to be processed.
+                // If coordinator is not known, requests are aborted.
+<span class="nc" id="L1141">                Node coordinator = checkAndGetCoordinator();</span>
+<span class="nc bnc" id="L1142" title="All 4 branches missed.">                if (coordinator != null &amp;&amp; !client.awaitPendingRequests(coordinator, timer))</span>
+<span class="nc" id="L1143">                    log.warn(&quot;Close timed out with {} pending requests to coordinator, terminating client connections&quot;,</span>
+<span class="nc" id="L1144">                            client.pendingRequestCount(coordinator));</span>
+<span class="nc" id="L1145">            }</span>
+        }
+<span class="nc" id="L1147">    }</span>
+
+    protected void handlePollTimeoutExpiry() {
+<span class="nc" id="L1150">        log.warn(&quot;consumer poll timeout has expired. This means the time between subsequent calls to poll() &quot; +</span>
+            &quot;was longer than the configured max.poll.interval.ms, which typically implies that &quot; +
+            &quot;the poll loop is spending too much time processing messages. You can address this &quot; +
+            &quot;either by increasing max.poll.interval.ms or by reducing the maximum size of batches &quot; +
+            &quot;returned in poll() with max.poll.records.&quot;);
+
+<span class="nc" id="L1156">        maybeLeaveGroup(DEFAULT, &quot;consumer poll timeout has expired.&quot;);</span>
+<span class="nc" id="L1157">    }</span>
+
+    /**
+     * Sends LeaveGroupRequest and logs the {@code leaveReason}, unless this member is using static membership
+     * with the default consumer group membership operation, or is already not part of the group (i.e., does not have a
+     * valid member ID, is in the UNJOINED state, or the coordinator is unknown).
+     *
+     * @param membershipOperation the operation on consumer group membership that the consumer will perform when closing
+     * @param leaveReason the reason to leave the group for logging
+     * @throws KafkaException if the rebalance callback throws exception
+     */
+    public synchronized RequestFuture&lt;Void&gt; maybeLeaveGroup(CloseOptions.GroupMembershipOperation membershipOperation, String leaveReason) {
+<span class="nc" id="L1169">        RequestFuture&lt;Void&gt; future = null;</span>
+
+<span class="nc bnc" id="L1171" title="All 2 branches missed.">        if (shouldSendLeaveGroupRequest(membershipOperation)) {</span>
+<span class="nc" id="L1172">            log.info(&quot;Member {} sending LeaveGroup request to coordinator {} due to {}&quot;,</span>
+                generation.memberId, coordinator, leaveReason);
+<span class="nc" id="L1174">            LeaveGroupRequest.Builder request = new LeaveGroupRequest.Builder(</span>
+                rebalanceConfig.groupId,
+<span class="nc" id="L1176">                Collections.singletonList(new MemberIdentity().setMemberId(generation.memberId).setReason(JoinGroupRequest.maybeTruncateReason(leaveReason)))</span>
+            );
+
+<span class="nc" id="L1179">            future = client.send(coordinator, request).compose(new LeaveGroupResponseHandler(generation));</span>
+<span class="nc" id="L1180">            client.pollNoWakeup();</span>
+        }
+
+<span class="nc" id="L1183">        resetGenerationOnLeaveGroup();</span>
+
+<span class="nc" id="L1185">        return future;</span>
+    }
+
+    private boolean shouldSendLeaveGroupRequest(CloseOptions.GroupMembershipOperation membershipOperation) {
+<span class="nc bnc" id="L1189" title="All 6 branches missed.">        if (!coordinatorUnknown() &amp;&amp; state != MemberState.UNJOINED &amp;&amp; generation.hasMemberId()) {</span>
+<span class="nc bnc" id="L1190" title="All 6 branches missed.">            return membershipOperation == LEAVE_GROUP || (isDynamicMember() &amp;&amp; membershipOperation == DEFAULT);</span>
+        } else {
+<span class="nc" id="L1192">            return false;</span>
+        }
+    }
+
+    protected boolean isDynamicMember() {
+<span class="nc" id="L1197">        return rebalanceConfig.groupInstanceId.isEmpty();</span>
+    }
+
+    private class LeaveGroupResponseHandler extends CoordinatorResponseHandler&lt;LeaveGroupResponse, Void&gt; {
+<span class="nc" id="L1201">        private LeaveGroupResponseHandler(final Generation generation) {</span>
+<span class="nc" id="L1202">            super(generation);</span>
+<span class="nc" id="L1203">        }</span>
+
+        @Override
+        public void handle(LeaveGroupResponse leaveResponse, RequestFuture&lt;Void&gt; future) {
+<span class="nc" id="L1207">            final List&lt;MemberResponse&gt; members = leaveResponse.memberResponses();</span>
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">            if (members.size() &gt; 1) {</span>
+<span class="nc" id="L1209">                future.raise(new IllegalStateException(&quot;The expected leave group response &quot; +</span>
+                                                           &quot;should only contain no more than one member info, however get &quot; + members));
+            }
+
+<span class="nc" id="L1213">            final Errors error = leaveResponse.error();</span>
+<span class="nc bnc" id="L1214" title="All 2 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc" id="L1215">                log.debug(&quot;LeaveGroup response with {} returned successfully: {}&quot;, sentGeneration, response);</span>
+<span class="nc" id="L1216">                future.complete(null);</span>
+            } else {
+<span class="nc" id="L1218">                log.error(&quot;LeaveGroup request with {} failed with error: {}&quot;, sentGeneration, error.message());</span>
+<span class="nc" id="L1219">                future.raise(error);</span>
+            }
+<span class="nc" id="L1221">        }</span>
+    }
+
+    // visible for testing
+    synchronized RequestFuture&lt;Void&gt; sendHeartbeatRequest() {
+<span class="nc" id="L1226">        log.debug(&quot;Sending Heartbeat request with generation {} and member id {} to coordinator {}&quot;,</span>
+<span class="nc" id="L1227">            generation.generationId, generation.memberId, coordinator);</span>
+<span class="nc" id="L1228">        HeartbeatRequest.Builder requestBuilder =</span>
+                new HeartbeatRequest.Builder(new HeartbeatRequestData()
+<span class="nc" id="L1230">                        .setGroupId(rebalanceConfig.groupId)</span>
+<span class="nc" id="L1231">                        .setMemberId(this.generation.memberId)</span>
+<span class="nc" id="L1232">                        .setGroupInstanceId(this.rebalanceConfig.groupInstanceId.orElse(null))</span>
+<span class="nc" id="L1233">                        .setGenerationId(this.generation.generationId));</span>
+<span class="nc" id="L1234">        return client.send(coordinator, requestBuilder)</span>
+<span class="nc" id="L1235">                .compose(new HeartbeatResponseHandler(generation));</span>
+    }
+
+    private class HeartbeatResponseHandler extends CoordinatorResponseHandler&lt;HeartbeatResponse, Void&gt; {
+<span class="nc" id="L1239">        private HeartbeatResponseHandler(final Generation generation) {</span>
+<span class="nc" id="L1240">            super(generation);</span>
+<span class="nc" id="L1241">        }</span>
+
+        @Override
+        public void handle(HeartbeatResponse heartbeatResponse, RequestFuture&lt;Void&gt; future) {
+<span class="nc" id="L1245">            sensors.heartbeatSensor.record(response.requestLatencyMs());</span>
+<span class="nc" id="L1246">            Errors error = heartbeatResponse.error();</span>
+
+<span class="nc bnc" id="L1248" title="All 2 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc" id="L1249">                log.debug(&quot;Received successful Heartbeat response&quot;);</span>
+<span class="nc" id="L1250">                future.complete(null);</span>
+<span class="nc bnc" id="L1251" title="All 4 branches missed.">            } else if (error == Errors.COORDINATOR_NOT_AVAILABLE</span>
+                    || error == Errors.NOT_COORDINATOR) {
+<span class="nc" id="L1253">                log.info(&quot;Attempt to heartbeat failed since coordinator {} is either not started or not valid&quot;,</span>
+<span class="nc" id="L1254">                        coordinator());</span>
+<span class="nc" id="L1255">                markCoordinatorUnknown(error);</span>
+<span class="nc" id="L1256">                future.raise(error);</span>
+<span class="nc bnc" id="L1257" title="All 2 branches missed.">            } else if (error == Errors.REBALANCE_IN_PROGRESS) {</span>
+                // since we may be sending the request during rebalance, we should check
+                // this case and ignore the REBALANCE_IN_PROGRESS error
+<span class="nc" id="L1260">                synchronized (AbstractCoordinator.this) {</span>
+<span class="nc bnc" id="L1261" title="All 2 branches missed.">                    if (state == MemberState.STABLE) {</span>
+<span class="nc" id="L1262">                        requestRejoin(&quot;group is already rebalancing&quot;);</span>
+<span class="nc" id="L1263">                        future.raise(error);</span>
+                    } else {
+<span class="nc" id="L1265">                        log.debug(&quot;Ignoring heartbeat response with error {} during {} state&quot;, error, state);</span>
+<span class="nc" id="L1266">                        future.complete(null);</span>
+                    }
+<span class="nc" id="L1268">                }</span>
+<span class="nc bnc" id="L1269" title="All 6 branches missed.">            } else if (error == Errors.ILLEGAL_GENERATION ||</span>
+                       error == Errors.UNKNOWN_MEMBER_ID ||
+                       error == Errors.FENCED_INSTANCE_ID) {
+<span class="nc bnc" id="L1272" title="All 2 branches missed.">                if (generationUnchanged()) {</span>
+<span class="nc" id="L1273">                    log.info(&quot;Attempt to heartbeat with {} and group instance id {} failed due to {}, resetting generation&quot;,</span>
+                        sentGeneration, rebalanceConfig.groupInstanceId, error);
+                    // don't reset generation member ID when ILLEGAL_GENERATION, since the member ID is still valid
+<span class="nc bnc" id="L1276" title="All 2 branches missed.">                    resetStateOnResponseError(ApiKeys.HEARTBEAT, error, error != Errors.ILLEGAL_GENERATION);</span>
+<span class="nc" id="L1277">                    future.raise(error);</span>
+                } else {
+                    // if the generation has changed, then ignore this error
+<span class="nc" id="L1280">                    log.info(&quot;Attempt to heartbeat with stale {} and group instance id {} failed due to {}, ignoring the error&quot;,</span>
+                        sentGeneration, rebalanceConfig.groupInstanceId, error);
+<span class="nc" id="L1282">                    future.complete(null);</span>
+                }
+<span class="nc bnc" id="L1284" title="All 2 branches missed.">            } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1285">                future.raise(GroupAuthorizationException.forGroupId(rebalanceConfig.groupId));</span>
+            } else {
+<span class="nc" id="L1287">                future.raise(new KafkaException(&quot;Unexpected error in heartbeat response: &quot; + error.message()));</span>
+            }
+<span class="nc" id="L1289">        }</span>
+    }
+
+    protected abstract class CoordinatorResponseHandler&lt;R, T&gt; extends RequestFutureAdapter&lt;ClientResponse, T&gt; {
+<span class="nc" id="L1293">        CoordinatorResponseHandler(final Generation generation) {</span>
+<span class="nc" id="L1294">            this.sentGeneration = generation;</span>
+<span class="nc" id="L1295">        }</span>
+
+        final Generation sentGeneration;
+        ClientResponse response;
+
+        public abstract void handle(R response, RequestFuture&lt;T&gt; future);
+
+        @Override
+        public void onFailure(RuntimeException e, RequestFuture&lt;T&gt; future) {
+            // mark the coordinator as dead
+<span class="nc bnc" id="L1305" title="All 2 branches missed.">            if (e instanceof DisconnectException) {</span>
+<span class="nc" id="L1306">                markCoordinatorUnknown(true, e.getMessage());</span>
+            }
+<span class="nc" id="L1308">            future.raise(e);</span>
+<span class="nc" id="L1309">        }</span>
+
+        @Override
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public void onSuccess(ClientResponse clientResponse, RequestFuture&lt;T&gt; future) {
+            try {
+<span class="nc" id="L1315">                this.response = clientResponse;</span>
+<span class="nc" id="L1316">                R responseObj = (R) clientResponse.responseBody();</span>
+<span class="nc" id="L1317">                handle(responseObj, future);</span>
+<span class="nc" id="L1318">            } catch (RuntimeException e) {</span>
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">                if (!future.isDone())</span>
+<span class="nc" id="L1320">                    future.raise(e);</span>
+<span class="nc" id="L1321">            }</span>
+<span class="nc" id="L1322">        }</span>
+
+        boolean generationUnchanged() {
+<span class="nc" id="L1325">            synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L1326">                return generation.equals(sentGeneration);</span>
+            }
+        }
+    }
+
+    /**
+     * Visible for testing.
+     */
+    protected BaseHeartbeatThread heartbeatThread() {
+<span class="nc" id="L1335">        return heartbeatThread;</span>
+    }
+
+    protected class AbstractCoordinatorMetrics extends AbstractConsumerMetricsManager {
+
+<span class="nc" id="L1340">        protected AbstractCoordinatorMetrics(MetricsLedger metrics) {</span>
+<span class="nc" id="L1341">            super(metrics);</span>
+<span class="nc" id="L1342">        }</span>
+
+        protected final Meter createMeter(String groupName, String baseName, String descriptiveName) {
+<span class="nc" id="L1345">            return new Meter(new WindowedCount(),</span>
+<span class="nc" id="L1346">                metrics.metricName(baseName + &quot;-rate&quot;, groupName,</span>
+<span class="nc" id="L1347">                    String.format(&quot;The number of %s per second&quot;, descriptiveName)),</span>
+<span class="nc" id="L1348">                metrics.metricName(baseName + &quot;-total&quot;, groupName,</span>
+<span class="nc" id="L1349">                    String.format(&quot;The total number of %s&quot;, descriptiveName)));</span>
+        }
+    }
+
+    private class GroupCoordinatorMetrics extends AbstractCoordinatorMetrics {
+        public final String metricGrpName;
+
+        public final Sensor heartbeatSensor;
+        public final Sensor joinSensor;
+        public final Sensor syncSensor;
+        public final Sensor successfulRebalanceSensor;
+        public final Sensor failedRebalanceSensor;
+
+        public GroupCoordinatorMetrics(Metrics metrics, String metricGrpPrefix) {
+<span class="nc" id="L1363">            this(new MetricsLedger(metrics), metricGrpPrefix);</span>
+<span class="nc" id="L1364">        }</span>
+
+<span class="nc" id="L1366">        private GroupCoordinatorMetrics(MetricsLedger metrics, String metricGrpPrefix) {</span>
+<span class="nc" id="L1367">            super(metrics);</span>
+<span class="nc" id="L1368">            this.metricGrpName = metricGrpPrefix + &quot;-coordinator-metrics&quot;;</span>
+
+<span class="nc" id="L1370">            this.heartbeatSensor = metrics.sensor(&quot;heartbeat-latency&quot;);</span>
+<span class="nc" id="L1371">            this.heartbeatSensor.add(metrics.metricName(&quot;heartbeat-response-time-max&quot;,</span>
+                this.metricGrpName,
+                &quot;The max time taken to receive a response to a heartbeat request&quot;), new Max());
+<span class="nc" id="L1374">            this.heartbeatSensor.add(createMeter(metricGrpName, &quot;heartbeat&quot;, &quot;heartbeats&quot;));</span>
+
+<span class="nc" id="L1376">            this.joinSensor = metrics.sensor(&quot;join-latency&quot;);</span>
+<span class="nc" id="L1377">            this.joinSensor.add(metrics.metricName(&quot;join-time-avg&quot;,</span>
+                this.metricGrpName,
+                &quot;The average time taken for a group rejoin&quot;), new Avg());
+<span class="nc" id="L1380">            this.joinSensor.add(metrics.metricName(&quot;join-time-max&quot;,</span>
+                this.metricGrpName,
+                &quot;The max time taken for a group rejoin&quot;), new Max());
+<span class="nc" id="L1383">            this.joinSensor.add(createMeter(metricGrpName, &quot;join&quot;, &quot;group joins&quot;));</span>
+
+<span class="nc" id="L1385">            this.syncSensor = metrics.sensor(&quot;sync-latency&quot;);</span>
+<span class="nc" id="L1386">            this.syncSensor.add(metrics.metricName(&quot;sync-time-avg&quot;,</span>
+                this.metricGrpName,
+                &quot;The average time taken for a group sync&quot;), new Avg());
+<span class="nc" id="L1389">            this.syncSensor.add(metrics.metricName(&quot;sync-time-max&quot;,</span>
+                this.metricGrpName,
+                &quot;The max time taken for a group sync&quot;), new Max());
+<span class="nc" id="L1392">            this.syncSensor.add(createMeter(metricGrpName, &quot;sync&quot;, &quot;group syncs&quot;));</span>
+
+<span class="nc" id="L1394">            this.successfulRebalanceSensor = metrics.sensor(&quot;rebalance-latency&quot;);</span>
+<span class="nc" id="L1395">            this.successfulRebalanceSensor.add(metrics.metricName(&quot;rebalance-latency-avg&quot;,</span>
+                this.metricGrpName,
+                &quot;The average time taken for a group to complete a successful rebalance, which may be composed of &quot; +
+                    &quot;several failed re-trials until it succeeded&quot;), new Avg());
+<span class="nc" id="L1399">            this.successfulRebalanceSensor.add(metrics.metricName(&quot;rebalance-latency-max&quot;,</span>
+                this.metricGrpName,
+                &quot;The max time taken for a group to complete a successful rebalance, which may be composed of &quot; +
+                    &quot;several failed re-trials until it succeeded&quot;), new Max());
+<span class="nc" id="L1403">            this.successfulRebalanceSensor.add(metrics.metricName(&quot;rebalance-latency-total&quot;,</span>
+                this.metricGrpName,
+                &quot;The total number of milliseconds this consumer has spent in successful rebalances since creation&quot;),
+                new CumulativeSum());
+<span class="nc" id="L1407">            this.successfulRebalanceSensor.add(</span>
+<span class="nc" id="L1408">                metrics.metricName(&quot;rebalance-total&quot;,</span>
+                    this.metricGrpName,
+                    &quot;The total number of successful rebalance events, each event is composed of &quot; +
+                        &quot;several failed re-trials until it succeeded&quot;),
+                new CumulativeCount()
+            );
+<span class="nc" id="L1414">            this.successfulRebalanceSensor.add(</span>
+<span class="nc" id="L1415">                metrics.metricName(</span>
+                    &quot;rebalance-rate-per-hour&quot;,
+                    this.metricGrpName,
+                    &quot;The number of successful rebalance events per hour, each event is composed of &quot; +
+                        &quot;several failed re-trials until it succeeded&quot;),
+                new Rate(TimeUnit.HOURS, new WindowedCount(), 1)
+            );
+
+<span class="nc" id="L1423">            this.failedRebalanceSensor = metrics.sensor(&quot;failed-rebalance&quot;);</span>
+<span class="nc" id="L1424">            this.failedRebalanceSensor.add(</span>
+<span class="nc" id="L1425">                metrics.metricName(&quot;failed-rebalance-total&quot;,</span>
+                    this.metricGrpName,
+                    &quot;The total number of failed rebalance events&quot;),
+                new CumulativeCount()
+            );
+<span class="nc" id="L1430">            this.failedRebalanceSensor.add(</span>
+<span class="nc" id="L1431">                metrics.metricName(</span>
+                    &quot;failed-rebalance-rate-per-hour&quot;,
+                    this.metricGrpName,
+                    &quot;The number of failed rebalance events per hour&quot;),
+                new Rate(TimeUnit.HOURS, new WindowedCount(), 1)
+            );
+
+<span class="nc" id="L1438">            Measurable lastRebalance = (config, now) -&gt; {</span>
+<span class="nc bnc" id="L1439" title="All 2 branches missed.">                if (lastRebalanceEndMs == -1L)</span>
+                    // if no rebalance is ever triggered, we just return -1.
+<span class="nc" id="L1441">                    return -1d;</span>
+                else
+<span class="nc" id="L1443">                    return TimeUnit.SECONDS.convert(now - lastRebalanceEndMs, TimeUnit.MILLISECONDS);</span>
+            };
+<span class="nc" id="L1445">            metrics.addMetric(metrics.metricName(&quot;last-rebalance-seconds-ago&quot;,</span>
+                this.metricGrpName,
+                &quot;The number of seconds since the last successful rebalance event&quot;),
+                lastRebalance);
+
+<span class="nc" id="L1450">            Measurable lastHeartbeat = (config, now) -&gt; {</span>
+<span class="nc bnc" id="L1451" title="All 2 branches missed.">                if (heartbeat.lastHeartbeatSend() == 0L)</span>
+                    // if no heartbeat is ever triggered, just return -1.
+<span class="nc" id="L1453">                    return -1d;</span>
+                else
+<span class="nc" id="L1455">                    return TimeUnit.SECONDS.convert(now - heartbeat.lastHeartbeatSend(), TimeUnit.MILLISECONDS);</span>
+            };
+<span class="nc" id="L1457">            metrics.addMetric(metrics.metricName(&quot;last-heartbeat-seconds-ago&quot;,</span>
+                this.metricGrpName,
+                &quot;The number of seconds since the last coordinator heartbeat was sent&quot;),
+                lastHeartbeat);
+<span class="nc" id="L1461">        }</span>
+    }
+
+    private class HeartbeatThread extends BaseHeartbeatThread {
+
+<span class="nc" id="L1466">        private HeartbeatThread() {</span>
+<span class="nc bnc" id="L1467" title="All 2 branches missed.">            super(HEARTBEAT_THREAD_PREFIX + (rebalanceConfig.groupId.isEmpty() ? &quot;&quot; : &quot; | &quot; + rebalanceConfig.groupId), true);</span>
+<span class="nc" id="L1468">        }</span>
+
+        @Override
+        public void enable() {
+<span class="nc" id="L1472">            synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L1473">                log.debug(&quot;Enabling heartbeat thread&quot;);</span>
+<span class="nc" id="L1474">                super.enable();</span>
+<span class="nc" id="L1475">                heartbeat.resetTimeouts();</span>
+<span class="nc" id="L1476">                AbstractCoordinator.this.notify();</span>
+<span class="nc" id="L1477">            }</span>
+<span class="nc" id="L1478">        }</span>
+
+        @Override
+        public void close() {
+<span class="nc" id="L1482">            synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L1483">                super.close();</span>
+<span class="nc" id="L1484">                AbstractCoordinator.this.notify();</span>
+<span class="nc" id="L1485">            }</span>
+<span class="nc" id="L1486">        }</span>
+
+        @Override
+        public void run() {
+            try {
+<span class="nc" id="L1491">                log.debug(&quot;Heartbeat thread started&quot;);</span>
+                while (true) {
+<span class="nc" id="L1493">                    synchronized (AbstractCoordinator.this) {</span>
+<span class="nc bnc" id="L1494" title="All 2 branches missed.">                        if (isClosed())</span>
+<span class="nc" id="L1495">                            return;</span>
+
+<span class="nc bnc" id="L1497" title="All 2 branches missed.">                        if (!isEnabled()) {</span>
+<span class="nc" id="L1498">                            AbstractCoordinator.this.wait();</span>
+<span class="nc" id="L1499">                            continue;</span>
+                        }
+
+                        // we do not need to heartbeat we are not part of a group yet;
+                        // also if we already have fatal error, the client will be
+                        // crashed soon, hence we do not need to continue heartbeating either
+<span class="nc bnc" id="L1505" title="All 4 branches missed.">                        if (state.hasNotJoinedGroup() || isFailed()) {</span>
+<span class="nc" id="L1506">                            disable();</span>
+<span class="nc" id="L1507">                            continue;</span>
+                        }
+
+<span class="nc" id="L1510">                        client.pollNoWakeup();</span>
+<span class="nc" id="L1511">                        long now = time.milliseconds();</span>
+
+<span class="nc bnc" id="L1513" title="All 2 branches missed.">                        if (coordinatorUnknown()) {</span>
+<span class="nc bnc" id="L1514" title="All 2 branches missed.">                            if (findCoordinatorFuture != null) {</span>
+                                // clear the future so that after the backoff, if the hb still sees coordinator unknown in
+                                // the next iteration it will try to re-discover the coordinator in case the main thread cannot
+<span class="nc" id="L1517">                                clearFindCoordinatorFuture();</span>
+                            } else {
+<span class="nc" id="L1519">                                lookupCoordinator();</span>
+                            }
+                            // backoff properly
+<span class="nc" id="L1522">                            AbstractCoordinator.this.wait(rebalanceConfig.retryBackoffMs);</span>
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">                        } else if (heartbeat.sessionTimeoutExpired(now)) {</span>
+                            // the session timeout has expired without seeing a successful heartbeat, so we should
+                            // probably make sure the coordinator is still healthy.
+<span class="nc" id="L1526">                            markCoordinatorUnknown(&quot;session timed out without receiving a &quot;</span>
+                                    + &quot;heartbeat response&quot;);
+<span class="nc bnc" id="L1528" title="All 2 branches missed.">                        } else if (heartbeat.pollTimeoutExpired(now)) {</span>
+                            // the poll timeout has expired, which means that the foreground thread has stalled
+                            // in between calls to poll().
+<span class="nc" id="L1531">                            handlePollTimeoutExpiry();</span>
+<span class="nc bnc" id="L1532" title="All 2 branches missed.">                        } else if (!heartbeat.shouldHeartbeat(now)) {</span>
+                            // poll again after waiting for the retry backoff in case the heartbeat failed or the
+                            // coordinator disconnected. Note that the heartbeat timing takes account of
+                            // exponential backoff.
+<span class="nc" id="L1536">                            AbstractCoordinator.this.wait(rebalanceConfig.retryBackoffMs);</span>
+                        } else {
+<span class="nc" id="L1538">                            heartbeat.sentHeartbeat(now);</span>
+<span class="nc" id="L1539">                            final RequestFuture&lt;Void&gt; heartbeatFuture = sendHeartbeatRequest();</span>
+<span class="nc" id="L1540">                            heartbeatFuture.addListener(new RequestFutureListener&lt;&gt;() {</span>
+                                @Override
+                                public void onSuccess(Void value) {
+<span class="nc" id="L1543">                                    synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L1544">                                        heartbeat.receiveHeartbeat();</span>
+<span class="nc" id="L1545">                                    }</span>
+<span class="nc" id="L1546">                                }</span>
+
+                                @Override
+                                public void onFailure(RuntimeException e) {
+<span class="nc" id="L1550">                                    synchronized (AbstractCoordinator.this) {</span>
+<span class="nc bnc" id="L1551" title="All 2 branches missed.">                                        if (e instanceof RebalanceInProgressException) {</span>
+                                            // it is valid to continue heartbeating while the group is rebalancing. This
+                                            // ensures that the coordinator keeps the member in the group for as long
+                                            // as the duration of the rebalance timeout. If we stop sending heartbeats,
+                                            // however, then the session timeout may expire before we can rejoin.
+<span class="nc" id="L1556">                                            heartbeat.receiveHeartbeat();</span>
+<span class="nc bnc" id="L1557" title="All 2 branches missed.">                                        } else if (e instanceof FencedInstanceIdException) {</span>
+<span class="nc" id="L1558">                                            log.error(&quot;Caught fenced group.instance.id {} error in heartbeat thread&quot;, rebalanceConfig.groupInstanceId);</span>
+<span class="nc" id="L1559">                                            setFailureCause(e);</span>
+                                        } else {
+<span class="nc" id="L1561">                                            heartbeat.failHeartbeat();</span>
+                                            // wake up the thread if it's sleeping to reschedule the heartbeat
+<span class="nc" id="L1563">                                            AbstractCoordinator.this.notify();</span>
+                                        }
+<span class="nc" id="L1565">                                    }</span>
+<span class="nc" id="L1566">                                }</span>
+                            });
+                        }
+<span class="nc" id="L1569">                    }</span>
+                }
+<span class="nc" id="L1571">            } catch (AuthenticationException e) {</span>
+<span class="nc" id="L1572">                log.error(&quot;An authentication error occurred in the heartbeat thread&quot;, e);</span>
+<span class="nc" id="L1573">                setFailureCause(e);</span>
+<span class="nc" id="L1574">                requestRejoin(&quot;authentication error in heartbeat thread&quot;);</span>
+<span class="nc" id="L1575">            } catch (GroupAuthorizationException e) {</span>
+<span class="nc" id="L1576">                log.error(&quot;A group authorization error occurred in the heartbeat thread&quot;, e);</span>
+<span class="nc" id="L1577">                setFailureCause(e);</span>
+<span class="nc" id="L1578">            } catch (InterruptedException | InterruptException e) {</span>
+<span class="nc" id="L1579">                Thread.interrupted();</span>
+<span class="nc" id="L1580">                log.error(&quot;Unexpected interrupt received in heartbeat thread&quot;, e);</span>
+<span class="nc" id="L1581">                setFailureCause(new RuntimeException(e));</span>
+<span class="nc" id="L1582">            } catch (Throwable e) {</span>
+<span class="nc" id="L1583">                log.error(&quot;Heartbeat thread failed due to unexpected error&quot;, e);</span>
+<span class="nc bnc" id="L1584" title="All 2 branches missed.">                if (e instanceof RuntimeException)</span>
+<span class="nc" id="L1585">                    setFailureCause((RuntimeException) e);</span>
+                else
+<span class="nc" id="L1587">                    setFailureCause(new RuntimeException(e));</span>
+            } finally {
+<span class="nc" id="L1589">                log.debug(&quot;Heartbeat thread has closed&quot;);</span>
+<span class="nc" id="L1590">                synchronized (AbstractCoordinator.this) {</span>
+<span class="nc" id="L1591">                    super.close();</span>
+<span class="nc" id="L1592">                }</span>
+            }
+<span class="nc" id="L1594">        }</span>
+    }
+
+    protected static class Generation {
+<span class="nc" id="L1598">        public static final Generation NO_GENERATION = new Generation(</span>
+                OffsetCommitRequest.DEFAULT_GENERATION_ID,
+                JoinGroupRequest.UNKNOWN_MEMBER_ID,
+                null);
+
+        public final int generationId;
+        public final String memberId;
+        public final String protocolName;
+
+<span class="nc" id="L1607">        public Generation(int generationId, String memberId, String protocolName) {</span>
+<span class="nc" id="L1608">            this.generationId = generationId;</span>
+<span class="nc" id="L1609">            this.memberId = memberId;</span>
+<span class="nc" id="L1610">            this.protocolName = protocolName;</span>
+<span class="nc" id="L1611">        }</span>
+
+        /**
+         * @return true if this generation has a valid member id, false otherwise. A member might have an id before
+         * it becomes part of a group generation.
+         */
+        public boolean hasMemberId() {
+<span class="nc bnc" id="L1618" title="All 2 branches missed.">            return !memberId.isEmpty();</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L1623" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L1624" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L1625">            final Generation that = (Generation) o;</span>
+<span class="nc bnc" id="L1626" title="All 2 branches missed.">            return generationId == that.generationId &amp;&amp;</span>
+<span class="nc bnc" id="L1627" title="All 2 branches missed.">                    Objects.equals(memberId, that.memberId) &amp;&amp;</span>
+<span class="nc bnc" id="L1628" title="All 2 branches missed.">                    Objects.equals(protocolName, that.protocolName);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L1633">            return Objects.hash(generationId, memberId, protocolName);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1638">            return &quot;Generation{&quot; +</span>
+                    &quot;generationId=&quot; + generationId +
+                    &quot;, memberId='&quot; + memberId + '\'' +
+                    &quot;, protocol='&quot; + protocolName + '\'' +
+                    '}';
+        }
+    }
+
+    private static class UnjoinedGroupException extends RetriableException {
+
+    }
+
+    // For testing only below
+    final Heartbeat heartbeat() {
+<span class="nc" id="L1652">        return heartbeat;</span>
+    }
+
+    final String rejoinReason() {
+<span class="nc" id="L1656">        return rejoinReason;</span>
+    }
+
+    final synchronized void setLastRebalanceTime(final long timestamp) {
+<span class="nc" id="L1660">        lastRebalanceEndMs = timestamp;</span>
+<span class="nc" id="L1661">    }</span>
+
+    /**
+     * Check whether given generation id is matching the record within current generation.
+     *
+     * @param generationId generation id
+     * @return true if the two ids are matching.
+     */
+    final boolean hasMatchingGenerationId(int generationId) {
+<span class="nc bnc" id="L1670" title="All 4 branches missed.">        return !generation.equals(Generation.NO_GENERATION) &amp;&amp; generation.generationId == generationId;</span>
+    }
+
+    final boolean hasUnknownGeneration() {
+<span class="nc" id="L1674">        return generation.equals(Generation.NO_GENERATION);</span>
+    }
+
+    /**
+     * @return true if the current generation's member ID is valid, false otherwise
+     */
+    final boolean hasValidMemberId() {
+<span class="nc bnc" id="L1681" title="All 4 branches missed.">        return !hasUnknownGeneration() &amp;&amp; generation.hasMemberId();</span>
+    }
+
+    final synchronized void setNewGeneration(final Generation generation) {
+<span class="nc" id="L1685">        this.generation = generation;</span>
+<span class="nc" id="L1686">    }</span>
+
+    final synchronized void setNewState(final MemberState state) {
+<span class="nc" id="L1689">        this.state = state;</span>
+<span class="nc" id="L1690">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

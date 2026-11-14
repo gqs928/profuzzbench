@@ -1,0 +1,61 @@
+include $(top_srcdir)/Makefile.test.include
+
+noinst_LTLIBRARIES = libsettings.la
+
+AM_CPPFLAGS = \
+	-I$(top_srcdir)/src/lib \
+	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-dns \
+	-I$(top_srcdir)/src/lib-var-expand
+
+libsettings_la_SOURCES = \
+	settings.c \
+	settings-bin-filter.c \
+	settings-history.c \
+	settings-parser.c
+
+headers = \
+	settings.h \
+	settings-bin-filter.h \
+	settings-history.h \
+	settings-parser.h \
+	settings-consts.h
+
+pkginc_libdir=$(pkgincludedir)
+pkginc_lib_HEADERS = $(headers)
+
+BUILT_SOURCES = settings-history-core.h
+
+settings-history.c: settings-history-core.h
+
+settings-history-core.h: $(srcdir)/settings-history-core.txt $(srcdir)/settings-history.py
+	$(AM_V_GEN)$(PYTHON) $(srcdir)/settings-history.py --pro $(DOVECOT_PRO_BUILD) $< $@
+
+EXTRA_DIST = \
+	settings-history-core.h \
+	settings-history-core.txt \
+	settings-history.py
+
+pkglibexecdir = $(libexecdir)/dovecot
+pkglibexec_SCRIPTS = \
+	settings-history.py
+
+test_programs = \
+	test-settings-parser \
+	test-settings
+
+test_libs = \
+	libsettings.la \
+	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
+	../lib-dns/libdns.la \
+	../lib-test/libtest.la \
+	../lib/liblib.la
+
+test_settings_parser_SOURCES = test-settings-parser.c
+test_settings_parser_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+test_settings_parser_DEPENDENCIES = $(test_libs)
+
+test_settings_SOURCES = test-settings.c
+test_settings_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+test_settings_DEPENDENCIES = $(test_libs)

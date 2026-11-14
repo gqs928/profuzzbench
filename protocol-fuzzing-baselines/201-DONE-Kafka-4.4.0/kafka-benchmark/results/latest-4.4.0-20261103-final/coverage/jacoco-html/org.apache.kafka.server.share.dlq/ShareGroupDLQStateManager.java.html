@@ -1,0 +1,1153 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShareGroupDLQStateManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.share.dlq</a> &gt; <span class="el_source">ShareGroupDLQStateManager.java</span></div><h1>ShareGroupDLQStateManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.server.share.dlq;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.KafkaClient;
+import org.apache.kafka.clients.RequestCompletionHandler;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.message.CreateTopicsRequestData;
+import org.apache.kafka.common.message.CreateTopicsResponseData;
+import org.apache.kafka.common.message.ProduceRequestData;
+import org.apache.kafka.common.message.ProduceResponseData;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.record.internal.DefaultRecord;
+import org.apache.kafka.common.record.internal.DefaultRecordBatch;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.Record;
+import org.apache.kafka.common.record.internal.SimpleRecord;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.requests.CreateTopicsRequest;
+import org.apache.kafka.common.requests.CreateTopicsResponse;
+import org.apache.kafka.common.requests.ProduceRequest;
+import org.apache.kafka.common.requests.ProduceResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.ExponentialBackoffManager;
+import org.apache.kafka.server.config.ServerConfigs;
+import org.apache.kafka.server.share.LogReader;
+import org.apache.kafka.server.share.metrics.ShareGroupMetrics;
+import org.apache.kafka.server.util.InterBrokerSendThread;
+import org.apache.kafka.server.util.RequestAndCompletionHandler;
+import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.server.util.timer.TimerTask;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Core implementation of RPC send logic for the dlq manager.
+ * This class allows for enqueuing records meant to be DLQ'ed
+ * and manages various RPC which are to be sent to the KafkaApis.
+ * These RPCs include PRODUCE, CREATE_TOPIC.
+ */
+public class ShareGroupDLQStateManager {
+<span class="nc" id="L87">    private final AtomicBoolean isStarted = new AtomicBoolean(false);</span>
+    private final SendThread sender;
+    private final Time time;
+    private final Timer timer;
+    private final ShareGroupDLQMetadataCacheHelper cacheHelper;
+    private final LogReader logReader;
+    private final ShareGroupMetrics shareGroupMetrics;
+    public static final long REQUEST_BACKOFF_MS = 1_000L;
+    public static final long REQUEST_BACKOFF_MAX_MS = 30_000L;
+    private static final int MAX_REQUEST_ATTEMPTS = 5;
+    private static final int RETRY_BACKOFF_EXP_BASE = CommonClientConfigs.RETRY_BACKOFF_EXP_BASE;
+    private static final double RETRY_BACKOFF_JITTER = CommonClientConfigs.RETRY_BACKOFF_JITTER;
+
+    /**
+     * In most cases we expect the records getting DLQ'ed will be single offsets and
+     * not complete batches. Hence, using a large upper limit while reading from the log
+     * would be fruitless in most cases. Therefore, the value of 1 MB has been chosen
+     * for the DLQ related log reads.
+     */
+    private static final int DLQ_MAX_FETCH_BYTES = 1024 * 1024;
+<span class="nc" id="L107">    private static final Logger log = LoggerFactory.getLogger(ShareGroupDLQStateManager.class);</span>
+
+<span class="nc" id="L109">    private final Set&lt;Node&gt; inFlight = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L110">    private final Map&lt;Node, List&lt;ProduceRequestHandler&gt;&gt; nodeRPCMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L111">    private final Object nodeMapLock = new Object();</span>
+
+    public ShareGroupDLQStateManager(
+        KafkaClient client,
+        ShareGroupDLQMetadataCacheHelper cacheHelper,
+        Time time,
+        Timer timer,
+        ShareGroupMetrics shareGroupMetrics,
+        LogReader logReader
+<span class="nc" id="L120">    ) {</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (client == null) {</span>
+<span class="nc" id="L122">            throw new IllegalArgumentException(&quot;Kafkaclient must not be null.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        if (cacheHelper == null) {</span>
+<span class="nc" id="L126">            throw new IllegalArgumentException(&quot;Cache helper must not be null.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (time == null) {</span>
+<span class="nc" id="L130">            throw new IllegalArgumentException(&quot;Time must not be null.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (timer == null) {</span>
+<span class="nc" id="L134">            throw new IllegalArgumentException(&quot;Timer must not be null.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        if (shareGroupMetrics == null) {</span>
+<span class="nc" id="L138">            throw new IllegalArgumentException(&quot;ShareGroupMetrics must not be null.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        if (logReader == null) {</span>
+<span class="nc" id="L142">            throw new IllegalArgumentException(&quot;LogReader must not be null.&quot;);</span>
+        }
+
+<span class="nc" id="L145">        this.time = time;</span>
+<span class="nc" id="L146">        this.timer = timer;</span>
+<span class="nc" id="L147">        this.cacheHelper = cacheHelper;</span>
+<span class="nc" id="L148">        this.shareGroupMetrics = shareGroupMetrics;</span>
+<span class="nc" id="L149">        this.logReader = logReader;</span>
+<span class="nc" id="L150">        this.sender = new SendThread(</span>
+            &quot;ShareGroupDLQSendThread&quot;,
+            client,
+<span class="nc" id="L153">            Math.toIntExact(CommonClientConfigs.DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS),  //30 seconds</span>
+            this.time,
+            true,
+<span class="nc" id="L156">            new Random(this.time.milliseconds())</span>
+        );
+<span class="nc" id="L158">    }</span>
+
+    public void start() {
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (isStarted.compareAndSet(false, true)) {</span>
+<span class="nc" id="L162">            log.info(&quot;Starting ShareGroupDLQStateManager&quot;);</span>
+<span class="nc" id="L163">            this.sender.start();</span>
+        }
+<span class="nc" id="L165">    }</span>
+
+    public void stop() throws Exception {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        if (isStarted.compareAndSet(true, false)) {</span>
+<span class="nc" id="L169">            this.sender.shutdown();</span>
+        }
+<span class="nc" id="L171">    }</span>
+
+    /**
+     * Enqueues a {@link ShareGroupDLQRecordParameter} based on which records will be DLQ'ed.
+     * The actual record written to the DLQ topic will be built by fetching information from this argument.
+     *
+     * @param param Reference comprising offset information
+     * @return A future completing normally on successful DLQ, exceptionally otherwise.
+     */
+    public CompletableFuture&lt;Void&gt; dlq(ShareGroupDLQRecordParameter param) {
+<span class="nc" id="L181">        return dlq(param, REQUEST_BACKOFF_MS, REQUEST_BACKOFF_MAX_MS, MAX_REQUEST_ATTEMPTS);</span>
+    }
+
+    // Visibility for tests
+    CompletableFuture&lt;Void&gt; dlq(ShareGroupDLQRecordParameter param, long requestBackoffMs, long requestBackoffMaxMs, int maxRequestAttempts) {
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        if (!this.isStarted.get()) {</span>
+<span class="nc" id="L187">            return CompletableFuture.failedFuture(new IllegalStateException(&quot;ShareGroupDLQStateManager is not started.&quot;));</span>
+        }
+<span class="nc" id="L189">        CompletableFuture&lt;Void&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L190">        ProduceRequestHandler requestHandler = new ProduceRequestHandler(param, future, requestBackoffMs, requestBackoffMaxMs, maxRequestAttempts);</span>
+
+        // Validate the DLQ configuration up front, synchronously on the calling thread, so a
+        // misconfigured DLQ fails fast, and we never read source records for one. enqueue() also
+        // re-validates so that retries re-check the (dynamic) config.
+<span class="nc" id="L195">        Optional&lt;Throwable&gt; validationError = requestHandler.validateDlqTopic();</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        if (validationError.isPresent()) {</span>
+<span class="nc" id="L197">            future.completeExceptionally(validationError.get());</span>
+<span class="nc" id="L198">            return future;</span>
+        }
+
+        // Resolve round 1's source records here - on the calling thread for local offsets and, for
+        // tiered offsets, asynchronously on the remote-storage reader pool - and enqueue only once
+        // resolution finishes. Later rounds (if the range needs more than one produce request) are
+        // resolved the same way from handleProduceResponse(), each with its own fresh decompression
+        // budget. Records are only read when copy is enabled for the group and the DLQ is correctly
+        // configured (validated above); otherwise we enqueue immediately.
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        if (cacheHelper.isShareGroupDlqCopyRecordEnabled(param.groupId())) {</span>
+<span class="nc" id="L208">            requestHandler.resolveRound().whenComplete((ignored, ignoredError) -&gt; enqueue(requestHandler));</span>
+        } else {
+<span class="nc" id="L210">            enqueue(requestHandler);</span>
+        }
+<span class="nc" id="L212">        return future;</span>
+    }
+
+    // Visibility for tests
+    Map&lt;Node, List&lt;ShareGroupDLQStateManager.ProduceRequestHandler&gt;&gt; nodeRPCMap() {
+        // Using Collections.unmodifiableMap and not Map.copyOf as we are looking for a quick
+        // immutable view of the map in the tests. The tests will invoke the
+        // method repeatedly to check the state of the map. Map.copyOf will create
+        // a deep copy of the map on every call and changes will might get missed resulting
+        // in flakiness.
+<span class="nc" id="L222">        return Collections.unmodifiableMap(nodeRPCMap);</span>
+    }
+
+    private void enqueue(ProduceRequestHandler requestHandler) {
+<span class="nc" id="L226">        sender.enqueue(requestHandler);</span>
+<span class="nc" id="L227">    }</span>
+
+    /**
+     * Add a produce request handler after determining that the DLQ topic exists
+     * or has been created by he CREATE_TOPIC RPC. The map is used to collect all PRODUCE
+     * requests which are destined for a specific destination node. The Sender class
+     * then performs coalescing on all the handlers to create one single PRODUCE instead
+     * of sending multiple RPCs. This method is currently called when a DLQ topic already
+     * exists and there is no need to send a CREATE_TOPIC RPC and if it does not, post
+     * successful DLQ topic creation.
+     *
+     * @param node    The destination node where the produce request needs to be sent.
+     * @param handler The handler instance to add to the node map.
+     */
+    private void addRequestToNodeMap(Node node, ProduceRequestHandler handler) {
+<span class="nc" id="L242">        synchronized (nodeMapLock) {</span>
+<span class="nc" id="L243">            nodeRPCMap.computeIfAbsent(node, k -&gt; new LinkedList&lt;&gt;())</span>
+<span class="nc" id="L244">                .add(handler);</span>
+<span class="nc" id="L245">        }</span>
+<span class="nc" id="L246">        sender.wakeup();</span>
+<span class="nc" id="L247">    }</span>
+
+    /**
+     * Invokes {@code handler.onComplete(response)}, isolating this one handler's failure from
+     * whatever else is being processed in the same batch (see the coalesced-response callback in
+     * {@link SendThread#generateRequests}, which invokes this once per handler in a shared
+     * produce response). An uncaught exception here must not prevent the rest of that batch's
+     * handlers from being notified - which would otherwise leave their {@link #dlq} futures
+     * hanging forever - so it's caught, logged, and the offending handler's own future is
+     * explicitly failed too, in case the exception happened before {@code onComplete} reached its
+     * own completion call.
+     */
+    // Visibility for tests
+    static void completeHandlerSafely(ProduceRequestHandler handler, ClientResponse response) {
+        try {
+<span class="nc" id="L262">            handler.onComplete(response);</span>
+<span class="nc" id="L263">        } catch (Exception e) {</span>
+<span class="nc" id="L264">            log.error(&quot;Uncaught error handling produce response for handler {}.&quot;, handler, e);</span>
+<span class="nc" id="L265">            handler.requestErrorResponse(e);</span>
+<span class="nc" id="L266">        }</span>
+<span class="nc" id="L267">    }</span>
+
+    // Visibility for tests
+    class ProduceRequestHandler implements RequestCompletionHandler {
+        private final CompletableFuture&lt;Void&gt; result;
+        private final ShareGroupDLQRecordParameter param;
+<span class="nc" id="L273">        private static final Logger LOG = LoggerFactory.getLogger(ShareGroupDLQStateManager.ProduceRequestHandler.class);</span>
+        private final ExponentialBackoffManager createTopicsBackoff;
+        private final ExponentialBackoffManager produceRequestBackoff;
+        // These DLQ topic fields are written by populateDLQTopicData() and read while building the
+        // produce request - both on the sender thread (from dlqTopicExists()/handleCreateTopicsResponse()).
+        // Kept volatile defensively.
+        private volatile Node dlqPartitionLeaderNode;
+        private volatile int dlqDestinationPartition;
+        private volatile ShareGroupDLQMetadataCacheHelper.TopicPartitionData dlqTopicPartitionData;
+        // The original source records for the CURRENT round only, resolved before this round is added
+        // to the node map (see resolveRound()): once for round 1 (before this handler is first
+        // enqueued), then again for each subsequent round after a successful produce response advances
+        // nextOffsetToSend. Volatile because resolution runs off the sender thread - on the calling
+        // thread for local offsets and, for tiered offsets, on the remote-storage reader pool - while
+        // this value is read on the sender thread when the produce request is built. Memoized per round:
+        // set once per round and reused for every retry of that round, so retries never re-fetch.
+<span class="nc" id="L289">        private volatile Map&lt;Long, Record&gt; resolvedRecordData = Map.of();</span>
+        // The largest offset such that everything from this round's start through it has a definitive
+        // outcome (real content, or a permanently-excluded gap) per the fetch behind resolvedRecordData -
+        // see ShareGroupDLQRecordFetcher.FetchResult. Caps topicProduceData()'s walk so it never packs in
+        // offsets the fetch never got to attempt this round as headers-only; those stay untouched for a
+        // fresh round (with a fresh decompression budget) to retry. Defaults to param.lastOffset() so a
+        // handler that never calls resolveRound() (copy-record disabled) still leaves the full range fair
+        // game for topicProduceData()'s own size-based packing.
+        private volatile long lastResolvedOffsetThisRound;
+        // The next offset that has not yet been included in a produce request. Starts at
+        // param.firstOffset() and advances past whatever topicProduceData() managed to fit within
+        // dlqTopicMaxMessageBytes() on each successful send, so a range that doesn't fit in a single
+        // batch is sent as a sequence of produce requests instead of failing.
+        private volatile long nextOffsetToSend;
+        // The last offset included in the most recently built produce request (see topicProduceData()),
+        // read back in handleProduceResponse() to decide whether more offsets remain to be sent.
+        private volatile long lastOffsetIncludedThisRound;
+        // The dlqTopicMaxMessageBytes() value used to build the most recent topicProduceData(), cached
+        // so coalesceProduceRequests()'s partition-budget check reuses the exact same value.
+        private volatile int lastMaxMessageBytes;
+
+        public static final String HEADER_DLQ_ERRORS_TOPIC = &quot;__dlq.errors.topic&quot;;
+        public static final String HEADER_DLQ_ERRORS_PARTITION = &quot;__dlq.errors.partition&quot;;
+        public static final String HEADER_DLQ_ERRORS_OFFSET = &quot;__dlq.errors.offset&quot;;
+        public static final String HEADER_DLQ_ERRORS_GROUP = &quot;__dlq.errors.group&quot;;
+        public static final String HEADER_DLQ_ERRORS_DELIVERY_COUNT = &quot;__dlq.errors.delivery.count&quot;;
+        public static final String HEADER_DLQ_ERRORS_MESSAGE = &quot;__dlq.errors.message&quot;;
+
+        public ProduceRequestHandler(
+            ShareGroupDLQRecordParameter param,
+            CompletableFuture&lt;Void&gt; result,
+            long backoffMs,
+            long backoffMaxMs,
+            int maxRPCRetryAttempts
+<span class="nc" id="L323">        ) {</span>
+<span class="nc" id="L324">            this.param = param;</span>
+<span class="nc" id="L325">            this.result = result;</span>
+<span class="nc" id="L326">            this.nextOffsetToSend = param.firstOffset();</span>
+<span class="nc" id="L327">            this.lastOffsetIncludedThisRound = param.firstOffset() - 1;</span>
+<span class="nc" id="L328">            this.lastResolvedOffsetThisRound = param.lastOffset();</span>
+<span class="nc" id="L329">            this.createTopicsBackoff = new ExponentialBackoffManager(</span>
+                maxRPCRetryAttempts,
+                backoffMs,
+                RETRY_BACKOFF_EXP_BASE,
+                backoffMaxMs,
+                RETRY_BACKOFF_JITTER
+            );
+<span class="nc" id="L336">            this.produceRequestBackoff = new ExponentialBackoffManager(</span>
+                maxRPCRetryAttempts,
+                backoffMs,
+                RETRY_BACKOFF_EXP_BASE,
+                backoffMaxMs,
+                RETRY_BACKOFF_JITTER
+            );
+<span class="nc" id="L343">        }</span>
+
+        @Override
+        public void onComplete(ClientResponse response) {
+            // We don't know if FIND_COORD or actual REQUEST. Let's err on side of request.
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            if (response == null) {</span>
+<span class="nc" id="L349">                result.completeExceptionally(Errors.UNKNOWN_SERVER_ERROR.exception());</span>
+<span class="nc" id="L350">                sender.wakeup();</span>
+<span class="nc" id="L351">                return;</span>
+            }
+
+<span class="nc bnc" id="L354" title="All 2 branches missed.">            if (response.requestHeader().apiKey() == ApiKeys.CREATE_TOPICS) {</span>
+<span class="nc" id="L355">                handleCreateTopicsResponse(response);</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            } else if (response.requestHeader().apiKey() == ApiKeys.PRODUCE) {</span>
+<span class="nc" id="L357">                handleProduceResponse(response);</span>
+            }
+
+<span class="nc" id="L360">            sender.wakeup();</span>
+<span class="nc" id="L361">        }</span>
+
+        public String name() {
+<span class="nc" id="L364">            return &quot;ProduceRequestHandler&quot;;</span>
+        }
+
+        public void requestErrorResponse(Throwable exception) {
+<span class="nc" id="L368">            this.result.completeExceptionally(exception);</span>
+<span class="nc" id="L369">        }</span>
+
+        public AbstractRequest.Builder&lt;CreateTopicsRequest&gt; createTopicBuilder() throws ConfigException {
+            // Since the configs are dynamic - something might have changed, so revalidate.
+<span class="nc" id="L373">            Optional&lt;String&gt; dlqTopic = cacheHelper.shareGroupDlqTopic(param.groupId());</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">            if (dlqTopic.isEmpty()) {</span>
+<span class="nc" id="L375">                throw new ConfigException(String.format(&quot;DLQ topic is not configured for share group %s.&quot;, param.groupId()));</span>
+            }
+
+<span class="nc" id="L378">            CreateTopicsRequestData.CreatableTopicConfigCollection topicConfigs = new CreateTopicsRequestData.CreatableTopicConfigCollection();</span>
+<span class="nc" id="L379">            CreateTopicsRequestData.CreatableTopicConfig enableDLQConfig = new CreateTopicsRequestData.CreatableTopicConfig()</span>
+<span class="nc" id="L380">                .setName(TopicConfig.ERRORS_DEADLETTERQUEUE_GROUP_ENABLE_CONFIG)</span>
+<span class="nc" id="L381">                .setValue(&quot;true&quot;);</span>
+<span class="nc" id="L382">            topicConfigs.add(enableDLQConfig);</span>
+            // Every DLQ record's timestamp is explicitly set to the DLQ write time (see topicProduceData()),
+            // so pin CreateTime here rather than letting the topic inherit the cluster's broker-level
+            // log.message.timestamp.type default, which - if LogAppendTime - would silently overwrite it.
+<span class="nc" id="L386">            CreateTopicsRequestData.CreatableTopicConfig timestampTypeConfig = new CreateTopicsRequestData.CreatableTopicConfig()</span>
+<span class="nc" id="L387">                .setName(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG)</span>
+<span class="nc" id="L388">                .setValue(TimestampType.CREATE_TIME.name);</span>
+<span class="nc" id="L389">            topicConfigs.add(timestampTypeConfig);</span>
+
+<span class="nc" id="L391">            CreateTopicsRequestData.CreatableTopicCollection topicCollection = new CreateTopicsRequestData.CreatableTopicCollection();</span>
+<span class="nc" id="L392">            topicCollection.add(new CreateTopicsRequestData.CreatableTopic()</span>
+<span class="nc" id="L393">                .setName(dlqTopic.get())</span>
+<span class="nc" id="L394">                .setReplicationFactor((short) -1)</span>
+<span class="nc" id="L395">                .setNumPartitions((short) -1)</span>
+<span class="nc" id="L396">                .setConfigs(topicConfigs));</span>
+
+<span class="nc" id="L398">            return new CreateTopicsRequest.Builder(new CreateTopicsRequestData()</span>
+<span class="nc" id="L399">                .setTopics(topicCollection));</span>
+        }
+
+        public void populateDLQTopicData() throws ConfigException {
+<span class="nc" id="L403">            Optional&lt;String&gt; dlqTopic = cacheHelper.shareGroupDlqTopic(param.groupId());</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            if (dlqTopic.isEmpty()) {</span>
+<span class="nc" id="L405">                throw new ConfigException(String.format(&quot;DLQ topic is not configured for share group %s.&quot;, param.groupId()));</span>
+            }
+
+<span class="nc" id="L408">            ShareGroupDLQMetadataCacheHelper.TopicPartitionData tpData = cacheHelper.topicPartitionData(dlqTopic.get());</span>
+
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            if (tpData.topicId().isEmpty()) {</span>
+<span class="nc" id="L411">                throw new ConfigException(String.format(&quot;DLQ topic id could not be found for share group %s with DLQ topic %s.&quot;, param.groupId(), dlqTopic.get()));</span>
+            }
+
+<span class="nc bnc" id="L414" title="All 2 branches missed.">            if (tpData.numPartitions().isEmpty()) {</span>
+<span class="nc" id="L415">                throw new ConfigException(String.format(&quot;DLQ topic partition count could not be found for share group %s with DLQ topic %s.&quot;, param.groupId(), dlqTopic.get()));</span>
+            }
+
+<span class="nc bnc" id="L418" title="All 4 branches missed.">            if (tpData.partitionLeaderNodes().isEmpty() || tpData.partitionLeaderNodes().size() != tpData.numPartitions().get()) {</span>
+<span class="nc" id="L419">                throw new ConfigException(String.format(&quot;DLQ topic partition leaders for share group %s with DLQ topic %s could not be found.&quot;, param.groupId(), dlqTopic.get()));</span>
+            }
+
+<span class="nc" id="L422">            this.dlqDestinationPartition = param.topicIdPartition().partition() % tpData.numPartitions().get();</span>
+<span class="nc" id="L423">            this.dlqPartitionLeaderNode = tpData.partitionLeaderNodes().get(dlqDestinationPartition);</span>
+
+<span class="nc bnc" id="L425" title="All 4 branches missed.">            if (this.dlqPartitionLeaderNode == null || this.dlqPartitionLeaderNode.equals(Node.noNode())) {</span>
+<span class="nc" id="L426">                throw new ConfigException(String.format(&quot;DLQ topic partition leader node for share group %s with DLQ topic %s and partition %d could not be found.&quot;, param.groupId(), dlqTopic.get(), dlqDestinationPartition));</span>
+            }
+
+<span class="nc" id="L429">            this.dlqTopicPartitionData = tpData;</span>
+<span class="nc" id="L430">        }</span>
+
+        public ProduceRequestData.TopicProduceData topicProduceData() {
+            // Records have already been resolved (including any remote storage reads) before this
+            // handler was added to the node map, so no blocking fetch happens on the sender thread here.
+<span class="nc" id="L435">            Map&lt;Long, Record&gt; originalRecordData = resolvedRecordData;</span>
+<span class="nc" id="L436">            int maxMessageBytes = dlqTopicMaxMessageBytes();</span>
+
+            // In most cases the offset range is a single offset (see DLQ_MAX_FETCH_BYTES). Track the
+            // running batch size incrementally via DefaultRecord.sizeInBytes() - the same formula
+            // MemoryRecords itself uses - instead of re-serializing the whole batch-so-far on every
+            // offset, which would make this loop quadratic in the number of offsets.
+<span class="nc" id="L442">            List&lt;SimpleRecord&gt; simpleRecords = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L443">            int batchSize = DefaultRecordBatch.RECORD_BATCH_OVERHEAD;</span>
+<span class="nc" id="L444">            Long baseTimestamp = null;</span>
+            // Capped at lastResolvedOffsetThisRound, not just param.lastOffset(): offsets beyond it were
+            // never attempted by this round's fetch and must stay untouched for a fresh round to retry,
+            // rather than being packed in here as headers-only just because they have no map entry yet.
+            // Floored at nextOffsetToSend itself (mirroring the single-record floor below for the
+            // size-exceeds-limit case): a fetch that resolved nothing at all for this round - e.g. a read
+            // that failed outright - would otherwise leave this loop with zero iterations, producing an
+            // empty record batch, which the broker rejects outright. Sending nextOffsetToSend alone,
+            // headers-only, guarantees forward progress even when nothing could be resolved.
+<span class="nc" id="L453">            long roundEnd = Math.max(nextOffsetToSend, Math.min(param.lastOffset(), lastResolvedOffsetThisRound));</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">            for (long offset = nextOffsetToSend; offset &lt;= roundEnd; offset++) {</span>
+                // Must be wall-clock (epoch) time: log retention decides whether to delete this
+                // record's segment by comparing its timestamp against the current wall-clock time.
+<span class="nc" id="L457">                long timestamp = time.milliseconds();</span>
+<span class="nc" id="L458">                ByteBuffer key = null;</span>
+<span class="nc" id="L459">                ByteBuffer value = null;</span>
+<span class="nc" id="L460">                Record record = originalRecordData.get(offset);</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">                if (record != null) {</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">                    key = record.hasKey() ? record.key() : null;</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">                    value = record.hasValue() ? record.value() : null;</span>
+                }
+<span class="nc" id="L465">                Header[] recordHeaders = headers(offset);</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">                if (baseTimestamp == null) {</span>
+<span class="nc" id="L467">                    baseTimestamp = timestamp;</span>
+                }
+<span class="nc" id="L469">                int recordSize = DefaultRecord.sizeInBytes(simpleRecords.size(), timestamp - baseTimestamp, key, value, recordHeaders);</span>
+
+<span class="nc bnc" id="L471" title="All 4 branches missed.">                if (batchSize + recordSize &gt; maxMessageBytes &amp;&amp; !simpleRecords.isEmpty()) {</span>
+                    // Adding this record would exceed the limit and the batch already has at least one
+                    // record - stop here and send the rest in a follow-up request.
+<span class="nc" id="L474">                    break;</span>
+                }
+<span class="nc" id="L476">                simpleRecords.add(new SimpleRecord(timestamp, key, value, recordHeaders));</span>
+<span class="nc" id="L477">                batchSize += recordSize;</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">                if (batchSize &gt; maxMessageBytes) {</span>
+                    // A single record (with its DLQ headers) already exceeds the limit on its own;
+                    // nothing to be gained by holding it back, so send it and let the broker
+                    // enforce/report the ultimate limit for this one, rather than stalling forever.
+<span class="nc" id="L482">                    break;</span>
+                }
+            }
+<span class="nc" id="L485">            lastOffsetIncludedThisRound = nextOffsetToSend + simpleRecords.size() - 1;</span>
+            // Cached so coalesceProduceRequests()'s partition-budget check can reuse the exact value
+            // used above to build this batch, instead of looking it up (and dynamically re-resolving
+            // it) a second time for the same round.
+<span class="nc" id="L489">            this.lastMaxMessageBytes = maxMessageBytes;</span>
+
+<span class="nc" id="L491">            MemoryRecords records = MemoryRecords.withRecords(</span>
+                Compression.NONE,
+<span class="nc" id="L493">                simpleRecords.toArray(new SimpleRecord[]{})</span>
+            );
+
+<span class="nc" id="L496">            return new ProduceRequestData.TopicProduceData()</span>
+<span class="nc" id="L497">                .setName(dlqTopicPartitionData.topicName())</span>
+<span class="nc" id="L498">                .setTopicId(dlqTopicPartitionData.topicId().get())</span>
+<span class="nc" id="L499">                .setPartitionData(List.of(</span>
+                    new ProduceRequestData.PartitionProduceData()
+<span class="nc" id="L501">                        .setIndex(dlqDestinationPartition)  // partition</span>
+<span class="nc" id="L502">                        .setRecords(records)</span>
+                ));
+        }
+
+        int dlqTopicMaxMessageBytes() {
+<span class="nc" id="L507">            return cacheHelper.dlqTopicMaxMessageBytes(dlqTopicPartitionData.topicName());</span>
+        }
+
+        int lastMaxMessageBytes() {
+<span class="nc" id="L511">            return lastMaxMessageBytes;</span>
+        }
+
+        void recordProduceMetric() {
+<span class="nc" id="L515">            shareGroupMetrics.recordDLQProduce(param.groupId());</span>
+<span class="nc" id="L516">        }</span>
+
+        public Node dlqPartitionLeaderNode() {
+<span class="nc" id="L519">            return this.dlqPartitionLeaderNode;</span>
+        }
+
+        public Optional&lt;Throwable&gt; validateDlqTopic() {
+<span class="nc" id="L523">            Optional&lt;String&gt; topicNameOpt = cacheHelper.shareGroupDlqTopic(param.groupId());</span>
+<span class="nc" id="L524">            Optional&lt;String&gt; topicPrefix = cacheHelper.shareGroupDlqTopicPrefix();</span>
+
+            // Verify that DLQ topic for the share group is set and is correctly named.
+<span class="nc bnc" id="L527" title="All 2 branches missed.">            if (topicNameOpt.isEmpty()) {</span>
+<span class="nc" id="L528">                return Optional.of(new ConfigException(String.format(&quot;Configured DLQ topic name in share group: %s is empty.&quot;, param.groupId())));</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">            } else if (topicNameOpt.get().startsWith(&quot;__&quot;)) {</span>
+<span class="nc" id="L530">                return Optional.of(new ConfigException(String.format(&quot;Configured DLQ topic name in share group: %s cannot start with __, topic: %s.&quot;, param.groupId(), topicNameOpt.get())));</span>
+            }
+
+<span class="nc" id="L533">            String topicName = topicNameOpt.get();</span>
+
+            // Verify that DLQ is enabled on a correctly named topic, configured on a share group.
+<span class="nc bnc" id="L536" title="All 4 branches missed.">            if (cacheHelper.containsTopic(topicName) &amp;&amp; !cacheHelper.isDlqEnabledOnTopic(topicName)) {</span>
+<span class="nc" id="L537">                return Optional.of(new ConfigException(String.format(&quot;DLQ is not enabled on configured DLQ topic for share group: %s, topic: %s.&quot;, param.groupId(), topicName)));</span>
+            }
+
+            // Verify that for a non-existent correctly named DLQ topic, auto create should be enabled.
+<span class="nc bnc" id="L541" title="All 4 branches missed.">            if (!cacheHelper.containsTopic(topicName) &amp;&amp; !cacheHelper.isDlqAutoTopicCreateEnabled()) {</span>
+<span class="nc" id="L542">                return Optional.of(new ConfigException(String.format(&quot;DLQ topic does not exist and auto create is disabled on cluster for share group: %s, topic: %s.&quot;, param.groupId(), topicName)));</span>
+            }
+
+            // Verify that if configured, the DLQ topic name prefix aligns with the topic name.
+<span class="nc" id="L546">            return topicPrefix.map(prefix -&gt; {</span>
+<span class="nc bnc" id="L547" title="All 4 branches missed.">                if (!prefix.isEmpty() &amp;&amp; !topicName.startsWith(prefix)) {</span>
+<span class="nc" id="L548">                    return new ConfigException(String.format(&quot;Configured DLQ topic name does not comply with the DLQ topic prefix in share group: %s, topic: %s, prefix: %s.&quot;, param.groupId(), topicName, prefix));</span>
+                }
+<span class="nc" id="L550">                return null;</span>
+            });
+        }
+
+        public boolean dlqTopicExists() {
+<span class="nc" id="L555">            Optional&lt;String&gt; shareGroupDlqTopic = cacheHelper.shareGroupDlqTopic(param.groupId());</span>
+<span class="nc" id="L556">            boolean isDlqTopicPresent = shareGroupDlqTopic.filter(cacheHelper::containsTopic).isPresent();</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">            if (isDlqTopicPresent) {</span>
+                try {
+<span class="nc" id="L559">                    populateDLQTopicData();</span>
+<span class="nc" id="L560">                } catch (ConfigException e) {</span>
+<span class="nc" id="L561">                    return false;</span>
+<span class="nc" id="L562">                }</span>
+                // This path handles both round 1 (dlq() already resolved its records before enqueue)
+                // and a retry of whichever round is currently in flight (nextOffsetToSend is untouched
+                // by a failed produce, so that round's records - resolved when it was first entered -
+                // are still valid); either way, this round's data is already resolved, so just add to
+                // the node map without fetching again.
+<span class="nc" id="L568">                addRequestToNodeMap(dlqPartitionLeaderNode, this);</span>
+            }
+<span class="nc" id="L570">            return isDlqTopicPresent;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L575">            return &quot;ProduceRequestHandler(&quot; +</span>
+                &quot;param: &quot; + param + &quot;\n&quot; +
+                &quot;dlqTopicData: &quot; + dlqTopicPartitionData + &quot;\n&quot; +
+                &quot;)&quot;;
+        }
+
+        private Header[] headers(long offset) {
+<span class="nc" id="L582">            List&lt;Header&gt; headers = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L583">            headers.add(new RecordHeader(HEADER_DLQ_ERRORS_TOPIC, recordTopic().getBytes(StandardCharsets.UTF_8)));</span>
+<span class="nc" id="L584">            headers.add(new RecordHeader(HEADER_DLQ_ERRORS_PARTITION, Integer.toString(param.topicIdPartition().partition()).getBytes(StandardCharsets.UTF_8)));</span>
+<span class="nc" id="L585">            headers.add(new RecordHeader(HEADER_DLQ_ERRORS_OFFSET, Long.toString(offset).getBytes(StandardCharsets.UTF_8)));</span>
+<span class="nc" id="L586">            headers.add(new RecordHeader(HEADER_DLQ_ERRORS_GROUP, param.groupId().getBytes(StandardCharsets.UTF_8)));</span>
+<span class="nc" id="L587">            param.deliveryCount().ifPresent(deliveryCount -&gt; headers.add(</span>
+<span class="nc" id="L588">                new RecordHeader(HEADER_DLQ_ERRORS_DELIVERY_COUNT, Short.toString(deliveryCount).getBytes(StandardCharsets.UTF_8))));</span>
+<span class="nc" id="L589">            param.cause().ifPresent(cause -&gt; {</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">                if (cause.getMessage() != null) {</span>
+<span class="nc" id="L591">                    headers.add(new RecordHeader(HEADER_DLQ_ERRORS_MESSAGE, cause.getMessage().getBytes(StandardCharsets.UTF_8)));</span>
+                }
+<span class="nc" id="L593">            });</span>
+
+<span class="nc" id="L595">            return headers.toArray(new Header[0]);</span>
+        }
+
+        private String recordTopic() {
+<span class="nc" id="L599">            TopicIdPartition topicIdPartition = param.topicIdPartition();</span>
+<span class="nc" id="L600">            String recordTopicName = param.topicIdPartition().topic();</span>
+<span class="nc bnc" id="L601" title="All 4 branches missed.">            if (recordTopicName == null || recordTopicName.isEmpty()) {</span>
+                // If topic name lookup fails, use topic id as a String in the header.
+<span class="nc" id="L603">                recordTopicName = cacheHelper.topicName(param.topicIdPartition().topicId()).orElse(topicIdPartition.topicId().toString());</span>
+            }
+<span class="nc" id="L605">            return recordTopicName;</span>
+        }
+
+        // Visibility for testing
+        Optional&lt;Errors&gt; checkResponseError(ClientResponse response) {
+<span class="nc bnc" id="L610" title="All 2 branches missed.">            if (response.hasResponse()) {</span>
+<span class="nc" id="L611">                return Optional.empty();</span>
+            }
+
+<span class="nc" id="L614">            String dlqTopicName = cacheHelper.shareGroupDlqTopic(param.groupId()).orElse(&quot;&lt;UNKNOWN&gt;&quot;);</span>
+
+<span class="nc" id="L616">            LOG.debug(&quot;Response for RPC for handler {} with DLQ topic {} is invalid - {}.&quot;, this, dlqTopicName, response);</span>
+
+<span class="nc bnc" id="L618" title="All 2 branches missed.">            if (response.authenticationException() != null) {</span>
+<span class="nc" id="L619">                LOG.error(&quot;Authentication exception.&quot;, response.authenticationException());</span>
+<span class="nc" id="L620">                Errors error = Errors.forException(response.authenticationException());</span>
+<span class="nc" id="L621">                return Optional.of(error);</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">            } else if (response.versionMismatch() != null) {</span>
+<span class="nc" id="L623">                LOG.error(&quot;Version mismatch exception.&quot;, response.versionMismatch());</span>
+<span class="nc" id="L624">                Errors error = Errors.forException(response.versionMismatch());</span>
+<span class="nc" id="L625">                return Optional.of(error);</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">            } else if (response.wasDisconnected()) {    // Retriable</span>
+<span class="nc" id="L627">                return Optional.of(Errors.NETWORK_EXCEPTION);</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">            } else if (response.wasTimedOut()) {    // Retriable</span>
+<span class="nc" id="L629">                LOG.debug(&quot;Response for RPC for handler {} with DLQ topic {} timed out - {}.&quot;, this, dlqTopicName, response);</span>
+<span class="nc" id="L630">                return Optional.of(Errors.REQUEST_TIMED_OUT);</span>
+            } else {
+<span class="nc" id="L632">                return Optional.of(Errors.UNKNOWN_SERVER_ERROR);</span>
+            }
+        }
+
+        private void handleCreateTopicsResponse(ClientResponse response) {
+<span class="nc" id="L637">            LOG.debug(&quot;Received CreateTopicsResponse {}.&quot;, response);</span>
+<span class="nc" id="L638">            createTopicsBackoff.incrementAttempt();</span>
+<span class="nc" id="L639">            Errors clientResponseError = checkResponseError(response).orElse(Errors.NONE);</span>
+<span class="nc" id="L640">            String clientResponseErrorMessage = clientResponseError.message();</span>
+<span class="nc" id="L641">            String dlqTopicName = cacheHelper.shareGroupDlqTopic(param.groupId()).orElse(&quot;&lt;UNKNOWN&gt;&quot;);</span>
+
+<span class="nc bnc" id="L643" title="All 3 branches missed.">            switch (clientResponseError) {</span>
+                case NONE:
+                    // Topic has been created
+<span class="nc" id="L646">                    CreateTopicsResponse createTopicsResponse = ((CreateTopicsResponse) response.responseBody());</span>
+<span class="nc" id="L647">                    Optional&lt;CreateTopicsResponseData.CreatableTopicResult&gt; topicResultOpt = createTopicsResponse.data().topics().stream().findFirst();</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">                    if (topicResultOpt.isEmpty()) {</span>
+<span class="nc" id="L649">                        LOG.error(&quot;DLQ topic not found in create topic response {}.&quot;, dlqTopicName);</span>
+<span class="nc" id="L650">                        requestErrorResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION.exception());</span>
+<span class="nc" id="L651">                        break;</span>
+                    }
+
+<span class="nc" id="L654">                    CreateTopicsResponseData.CreatableTopicResult topicResult = topicResultOpt.get();</span>
+<span class="nc" id="L655">                    Errors error = Errors.forCode(topicResult.errorCode());</span>
+<span class="nc" id="L656">                    String errorMessage = topicResult.errorMessage();</span>
+<span class="nc bnc" id="L657" title="All 3 branches missed.">                    switch (error) {</span>
+                        case NONE:
+                            try {
+<span class="nc" id="L660">                                populateDLQTopicData();</span>
+<span class="nc" id="L661">                                createTopicsBackoff.resetAttempts();</span>
+                                // This path is only ever reached for round 1 (a brand-new handler still
+                                // waiting on topic creation), whose records dlq() already resolved before
+                                // enqueue; just add to the node map.
+<span class="nc" id="L665">                                addRequestToNodeMap(this.dlqPartitionLeaderNode, this);</span>
+<span class="nc" id="L666">                            } catch (ConfigException e) {</span>
+<span class="nc" id="L667">                                LOG.error(&quot;Error enqueueing after DLQ create topic response {}.&quot;, this, e);</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">                                if (!createTopicsBackoff.canAttempt()) {</span>
+<span class="nc" id="L669">                                    LOG.error(&quot;Exhausted max retries while populating DLQ topic for {} using DLQ topic {} without success.&quot;, name(), dlqTopicName);</span>
+<span class="nc" id="L670">                                    requestErrorResponse(new Exception(&quot;Exhausted max retries while populating DLQ topic without success.&quot;));</span>
+<span class="nc" id="L671">                                    break;</span>
+                                }
+<span class="nc" id="L673">                                timer.add(new ShareGroupDLQTimerTask(createTopicsBackoff.backOff(), this));</span>
+<span class="nc" id="L674">                            }</span>
+<span class="nc" id="L675">                            break;</span>
+
+                        case TOPIC_ALREADY_EXISTS:
+                            // When topic creation request was sent, it could be that it a previous request
+                            // was in-flight. As such this request might get TOPIC_ALREADY_EXISTS error, which is acceptable
+                            // let it try again and sender logic will take care of it.
+                        case THROTTLING_QUOTA_EXCEEDED:
+<span class="nc" id="L682">                            LOG.debug(&quot;Received retriable error in create DLQ topic response for {} using DLQ topic {}: {}.&quot;, name(), dlqTopicName, errorMessage);</span>
+<span class="nc bnc" id="L683" title="All 2 branches missed.">                            if (!createTopicsBackoff.canAttempt()) {</span>
+<span class="nc" id="L684">                                LOG.error(&quot;Exhausted max retries to create DLQ topic for {} using DLQ topic {} without success.&quot;, name(), dlqTopicName);</span>
+<span class="nc" id="L685">                                requestErrorResponse(new Exception(&quot;Exhausted max retries to create DLQ topic without success.&quot;));</span>
+<span class="nc" id="L686">                                break;</span>
+                            }
+<span class="nc" id="L688">                            timer.add(new ShareGroupDLQTimerTask(createTopicsBackoff.backOff(), this));</span>
+<span class="nc" id="L689">                            break;</span>
+
+                        default:
+<span class="nc" id="L692">                            LOG.error(&quot;Unable to create DLQ topic for {} using DLQ topic {}: {}.&quot;, name(), dlqTopicName, errorMessage);</span>
+<span class="nc" id="L693">                            requestErrorResponse(error.exception());</span>
+                    }
+<span class="nc" id="L695">                    break;</span>
+
+                case NETWORK_EXCEPTION: // Retriable client response error codes.
+                case REQUEST_TIMED_OUT:
+<span class="nc" id="L699">                    LOG.debug(&quot;Received retriable error in create topics client response for {} using DLQ topic {} due to {}.&quot;, name(), dlqTopicName, clientResponseErrorMessage);</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">                    if (!createTopicsBackoff.canAttempt()) {</span>
+<span class="nc" id="L701">                        LOG.error(&quot;Exhausted max retries to create DLQ topic due to error in client response for {} using DLQ topic {}.&quot;, name(), dlqTopicName);</span>
+<span class="nc" id="L702">                        requestErrorResponse(clientResponseError.exception());</span>
+<span class="nc" id="L703">                        break;</span>
+                    }
+<span class="nc" id="L705">                    timer.add(new ShareGroupDLQTimerTask(createTopicsBackoff.backOff(), this));</span>
+<span class="nc" id="L706">                    break;</span>
+
+                default:
+<span class="nc" id="L709">                    LOG.error(&quot;Unable to create DLQ topic due to error in client response for {} using DLQ topic {}: {}.&quot;, name(), dlqTopicName, clientResponseError.code());</span>
+<span class="nc" id="L710">                    requestErrorResponse(clientResponseError.exception());</span>
+            }
+<span class="nc" id="L712">        }</span>
+
+        private void handleProduceResponse(ClientResponse response) {
+<span class="nc" id="L715">            LOG.debug(&quot;Received ProduceRequestResponse {}.&quot;, response);</span>
+<span class="nc" id="L716">            produceRequestBackoff.incrementAttempt();</span>
+<span class="nc" id="L717">            Errors clientResponseError = checkResponseError(response).orElse(Errors.NONE);</span>
+<span class="nc" id="L718">            String clientResponseErrorMessage = clientResponseError.message();</span>
+
+<span class="nc bnc" id="L720" title="All 3 branches missed.">            switch (clientResponseError) {</span>
+                case NONE:
+                    // Produce response received
+<span class="nc" id="L723">                    ProduceResponse produceResponse = ((ProduceResponse) response.responseBody());</span>
+<span class="nc" id="L724">                    ProduceResponseData.TopicProduceResponseCollection produceResponseCollection = produceResponse.data().responses();</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">                    if (produceResponseCollection.isEmpty()) {</span>
+<span class="nc" id="L726">                        LOG.error(&quot;Received empty produce response for {} to dlq topic node {}.&quot;, this, dlqPartitionLeaderNode());</span>
+<span class="nc" id="L727">                        requestErrorResponse(Errors.UNKNOWN_SERVER_ERROR.exception());</span>
+<span class="nc" id="L728">                        break;</span>
+                    }
+
+<span class="nc" id="L731">                    ProduceResponseData.TopicProduceResponse topicProduceResponse = produceResponseCollection.find(</span>
+                        new ProduceResponseData.TopicProduceResponse()
+<span class="nc" id="L733">                            .setTopicId(dlqTopicPartitionData.topicId().get())</span>
+                    );
+<span class="nc bnc" id="L735" title="All 2 branches missed.">                    if (topicProduceResponse == null ||</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">                        topicProduceResponse.partitionResponses().isEmpty()</span>
+                    ) {
+<span class="nc" id="L738">                        LOG.error(&quot;Received empty topic produce response {} to dlq topic node {}.&quot;, this, dlqPartitionLeaderNode());</span>
+<span class="nc" id="L739">                        requestErrorResponse(Errors.UNKNOWN_SERVER_ERROR.exception());</span>
+<span class="nc" id="L740">                        break;</span>
+                    }
+
+<span class="nc" id="L743">                    List&lt;ProduceResponseData.PartitionProduceResponse&gt; partitionResponses = topicProduceResponse.partitionResponses();</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">                    ProduceResponseData.PartitionProduceResponse partitionResponse = partitionResponses.stream().filter(res -&gt; res.index() == dlqDestinationPartition)</span>
+<span class="nc" id="L745">                        .findFirst()</span>
+<span class="nc" id="L746">                        .orElse(null);</span>
+
+<span class="nc bnc" id="L748" title="All 2 branches missed.">                    if (partitionResponse == null) {</span>
+<span class="nc" id="L749">                        LOG.error(&quot;Received empty partition produce response {} to dlq topic node {}.&quot;, this, dlqPartitionLeaderNode());</span>
+<span class="nc" id="L750">                        requestErrorResponse(Errors.UNKNOWN_SERVER_ERROR.exception());</span>
+<span class="nc" id="L751">                        break;</span>
+                    }
+
+<span class="nc" id="L754">                    Errors error = Errors.forCode(partitionResponse.errorCode());</span>
+<span class="nc" id="L755">                    String errorMessage = partitionResponse.errorMessage();</span>
+<span class="nc bnc" id="L756" title="All 3 branches missed.">                    switch (error) {</span>
+                        case NONE:
+<span class="nc" id="L758">                            LOG.debug(&quot;Successfully produced records {} to dlq topic node {}.&quot;, this, dlqPartitionLeaderNode());</span>
+<span class="nc" id="L759">                            shareGroupMetrics.recordDLQRecordWrite(param.groupId(), (int) (lastOffsetIncludedThisRound - nextOffsetToSend + 1));</span>
+<span class="nc" id="L760">                            produceRequestBackoff.resetAttempts();</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">                            if (lastOffsetIncludedThisRound &lt; param.lastOffset()) {</span>
+                                // Only part of the offset range fit within dlqTopicMaxMessageBytes - continue
+                                // sending the remainder as a follow-up produce request instead of completing.
+                                // Resolve the next round's source records (a fresh decompression budget, scoped
+                                // to what's left to send) before rejoining the node map, mirroring the
+                                // &quot;resolved before eligible for coalescing&quot; invariant dlq() establishes for round 1.
+<span class="nc" id="L767">                                nextOffsetToSend = lastOffsetIncludedThisRound + 1;</span>
+<span class="nc" id="L768">                                resolveRound().whenComplete((ignored, err) -&gt; addRequestToNodeMap(dlqPartitionLeaderNode(), this));</span>
+                            } else {
+<span class="nc" id="L770">                                this.result.complete(null);</span>
+                            }
+<span class="nc" id="L772">                            break;</span>
+
+                        case NOT_LEADER_OR_FOLLOWER:
+<span class="nc" id="L775">                            LOG.debug(&quot;Received retriable error produce response for {} to dlq topic node {} - {}.&quot;, this, dlqPartitionLeaderNode(), errorMessage);</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">                            if (!produceRequestBackoff.canAttempt()) {</span>
+<span class="nc" id="L777">                                LOG.error(&quot;Exhausted max retries to produce {} to  DLQ topic node {}.&quot;, this, dlqPartitionLeaderNode());</span>
+<span class="nc" id="L778">                                shareGroupMetrics.recordDLQProduceFailed(param.groupId());</span>
+<span class="nc" id="L779">                                requestErrorResponse(new Exception(&quot;Exhausted max retries to produce to DLQ topic without success.&quot;));</span>
+<span class="nc" id="L780">                                break;</span>
+                            }
+<span class="nc" id="L782">                            timer.add(new ShareGroupDLQTimerTask(produceRequestBackoff.backOff(), this));</span>
+<span class="nc" id="L783">                            break;</span>
+
+                        default:
+<span class="nc" id="L786">                            LOG.error(&quot;Unable to produce {} to DLQ topic node {} - {}.&quot;, this, dlqPartitionLeaderNode(), errorMessage);</span>
+<span class="nc" id="L787">                            partitionResponse.recordErrors().forEach(recordError -&gt;</span>
+<span class="nc" id="L788">                                LOG.error(&quot;Records with errors {} - {}.&quot;, recordError.batchIndex(), recordError.batchIndexErrorMessage()));</span>
+<span class="nc" id="L789">                            shareGroupMetrics.recordDLQProduceFailed(param.groupId());</span>
+<span class="nc" id="L790">                            requestErrorResponse(error.exception());</span>
+                    }
+<span class="nc" id="L792">                    break;</span>
+
+                case NETWORK_EXCEPTION: // Retriable client response error codes.
+                case REQUEST_TIMED_OUT:
+<span class="nc" id="L796">                    LOG.debug(&quot;Received retriable error produce client response for {} for DLQ node {} due to {}.&quot;,</span>
+<span class="nc" id="L797">                        param, dlqPartitionLeaderNode(), clientResponseErrorMessage);</span>
+<span class="nc bnc" id="L798" title="All 2 branches missed.">                    if (!produceRequestBackoff.canAttempt()) {</span>
+<span class="nc" id="L799">                        LOG.error(&quot;Exhausted max retries to produce {} to  DLQ topic node {} due to client response error {}.&quot;,</span>
+<span class="nc" id="L800">                            param, dlqPartitionLeaderNode(), clientResponseErrorMessage);</span>
+<span class="nc" id="L801">                        shareGroupMetrics.recordDLQProduceFailed(param.groupId());</span>
+<span class="nc" id="L802">                        requestErrorResponse(clientResponseError.exception());</span>
+<span class="nc" id="L803">                        break;</span>
+                    }
+<span class="nc" id="L805">                    timer.add(new ShareGroupDLQTimerTask(produceRequestBackoff.backOff(), this));</span>
+<span class="nc" id="L806">                    break;</span>
+
+                default:
+<span class="nc" id="L809">                    LOG.error(&quot;Unable to produce {} to DLQ topic node {} due to client response error {}.&quot;,</span>
+<span class="nc" id="L810">                        param, dlqPartitionLeaderNode(), clientResponseErrorMessage);</span>
+<span class="nc" id="L811">                    shareGroupMetrics.recordDLQProduceFailed(param.groupId());</span>
+<span class="nc" id="L812">                    requestErrorResponse(clientResponseError.exception());</span>
+            }
+<span class="nc" id="L814">        }</span>
+
+        /**
+         * Resolves the source records for the CURRENT round only - the window starting at
+         * {@link #nextOffsetToSend} - reading from the local log on the calling thread and, for any
+         * offsets tiered to remote storage, asynchronously on the remote-storage reader pool. The result
+         * is memoized in {@link #resolvedRecordData} and reused for every retry of this same round (this
+         * method is only ever called once per round - see {@link #dlq} for round 1 and
+         * {@link #handleProduceResponse} for subsequent rounds - so a round's data is never re-fetched by
+         * a retry of that round).
+         *
+         * &lt;p&gt;A failed fetch is non-fatal: {@link #resolvedRecordData} stays empty, {@link
+         * #lastResolvedOffsetThisRound} is set to {@code param.lastOffset()} so {@code topicProduceData()}
+         * treats the whole remaining range as settled, and the DLQ record is produced with headers only
+         * (no key/value) for it - mirroring how individually unavailable offsets are skipped. Unlike a
+         * fetch that partially succeeds (see {@link ShareGroupDLQRecordFetcher.FetchResult}), a total
+         * failure here isn't a decompression-budget gap a fresh round could resolve, so there's no reason
+         * to hold any of the range back for a retry. This applies equally to an unexpected error thrown
+         * synchronously by {@link #maybeFetchRecordData} itself (e.g. a cache-helper lookup) - not just
+         * one carried by the returned future's exceptional completion - since this method is called
+         * directly from {@link #handleProduceResponse} (on the sender thread, inside a
+         * {@code RequestCompletionHandler} callback) for round 2 onward: letting an exception escape
+         * from here would propagate out of {@code onComplete()}, which - depending on which internal
+         * path delivers the response - is not guaranteed to be caught before reaching the broker's
+         * fatal-error handling.
+         *
+         * @return A future that always completes normally, once this round's resolution has finished.
+         */
+        CompletableFuture&lt;Void&gt; resolveRound() {
+<span class="nc" id="L843">            long roundStart = nextOffsetToSend;</span>
+<span class="nc" id="L844">            CompletableFuture&lt;Void&gt; resolved = new CompletableFuture&lt;&gt;();</span>
+            try {
+<span class="nc" id="L846">                maybeFetchRecordData(roundStart).whenComplete((fetchResult, exception) -&gt; {</span>
+<span class="nc bnc" id="L847" title="All 4 branches missed.">                    if (exception != null || fetchResult == null) {</span>
+<span class="nc" id="L848">                        LOG.warn(&quot;Unable to fetch original record data for handler {} for the round starting at offset {}. &quot; +</span>
+<span class="nc" id="L849">                            &quot;DLQ records will be produced with headers only for this round.&quot;, this, roundStart, exception);</span>
+<span class="nc" id="L850">                        this.resolvedRecordData = Map.of();</span>
+<span class="nc" id="L851">                        this.lastResolvedOffsetThisRound = param.lastOffset();</span>
+                    } else {
+<span class="nc" id="L853">                        this.resolvedRecordData = fetchResult.records();</span>
+<span class="nc" id="L854">                        this.lastResolvedOffsetThisRound = fetchResult.lastResolvedOffset();</span>
+                    }
+<span class="nc" id="L856">                    resolved.complete(null);</span>
+<span class="nc" id="L857">                });</span>
+<span class="nc" id="L858">            } catch (Throwable t) {</span>
+<span class="nc" id="L859">                LOG.warn(&quot;Unexpected error resolving round starting at offset {} for {}. &quot; +</span>
+<span class="nc" id="L860">                    &quot;DLQ records will be produced with headers only for this round.&quot;, roundStart, this, t);</span>
+<span class="nc" id="L861">                this.resolvedRecordData = Map.of();</span>
+<span class="nc" id="L862">                this.lastResolvedOffsetThisRound = param.lastOffset();</span>
+<span class="nc" id="L863">                resolved.complete(null);</span>
+<span class="nc" id="L864">            }</span>
+<span class="nc" id="L865">            return resolved;</span>
+        }
+
+        private CompletableFuture&lt;ShareGroupDLQRecordFetcher.FetchResult&gt; maybeFetchRecordData(long fromOffset) {
+<span class="nc bnc" id="L869" title="All 2 branches missed.">            if (!cacheHelper.isShareGroupDlqCopyRecordEnabled(param.groupId())) {</span>
+<span class="nc" id="L870">                return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L871">                    new ShareGroupDLQRecordFetcher.FetchResult(Map.of(), param.lastOffset()));</span>
+            }
+            // Bounds decompression memory against a pathologically compressible source record: there's
+            // no point retaining more decompressed data than the DLQ topic could ever accept anyway, and
+            // (unlike the user's own topic config) this value isn't controlled by whoever produced the
+            // record being copied. Falls back to DLQ_MAX_FETCH_BYTES in the (defensive-only) case the DLQ
+            // topic isn't resolvable here - copy-record being enabled implies one is configured in practice.
+<span class="nc" id="L878">            int maxDecompressedBytes = cacheHelper.shareGroupDlqTopic(param.groupId())</span>
+<span class="nc" id="L879">                .map(cacheHelper::dlqTopicMaxMessageBytes)</span>
+<span class="nc" id="L880">                .orElse(DLQ_MAX_FETCH_BYTES);</span>
+            // param itself is never mutated - headers()/topicProduceData() rely on its original,
+            // unwindowed firstOffset/lastOffset for the handler's whole lifetime. Build a throwaway
+            // windowed copy only to scope this round's fetch (and its decompression budget) to what's
+            // left to send.
+            ShareGroupDLQRecordParameter window;
+<span class="nc bnc" id="L886" title="All 2 branches missed.">            if (fromOffset == param.firstOffset()) {</span>
+<span class="nc" id="L887">                window = param;</span>
+            } else {
+<span class="nc" id="L889">                window = new ShareGroupDLQRecordParameter(param.groupId(), param.topicIdPartition(), fromOffset,</span>
+<span class="nc" id="L890">                    param.lastOffset(), param.deliveryCount(), param.cause());</span>
+            }
+<span class="nc" id="L892">            return new ShareGroupDLQRecordFetcher(logReader, time, window, DLQ_MAX_FETCH_BYTES, maxDecompressedBytes).fetch();</span>
+        }
+    }
+
+    private class SendThread extends InterBrokerSendThread {
+<span class="nc" id="L897">        private final ConcurrentLinkedQueue&lt;ShareGroupDLQStateManager.ProduceRequestHandler&gt; queue = new ConcurrentLinkedQueue&lt;&gt;();</span>
+        private final Random random;
+
+<span class="nc" id="L900">        SendThread(String name, KafkaClient client, int requestTimeoutMs, Time time, boolean isInterruptible, Random random) {</span>
+<span class="nc" id="L901">            super(name, client, requestTimeoutMs, time, isInterruptible);</span>
+<span class="nc" id="L902">            this.random = random;</span>
+<span class="nc" id="L903">        }</span>
+
+        @Override
+        public Collection&lt;RequestAndCompletionHandler&gt; generateRequests() {
+<span class="nc" id="L907">            List&lt;RequestAndCompletionHandler&gt; requests = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L909" title="All 2 branches missed.">            if (!queue.isEmpty()) {</span>
+<span class="nc" id="L910">                ShareGroupDLQStateManager.ProduceRequestHandler handler = queue.poll();</span>
+                // At this point either a correctly named and configured DLQ topic exists or
+                // one is configured but does non-exist. We have already validated that the
+                // auto create should be enabled, in that case.
+<span class="nc bnc" id="L914" title="All 2 branches missed.">                if (!handler.dlqTopicExists()) {</span>
+                    // We need to send RPC to create the topic
+<span class="nc" id="L916">                    Node randomNode = randomNode();</span>
+<span class="nc bnc" id="L917" title="All 2 branches missed.">                    if (randomNode == Node.noNode()) {</span>
+<span class="nc" id="L918">                        log.error(&quot;Unable to find node to send create topic request for handler {}.&quot;, handler);</span>
+                        // fatal failure, cannot retry or progress
+                        // fail the RPC
+<span class="nc" id="L921">                        handler.requestErrorResponse(Errors.BROKER_NOT_AVAILABLE.exception());</span>
+<span class="nc" id="L922">                        return List.of();</span>
+                    }
+
+                    try {
+<span class="nc" id="L926">                        AbstractRequest.Builder&lt;CreateTopicsRequest&gt; builder = handler.createTopicBuilder();</span>
+<span class="nc" id="L927">                        return List.of(new RequestAndCompletionHandler(</span>
+<span class="nc" id="L928">                            time.milliseconds(),</span>
+                            randomNode,
+                            builder,
+                            handler
+                        ));
+<span class="nc" id="L933">                    } catch (ConfigException exp) {</span>
+<span class="nc" id="L934">                        log.error(&quot;Unable to create topic request for handler {}.&quot;, handler, exp);</span>
+<span class="nc" id="L935">                        handler.requestErrorResponse(Errors.INVALID_CONFIG.exception());</span>
+                    }
+                }
+                // When the DLQ topic already exists, the handler is added to the node map for produce
+                // coalescing (asynchronously, once its records are resolved), so nothing more to do here.
+            }
+
+            // {
+            //  node1: {
+            //      [P1, P2, P3]
+            //  },
+            //  node2: {
+            //.     [P4, P5]
+            //  }, ...
+            // }
+            // For a sequence of produce RPCs, the flow would be:
+            // 1. 1st produce request arrives.
+            // 2. it is enqueued in the send thread.
+            // 3. wakeup event causes the generate requests to create the DLQ topic if required.
+            // 4. it will cause either RPC or cache lookup.
+            // 5. once complete, the produce handler is added to the nodeMap for batching and not the queue.
+            // 6. wakeup event causes generateRequests to iterate over the map and send the produce request (P1) and
+            // remove node from the nodeMap and add it to inFlight.
+            // 7. until P1 completes, more produce requests (P2, P3, ...) could come in and get added to the nodeMap as per point 3, 4, 5.
+            // 8. if these belong to same node as P1. They will not be sent as the membership test with inFlight will pass.
+            // 9. when P1 completes, it will clear inFlight and raise wakeup event.
+            // 10. at this point P2, P3, etc. could be sent as a combined request thus achieving batching.
+<span class="nc" id="L962">            final Set&lt;Node&gt; sending = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L963">            final Set&lt;Node&gt; emptyNodes = new HashSet&lt;&gt;();   // Nodes for which no coalesced handler was found.</span>
+            // Handlers that didn't fit within this round's dlqTopicMaxMessageBytes budget for their
+            // destination partition - re-added to the node map below (after nodeRPCMap.remove(node),
+            // which would otherwise wipe them out) so they're retried on a subsequent tick.
+<span class="nc" id="L967">            final List&lt;ProduceRequestHandler&gt; deferredForNextRound = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L968">            synchronized (nodeMapLock) {</span>
+<span class="nc" id="L969">                nodeRPCMap.forEach((destNode, handlers) -&gt; {</span>
+                    // this condition causes requests of same type and same destination node
+                    // to not be sent immediately but get batched
+<span class="nc bnc" id="L972" title="All 2 branches missed.">                    if (!inFlight.contains(destNode)) {</span>
+<span class="nc" id="L973">                        CoalesceResults results = coalesceProduceRequests(handlers);</span>
+<span class="nc" id="L974">                        deferredForNextRound.addAll(results.deferredHandlers());</span>
+<span class="nc bnc" id="L975" title="All 2 branches missed.">                        if (results.liveHandlers().isEmpty()) {</span>
+<span class="nc" id="L976">                            emptyNodes.add(destNode);</span>
+<span class="nc" id="L977">                            return;</span>
+                        }
+<span class="nc" id="L979">                        requests.add(new RequestAndCompletionHandler(</span>
+<span class="nc" id="L980">                            time.milliseconds(),</span>
+                            destNode,
+<span class="nc" id="L982">                            results.request(),</span>
+                            response -&gt; {
+<span class="nc" id="L984">                                inFlight.remove(destNode);</span>
+
+                                // now the combined request has completed
+                                // we need to create responses for individual
+                                // requests which composed the combined request
+<span class="nc" id="L989">                                results.liveHandlers().forEach(handler -&gt; completeHandlerSafely(handler, response));</span>
+<span class="nc" id="L990">                                wakeup();</span>
+<span class="nc" id="L991">                            }));</span>
+<span class="nc" id="L992">                        sending.add(destNode);</span>
+                    }
+<span class="nc" id="L994">                });</span>
+
+<span class="nc" id="L996">                emptyNodes.forEach(nodeRPCMap::remove);</span>
+<span class="nc" id="L997">                sending.forEach(node -&gt; {</span>
+                    // we need to add these nodes to inFlight
+<span class="nc" id="L999">                    inFlight.add(node);</span>
+
+                    // remove from nodeMap
+<span class="nc" id="L1002">                    nodeRPCMap.remove(node);</span>
+<span class="nc" id="L1003">                });</span>
+<span class="nc" id="L1004">            } // close of synchronized context</span>
+
+<span class="nc" id="L1006">            deferredForNextRound.forEach(handler -&gt; addRequestToNodeMap(handler.dlqPartitionLeaderNode(), handler));</span>
+
+<span class="nc" id="L1008">            return requests;</span>
+        }
+
+        public void enqueue(ShareGroupDLQStateManager.ProduceRequestHandler handler) {
+<span class="nc" id="L1012">            Optional&lt;Throwable&gt; exp = handler.validateDlqTopic();</span>
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">            if (exp.isPresent()) {</span>
+<span class="nc" id="L1014">                handler.requestErrorResponse(exp.get());</span>
+<span class="nc" id="L1015">                return;</span>
+            }
+<span class="nc" id="L1017">            queue.add(handler);</span>
+<span class="nc" id="L1018">            wakeup();</span>
+<span class="nc" id="L1019">        }</span>
+
+        private Node randomNode() {
+<span class="nc" id="L1022">            List&lt;Node&gt; nodes = cacheHelper.getClusterNodes();</span>
+<span class="nc bnc" id="L1023" title="All 4 branches missed.">            if (nodes == null || nodes.isEmpty()) {</span>
+<span class="nc" id="L1024">                return Node.noNode();</span>
+            }
+<span class="nc" id="L1026">            return nodes.get(random.nextInt(nodes.size()));</span>
+        }
+    }
+
+    private final class ShareGroupDLQTimerTask extends TimerTask {
+        private final ProduceRequestHandler handler;
+
+<span class="nc" id="L1033">        ShareGroupDLQTimerTask(long delayMs, ProduceRequestHandler handler) {</span>
+<span class="nc" id="L1034">            super(delayMs);</span>
+<span class="nc" id="L1035">            this.handler = handler;</span>
+<span class="nc" id="L1036">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc" id="L1040">            sender.enqueue(handler);</span>
+<span class="nc" id="L1041">            sender.wakeup();</span>
+<span class="nc" id="L1042">        }</span>
+    }
+
+    // Visibility for tests
+<span class="nc" id="L1046">    record CoalesceResults(</span>
+        AbstractRequest.Builder&lt;? extends AbstractRequest&gt; request,
+        List&lt;ProduceRequestHandler&gt; liveHandlers,
+        List&lt;ProduceRequestHandler&gt; deferredHandlers
+    ) {
+    }
+
+    // Visibility for tests
+    static CoalesceResults coalesceProduceRequests(List&lt;ProduceRequestHandler&gt; handlers) {
+        // Above handlers are destined for the same broker node - it could be for different DLQ topics and partitions
+        // but the same broker node. The produce request requires each topic data request to be scoped to a
+        // specific topic/topicId, and within a topic each partition must appear at most once (the broker keys
+        // partitions by (topicId, index) and would otherwise drop all but one entry). So we first collect the
+        // records into a map keyed by DLQ topic id and then DLQ partition - merging the records of all handlers
+        // that target the same (topic, partition) - and then build a single produce request from that map.
+<span class="nc" id="L1061">        Map&lt;Uuid, String&gt; topicNames = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1062">        Map&lt;Uuid, Map&lt;Integer, List&lt;MemoryRecords&gt;&gt;&gt; recordsByTopicAndPartition = new LinkedHashMap&lt;&gt;();</span>
+        // Running merged-batch size per (topic, partition), used to defer handlers that would push a
+        // merged batch over dlqTopicMaxMessageBytes rather than sending an oversized request. Each
+        // handler's own batch is already &lt;= the limit (see topicProduceData()), so this only ever needs
+        // to decide how many whole handlers fit - the first handler for a given partition is always
+        // admitted, guaranteeing progress even if it alone is at the limit.
+<span class="nc" id="L1068">        Map&lt;Uuid, Map&lt;Integer, Integer&gt;&gt; runningSizeByTopicAndPartition = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1069">        List&lt;ProduceRequestHandler&gt; liveHandlers = new ArrayList&lt;&gt;(handlers.size());</span>
+<span class="nc" id="L1070">        List&lt;ProduceRequestHandler&gt; deferredHandlers = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1071">        handlers.forEach(handler -&gt; {</span>
+            try {
+<span class="nc" id="L1073">                ProduceRequestData.TopicProduceData topicProduceData = handler.topicProduceData();</span>
+<span class="nc" id="L1074">                Uuid topicId = topicProduceData.topicId();</span>
+<span class="nc" id="L1075">                int maxMessageBytes = handler.lastMaxMessageBytes();</span>
+<span class="nc" id="L1076">                Map&lt;Integer, Integer&gt; runningSizeByPartition =</span>
+<span class="nc" id="L1077">                    runningSizeByTopicAndPartition.computeIfAbsent(topicId, k -&gt; new HashMap&lt;&gt;());</span>
+
+<span class="nc" id="L1079">                boolean fits = topicProduceData.partitionData().stream().allMatch(partitionData -&gt; {</span>
+<span class="nc" id="L1080">                    int runningSize = runningSizeByPartition.getOrDefault(partitionData.index(), 0);</span>
+<span class="nc" id="L1081">                    int recordsSize = partitionData.records().sizeInBytes();</span>
+<span class="nc bnc" id="L1082" title="All 4 branches missed.">                    return runningSize == 0 || runningSize + recordsSize &lt;= maxMessageBytes;</span>
+                });
+
+<span class="nc bnc" id="L1085" title="All 2 branches missed.">                if (!fits) {</span>
+<span class="nc" id="L1086">                    deferredHandlers.add(handler);</span>
+<span class="nc" id="L1087">                    return;</span>
+                }
+
+<span class="nc" id="L1090">                topicNames.putIfAbsent(topicId, topicProduceData.name());</span>
+<span class="nc" id="L1091">                Map&lt;Integer, List&lt;MemoryRecords&gt;&gt; partitionRecords =</span>
+<span class="nc" id="L1092">                    recordsByTopicAndPartition.computeIfAbsent(topicId, k -&gt; new LinkedHashMap&lt;&gt;());</span>
+<span class="nc" id="L1093">                topicProduceData.partitionData().forEach(partitionData -&gt; {</span>
+<span class="nc" id="L1094">                    MemoryRecords records = (MemoryRecords) partitionData.records();</span>
+<span class="nc" id="L1095">                    partitionRecords.computeIfAbsent(partitionData.index(), k -&gt; new ArrayList&lt;&gt;()).add(records);</span>
+<span class="nc" id="L1096">                    runningSizeByPartition.merge(partitionData.index(), records.sizeInBytes(), Integer::sum);</span>
+<span class="nc" id="L1097">                });</span>
+<span class="nc" id="L1098">                liveHandlers.add(handler);</span>
+                // Only counted once the handler's data is actually admitted into the outgoing request -
+                // a handler that gets deferred here (see above) hasn't produced anything yet, so it
+                // must not be counted, however many times it gets re-evaluated across ticks.
+<span class="nc" id="L1102">                handler.recordProduceMetric();</span>
+<span class="nc" id="L1103">            } catch (Exception exception) {</span>
+<span class="nc" id="L1104">                log.error(&quot;Unable to coalesce ProduceRequestData for handler {}. It will be skipped from DLQ.&quot;, handler, exception);</span>
+<span class="nc" id="L1105">                handler.requestErrorResponse(exception);</span>
+<span class="nc" id="L1106">            }</span>
+<span class="nc" id="L1107">        });</span>
+
+<span class="nc" id="L1109">        ProduceRequestData.TopicProduceDataCollection topicData = new ProduceRequestData.TopicProduceDataCollection();</span>
+<span class="nc" id="L1110">        recordsByTopicAndPartition.forEach((topicId, partitionRecords) -&gt; {</span>
+<span class="nc" id="L1111">            List&lt;ProduceRequestData.PartitionProduceData&gt; partitionData = new ArrayList&lt;&gt;(partitionRecords.size());</span>
+<span class="nc" id="L1112">            partitionRecords.forEach((partitionIndex, records) -&gt;</span>
+<span class="nc" id="L1113">                partitionData.add(new ProduceRequestData.PartitionProduceData()</span>
+<span class="nc" id="L1114">                    .setIndex(partitionIndex)</span>
+<span class="nc" id="L1115">                    .setRecords(mergeRecords(records))));</span>
+<span class="nc" id="L1116">            topicData.add(new ProduceRequestData.TopicProduceData()</span>
+<span class="nc" id="L1117">                .setName(topicNames.get(topicId))</span>
+<span class="nc" id="L1118">                .setTopicId(topicId)</span>
+<span class="nc" id="L1119">                .setPartitionData(partitionData));</span>
+<span class="nc" id="L1120">        });</span>
+
+<span class="nc" id="L1122">        ProduceRequestData data = new ProduceRequestData()</span>
+<span class="nc" id="L1123">            .setTopicData(topicData)</span>
+<span class="nc" id="L1124">            .setAcks((short) -1)  // all replicas</span>
+<span class="nc" id="L1125">            .setTimeoutMs(ServerConfigs.REQUEST_TIMEOUT_MS_DEFAULT);</span>
+
+<span class="nc" id="L1127">        return new CoalesceResults(</span>
+<span class="nc" id="L1128">            new ProduceRequest.Builder(ApiKeys.PRODUCE.latestVersion(), ApiKeys.PRODUCE.latestVersion(), data),</span>
+            liveHandlers,
+            deferredHandlers
+        );
+    }
+
+    /**
+     * Merges the records of all handlers that target the same DLQ partition into a single {@link MemoryRecords}
+     * (one record batch). The partition must appear only once in the coalesced produce request, and a produce
+     * request is only allowed one record batch per partition - so when more than one handler contributes records
+     * for a partition, they are combined into a single batch.
+     */
+    private static MemoryRecords mergeRecords(List&lt;MemoryRecords&gt; recordsList) {
+<span class="nc bnc" id="L1141" title="All 2 branches missed.">        if (recordsList.size() == 1) {</span>
+<span class="nc" id="L1142">            return recordsList.get(0);</span>
+        }
+<span class="nc" id="L1144">        List&lt;SimpleRecord&gt; simpleRecords = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">        for (MemoryRecords records : recordsList) {</span>
+<span class="nc bnc" id="L1146" title="All 2 branches missed.">            for (Record record : records.records()) {</span>
+<span class="nc" id="L1147">                simpleRecords.add(new SimpleRecord(record.timestamp(), record.key(), record.value(), record.headers()));</span>
+<span class="nc" id="L1148">            }</span>
+<span class="nc" id="L1149">        }</span>
+<span class="nc" id="L1150">        return MemoryRecords.withRecords(Compression.NONE, simpleRecords.toArray(new SimpleRecord[0]));</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

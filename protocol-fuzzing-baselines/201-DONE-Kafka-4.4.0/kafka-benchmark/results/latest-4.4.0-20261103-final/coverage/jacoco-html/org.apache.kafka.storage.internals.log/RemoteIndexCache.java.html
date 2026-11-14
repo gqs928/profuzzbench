@@ -1,0 +1,745 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RemoteIndexCache.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.storage.internals.log</a> &gt; <span class="el_source">RemoteIndexCache.java</span></div><h1>RemoteIndexCache.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.storage.internals.log;
+
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.server.log.remote.storage.RemoteLogSegmentMetadata;
+import org.apache.kafka.server.log.remote.storage.RemoteResourceNotFoundException;
+import org.apache.kafka.server.log.remote.storage.RemoteStorageException;
+import org.apache.kafka.server.log.remote.storage.RemoteStorageManager;
+import org.apache.kafka.server.log.remote.storage.RemoteStorageManager.IndexType;
+import org.apache.kafka.server.util.KafkaScheduler;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalCause;
+import com.github.benmanes.caffeine.cache.Ticker;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
+import java.util.stream.Stream;
+
+import static org.apache.kafka.storage.internals.log.LogFileUtils.INDEX_FILE_SUFFIX;
+import static org.apache.kafka.storage.internals.log.LogFileUtils.TIME_INDEX_FILE_SUFFIX;
+import static org.apache.kafka.storage.internals.log.LogFileUtils.TXN_INDEX_FILE_SUFFIX;
+
+/**
+ * This is a LFU (Least Frequently Used) cache of remote index files stored in `$logdir/remote-log-index-cache`.
+ * This is helpful to avoid re-fetching the index files like offset, time indexes from the remote storage for every
+ * fetch call. The cache is re-initialized from the index files on disk on startup, if the index files are available.
+ *
+ * The cache contains a garbage collection thread which will delete the files for entries that have been removed from
+ * the cache.
+ *
+ * Note that closing this cache does not delete the index files on disk.
+ * Note that the cache eviction policy is based on the default implementation of Caffeine i.e.
+ * &lt;a href=&quot;https://github.com/ben-manes/caffeine/wiki/Efficiency&quot;&gt;Window TinyLfu&lt;/a&gt;. TinyLfu relies on a frequency
+ * sketch to probabilistically estimate the historic usage of an entry.
+ *
+ * This class is thread safe.
+ */
+public class RemoteIndexCache implements Closeable {
+
+<span class="nc" id="L80">    private static final Logger log = LoggerFactory.getLogger(RemoteIndexCache.class);</span>
+    private static final String TMP_FILE_SUFFIX = &quot;.tmp&quot;;
+    public static final String REMOTE_LOG_INDEX_CACHE_CLEANER_THREAD = &quot;remote-log-index-cleaner&quot;;
+    public static final String DIR_NAME = &quot;remote-log-index-cache&quot;;
+
+    /**
+     * Directory where the index files will be stored on disk.
+     */
+    private final File cacheDir;
+
+    /**
+     * Represents if the cache is closed or not. Closing the cache is an irreversible operation.
+     */
+<span class="nc" id="L93">    private final AtomicBoolean isRemoteIndexCacheClosed = new AtomicBoolean(false);</span>
+
+    /**
+     * Lock used to synchronize close with other read operations. This ensures that when we close, we don't have any other
+     * concurrent reads in-progress.
+     */
+<span class="nc" id="L99">    private final ReadWriteLock lock = new ReentrantReadWriteLock();</span>
+    private final RemoteStorageManager remoteStorageManager;
+<span class="nc" id="L101">    private final KafkaScheduler cleanerScheduler = new KafkaScheduler(1, true, REMOTE_LOG_INDEX_CACHE_CLEANER_THREAD);</span>
+<span class="nc" id="L102">    private int fileDeleteDelayMs = 10_000;</span>
+
+    /**
+     * Actual cache implementation that this file wraps around.
+     *
+     * The requirements for this internal cache is as follows:
+     * 1. Multiple threads should be able to read concurrently.
+     * 2. Fetch for missing keys should not block read for available keys.
+     * 3. Only one thread should fetch for a specific key.
+     * 4. Should support LRU-like policy.
+     *
+     * We use {@link Caffeine} cache instead of implementing a thread safe LRU cache on our own.
+     */
+    private final Cache&lt;Uuid, Entry&gt; internalCache;
+
+    /**
+     * Creates RemoteIndexCache with the given configs.
+     *
+     * @param maxSize              maximum bytes size of segment index entries to be cached.
+     * @param remoteStorageManager RemoteStorageManager instance, to be used in fetching indexes.
+     * @param logDir               log directory
+     */
+    public RemoteIndexCache(long maxSize, RemoteStorageManager remoteStorageManager, String logDir) throws IOException {
+<span class="nc" id="L125">        this(maxSize, -1L, false, remoteStorageManager, logDir);</span>
+<span class="nc" id="L126">    }</span>
+
+    /**
+     * Creates RemoteIndexCache with the given configs.
+     *
+     * @param maxSize              maximum bytes size of segment index entries to be cached.
+     * @param ttlMs                maximum time in milliseconds an entry can remain in cache after last access. -1 to disable.
+     * @param recordStats          whether to record cache statistics. Recording statistics requires bookkeeping with each operation.
+     * @param remoteStorageManager RemoteStorageManager instance, to be used in fetching indexes.
+     * @param logDir               log directory
+     */
+    public RemoteIndexCache(long maxSize, long ttlMs, boolean recordStats, RemoteStorageManager remoteStorageManager, String logDir) throws IOException {
+<span class="nc" id="L138">        this(maxSize, ttlMs, recordStats, remoteStorageManager, logDir, null);</span>
+<span class="nc" id="L139">    }</span>
+
+    /**
+     * Creates RemoteIndexCache with the given configs and custom ticker (for testing).
+     *
+     * @param maxSize              maximum bytes size of segment index entries to be cached.
+     * @param ttlMs                maximum time in milliseconds an entry can remain in cache after last access. -1 to disable.
+     * @param recordStats          whether to record cache statistics. Recording statistics requires bookkeeping with each operation.
+     * @param remoteStorageManager RemoteStorageManager instance, to be used in fetching indexes.
+     * @param logDir               log directory
+     * @param ticker               custom ticker for testing time-based eviction (null for system ticker)
+     */
+    public RemoteIndexCache(long maxSize, long ttlMs, boolean recordStats, RemoteStorageManager remoteStorageManager, String logDir,
+<span class="nc" id="L152">                           Ticker ticker) throws IOException {</span>
+<span class="nc" id="L153">        this.remoteStorageManager = remoteStorageManager;</span>
+<span class="nc" id="L154">        cacheDir = new File(logDir, DIR_NAME);</span>
+
+<span class="nc" id="L156">        internalCache = initEmptyCache(maxSize, ttlMs, recordStats, ticker);</span>
+<span class="nc" id="L157">        init();</span>
+<span class="nc" id="L158">        cleanerScheduler.startup();</span>
+<span class="nc" id="L159">    }</span>
+
+    public void resizeCacheSize(long remoteLogIndexFileCacheSize) {
+<span class="nc" id="L162">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L164">            internalCache.policy().eviction().orElseThrow(() -&gt; new NoSuchElementException(&quot;No eviction policy is set for the remote index cache.&quot;)</span>
+<span class="nc" id="L165">            ).setMaximum(remoteLogIndexFileCacheSize);</span>
+        } finally {
+<span class="nc" id="L167">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L169">    }</span>
+
+    private Cache&lt;Uuid, Entry&gt; initEmptyCache(long maxSize, long ttlMs, boolean recordStats, Ticker ticker) {
+<span class="nc" id="L172">        Caffeine&lt;Uuid, Entry&gt; builder = Caffeine.newBuilder()</span>
+<span class="nc" id="L173">                .maximumWeight(maxSize)</span>
+<span class="nc" id="L174">                .weigher((Uuid key, Entry entry) -&gt; (int) entry.entrySizeBytes);</span>
+
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        if (recordStats) {</span>
+<span class="nc" id="L177">            builder.recordStats();</span>
+        }
+
+<span class="nc bnc" id="L180" title="All 2 branches missed.">        if (ticker != null) {</span>
+<span class="nc" id="L181">            builder.ticker(ticker);</span>
+        }
+
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        if (ttlMs &gt; 0) {</span>
+<span class="nc" id="L185">            builder.expireAfterAccess(ttlMs, TimeUnit.MILLISECONDS);</span>
+        }
+
+<span class="nc" id="L188">        return builder</span>
+                // This listener is invoked each time an entry is being automatically removed due to eviction. The cache will invoke this listener
+                // during the atomic operation to remove the entry (refer: https://github.com/ben-manes/caffeine/wiki/Removal),
+                // hence, care must be taken to ensure that this operation is not expensive. Note that this listener is not invoked when
+                // RemovalCause from cache is EXPLICIT or REPLACED (e.g. on Cache.invalidate(), Cache.put() etc.) For a complete list see:
+                // https://github.com/ben-manes/caffeine/blob/0cef55168986e3816314e7fdba64cb0b996dd3cc/caffeine/src/main/java/com/github/benmanes/caffeine/cache/RemovalCause.java#L23
+                // Hence, any operation required after removal from cache must be performed manually for these scenarios.
+<span class="nc" id="L195">                .evictionListener((Uuid key, Entry entry, RemovalCause cause) -&gt; {</span>
+                    // Mark the entries for cleanup and add them to the queue to be garbage collected later by the background thread.
+<span class="nc bnc" id="L197" title="All 2 branches missed.">                    if (entry != null) {</span>
+<span class="nc" id="L198">                        enqueueEntryForCleanup(entry);</span>
+                    } else {
+<span class="nc" id="L200">                        log.error(&quot;Received entry as null for key {} when the it is removed from the cache.&quot;, key);</span>
+                    }
+<span class="nc" id="L202">                }).build();</span>
+    }
+
+    // Visible for testing
+    int expiredIdxPendingForDeletion() {
+<span class="nc" id="L207">        return cleanerScheduler.pendingTaskSize();</span>
+    }
+
+    // Visible for testing
+    Cache&lt;Uuid, Entry&gt; internalCache() {
+<span class="nc" id="L212">        return internalCache;</span>
+    }
+
+    // Visible for testing
+    File cacheDir() {
+<span class="nc" id="L217">        return cacheDir;</span>
+    }
+
+    public void remove(Uuid key) {
+<span class="nc" id="L221">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L223">            internalCache.asMap().computeIfPresent(key, (k, v) -&gt; {</span>
+<span class="nc" id="L224">                enqueueEntryForCleanup(v);</span>
+                // Returning null to remove the key from the cache
+<span class="nc" id="L226">                return null;</span>
+            });
+        } finally {
+<span class="nc" id="L229">            lock.readLock().unlock();</span>
+        }
+<span class="nc" id="L231">    }</span>
+
+    public void removeAll(Collection&lt;Uuid&gt; keys) {
+<span class="nc" id="L234">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L236">            keys.forEach(key -&gt; internalCache.asMap().computeIfPresent(key, (k, v) -&gt; {</span>
+                // Mark then entry for cleanup before removing it from the cache to avoid contention with the
+                // next fetch for the same key.
+<span class="nc" id="L239">                enqueueEntryForCleanup(v);</span>
+                // Returning null to remove the key from the cache
+<span class="nc" id="L241">                return null;</span>
+            }));
+        } finally {
+<span class="nc" id="L244">            lock.readLock().unlock();</span>
+        }
+<span class="nc" id="L246">    }</span>
+
+    private void enqueueEntryForCleanup(Entry entry) {
+        try {
+<span class="nc" id="L250">            entry.markForCleanup();</span>
+<span class="nc" id="L251">            Runnable runnable = () -&gt; {</span>
+                try {
+<span class="nc" id="L253">                    entry.cleanup();</span>
+<span class="nc" id="L254">                    log.debug(&quot;Cleaned up index entry {}&quot;, entry);</span>
+<span class="nc" id="L255">                } catch (Exception ex) {</span>
+<span class="nc" id="L256">                    log.error(&quot;Error occurred while cleaning up expired entry: {}&quot;, entry, ex);</span>
+<span class="nc" id="L257">                }</span>
+<span class="nc" id="L258">            };</span>
+<span class="nc" id="L259">            cleanerScheduler.scheduleOnce(&quot;delete-index&quot;, runnable, fileDeleteDelayMs);</span>
+<span class="nc" id="L260">        } catch (IOException e) {</span>
+<span class="nc" id="L261">            throw new KafkaException(e);</span>
+<span class="nc" id="L262">        }</span>
+<span class="nc" id="L263">    }</span>
+
+    // Visible for testing
+    void setFileDeleteDelayMs(int fileDeleteDelayMs) {
+<span class="nc" id="L267">        this.fileDeleteDelayMs = fileDeleteDelayMs;</span>
+<span class="nc" id="L268">    }</span>
+
+    // Visible for testing
+    KafkaScheduler cleanerScheduler() {
+<span class="nc" id="L272">        return cleanerScheduler;</span>
+    }
+
+    private void init() throws IOException {
+<span class="nc" id="L276">        long start = Time.SYSTEM.hiResClockMs();</span>
+
+        try {
+<span class="nc" id="L279">            Files.createDirectory(cacheDir.toPath());</span>
+<span class="nc" id="L280">            log.info(&quot;Created new file {} for RemoteIndexCache&quot;, cacheDir);</span>
+<span class="nc" id="L281">        } catch (FileAlreadyExistsException e) {</span>
+<span class="nc" id="L282">            log.info(&quot;RemoteIndexCache directory {} already exists. Re-using the same directory.&quot;, cacheDir);</span>
+<span class="nc" id="L283">        } catch (Exception e) {</span>
+<span class="nc" id="L284">            log.error(&quot;Unable to create directory {} for RemoteIndexCache.&quot;, cacheDir, e);</span>
+<span class="nc" id="L285">            throw new KafkaException(e);</span>
+<span class="nc" id="L286">        }</span>
+
+        // Delete any .deleted or .tmp files remained from the earlier run of the broker.
+<span class="nc" id="L289">        try (Stream&lt;Path&gt; paths = Files.list(cacheDir.toPath())) {</span>
+<span class="nc" id="L290">            paths.forEach(path -&gt; {</span>
+<span class="nc" id="L291">                String filename = path.getFileName().toString();</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">                if (filename.endsWith(LogFileUtils.DELETED_FILE_SUFFIX) ||</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">                        filename.endsWith(TMP_FILE_SUFFIX)) {</span>
+                    try {
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                        if (Files.deleteIfExists(path)) {</span>
+<span class="nc" id="L296">                            log.debug(&quot;Deleted file path {} on cache initialization&quot;, path);</span>
+                        }
+<span class="nc" id="L298">                    } catch (IOException e) {</span>
+<span class="nc" id="L299">                        throw new KafkaException(e);</span>
+<span class="nc" id="L300">                    }</span>
+                }
+<span class="nc" id="L302">            });</span>
+        }
+
+<span class="nc" id="L305">        try (Stream&lt;Path&gt; paths = Files.list(cacheDir.toPath())) {</span>
+<span class="nc" id="L306">            Iterator&lt;Path&gt; iterator = paths.iterator();</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            while (iterator.hasNext()) {</span>
+<span class="nc" id="L308">                Path path = iterator.next();</span>
+<span class="nc" id="L309">                Path fileNamePath = path.getFileName();</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">                if (fileNamePath == null)</span>
+<span class="nc" id="L311">                    throw new KafkaException(&quot;Empty file name in remote index cache directory: &quot; + cacheDir);</span>
+
+<span class="nc" id="L313">                String indexFileName = fileNamePath.toString();</span>
+<span class="nc" id="L314">                Uuid uuid = remoteLogSegmentIdFromRemoteIndexFileName(indexFileName);</span>
+
+                // It is safe to update the internalCache non-atomically here since this function is always called by a single
+                // thread only.
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                if (!internalCache.asMap().containsKey(uuid)) {</span>
+<span class="nc" id="L319">                    String fileNameWithoutSuffix = indexFileName.substring(0, indexFileName.indexOf(&quot;.&quot;));</span>
+<span class="nc" id="L320">                    File offsetIndexFile = new File(cacheDir, fileNameWithoutSuffix + INDEX_FILE_SUFFIX);</span>
+<span class="nc" id="L321">                    File timestampIndexFile = new File(cacheDir, fileNameWithoutSuffix + TIME_INDEX_FILE_SUFFIX);</span>
+<span class="nc" id="L322">                    File txnIndexFile = new File(cacheDir, fileNameWithoutSuffix + TXN_INDEX_FILE_SUFFIX);</span>
+
+                    // Create entries for each path if all the index files exist.
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                    if (Files.exists(offsetIndexFile.toPath()) &amp;&amp;</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                            Files.exists(timestampIndexFile.toPath()) &amp;&amp;</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">                            Files.exists(txnIndexFile.toPath())) {</span>
+<span class="nc" id="L328">                        long offset = offsetFromRemoteIndexFileName(indexFileName);</span>
+<span class="nc" id="L329">                        OffsetIndex offsetIndex = new OffsetIndex(offsetIndexFile, offset, Integer.MAX_VALUE, false);</span>
+<span class="nc" id="L330">                        offsetIndex.sanityCheck();</span>
+
+<span class="nc" id="L332">                        TimeIndex timeIndex = new TimeIndex(timestampIndexFile, offset, Integer.MAX_VALUE, false);</span>
+<span class="nc" id="L333">                        timeIndex.sanityCheck();</span>
+
+<span class="nc" id="L335">                        TransactionIndex txnIndex = new TransactionIndex(offset, txnIndexFile);</span>
+<span class="nc" id="L336">                        txnIndex.sanityCheck();</span>
+
+<span class="nc" id="L338">                        Entry entry = new Entry(offsetIndex, timeIndex, txnIndex);</span>
+<span class="nc" id="L339">                        internalCache.put(uuid, entry);</span>
+<span class="nc" id="L340">                    } else {</span>
+                        // Delete all of them if any one of those indexes is not available for a specific segment id
+<span class="nc" id="L342">                        tryAll(List.of(</span>
+                                () -&gt; {
+<span class="nc" id="L344">                                    Files.deleteIfExists(offsetIndexFile.toPath());</span>
+<span class="nc" id="L345">                                    return null;</span>
+                                },
+                                () -&gt; {
+<span class="nc" id="L348">                                    Files.deleteIfExists(timestampIndexFile.toPath());</span>
+<span class="nc" id="L349">                                    return null;</span>
+                                },
+                                () -&gt; {
+<span class="nc" id="L352">                                    Files.deleteIfExists(txnIndexFile.toPath());</span>
+<span class="nc" id="L353">                                    return null;</span>
+                                }));
+                    }
+                }
+<span class="nc" id="L357">            }</span>
+        }
+<span class="nc" id="L359">        log.info(&quot;RemoteIndexCache starts up in {} ms.&quot;, Time.SYSTEM.hiResClockMs() - start);</span>
+<span class="nc" id="L360">    }</span>
+
+    private &lt;T&gt; T loadIndexFile(File file,
+                                RemoteLogSegmentMetadata remoteLogSegmentMetadata,
+                                Function&lt;RemoteLogSegmentMetadata, InputStream&gt; fetchRemoteIndex,
+                                Function&lt;File, T&gt; readIndex) throws IOException {
+<span class="nc" id="L366">        File indexFile = new File(cacheDir, file.getName());</span>
+<span class="nc" id="L367">        T index = null;</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        if (Files.exists(indexFile.toPath())) {</span>
+            try {
+<span class="nc" id="L370">                index = readIndex.apply(indexFile);</span>
+<span class="nc" id="L371">            } catch (CorruptIndexException ex) {</span>
+<span class="nc" id="L372">                log.info(&quot;Error occurred while loading the stored index file {}&quot;, indexFile.getPath(), ex);</span>
+<span class="nc" id="L373">            }</span>
+        }
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if (index == null) {</span>
+<span class="nc" id="L376">            File tmpIndexFile = new File(indexFile.getParentFile(), indexFile.getName() + RemoteIndexCache.TMP_FILE_SUFFIX);</span>
+<span class="nc" id="L377">            try (InputStream inputStream = fetchRemoteIndex.apply(remoteLogSegmentMetadata)) {</span>
+<span class="nc" id="L378">                Files.copy(inputStream, tmpIndexFile.toPath(), StandardCopyOption.REPLACE_EXISTING);</span>
+            }
+<span class="nc" id="L380">            Utils.atomicMoveWithFallback(tmpIndexFile.toPath(), indexFile.toPath(), false);</span>
+<span class="nc" id="L381">            index = readIndex.apply(indexFile);</span>
+        }
+<span class="nc" id="L383">        return index;</span>
+    }
+
+    public Entry getIndexEntry(RemoteLogSegmentMetadata metadata) {
+<span class="nc" id="L387">        Uuid uuid = metadata.remoteLogSegmentId().id();</span>
+<span class="nc" id="L388">        throwIfCacheClosed(uuid);</span>
+<span class="nc" id="L389">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L391">            throwIfCacheClosed(uuid);</span>
+<span class="nc" id="L392">            return internalCache.get(uuid, k -&gt; createCacheEntry(metadata));</span>
+        } finally {
+<span class="nc" id="L394">            lock.readLock().unlock();</span>
+        }
+    }
+
+    private void throwIfCacheClosed(Uuid uuid) {
+<span class="nc bnc" id="L399" title="All 2 branches missed.">        if (isRemoteIndexCacheClosed.get()) {</span>
+<span class="nc" id="L400">            throw new IllegalStateException(&quot;Unable to fetch index for segment-id = &quot; + uuid +</span>
+                    &quot;. RemoteIndexCache is closed.&quot;);
+        }
+<span class="nc" id="L403">    }</span>
+
+    private RemoteIndexCache.Entry createCacheEntry(RemoteLogSegmentMetadata remoteLogSegmentMetadata) {
+<span class="nc" id="L406">        long startOffset = remoteLogSegmentMetadata.startOffset();</span>
+        try {
+<span class="nc" id="L408">            File offsetIndexFile = remoteOffsetIndexFile(cacheDir, remoteLogSegmentMetadata);</span>
+<span class="nc" id="L409">            OffsetIndex offsetIndex = loadIndexFile(offsetIndexFile, remoteLogSegmentMetadata, rlsMetadata -&gt; {</span>
+                try {
+<span class="nc" id="L411">                    return remoteStorageManager.fetchIndex(rlsMetadata, IndexType.OFFSET);</span>
+<span class="nc" id="L412">                } catch (RemoteStorageException e) {</span>
+<span class="nc" id="L413">                    throw new KafkaException(e);</span>
+                }
+            }, file -&gt; {
+                try {
+<span class="nc" id="L417">                    OffsetIndex index = new OffsetIndex(file, startOffset, Integer.MAX_VALUE, false);</span>
+<span class="nc" id="L418">                    index.sanityCheck();</span>
+<span class="nc" id="L419">                    return index;</span>
+<span class="nc" id="L420">                } catch (IOException e) {</span>
+<span class="nc" id="L421">                    throw new KafkaException(e);</span>
+                }
+            });
+<span class="nc" id="L424">            File timeIndexFile = remoteTimeIndexFile(cacheDir, remoteLogSegmentMetadata);</span>
+<span class="nc" id="L425">            TimeIndex timeIndex = loadIndexFile(timeIndexFile, remoteLogSegmentMetadata, rlsMetadata -&gt; {</span>
+                try {
+<span class="nc" id="L427">                    return remoteStorageManager.fetchIndex(rlsMetadata, IndexType.TIMESTAMP);</span>
+<span class="nc" id="L428">                } catch (RemoteStorageException e) {</span>
+<span class="nc" id="L429">                    throw new KafkaException(e);</span>
+                }
+            }, file -&gt; {
+                try {
+<span class="nc" id="L433">                    TimeIndex index = new TimeIndex(file, startOffset, Integer.MAX_VALUE, false);</span>
+<span class="nc" id="L434">                    index.sanityCheck();</span>
+<span class="nc" id="L435">                    return index;</span>
+<span class="nc" id="L436">                } catch (IOException e) {</span>
+<span class="nc" id="L437">                    throw new KafkaException(e);</span>
+                }
+            });
+<span class="nc" id="L440">            File txnIndexFile = remoteTransactionIndexFile(cacheDir, remoteLogSegmentMetadata);</span>
+<span class="nc" id="L441">            TransactionIndex txnIndex = loadIndexFile(txnIndexFile, remoteLogSegmentMetadata, rlsMetadata -&gt; {</span>
+                try {
+<span class="nc" id="L443">                    return remoteStorageManager.fetchIndex(rlsMetadata, IndexType.TRANSACTION);</span>
+<span class="nc" id="L444">                } catch (RemoteResourceNotFoundException e) {</span>
+                    // Don't throw an exception since the transaction index may not exist because of no transactional
+                    // records. Instead, we return an empty stream so that an empty file is created in the cache
+<span class="nc" id="L447">                    return new ByteArrayInputStream(new byte[0]);</span>
+<span class="nc" id="L448">                } catch (RemoteStorageException e) {</span>
+<span class="nc" id="L449">                    throw new KafkaException(e);</span>
+                }
+            }, file -&gt; {
+                try {
+<span class="nc" id="L453">                    TransactionIndex index = new TransactionIndex(startOffset, file);</span>
+<span class="nc" id="L454">                    index.sanityCheck();</span>
+<span class="nc" id="L455">                    return index;</span>
+<span class="nc" id="L456">                } catch (IOException e) {</span>
+<span class="nc" id="L457">                    throw new KafkaException(e);</span>
+                }
+            });
+
+<span class="nc" id="L461">            return new Entry(offsetIndex, timeIndex, txnIndex);</span>
+<span class="nc" id="L462">        } catch (IOException e) {</span>
+<span class="nc" id="L463">            throw new KafkaException(e);</span>
+        }
+    }
+
+    public int lookupOffset(RemoteLogSegmentMetadata remoteLogSegmentMetadata, long offset) {
+<span class="nc" id="L468">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L470">            return getIndexEntry(remoteLogSegmentMetadata).lookupOffset(offset).position();</span>
+        } finally {
+<span class="nc" id="L472">            lock.readLock().unlock();</span>
+        }
+    }
+
+    public int lookupTimestamp(RemoteLogSegmentMetadata remoteLogSegmentMetadata, long timestamp, long startingOffset) {
+<span class="nc" id="L477">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L479">            return getIndexEntry(remoteLogSegmentMetadata).lookupTimestamp(timestamp, startingOffset).position();</span>
+        } finally {
+<span class="nc" id="L481">            lock.readLock().unlock();</span>
+        }
+    }
+
+    @Override
+    public void close() {
+        // Make close idempotent and ensure no more reads allowed from henceforth. The in-progress reads will continue to
+        // completion (release the read lock) and then close will begin executing. Cleaner thread will immediately stop work.
+<span class="nc bnc" id="L489" title="All 2 branches missed.">        if (!isRemoteIndexCacheClosed.getAndSet(true)) {</span>
+<span class="nc" id="L490">            lock.writeLock().lock();</span>
+            try {
+<span class="nc" id="L492">                log.info(&quot;Close initiated for RemoteIndexCache. Cache stats={}. Cache entries pending delete={}&quot;,</span>
+<span class="nc" id="L493">                        internalCache.stats(), expiredIdxPendingForDeletion());</span>
+<span class="nc" id="L494">                cleanerScheduler.shutdown();</span>
+                // Close all the opened indexes to force unload mmap memory. This does not delete the index files from disk.
+                // Note that internal cache does not require explicit cleaning/closing. We don't want to invalidate or cleanup
+                // the cache as both would lead to triggering of removal listener.
+<span class="nc" id="L498">                internalCache.asMap().forEach((uuid, entry) -&gt; entry.close());</span>
+<span class="nc" id="L499">                log.info(&quot;Close completed for RemoteIndexCache&quot;);</span>
+<span class="nc" id="L500">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L501">                throw new KafkaException(e);</span>
+            } finally {
+<span class="nc" id="L503">                lock.writeLock().unlock();</span>
+            }
+        }
+<span class="nc" id="L506">    }</span>
+
+    public static class Entry implements AutoCloseable {
+
+        private final OffsetIndex offsetIndex;
+        private final TimeIndex timeIndex;
+        private final TransactionIndex txnIndex;
+
+        // This lock is used to synchronize cleanup methods and read methods. This ensures that cleanup (which changes the
+        // underlying files of the index) isn't performed while a read is in-progress for the entry. This is required in
+        // addition to using the thread safe cache because, while the thread safety of the cache ensures that we can read
+        // entries concurrently, it does not ensure that we won't mutate underlying files belonging to an entry.
+<span class="nc" id="L518">        private final ReentrantReadWriteLock entryLock = new ReentrantReadWriteLock();</span>
+
+<span class="nc" id="L520">        private boolean cleanStarted = false;</span>
+
+<span class="nc" id="L522">        private boolean markedForCleanup = false;</span>
+
+        private final long entrySizeBytes;
+
+<span class="nc" id="L526">        public Entry(OffsetIndex offsetIndex, TimeIndex timeIndex, TransactionIndex txnIndex) {</span>
+<span class="nc" id="L527">            this.offsetIndex = offsetIndex;</span>
+<span class="nc" id="L528">            this.timeIndex = timeIndex;</span>
+<span class="nc" id="L529">            this.txnIndex = txnIndex;</span>
+<span class="nc" id="L530">            this.entrySizeBytes = estimatedEntrySize();</span>
+<span class="nc" id="L531">        }</span>
+
+        public OffsetIndex offsetIndex() {
+<span class="nc" id="L534">            return offsetIndex;</span>
+        }
+
+        public TimeIndex timeIndex() {
+<span class="nc" id="L538">            return timeIndex;</span>
+        }
+
+        public TransactionIndex txnIndex() {
+<span class="nc" id="L542">            return txnIndex;</span>
+        }
+
+        // Visible for testing
+        boolean isCleanStarted() {
+<span class="nc" id="L547">            return cleanStarted;</span>
+        }
+
+        // Visible for testing
+        boolean isMarkedForCleanup() {
+<span class="nc" id="L552">            return markedForCleanup;</span>
+        }
+
+        // Visible for testing
+        long entrySizeBytes() {
+<span class="nc" id="L557">            return entrySizeBytes;</span>
+        }
+
+        private long estimatedEntrySize() {
+<span class="nc" id="L561">            entryLock.readLock().lock();</span>
+            try {
+<span class="nc" id="L563">                return offsetIndex.sizeInBytes() + timeIndex.sizeInBytes() + Files.size(txnIndex.file().toPath());</span>
+<span class="nc" id="L564">            } catch (IOException e) {</span>
+<span class="nc" id="L565">                log.warn(&quot;Error occurred when estimating remote index cache entry bytes size, just set 0 firstly.&quot;, e);</span>
+<span class="nc" id="L566">                return 0L;</span>
+            } finally {
+<span class="nc" id="L568">                entryLock.readLock().unlock();</span>
+            }
+        }
+
+        public OffsetPosition lookupOffset(long targetOffset) {
+<span class="nc" id="L573">            entryLock.readLock().lock();</span>
+            try {
+<span class="nc bnc" id="L575" title="All 2 branches missed.">                if (cleanStarted)</span>
+<span class="nc" id="L576">                    throw new IllegalStateException(&quot;This entry is marked for cleanup&quot;);</span>
+<span class="nc" id="L577">                return offsetIndex.lookup(targetOffset);</span>
+            } finally {
+<span class="nc" id="L579">                entryLock.readLock().unlock();</span>
+            }
+        }
+
+        public OffsetPosition lookupTimestamp(long timestamp, long startingOffset) {
+<span class="nc" id="L584">            entryLock.readLock().lock();</span>
+            try {
+<span class="nc bnc" id="L586" title="All 2 branches missed.">                if (cleanStarted)</span>
+<span class="nc" id="L587">                    throw new IllegalStateException(&quot;This entry is marked for cleanup&quot;);</span>
+<span class="nc" id="L588">                TimestampOffset timestampOffset = timeIndex.lookup(timestamp);</span>
+<span class="nc" id="L589">                return offsetIndex.lookup(Math.max(startingOffset, timestampOffset.offset()));</span>
+            } finally {
+<span class="nc" id="L591">                entryLock.readLock().unlock();</span>
+            }
+        }
+
+        void markForCleanup() throws IOException {
+<span class="nc" id="L596">            entryLock.writeLock().lock();</span>
+            try {
+<span class="nc bnc" id="L598" title="All 2 branches missed.">                if (!markedForCleanup) {</span>
+<span class="nc" id="L599">                    markedForCleanup = true;</span>
+<span class="nc" id="L600">                    offsetIndex.renameTo(new File(Utils.replaceSuffix(offsetIndex.file().getPath(), &quot;&quot;, LogFileUtils.DELETED_FILE_SUFFIX)));</span>
+<span class="nc" id="L601">                    timeIndex.renameTo(new File(Utils.replaceSuffix(timeIndex.file().getPath(), &quot;&quot;, LogFileUtils.DELETED_FILE_SUFFIX)));</span>
+<span class="nc" id="L602">                    txnIndex.renameTo(new File(Utils.replaceSuffix(txnIndex.file().getPath(), &quot;&quot;, LogFileUtils.DELETED_FILE_SUFFIX)));</span>
+                }
+            } finally {
+<span class="nc" id="L605">                entryLock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L607">        }</span>
+
+        void cleanup() throws IOException {
+<span class="nc" id="L610">            entryLock.writeLock().lock();</span>
+            try {
+                // no-op if clean is done already
+<span class="nc bnc" id="L613" title="All 4 branches missed.">                if (!cleanStarted &amp;&amp; isMarkedForCleanup()) {</span>
+<span class="nc" id="L614">                    cleanStarted = true;</span>
+<span class="nc" id="L615">                    List&lt;StorageAction&lt;Void, Exception&gt;&gt; actions = List.of(() -&gt; {</span>
+<span class="nc" id="L616">                        offsetIndex.deleteIfExists();</span>
+<span class="nc" id="L617">                        return null;</span>
+                    }, () -&gt; {
+<span class="nc" id="L619">                        timeIndex.deleteIfExists();</span>
+<span class="nc" id="L620">                        return null;</span>
+                    }, () -&gt; {
+<span class="nc" id="L622">                        txnIndex.deleteIfExists();</span>
+<span class="nc" id="L623">                        return null;</span>
+                    });
+<span class="nc" id="L625">                    tryAll(actions);</span>
+                }
+            } finally {
+<span class="nc" id="L628">                entryLock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L630">        }</span>
+
+        @Override
+        public void close() {
+<span class="nc" id="L634">            entryLock.writeLock().lock();</span>
+            try {
+<span class="nc" id="L636">                Utils.closeQuietly(offsetIndex, &quot;OffsetIndex&quot;);</span>
+<span class="nc" id="L637">                Utils.closeQuietly(timeIndex, &quot;TimeIndex&quot;);</span>
+<span class="nc" id="L638">                Utils.closeQuietly(txnIndex, &quot;TransactionIndex&quot;);</span>
+            } finally {
+<span class="nc" id="L640">                entryLock.writeLock().unlock();</span>
+            }
+<span class="nc" id="L642">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L646">            return &quot;Entry{&quot; +</span>
+<span class="nc" id="L647">                    &quot;offsetIndex=&quot; + offsetIndex.file().getName() +</span>
+<span class="nc" id="L648">                    &quot;, timeIndex=&quot; + timeIndex.file().getName() +</span>
+<span class="nc" id="L649">                    &quot;, txnIndex=&quot; + txnIndex.file().getName() +</span>
+                    '}';
+        }
+    }
+
+    /**
+     * Executes each entry in `actions` list even if one or more throws an exception. If any of them throws
+     * an IOException, it will be rethrown and adds all other encountered exceptions as suppressed to that IOException.
+     * Otherwise, it throws KafkaException wrapped with the first exception and the remaining exceptions are added as
+     * suppressed to the KafkaException.
+     *
+     * @param actions actions to be executes
+     * @throws IOException Any IOException encountered while executing those actions.
+     * @throws KafkaException Any other non IOExceptions are wrapped and thrown as KafkaException
+     */
+    private static void tryAll(List&lt;StorageAction&lt;Void, Exception&gt;&gt; actions) throws IOException {
+<span class="nc" id="L665">        IOException firstIOException = null;</span>
+<span class="nc" id="L666">        List&lt;Exception&gt; exceptions = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">        for (StorageAction&lt;Void, Exception&gt; action : actions) {</span>
+            try {
+<span class="nc" id="L669">                action.execute();</span>
+<span class="nc" id="L670">            } catch (IOException e) {</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">                if (firstIOException == null) {</span>
+<span class="nc" id="L672">                    firstIOException = e;</span>
+                } else {
+<span class="nc" id="L674">                    exceptions.add(e);</span>
+                }
+<span class="nc" id="L676">            } catch (Exception e) {</span>
+<span class="nc" id="L677">                exceptions.add(e);</span>
+<span class="nc" id="L678">            }</span>
+<span class="nc" id="L679">        }</span>
+
+<span class="nc bnc" id="L681" title="All 2 branches missed.">        if (firstIOException != null) {</span>
+<span class="nc" id="L682">            exceptions.forEach(firstIOException::addSuppressed);</span>
+<span class="nc" id="L683">            throw firstIOException;</span>
+<span class="nc bnc" id="L684" title="All 2 branches missed.">        } else if (!exceptions.isEmpty()) {</span>
+<span class="nc" id="L685">            Iterator&lt;Exception&gt; iterator = exceptions.iterator();</span>
+<span class="nc" id="L686">            KafkaException kafkaException = new KafkaException(iterator.next());</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            while (iterator.hasNext()) {</span>
+<span class="nc" id="L688">                kafkaException.addSuppressed(iterator.next());</span>
+            }
+<span class="nc" id="L690">            throw kafkaException;</span>
+        }
+<span class="nc" id="L692">    }</span>
+
+    private static Uuid remoteLogSegmentIdFromRemoteIndexFileName(String fileName) {
+<span class="nc" id="L695">        int underscoreIndex = fileName.indexOf(&quot;_&quot;);</span>
+<span class="nc" id="L696">        int dotIndex = fileName.indexOf(&quot;.&quot;);</span>
+<span class="nc" id="L697">        return Uuid.fromString(fileName.substring(underscoreIndex + 1, dotIndex));</span>
+    }
+
+    private static long offsetFromRemoteIndexFileName(String fileName) {
+<span class="nc" id="L701">        return Long.parseLong(fileName.substring(0, fileName.indexOf(&quot;_&quot;)));</span>
+    }
+
+    /**
+     * Generates prefix for file name for the on-disk representation of remote indexes.
+     * &lt;p&gt;
+     * Example of file name prefix is 45_fooid where 45 represents the base offset for the segment and
+     * fooid represents the unique {@link org.apache.kafka.server.log.remote.storage.RemoteLogSegmentId}
+     *
+     * @param remoteLogSegmentMetadata remote segment for the remote indexes
+     * @return string which should be used as prefix for on-disk representation of remote indexes
+     */
+    private static String generateFileNamePrefixForIndex(RemoteLogSegmentMetadata remoteLogSegmentMetadata) {
+<span class="nc" id="L714">        long startOffset = remoteLogSegmentMetadata.startOffset();</span>
+<span class="nc" id="L715">        Uuid segmentId = remoteLogSegmentMetadata.remoteLogSegmentId().id();</span>
+        // uuid.toString uses URL encoding which is safe for filenames and URLs.
+<span class="nc" id="L717">        return startOffset + &quot;_&quot; + segmentId.toString();</span>
+    }
+
+    static File remoteOffsetIndexFile(File dir, RemoteLogSegmentMetadata remoteLogSegmentMetadata) {
+<span class="nc" id="L721">        return new File(dir, remoteOffsetIndexFileName(remoteLogSegmentMetadata));</span>
+    }
+
+    static String remoteOffsetIndexFileName(RemoteLogSegmentMetadata remoteLogSegmentMetadata) {
+<span class="nc" id="L725">        String prefix = generateFileNamePrefixForIndex(remoteLogSegmentMetadata);</span>
+<span class="nc" id="L726">        return prefix + LogFileUtils.INDEX_FILE_SUFFIX;</span>
+    }
+
+    static File remoteTimeIndexFile(File dir, RemoteLogSegmentMetadata remoteLogSegmentMetadata) {
+<span class="nc" id="L730">        return new File(dir, remoteTimeIndexFileName(remoteLogSegmentMetadata));</span>
+    }
+
+    static String remoteTimeIndexFileName(RemoteLogSegmentMetadata remoteLogSegmentMetadata) {
+<span class="nc" id="L734">        return generateFileNamePrefixForIndex(remoteLogSegmentMetadata) + TIME_INDEX_FILE_SUFFIX;</span>
+    }
+
+    static File remoteTransactionIndexFile(File dir, RemoteLogSegmentMetadata remoteLogSegmentMetadata) {
+<span class="nc" id="L738">        return new File(dir, remoteTransactionIndexFileName(remoteLogSegmentMetadata));</span>
+    }
+
+    static String remoteTransactionIndexFileName(RemoteLogSegmentMetadata remoteLogSegmentMetadata) {
+<span class="nc" id="L742">        return generateFileNamePrefixForIndex(remoteLogSegmentMetadata) + LogFileUtils.TXN_INDEX_FILE_SUFFIX;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

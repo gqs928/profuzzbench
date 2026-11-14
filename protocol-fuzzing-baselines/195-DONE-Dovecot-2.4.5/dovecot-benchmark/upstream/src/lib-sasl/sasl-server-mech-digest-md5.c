@@ -1,0 +1,542 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+/* Digest-MD5 SASL authentication, see RFC-2831 */
+
+#include "lib.h"
+#include "base64.h"
+#include "buffer.h"
+#include "hex-binary.h"
+#include "md5.h"
+#include "randgen.h"
+#include "str.h"
+#include "str-sanitize.h"
+#include "settings-parser.h"
+#include "auth-digest.h"
+#include "password-scheme.h"
+
+#include "sasl-server-protected.h"
+
+enum qop_option {
+	QOP_AUTH	= 0x01,	/* authenticate */
+	QOP_AUTH_INT	= 0x02, /* + integrity protection, not supported yet */
+	QOP_AUTH_CONF	= 0x04, /* + encryption, not supported yet */
+
+	QOP_COUNT	= 3
+};
+
+struct digest_auth_request {
+	struct sasl_server_mech_request auth_request;
+
+	/* requested: */
+	char *nonce;
+	enum qop_option qop;
+
+	/* received: */
+	char *username;
+	char *cnonce;
+	char *nonce_count;
+	char *qop_value;
+	char *digest_uri; /* may be NULL */
+	char *authzid; /* may be NULL, authorization ID */
+	unsigned char response[32];
+	unsigned long maxbuf;
+	bool nonce_found:1;
+
+	/* final reply: */
+	char *rspauth;
+};
+
+static const char *qop_names[] = { "auth", "auth-int", "auth-conf" };
+static_assert_array_size(qop_names, QOP_COUNT);
+
+static string_t *get_digest_challenge(struct digest_auth_request *request)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	const struct sasl_server_settings *set = auth_request->set;
+	buffer_t buf;
+	string_t *str;
+	const char *const *tmp;
+	unsigned char nonce[16];
+	unsigned char nonce_base64[MAX_BASE64_ENCODED_SIZE(sizeof(nonce))+1];
+	int i;
+	bool first_qop;
+
+	/*
+	   realm="hostname" (multiple allowed)
+	   nonce="randomized data, at least 64bit"
+	   qop="auth,auth-int,auth-conf"
+	   maxbuf=number (with auth-int, auth-conf, defaults to 64k)
+	   charset="utf-8" (iso-8859-1 if it doesn't exist)
+	   algorithm="md5-sess"
+	   cipher="3des,des,rc4-40,rc4,rc4-56" (with auth-conf)
+	*/
+
+	/* get 128bit of random data as nonce */
+	random_fill(nonce, sizeof(nonce));
+
+	buffer_create_from_data(&buf, nonce_base64, sizeof(nonce_base64));
+	base64_encode(nonce, sizeof(nonce), &buf);
+	buffer_append_c(&buf, '\0');
+	request->nonce = p_strdup(auth_request->pool, buf.data);
+
+	str = t_str_new(256);
+	if (set->realms == NULL) {
+		/* If no realms are given, at least Cyrus SASL client defaults
+		   to destination host name */
+		str_append(str, "realm=\"\",");
+	} else {
+		for (tmp = set->realms; *tmp != NULL; tmp++)
+			str_printfa(str, "realm=\"%s\",", *tmp);
+	}
+
+	str_printfa(str, "nonce=\"%s\",", request->nonce);
+
+	str_append(str, "qop=\""); first_qop = TRUE;
+	for (i = 0; i < QOP_COUNT; i++) {
+		if ((request->qop & (1 << i)) != 0) {
+			if (first_qop)
+				first_qop = FALSE;
+			else
+				str_append_c(str, ',');
+			str_append(str, qop_names[i]);
+		}
+	}
+	str_append(str, "\",");
+
+	str_append(str, "charset=\"utf-8\","
+		   "algorithm=\"md5-sess\"");
+	return str;
+}
+
+static void
+verify_credentials(struct sasl_server_mech_request *auth_request,
+		   const unsigned char *credentials, size_t size)
+{
+	static const struct hash_method *const hmethod = &hash_method_md5;
+	struct digest_auth_request *request =
+		container_of(auth_request, struct digest_auth_request,
+			     auth_request);
+	const char *a1_hex, *response_hex;
+
+	/* get the MD5 password */
+	if (size != hmethod->digest_size) {
+		e_error(auth_request->event, "invalid credentials length");
+		sasl_server_request_failure(auth_request);
+		return;
+	}
+
+	/*
+	   response =
+	     HEX( KD ( HEX(H(A1)),
+		     { nonce-value, ":" nc-value, ":",
+		       cnonce-value, ":", qop-value, ":", HEX(H(A2)) }))
+
+	   and if authzid is not empty:
+
+	   A1 = { H( { username-value, ":", realm-value, ":", passwd } ),
+		":", nonce-value, ":", cnonce-value, ":", authzid }
+
+	   else:
+
+	   A1 = { H( { username-value, ":", realm-value, ":", passwd } ),
+		":", nonce-value, ":", cnonce-value }
+
+	   If the "qop" directive's value is "auth", then A2 is:
+
+	      A2       = { "AUTHENTICATE:", digest-uri-value }
+
+	   If the "qop" value is "auth-int" or "auth-conf" then A2 is:
+
+	      A2       = { "AUTHENTICATE:", digest-uri-value,
+		       ":00000000000000000000000000000000" }
+	*/
+
+	/* A1 */
+	a1_hex = auth_digest_get_hash_a1(hmethod, credentials,
+					 request->nonce, request->cnonce,
+					 request->authzid);
+
+	const char *entity_body_hash = NULL;
+
+	if (request->qop == QOP_AUTH_INT ||
+	    request->qop == QOP_AUTH_CONF)
+		entity_body_hash = "00000000000000000000000000000000";
+
+	/* client response */
+	response_hex = auth_digest_get_client_response(
+		hmethod, a1_hex, "AUTHENTICATE", request->digest_uri,
+		request->qop_value, request->nonce, request->nonce_count,
+		request->cnonce, entity_body_hash);
+
+	/* verify response */
+	if (!mem_equals_timing_safe(response_hex, request->response,
+				    hmethod->digest_size * 2)) {
+		sasl_server_request_password_mismatch(auth_request);
+		return;
+	}
+
+	/* server response */
+	response_hex = auth_digest_get_server_response(
+		hmethod, a1_hex, request->digest_uri, request->qop_value,
+		request->nonce, request->nonce_count, request->cnonce,
+		entity_body_hash);
+
+	request->rspauth = p_strconcat(auth_request->pool, "rspauth=",
+				       response_hex, NULL);
+	sasl_server_request_success(auth_request, request->rspauth,
+				    strlen(request->rspauth));
+}
+
+static bool
+auth_handle_response(struct digest_auth_request *request,
+		     const char *key, const char *value, const char **error_r)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	unsigned int i;
+
+	if (strcmp(key, "realm") == 0) {
+		if (auth_request->realm == NULL && *value != '\0')
+			sasl_server_request_set_realm(auth_request, value);
+		return TRUE;
+	}
+
+	if (strcmp(key, "username") == 0) {
+		if (request->username != NULL) {
+			*error_r = "username must not exist more than once";
+			return FALSE;
+		}
+
+		if (*value == '\0') {
+			*error_r = "empty username";
+			return FALSE;
+		}
+
+		request->username = p_strdup(auth_request->pool, value);
+		return TRUE;
+	}
+
+	if (strcmp(key, "nonce") == 0) {
+		/* nonce must be same */
+		if (strcmp(value, request->nonce) != 0) {
+			*error_r = "Invalid nonce";
+			return FALSE;
+		}
+
+		request->nonce_found = TRUE;
+		return TRUE;
+	}
+
+	if (strcmp(key, "cnonce") == 0) {
+		if (request->cnonce != NULL) {
+			*error_r = "cnonce must not exist more than once";
+			return FALSE;
+		}
+
+		if (*value == '\0') {
+			*error_r = "cnonce can't contain empty value";
+			return FALSE;
+		}
+
+		request->cnonce = p_strdup(auth_request->pool, value);
+		return TRUE;
+	}
+
+	if (strcmp(key, "nc") == 0) {
+		unsigned int nc;
+
+		if (request->nonce_count != NULL) {
+			*error_r = "nonce-count must not exist more than once";
+			return FALSE;
+		}
+
+		if (str_to_uint(value, &nc) < 0) {
+			*error_r = "nonce-count value invalid";
+			return FALSE;
+		}
+
+		if (nc != 1) {
+			*error_r = "re-auth not supported currently";
+			return FALSE;
+		}
+
+		request->nonce_count = p_strdup(auth_request->pool, value);
+		return TRUE;
+	}
+
+	if (strcmp(key, "qop") == 0) {
+		for (i = 0; i < QOP_COUNT; i++) {
+			if (strcasecmp(qop_names[i], value) == 0)
+				break;
+		}
+
+		if (i == QOP_COUNT) {
+			*error_r = t_strdup_printf("Unknown QoP value: %s",
+						   str_sanitize(value, 32));
+			return FALSE;
+		}
+
+		request->qop &= (1 << i);
+		if (request->qop == 0) {
+			*error_r = "Nonallowed QoP requested";
+			return FALSE;
+		}
+
+		request->qop_value = p_strdup(auth_request->pool, value);
+		return TRUE;
+	}
+
+	if (strcmp(key, "digest-uri") == 0) {
+		/* type / host / serv-name */
+		const char *const *uri = t_strsplit(value, "/");
+
+		if (uri[0] == NULL || uri[1] == NULL) {
+			*error_r = "Invalid digest-uri";
+			return FALSE;
+		}
+
+		/* FIXME: RFC recommends that we verify the host/serv-type.
+		   But isn't the realm enough already? That'd be just extra
+		   configuration.. Maybe optionally list valid hosts in
+		   config file? */
+		request->digest_uri = p_strdup(auth_request->pool, value);
+		return TRUE;
+	}
+
+	if (strcmp(key, "maxbuf") == 0) {
+		if (request->maxbuf != 0) {
+			*error_r = "maxbuf must not exist more than once";
+			return FALSE;
+		}
+
+		if (str_to_ulong(value, &request->maxbuf) < 0 ||
+		    request->maxbuf == 0) {
+			*error_r = "Invalid maxbuf value";
+			return FALSE;
+		}
+		return TRUE;
+	}
+
+	if (strcmp(key, "charset") == 0) {
+		if (strcasecmp(value, "utf-8") != 0) {
+			*error_r = "Only utf-8 charset is allowed";
+			return FALSE;
+		}
+
+		return TRUE;
+	}
+
+	if (strcmp(key, "response") == 0) {
+		if (strlen(value) != 32) {
+			*error_r = "Invalid response value";
+			return FALSE;
+		}
+
+		memcpy(request->response, value, 32);
+		return TRUE;
+	}
+
+	if (strcmp(key, "cipher") == 0) {
+		/* not supported, ignore */
+		return TRUE;
+	}
+
+	if (strcmp(key, "authzid") == 0) {
+		if (request->authzid != NULL) {
+		    *error_r = "authzid must not exist more than once";
+		    return FALSE;
+		}
+
+		if (*value == '\0') {
+		    *error_r = "empty authzid";
+		    return FALSE;
+		}
+
+		request->authzid = p_strdup(auth_request->pool, value);
+		return TRUE;
+	}
+
+	/* unknown key, ignore */
+	return TRUE;
+}
+
+static bool
+parse_digest_response(struct digest_auth_request *request,
+		      const unsigned char *data, size_t size,
+		      const char **error_r)
+{
+	struct sasl_server_mech_request *auth_request = &request->auth_request;
+	char *copy;
+	bool failed;
+
+	/*
+	   realm="realm"
+	   username="username"
+	   nonce="randomized data"
+	   cnonce="??"
+	   nc=00000001
+	   qop="auth|auth-int|auth-conf"
+	   digest-uri="serv-type/host[/serv-name]"
+	   response=32 HEX digits
+	   maxbuf=number (with auth-int, auth-conf, defaults to 64k)
+	   charset="utf-8" (iso-8859-1 if it doesn't exist)
+	   cipher="cipher-value"
+	   authzid="authzid-value"
+	*/
+
+	*error_r = NULL;
+	failed = FALSE;
+
+	if (size == 0) {
+		*error_r = "Client sent no input";
+		return FALSE;
+	}
+
+	/* treating response as NUL-terminated string also gets rid of all
+	   potential problems with NUL characters in strings. */
+	copy = t_strdup_noconst(t_strndup(data, size));
+	while (*copy != '\0') {
+		const char *key, *value;
+
+		if (auth_digest_parse_keyvalue(&copy, &key, &value)) {
+			if (!auth_handle_response(request, key, value,
+						  error_r)) {
+				failed = TRUE;
+				break;
+			}
+		}
+
+		if (*copy == ',')
+			copy++;
+	}
+
+	if (!failed) {
+		if (!request->nonce_found) {
+			*error_r = "Missing nonce parameter";
+			failed = TRUE;
+		} else if (request->cnonce == NULL) {
+			*error_r = "Missing cnonce parameter";
+			failed = TRUE;
+		} else if (request->username == NULL) {
+			*error_r = "Missing username parameter";
+			failed = TRUE;
+		}
+	}
+
+	if (request->nonce_count == NULL)
+		request->nonce_count = p_strdup(auth_request->pool, "00000001");
+	if (request->qop_value == NULL)
+		request->qop_value = p_strdup(auth_request->pool, "auth");
+
+	return !failed;
+}
+
+static void
+credentials_callback(struct sasl_server_mech_request *auth_request,
+		     const struct sasl_passdb_result *result)
+{
+	switch (result->status) {
+	case SASL_PASSDB_RESULT_OK:
+		verify_credentials(auth_request, result->credentials.data,
+				   result->credentials.size);
+		break;
+	case SASL_PASSDB_RESULT_INTERNAL_FAILURE:
+		sasl_server_request_internal_failure(auth_request);
+		break;
+	default:
+		sasl_server_request_failure(auth_request);
+		break;
+	}
+}
+
+static void
+mech_digest_md5_auth_continue(struct sasl_server_mech_request *auth_request,
+			      const unsigned char *data, size_t data_size)
+{
+	struct digest_auth_request *request =
+		container_of(auth_request, struct digest_auth_request,
+			     auth_request);
+	const char *error;
+
+	if (!parse_digest_response(request, data, data_size, &error)) {
+		e_info(auth_request->event, "%s", error);
+		sasl_server_request_failure(auth_request);
+		return;
+	}
+	if (!sasl_server_request_set_authid(auth_request,
+					    SASL_SERVER_AUTHID_TYPE_USERNAME,
+					    request->username)) {
+		sasl_server_request_failure(auth_request);
+		return;
+	}
+	if (request->authzid != NULL &&
+	    !sasl_server_request_set_authzid(auth_request, request->authzid)) {
+		sasl_server_request_failure(auth_request);
+		return;
+	}
+
+	sasl_server_request_lookup_credentials(auth_request, "DIGEST-MD5",
+					       credentials_callback);
+}
+
+static void
+mech_digest_md5_auth_initial(struct sasl_server_mech_request *auth_request,
+			     const unsigned char *data ATTR_UNUSED,
+			     size_t data_size ATTR_UNUSED)
+{
+	struct digest_auth_request *request =
+		container_of(auth_request, struct digest_auth_request,
+			     auth_request);
+	string_t *challenge;
+
+	/* FIXME: there's no support for subsequent authentication */
+
+	challenge = get_digest_challenge(request);
+	sasl_server_request_output(auth_request, str_data(challenge),
+				   str_len(challenge));
+}
+
+static struct sasl_server_mech_request *
+mech_digest_md5_auth_new(const struct sasl_server_mech *mech ATTR_UNUSED,
+			 pool_t pool)
+{
+	struct digest_auth_request *request;
+
+	request = p_new(pool, struct digest_auth_request, 1);
+	request->qop = QOP_AUTH;
+
+	return &request->auth_request;
+}
+
+static const struct sasl_server_mech_funcs mech_digest_md5_funcs = {
+	.auth_new = mech_digest_md5_auth_new,
+	.auth_initial = mech_digest_md5_auth_initial,
+	.auth_continue = mech_digest_md5_auth_continue,
+};
+
+static const struct sasl_server_mech_def mech_digest_md5 = {
+	.name = SASL_MECH_NAME_DIGEST_MD5,
+
+	.flags = SASL_MECH_SEC_DICTIONARY | SASL_MECH_SEC_ACTIVE |
+		 SASL_MECH_SEC_MUTUAL_AUTH,
+	.passdb_need = SASL_MECH_PASSDB_NEED_LOOKUP_CREDENTIALS,
+
+	.funcs = &mech_digest_md5_funcs,
+};
+
+void sasl_server_mech_register_digest_md5(struct sasl_server_instance *sinst)
+{
+	sasl_server_mech_register(sinst, &mech_digest_md5, NULL);
+}
+
+void sasl_server_mech_digest_md5_test_set_nonce(
+	struct sasl_server_req_ctx *rctx, const char *nonce)
+{
+	struct sasl_server_mech_request *auth_request =
+		sasl_server_request_get_mech_request(rctx);
+	struct digest_auth_request *request =
+		container_of(auth_request, struct digest_auth_request,
+			     auth_request);
+
+	i_assert(auth_request->mech->def == &mech_digest_md5);
+	request->nonce = p_strdup(auth_request->pool, nonce);
+}

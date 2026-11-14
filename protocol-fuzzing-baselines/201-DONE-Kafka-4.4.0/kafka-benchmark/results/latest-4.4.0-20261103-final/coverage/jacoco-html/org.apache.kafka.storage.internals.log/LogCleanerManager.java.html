@@ -1,0 +1,797 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogCleanerManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.storage.internals.log</a> &gt; <span class="el_source">LogCleanerManager.java</span></div><h1>LogCleanerManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.storage.internals.log;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.KafkaStorageException;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+import org.apache.kafka.storage.internals.checkpoint.OffsetCheckpointFile;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static org.apache.kafka.server.util.LockUtils.inLock;
+
+/**
+ * This class manages the state (see {@link LogCleaningState}) of each partition being cleaned.
+ * &lt;ul&gt;
+ * &lt;li&gt;1. None                    : No cleaning state in a TopicPartition. In this state, it can become LogCleaningInProgress
+ *                                or LogCleaningPaused(1). Valid previous state are LogCleaningInProgress and LogCleaningPaused(1)&lt;/li&gt;
+ * &lt;li&gt;2. LogCleaningInProgress   : The cleaning is currently in progress. In this state, it can become None when log cleaning is finished
+ *                                or become LogCleaningAborted. Valid previous state is None.&lt;/li&gt;
+ * &lt;li&gt;3. LogCleaningAborted      : The cleaning abort is requested. In this state, it can become LogCleaningPaused(1).
+ *                                Valid previous state is LogCleaningInProgress.&lt;/li&gt;
+ * &lt;li&gt;4-a. LogCleaningPaused(1)  : The cleaning is paused once. No log cleaning can be done in this state.
+ *                                In this state, it can become None or LogCleaningPaused(2).
+ *                                Valid previous state is None, LogCleaningAborted or LogCleaningPaused(2).&lt;/li&gt;
+ * &lt;li&gt;4-b. LogCleaningPaused(i)  : The cleaning is paused i times where i&gt;= 2. No log cleaning can be done in this state.
+ *                                In this state, it can become LogCleaningPaused(i-1) or LogCleaningPaused(i+1).
+ *                                Valid previous state is LogCleaningPaused(i-1) or LogCleaningPaused(i+1).&lt;/li&gt;
+ * &lt;/ul&gt;
+ */
+public class LogCleanerManager {
+    public static final String OFFSET_CHECKPOINT_FILE = &quot;cleaner-offset-checkpoint&quot;;
+
+<span class="nc" id="L68">    private static final Logger LOG = LoggerFactory.getLogger(&quot;kafka.log.LogCleaner&quot;);</span>
+
+    private static final String UNCLEANABLE_PARTITIONS_COUNT_METRIC_NAME = &quot;uncleanable-partitions-count&quot;;
+    private static final String UNCLEANABLE_BYTES_METRIC_NAME = &quot;uncleanable-bytes&quot;;
+    private static final String MAX_DIRTY_PERCENT_METRIC_NAME = &quot;max-dirty-percent&quot;;
+    private static final String TIME_SINCE_LAST_RUN_MS_METRIC_NAME = &quot;time-since-last-run-ms&quot;;
+
+    // Visible for testing
+<span class="nc" id="L76">    public static final Set&lt;String&gt; GAUGE_METRIC_NAME_NO_TAG = Set.of(MAX_DIRTY_PERCENT_METRIC_NAME, TIME_SINCE_LAST_RUN_MS_METRIC_NAME);</span>
+
+    // For compatibility, metrics are defined to be under `kafka.log.LogCleanerManager` class
+<span class="nc" id="L79">    private final KafkaMetricsGroup metricsGroup = new KafkaMetricsGroup(&quot;kafka.log&quot;, &quot;LogCleanerManager&quot;);</span>
+
+    /**
+     * The set of logs currently being cleaned.
+     */
+<span class="nc" id="L84">    private final Map&lt;TopicPartition, LogCleaningState&gt; inProgress = new HashMap&lt;&gt;();</span>
+
+    /**
+     * The set of uncleanable partitions (partitions that have raised an unexpected error during cleaning)
+     * for each log directory.
+     */
+<span class="nc" id="L90">    private final Map&lt;String, Set&lt;TopicPartition&gt;&gt; uncleanablePartitions = new HashMap&lt;&gt;();</span>
+
+    /**
+     * A global lock used to control all access to the in-progress set and the offset checkpoints.
+     */
+<span class="nc" id="L95">    private final Lock lock = new ReentrantLock();</span>
+
+    /**
+     * For coordinating the pausing and the cleaning of a partition.
+     */
+<span class="nc" id="L100">    private final Condition pausedCleaningCond = lock.newCondition();</span>
+
+<span class="nc" id="L102">    private final Map&lt;String, List&lt;Map&lt;String, String&gt;&gt;&gt; gaugeMetricNameWithTag = new HashMap&lt;&gt;();</span>
+
+    private final ConcurrentMap&lt;TopicPartition, UnifiedLog&gt; logs;
+
+    /**
+     * The offset checkpoints holding the last cleaned point for each log.
+     */
+    private volatile Map&lt;File, OffsetCheckpointFile&gt; checkpoints;
+
+    private volatile double dirtiestLogCleanableRatio;
+    private volatile long timeOfLastRun;
+
+    @SuppressWarnings({&quot;this-escape&quot;})
+    public LogCleanerManager(
+            List&lt;File&gt; logDirs,
+            ConcurrentMap&lt;TopicPartition, UnifiedLog&gt; logs,
+            LogDirFailureChannel logDirFailureChannel
+<span class="nc" id="L119">    ) {</span>
+<span class="nc" id="L120">        this.logs = logs;</span>
+<span class="nc" id="L121">        checkpoints = logDirs.stream()</span>
+<span class="nc" id="L122">                .collect(Collectors.toMap(</span>
+<span class="nc" id="L123">                        dir -&gt; dir,</span>
+                        dir -&gt; {
+                            try {
+<span class="nc" id="L126">                                return new OffsetCheckpointFile(new File(dir, OFFSET_CHECKPOINT_FILE), logDirFailureChannel);</span>
+<span class="nc" id="L127">                            } catch (IOException e) {</span>
+<span class="nc" id="L128">                                throw new RuntimeException(e);</span>
+                            }
+                        }
+                ));
+
+<span class="nc" id="L133">        registerMetrics(logDirs);</span>
+<span class="nc" id="L134">    }</span>
+
+    private void registerMetrics(List&lt;File&gt; logDirs) {
+        // gauges for tracking the number of partitions marked as uncleanable for each log directory
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        for (File dir : logDirs) {</span>
+<span class="nc" id="L139">            Map&lt;String, String&gt; metricTag = Map.of(&quot;logDirectory&quot;, dir.getAbsolutePath());</span>
+<span class="nc" id="L140">            metricsGroup.newGauge(</span>
+                    UNCLEANABLE_PARTITIONS_COUNT_METRIC_NAME,
+<span class="nc" id="L142">                    () -&gt; inLock(lock, () -&gt; uncleanablePartitions.getOrDefault(dir.getAbsolutePath(), Set.of()).size()),</span>
+                    metricTag
+            );
+
+<span class="nc" id="L146">            gaugeMetricNameWithTag</span>
+<span class="nc" id="L147">                    .computeIfAbsent(UNCLEANABLE_PARTITIONS_COUNT_METRIC_NAME, k -&gt; new ArrayList&lt;&gt;())</span>
+<span class="nc" id="L148">                    .add(metricTag);</span>
+<span class="nc" id="L149">        }</span>
+
+        // gauges for tracking the number of uncleanable bytes from uncleanable partitions for each log directory
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        for (File dir : logDirs) {</span>
+<span class="nc" id="L153">            Map&lt;String, String&gt; metricTag = Map.of(&quot;logDirectory&quot;, dir.getAbsolutePath());</span>
+<span class="nc" id="L154">            metricsGroup.newGauge(</span>
+                    UNCLEANABLE_BYTES_METRIC_NAME,
+<span class="nc" id="L156">                    () -&gt; inLock(lock, () -&gt; {</span>
+<span class="nc" id="L157">                        Set&lt;TopicPartition&gt; partitions = uncleanablePartitions.get(dir.getAbsolutePath());</span>
+
+<span class="nc bnc" id="L159" title="All 2 branches missed.">                        if (partitions == null) {</span>
+<span class="nc" id="L160">                            return 0;</span>
+                        } else {
+<span class="nc" id="L162">                            Map&lt;TopicPartition, Long&gt; lastClean = allCleanerCheckpoints();</span>
+<span class="nc" id="L163">                            long now = Time.SYSTEM.milliseconds();</span>
+<span class="nc" id="L164">                            return partitions.stream()</span>
+<span class="nc" id="L165">                                    .mapToLong(tp -&gt; {</span>
+<span class="nc" id="L166">                                        UnifiedLog log = logs.get(tp);</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">                                        if (log != null) {</span>
+<span class="nc" id="L168">                                            Optional&lt;Long&gt; lastCleanOffset = Optional.of(lastClean.get(tp));</span>
+                                            try {
+<span class="nc" id="L170">                                                OffsetsToClean offsetsToClean = cleanableOffsets(log, lastCleanOffset, now);</span>
+<span class="nc" id="L171">                                                return calculateCleanableBytes(log, offsetsToClean.firstDirtyOffset(),</span>
+<span class="nc" id="L172">                                                        offsetsToClean.firstUncleanableDirtyOffset()).getValue();</span>
+<span class="nc" id="L173">                                            } catch (IOException e) {</span>
+<span class="nc" id="L174">                                                throw new RuntimeException(e);</span>
+                                            }
+                                        } else {
+<span class="nc" id="L177">                                            return 0L;</span>
+                                        }
+<span class="nc" id="L179">                                    }).sum();</span>
+                        }
+                    }),
+                    metricTag
+            );
+
+<span class="nc" id="L185">            gaugeMetricNameWithTag</span>
+<span class="nc" id="L186">                    .computeIfAbsent(UNCLEANABLE_BYTES_METRIC_NAME, k -&gt; new ArrayList&lt;&gt;())</span>
+<span class="nc" id="L187">                    .add(metricTag);</span>
+<span class="nc" id="L188">        }</span>
+
+        // a gauge for tracking the cleanable ratio of the dirtiest log
+<span class="nc" id="L191">        dirtiestLogCleanableRatio = 0.0;</span>
+<span class="nc" id="L192">        metricsGroup.newGauge(MAX_DIRTY_PERCENT_METRIC_NAME, () -&gt; (int) (100 * dirtiestLogCleanableRatio));</span>
+
+        // a gauge for tracking the time since the last log cleaner run, in milliseconds
+<span class="nc" id="L195">        timeOfLastRun = Time.SYSTEM.milliseconds();</span>
+<span class="nc" id="L196">        metricsGroup.newGauge(TIME_SINCE_LAST_RUN_MS_METRIC_NAME, () -&gt; Time.SYSTEM.milliseconds() - timeOfLastRun);</span>
+<span class="nc" id="L197">    }</span>
+
+    public Map&lt;String, List&lt;Map&lt;String, String&gt;&gt;&gt; gaugeMetricNameWithTag() {
+<span class="nc" id="L200">        return gaugeMetricNameWithTag;</span>
+    }
+
+    /**
+     * @return the position processed for all logs.
+     */
+    public Map&lt;TopicPartition, Long&gt; allCleanerCheckpoints() {
+<span class="nc" id="L207">        return inLock(lock, () -&gt; checkpoints.values().stream()</span>
+<span class="nc" id="L208">                .flatMap(checkpoint -&gt; {</span>
+                    try {
+<span class="nc" id="L210">                        return checkpoint.read().entrySet().stream();</span>
+<span class="nc" id="L211">                    } catch (KafkaStorageException e) {</span>
+<span class="nc" id="L212">                        LOG.error(&quot;Failed to access checkpoint file {} in dir {}&quot;,</span>
+<span class="nc" id="L213">                                checkpoint.file().getName(), checkpoint.file().getParentFile().getAbsolutePath(), e);</span>
+<span class="nc" id="L214">                        return Stream.empty();</span>
+                    }
+                })
+<span class="nc" id="L217">                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)));</span>
+    }
+
+    /**
+     * For testing only. Get the cleaning state of the partition.
+     */
+    Optional&lt;LogCleaningState&gt; cleaningState(TopicPartition tp) {
+<span class="nc" id="L224">        return inLock(lock, () -&gt; Optional.ofNullable(inProgress.get(tp)));</span>
+    }
+
+    /**
+     * For testing only. Set the cleaning state of the partition.
+     */
+    void setCleaningState(TopicPartition tp, LogCleaningState state) {
+<span class="nc" id="L231">        inLock(lock, () -&gt; inProgress.put(tp, state));</span>
+<span class="nc" id="L232">    }</span>
+
+    /**
+     * Choose the log to clean next and add it to the in-progress set. We recompute this
+     * each time from the full set of logs to allow logs to be dynamically added to the pool of logs
+     * the log manager maintains.
+     */
+    public Optional&lt;LogToClean&gt; grabFilthiestCompactedLog(Time time, PreCleanStats preCleanStats) {
+<span class="nc" id="L240">        return inLock(lock, () -&gt; {</span>
+<span class="nc" id="L241">            long now = time.milliseconds();</span>
+<span class="nc" id="L242">            timeOfLastRun = now;</span>
+<span class="nc" id="L243">            Map&lt;TopicPartition, Long&gt; lastClean = allCleanerCheckpoints();</span>
+
+<span class="nc" id="L245">            List&lt;LogToClean&gt; dirtyLogs = logs.entrySet().stream()</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">                    .filter(entry -&gt; entry.getValue().config().compact &amp;&amp;</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                            !inProgress.containsKey(entry.getKey()) &amp;&amp;</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                            !isUncleanablePartition(entry.getValue(), entry.getKey())</span>
+                    )
+<span class="nc" id="L250">                    .map(entry -&gt; {</span>
+                                // create a LogToClean instance for each
+<span class="nc" id="L252">                                TopicPartition topicPartition = entry.getKey();</span>
+<span class="nc" id="L253">                                UnifiedLog log = entry.getValue();</span>
+                                try {
+<span class="nc" id="L255">                                    Long lastCleanOffset = lastClean.get(topicPartition);</span>
+<span class="nc" id="L256">                                    OffsetsToClean offsetsToClean = cleanableOffsets(log, Optional.ofNullable(lastCleanOffset), now);</span>
+                                    // update checkpoint for logs with invalid checkpointed offsets
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                                    if (offsetsToClean.forceUpdateCheckpoint) {</span>
+<span class="nc" id="L259">                                        updateCheckpoints(log.parentDirFile(), Optional.of(Map.entry(topicPartition, offsetsToClean.firstDirtyOffset)), Optional.empty());</span>
+                                    }
+<span class="nc" id="L261">                                    long compactionDelayMs = maxCompactionDelay(log, offsetsToClean.firstDirtyOffset, now);</span>
+<span class="nc" id="L262">                                    preCleanStats.updateMaxCompactionDelay(compactionDelayMs);</span>
+
+<span class="nc bnc" id="L264" title="All 2 branches missed.">                                    return new LogToClean(log, offsetsToClean.firstDirtyOffset,</span>
+                                            offsetsToClean.firstUncleanableDirtyOffset, compactionDelayMs &gt; 0);
+<span class="nc" id="L266">                                } catch (Throwable e) {</span>
+<span class="nc" id="L267">                                    throw new LogCleaningException(log, &quot;Failed to calculate log cleaning stats for partition &quot; + topicPartition, e);</span>
+                                }
+                            }
+                    )
+<span class="nc bnc" id="L271" title="All 2 branches missed.">                    .filter(ltc -&gt; ltc.totalBytes() &gt; 0) // skip any empty logs</span>
+<span class="nc" id="L272">                    .toList();</span>
+
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            dirtiestLogCleanableRatio = dirtyLogs.isEmpty()</span>
+<span class="nc" id="L275">                    ? 0</span>
+<span class="nc" id="L276">                    : dirtyLogs.stream()</span>
+<span class="nc" id="L277">                        .mapToDouble(LogToClean::cleanableRatio)</span>
+<span class="nc" id="L278">                        .max()</span>
+<span class="nc" id="L279">                        .orElse(0.0);</span>
+            // and must meet the minimum threshold for dirty byte ratio or have some bytes required to be compacted
+<span class="nc" id="L281">            List&lt;LogToClean&gt; cleanableLogs = dirtyLogs.stream()</span>
+<span class="nc bnc" id="L282" title="All 6 branches missed.">                    .filter(ltc -&gt; (ltc.needCompactionNow() &amp;&amp; ltc.cleanableBytes() &gt; 0) || ltc.cleanableRatio() &gt; ltc.log().config().minCleanableRatio)</span>
+<span class="nc" id="L283">                    .toList();</span>
+
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            if (cleanableLogs.isEmpty()) {</span>
+<span class="nc" id="L286">                return Optional.empty();</span>
+            } else {
+<span class="nc" id="L288">                preCleanStats.recordCleanablePartitions(cleanableLogs.size());</span>
+<span class="nc" id="L289">                LogToClean filthiest = cleanableLogs.stream()</span>
+<span class="nc" id="L290">                        .max(Comparator.comparingDouble(LogToClean::cleanableRatio))</span>
+<span class="nc" id="L291">                        .orElseThrow(() -&gt; new IllegalStateException(&quot;No filthiest log found&quot;));</span>
+
+<span class="nc" id="L293">                inProgress.put(filthiest.topicPartition(), LogCleaningState.LOG_CLEANING_IN_PROGRESS);</span>
+<span class="nc" id="L294">                return Optional.of(filthiest);</span>
+            }
+        });
+    }
+
+    /**
+     * Pause logs cleaning for logs that do not have compaction enabled
+     * and do not have other deletion or compaction in progress.
+     * This is to handle potential race between retention and cleaner threads when users
+     * switch topic configuration between compacted and non-compacted topic.
+     *
+     * @return retention logs that have log cleaning successfully paused
+     */
+    public List&lt;Map.Entry&lt;TopicPartition, UnifiedLog&gt;&gt; pauseCleaningForNonCompactedPartitions() {
+<span class="nc" id="L308">        return inLock(lock, () -&gt; {</span>
+<span class="nc" id="L309">            List&lt;Map.Entry&lt;TopicPartition, UnifiedLog&gt;&gt; deletableLogs = logs.entrySet().stream()</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">                    .filter(entry -&gt; !entry.getValue().config().compact) // pick non-compacted logs</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">                    .filter(entry -&gt; !inProgress.containsKey(entry.getKey())) // skip any logs already in-progress</span>
+<span class="nc" id="L312">                    .collect(Collectors.toList());</span>
+
+<span class="nc" id="L314">            deletableLogs.forEach(entry -&gt; inProgress.put(entry.getKey(), LogCleaningState.logCleaningPaused(1)));</span>
+
+<span class="nc" id="L316">            return deletableLogs;</span>
+        });
+    }
+
+    /**
+     * Find any logs that have compaction enabled. Mark them as being cleaned
+     * Include logs without delete enabled, as they may have segments
+     * that precede the start offset.
+     */
+    public Map&lt;TopicPartition, UnifiedLog&gt; deletableLogs() {
+<span class="nc" id="L326">        return inLock(lock, () -&gt; {</span>
+<span class="nc" id="L327">            Map&lt;TopicPartition, UnifiedLog&gt; toClean = logs.entrySet().stream()</span>
+<span class="nc" id="L328">                    .filter(entry -&gt; {</span>
+<span class="nc" id="L329">                        TopicPartition topicPartition = entry.getKey();</span>
+<span class="nc" id="L330">                        UnifiedLog log = entry.getValue();</span>
+<span class="nc bnc" id="L331" title="All 4 branches missed.">                        return !inProgress.containsKey(topicPartition) &amp;&amp; log.config().compact &amp;&amp;</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">                                !isUncleanablePartition(log, topicPartition);</span>
+                    })
+<span class="nc" id="L334">                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+<span class="nc" id="L335">            toClean.forEach((partition, log) -&gt; inProgress.put(partition, LogCleaningState.LOG_CLEANING_IN_PROGRESS));</span>
+<span class="nc" id="L336">            return toClean;</span>
+        });
+    }
+
+    /**
+     * Abort the cleaning of a particular partition, if it's in progress. This call blocks until the cleaning of
+     * the partition is aborted.
+     * This is implemented by first abortAndPausing and then resuming the cleaning of the partition.
+     */
+    public void abortCleaning(TopicPartition topicPartition) {
+<span class="nc" id="L346">        inLock(lock, () -&gt; {</span>
+<span class="nc" id="L347">            abortAndPauseCleaning(topicPartition);</span>
+<span class="nc" id="L348">            resumeCleaning(Set.of(topicPartition));</span>
+<span class="nc" id="L349">            return null;</span>
+        });
+<span class="nc" id="L351">    }</span>
+
+    /**
+     * Abort the cleaning of a particular partition if it's in progress, and pause any future cleaning of this partition.
+     * This call blocks until the cleaning of the partition is aborted and paused.
+     * &lt;ol&gt;
+     * &lt;li&gt;If the partition is not in progress, mark it as paused.&lt;/li&gt;
+     * &lt;li&gt;Otherwise, first mark the state of the partition as aborted.&lt;/li&gt;
+     * &lt;li&gt;The cleaner thread checks the state periodically and if it sees the state of the partition is aborted, it
+     *    throws a LogCleaningAbortedException to stop the cleaning task.&lt;/li&gt;
+     * &lt;li&gt;When the cleaning task is stopped, doneCleaning() is called, which sets the state of the partition as paused.&lt;/li&gt;
+     * &lt;li&gt;abortAndPauseCleaning() waits until the state of the partition is changed to paused.&lt;/li&gt;
+     * &lt;li&gt;If the partition is already paused, a new call to this function
+     *    will increase the paused count by one.&lt;/li&gt;
+     * &lt;/ol&gt;
+     */
+    public void abortAndPauseCleaning(TopicPartition topicPartition) {
+<span class="nc" id="L368">        inLock(lock, () -&gt; {</span>
+<span class="nc" id="L369">            LogCleaningState state = inProgress.get(topicPartition);</span>
+
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            if (state == null) {</span>
+<span class="nc" id="L372">                inProgress.put(topicPartition, LogCleaningState.logCleaningPaused(1));</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">            } else if (state == LogCleaningState.LOG_CLEANING_IN_PROGRESS) {</span>
+<span class="nc" id="L374">                inProgress.put(topicPartition, LogCleaningState.LOG_CLEANING_ABORTED);</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            } else if (state instanceof LogCleaningState.LogCleaningPaused logCleaningPaused) {</span>
+<span class="nc" id="L376">                inProgress.put(topicPartition, LogCleaningState.logCleaningPaused(logCleaningPaused.pausedCount() + 1));</span>
+            } else {
+<span class="nc" id="L378">                throw new IllegalStateException(&quot;Compaction for partition &quot; + topicPartition +</span>
+                        &quot; cannot be aborted and paused since it is in &quot; + state + &quot; state.&quot;);
+            }
+
+<span class="nc bnc" id="L382" title="All 2 branches missed.">            while (!isCleaningInStatePaused(topicPartition)) {</span>
+                try {
+<span class="nc" id="L384">                    pausedCleaningCond.await(100, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L385">                } catch (InterruptedException e) {</span>
+<span class="nc" id="L386">                    throw new RuntimeException(e);</span>
+<span class="nc" id="L387">                }</span>
+            }
+
+<span class="nc" id="L390">            return null;</span>
+        });
+<span class="nc" id="L392">    }</span>
+
+    /**
+     * Resume the cleaning of paused partitions.
+     * Each call of this function will undo one pause.
+     */
+    public void resumeCleaning(Set&lt;TopicPartition&gt; topicPartitions) {
+<span class="nc" id="L399">        inLock(lock, () -&gt; {</span>
+<span class="nc" id="L400">            topicPartitions.forEach(topicPartition -&gt; {</span>
+<span class="nc" id="L401">                LogCleaningState state = inProgress.get(topicPartition);</span>
+
+<span class="nc bnc" id="L403" title="All 2 branches missed.">                if (state == null) {</span>
+<span class="nc" id="L404">                    throw new IllegalStateException(&quot;Compaction for partition &quot; + topicPartition + &quot; cannot be resumed since it is not paused.&quot;);</span>
+                }
+
+<span class="nc bnc" id="L407" title="All 2 branches missed.">                if (state instanceof LogCleaningState.LogCleaningPaused logCleaningPaused) {</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">                    if (logCleaningPaused.pausedCount() == 1) {</span>
+<span class="nc" id="L409">                        inProgress.remove(topicPartition);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">                    } else if (logCleaningPaused.pausedCount() &gt; 1) {</span>
+<span class="nc" id="L411">                        inProgress.put(topicPartition, LogCleaningState.logCleaningPaused(logCleaningPaused.pausedCount() - 1));</span>
+                    }
+                } else {
+<span class="nc" id="L414">                    throw new IllegalStateException(&quot;Compaction for partition &quot; + topicPartition +</span>
+                            &quot; cannot be resumed since it is in &quot; + state + &quot; state.&quot;);
+                }
+<span class="nc" id="L417">            });</span>
+
+<span class="nc" id="L419">            return null;</span>
+        });
+<span class="nc" id="L421">    }</span>
+
+    /**
+     * Check if the cleaning for a partition is in a particular state. The caller is expected to hold lock while making the call.
+     */
+    private boolean isCleaningInState(TopicPartition topicPartition, LogCleaningState expectedState) {
+<span class="nc" id="L427">        LogCleaningState state = inProgress.get(topicPartition);</span>
+
+<span class="nc bnc" id="L429" title="All 2 branches missed.">        if (state == null) {</span>
+<span class="nc" id="L430">            return false;</span>
+        } else {
+<span class="nc bnc" id="L432" title="All 2 branches missed.">            return state == expectedState;</span>
+        }
+    }
+
+    /**
+     * Check if the cleaning for a partition is paused. The caller is expected to hold lock while making the call.
+     */
+    private boolean isCleaningInStatePaused(TopicPartition topicPartition) {
+<span class="nc" id="L440">        LogCleaningState state = inProgress.get(topicPartition);</span>
+
+<span class="nc bnc" id="L442" title="All 2 branches missed.">        if (state == null) {</span>
+<span class="nc" id="L443">            return false;</span>
+        } else {
+<span class="nc" id="L445">            return state instanceof LogCleaningState.LogCleaningPaused;</span>
+        }
+    }
+
+    /**
+     * Check if the cleaning for a partition is aborted. If so, throw an exception.
+     */
+    public void checkCleaningAborted(TopicPartition topicPartition) {
+<span class="nc" id="L453">        inLock(lock, () -&gt; {</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">            if (isCleaningInState(topicPartition, LogCleaningState.LOG_CLEANING_ABORTED)) {</span>
+<span class="nc" id="L455">                throw new LogCleaningAbortedException();</span>
+            }
+<span class="nc" id="L457">            return null;</span>
+        });
+<span class="nc" id="L459">    }</span>
+
+    /**
+     * Update checkpoint file, adding or removing partitions if necessary.
+     *
+     * @param dataDir                The File object to be updated
+     * @param partitionToUpdateOrAdd The [TopicPartition, Long] map entry to be updated. pass &quot;Optional.empty&quot; if doing remove, not add
+     * @param partitionToRemove      The TopicPartition to be removed
+     */
+    public void updateCheckpoints(
+            File dataDir,
+            Optional&lt;Map.Entry&lt;TopicPartition, Long&gt;&gt; partitionToUpdateOrAdd,
+            Optional&lt;TopicPartition&gt; partitionToRemove
+    ) {
+<span class="nc" id="L473">        inLock(lock, () -&gt; {</span>
+<span class="nc" id="L474">            OffsetCheckpointFile checkpoint = checkpoints.get(dataDir);</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">            if (checkpoint != null) {</span>
+                try {
+<span class="nc" id="L477">                    Map&lt;TopicPartition, Long&gt; currentCheckpoint = checkpoint.read().entrySet().stream()</span>
+<span class="nc" id="L478">                            .filter(entry -&gt; logs.containsKey(entry.getKey()))</span>
+<span class="nc" id="L479">                            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+
+<span class="nc" id="L481">                    Map&lt;TopicPartition, Long&gt; updatedCheckpoint = new HashMap&lt;&gt;(currentCheckpoint);</span>
+
+                    // Remove the partition offset if present
+<span class="nc" id="L484">                    partitionToRemove.ifPresent(updatedCheckpoint::remove);</span>
+
+                    // Update or add the partition offset if present
+<span class="nc" id="L487">                    partitionToUpdateOrAdd.ifPresent(entry -&gt; updatedCheckpoint.put(entry.getKey(), entry.getValue()));</span>
+
+                    // Write back the updated checkpoint
+<span class="nc" id="L490">                    checkpoint.write(updatedCheckpoint);</span>
+<span class="nc" id="L491">                } catch (KafkaStorageException e) {</span>
+<span class="nc" id="L492">                    LOG.error(&quot;Failed to access checkpoint file {} in dir {}&quot;,</span>
+<span class="nc" id="L493">                            checkpoint.file().getName(), checkpoint.file().getParentFile().getAbsolutePath(), e);</span>
+<span class="nc" id="L494">                }</span>
+            }
+
+<span class="nc" id="L497">            return null;</span>
+        });
+<span class="nc" id="L499">    }</span>
+
+    /**
+     * Alter the checkpoint directory for the topicPartition, to remove the data in sourceLogDir, and add the data in destLogDir.
+     */
+    public void alterCheckpointDir(TopicPartition topicPartition, File sourceLogDir, File destLogDir) {
+<span class="nc" id="L505">        inLock(lock, () -&gt; {</span>
+            try {
+<span class="nc" id="L507">                Optional&lt;Long&gt; offsetOpt = Optional.ofNullable(checkpoints.get(sourceLogDir))</span>
+<span class="nc" id="L508">                        .flatMap(checkpoint -&gt; Optional.ofNullable(checkpoint.read().get(topicPartition)));</span>
+
+<span class="nc" id="L510">                offsetOpt.ifPresent(offset -&gt; {</span>
+<span class="nc" id="L511">                    LOG.debug(&quot;Removing the partition offset data in checkpoint file for '{}' from {} directory.&quot;,</span>
+<span class="nc" id="L512">                            topicPartition, sourceLogDir.getAbsoluteFile());</span>
+<span class="nc" id="L513">                    updateCheckpoints(sourceLogDir, Optional.empty(), Optional.of(topicPartition));</span>
+
+<span class="nc" id="L515">                    LOG.debug(&quot;Adding the partition offset data in checkpoint file for '{}' to {} directory.&quot;,</span>
+<span class="nc" id="L516">                            topicPartition, destLogDir.getAbsoluteFile());</span>
+<span class="nc" id="L517">                    updateCheckpoints(destLogDir, Optional.of(Map.entry(topicPartition, offset)), Optional.empty());</span>
+<span class="nc" id="L518">                });</span>
+<span class="nc" id="L519">            } catch (KafkaStorageException e) {</span>
+<span class="nc" id="L520">                LOG.error(&quot;Failed to access checkpoint file in dir {}&quot;, sourceLogDir.getAbsolutePath(), e);</span>
+<span class="nc" id="L521">            }</span>
+
+<span class="nc" id="L523">            Set&lt;TopicPartition&gt; logUncleanablePartitions = uncleanablePartitions.getOrDefault(sourceLogDir.toString(), Set.of());</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">            if (logUncleanablePartitions.contains(topicPartition)) {</span>
+<span class="nc" id="L525">                logUncleanablePartitions.remove(topicPartition);</span>
+<span class="nc" id="L526">                markPartitionUncleanable(destLogDir.toString(), topicPartition);</span>
+            }
+
+<span class="nc" id="L529">            return null;</span>
+        });
+<span class="nc" id="L531">    }</span>
+
+    /**
+     * Stop cleaning logs in the provided directory.
+     *
+     * @param dir the absolute path of the log dir
+     */
+    public void handleLogDirFailure(String dir) {
+<span class="nc" id="L539">        LOG.warn(&quot;Stopping cleaning logs in dir {}&quot;, dir);</span>
+<span class="nc" id="L540">        inLock(lock, () -&gt; {</span>
+<span class="nc" id="L541">            checkpoints = checkpoints.entrySet().stream()</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">                    .filter(entry -&gt; !entry.getKey().getAbsolutePath().equals(dir))</span>
+<span class="nc" id="L543">                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+
+<span class="nc" id="L545">            return null;</span>
+        });
+<span class="nc" id="L547">    }</span>
+
+    /**
+     * Truncate the checkpointed offset for the given partition if its checkpointed offset is larger than the given offset.
+     */
+    public void maybeTruncateCheckpoint(File dataDir, TopicPartition topicPartition, long offset) {
+<span class="nc" id="L553">        inLock(lock, () -&gt; {</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">            if (logs.get(topicPartition).config().compact) {</span>
+<span class="nc" id="L555">                OffsetCheckpointFile checkpoint = checkpoints.get(dataDir);</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">                if (checkpoint != null) {</span>
+<span class="nc" id="L557">                    Map&lt;TopicPartition, Long&gt; existing = checkpoint.read();</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">                    if (existing.getOrDefault(topicPartition, 0L) &gt; offset) {</span>
+<span class="nc" id="L559">                        existing.put(topicPartition, offset);</span>
+<span class="nc" id="L560">                        checkpoint.write(existing);</span>
+                    }
+                }
+            }
+
+<span class="nc" id="L565">            return null;</span>
+        });
+<span class="nc" id="L567">    }</span>
+
+    /**
+     * Save out the endOffset and remove the given log from the in-progress set, if not aborted.
+     */
+    public void doneCleaning(TopicPartition topicPartition, File dataDir, long endOffset) {
+<span class="nc" id="L573">        inLock(lock, () -&gt; {</span>
+<span class="nc" id="L574">            LogCleaningState state = inProgress.get(topicPartition);</span>
+
+<span class="nc bnc" id="L576" title="All 2 branches missed.">            if (state == null) {</span>
+<span class="nc" id="L577">                throw new IllegalStateException(&quot;State for partition &quot; + topicPartition + &quot; should exist.&quot;);</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">            } else if (state == LogCleaningState.LOG_CLEANING_IN_PROGRESS) {</span>
+<span class="nc" id="L579">                updateCheckpoints(dataDir, Optional.of(Map.entry(topicPartition, endOffset)), Optional.empty());</span>
+<span class="nc" id="L580">                inProgress.remove(topicPartition);</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">            } else if (state == LogCleaningState.LOG_CLEANING_ABORTED) {</span>
+<span class="nc" id="L582">                inProgress.put(topicPartition, LogCleaningState.logCleaningPaused(1));</span>
+<span class="nc" id="L583">                pausedCleaningCond.signalAll();</span>
+            } else {
+<span class="nc" id="L585">                throw new IllegalStateException(&quot;In-progress partition &quot; + topicPartition + &quot; cannot be in &quot; + state + &quot; state.&quot;);</span>
+            }
+
+<span class="nc" id="L588">            return null;</span>
+        });
+<span class="nc" id="L590">    }</span>
+
+    public void doneDeleting(List&lt;TopicPartition&gt; topicPartitions) {
+<span class="nc" id="L593">        inLock(lock, () -&gt; {</span>
+<span class="nc" id="L594">            topicPartitions.forEach(topicPartition -&gt; {</span>
+<span class="nc" id="L595">                LogCleaningState logCleaningState = inProgress.get(topicPartition);</span>
+
+<span class="nc bnc" id="L597" title="All 2 branches missed.">                if (logCleaningState == null) {</span>
+<span class="nc" id="L598">                    throw new IllegalStateException(&quot;State for partition &quot; + topicPartition + &quot; should exist.&quot;);</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">                } else if (logCleaningState == LogCleaningState.LOG_CLEANING_IN_PROGRESS) {</span>
+<span class="nc" id="L600">                    inProgress.remove(topicPartition);</span>
+<span class="nc bnc" id="L601" title="All 2 branches missed.">                } else if (logCleaningState == LogCleaningState.LOG_CLEANING_ABORTED) {</span>
+<span class="nc" id="L602">                    inProgress.put(topicPartition, LogCleaningState.logCleaningPaused(1));</span>
+<span class="nc" id="L603">                    pausedCleaningCond.signalAll();</span>
+                } else {
+<span class="nc" id="L605">                    throw new IllegalStateException(&quot;In-progress partition &quot; + topicPartition + &quot; cannot be in &quot; + logCleaningState + &quot; state.&quot;);</span>
+                }
+<span class="nc" id="L607">            });</span>
+
+<span class="nc" id="L609">            return null;</span>
+        });
+<span class="nc" id="L611">    }</span>
+
+    /**
+     * For testing only. Returns an immutable set of the uncleanable partitions for a given log directory.
+     * Only used for testing.
+     */
+    public Set&lt;TopicPartition&gt; uncleanablePartitions(String logDir) {
+<span class="nc" id="L618">        return inLock(lock, () -&gt; {</span>
+<span class="nc" id="L619">            Set&lt;TopicPartition&gt; partitions = uncleanablePartitions.get(logDir);</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">            return partitions != null ? Set.copyOf(partitions) : Set.of();</span>
+        });
+    }
+
+    public void markPartitionUncleanable(String logDir, TopicPartition partition) {
+<span class="nc" id="L625">        inLock(lock, () -&gt; {</span>
+<span class="nc" id="L626">            Set&lt;TopicPartition&gt; partitions = uncleanablePartitions.computeIfAbsent(logDir, dir -&gt; new HashSet&lt;&gt;());</span>
+<span class="nc" id="L627">            partitions.add(partition);</span>
+
+<span class="nc" id="L629">            return null;</span>
+        });
+<span class="nc" id="L631">    }</span>
+
+    private boolean isUncleanablePartition(UnifiedLog log, TopicPartition topicPartition) {
+<span class="nc" id="L634">        return inLock(lock, () -&gt; Optional.ofNullable(uncleanablePartitions.get(log.parentDir()))</span>
+<span class="nc" id="L635">                .map(partitions -&gt; partitions.contains(topicPartition))</span>
+<span class="nc" id="L636">                .orElse(false)</span>
+        );
+    }
+
+    public void maintainUncleanablePartitions() {
+        // Remove deleted partitions from uncleanablePartitions
+<span class="nc" id="L642">        inLock(lock, () -&gt; {</span>
+            // Remove deleted partitions
+<span class="nc" id="L644">            uncleanablePartitions.values().forEach(partitions -&gt;</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">                    partitions.removeIf(partition -&gt; !logs.containsKey(partition)));</span>
+
+            // Remove entries with empty partition set.
+<span class="nc" id="L648">            uncleanablePartitions.entrySet().removeIf(entry -&gt; entry.getValue().isEmpty());</span>
+
+<span class="nc" id="L650">            return null;</span>
+        });
+<span class="nc" id="L652">    }</span>
+
+    public void removeMetrics() {
+<span class="nc" id="L655">        GAUGE_METRIC_NAME_NO_TAG.forEach(metricsGroup::removeMetric);</span>
+<span class="nc" id="L656">        gaugeMetricNameWithTag.forEach((metricName, tags) -&gt;</span>
+<span class="nc" id="L657">                tags.forEach(tag -&gt; metricsGroup.removeMetric(metricName, tag)));</span>
+<span class="nc" id="L658">        gaugeMetricNameWithTag.clear();</span>
+<span class="nc" id="L659">    }</span>
+
+    private static boolean isCompactAndDelete(UnifiedLog log) {
+<span class="nc bnc" id="L662" title="All 4 branches missed.">        return log.config().compact &amp;&amp; log.config().delete;</span>
+    }
+
+    /**
+     * Get max delay between the time when log is required to be compacted as determined
+     * by maxCompactionLagMs and the current time.
+     */
+    private static long maxCompactionDelay(UnifiedLog log, long firstDirtyOffset, long now) {
+<span class="nc" id="L670">        List&lt;LogSegment&gt; dirtyNonActiveSegments = log.nonActiveLogSegmentsFrom(firstDirtyOffset);</span>
+<span class="nc" id="L671">        Stream&lt;Long&gt; firstBatchTimestamps = log.getFirstBatchTimestampForSegments(dirtyNonActiveSegments).stream()</span>
+<span class="nc bnc" id="L672" title="All 2 branches missed.">                .filter(timestamp -&gt; timestamp &gt; 0);</span>
+
+<span class="nc" id="L674">        long earliestDirtySegmentTimestamp = firstBatchTimestamps.min(Comparator.naturalOrder()).orElse(Long.MAX_VALUE);</span>
+
+<span class="nc" id="L676">        long maxCompactionLagMs = Math.max(log.config().maxCompactionLagMs, 0L);</span>
+<span class="nc" id="L677">        long cleanUntilTime = now - maxCompactionLagMs;</span>
+
+<span class="nc bnc" id="L679" title="All 2 branches missed.">        return earliestDirtySegmentTimestamp &lt; cleanUntilTime ? cleanUntilTime - earliestDirtySegmentTimestamp : 0L;</span>
+    }
+
+    /**
+     * Returns the range of dirty offsets that can be cleaned.
+     *
+     * @param log             the log
+     * @param lastCleanOffset the last checkpointed offset
+     * @param now             the current time in milliseconds of the cleaning operation
+     * @return OffsetsToClean containing offsets for cleanable portion of log and whether the log checkpoint needs updating
+     * @throws IOException    if an I/O error occurs
+     */
+    // Visible for testing
+    static OffsetsToClean cleanableOffsets(UnifiedLog log, Optional&lt;Long&gt; lastCleanOffset, long now) throws IOException {
+        // If the log segments are abnormally truncated and hence the checkpointed offset is no longer valid;
+        // reset to the log starting offset and log the error
+
+<span class="nc" id="L696">        long logStartOffset = log.logStartOffset();</span>
+<span class="nc" id="L697">        long checkpointDirtyOffset = lastCleanOffset.orElse(logStartOffset);</span>
+
+        long firstDirtyOffset;
+        boolean forceUpdateCheckpoint;
+
+<span class="nc bnc" id="L702" title="All 2 branches missed.">        if (checkpointDirtyOffset &lt; logStartOffset) {</span>
+            // Don't bother with the warning if compact and delete are enabled.
+<span class="nc bnc" id="L704" title="All 2 branches missed.">            if (!isCompactAndDelete(log))</span>
+<span class="nc" id="L705">                LOG.warn(&quot;Resetting first dirty offset of {} to log start offset {} since the checkpointed offset {} is invalid.&quot;,</span>
+<span class="nc" id="L706">                        log.name(), logStartOffset, checkpointDirtyOffset);</span>
+
+<span class="nc" id="L708">            firstDirtyOffset = logStartOffset;</span>
+<span class="nc" id="L709">            forceUpdateCheckpoint = true;</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">        } else if (checkpointDirtyOffset &gt; log.logEndOffset()) {</span>
+            // The dirty offset has gotten ahead of the log end offset. This could happen if there was data
+            // corruption at the end of the log. We conservatively assume that the full log needs cleaning.
+<span class="nc" id="L713">            LOG.warn(&quot;The last checkpoint dirty offset for partition {} is {}, &quot; +</span>
+                            &quot;which is larger than the log end offset {}. Resetting to the log start offset {}.&quot;,
+<span class="nc" id="L715">                    log.name(), checkpointDirtyOffset, log.logEndOffset(), logStartOffset);</span>
+
+<span class="nc" id="L717">            firstDirtyOffset = logStartOffset;</span>
+<span class="nc" id="L718">            forceUpdateCheckpoint = true;</span>
+        } else {
+<span class="nc" id="L720">            firstDirtyOffset = checkpointDirtyOffset;</span>
+<span class="nc" id="L721">            forceUpdateCheckpoint = false;</span>
+        }
+
+<span class="nc" id="L724">        long minCompactionLagMs = Math.max(log.config().compactionLagMs, 0L);</span>
+
+        // Find the first segment that cannot be cleaned. We cannot clean past:
+        // 1. The active segment
+        // 2. The last stable offset (including the high watermark)
+        // 3. Any segments closer to the head of the log than the minimum compaction lag time
+<span class="nc" id="L730">        long firstUncleanableDirtyOffset = Stream.of(</span>
+                        // we do not clean beyond the last stable offset
+<span class="nc" id="L732">                        Optional.of(log.lastStableOffset()),</span>
+
+                        // the active segment is always uncleanable
+<span class="nc" id="L735">                        Optional.of(log.activeSegment().baseOffset()),</span>
+
+                        // the first segment whose largest message timestamp is within a minimum time lag from now
+<span class="nc bnc" id="L738" title="All 2 branches missed.">                        minCompactionLagMs &gt; 0 ? findFirstUncleanableSegment(log, firstDirtyOffset, now, minCompactionLagMs) : Optional.&lt;Long&gt;empty()</span>
+                )
+<span class="nc" id="L740">                .flatMap(Optional::stream)</span>
+<span class="nc" id="L741">                .min(Long::compare)</span>
+<span class="nc" id="L742">                .orElseThrow(() -&gt; new IllegalStateException(&quot;No uncleanable offset found&quot;));</span>
+
+<span class="nc" id="L744">        LOG.debug(&quot;Finding range of cleanable offsets for log={}. Last clean offset={} &quot; +</span>
+                        &quot;now={} =&gt; firstDirtyOffset={} firstUncleanableOffset={} activeSegment.baseOffset={}&quot;,
+<span class="nc" id="L746">                log.name(), lastCleanOffset, now, firstDirtyOffset, firstUncleanableDirtyOffset, log.activeSegment().baseOffset());</span>
+
+<span class="nc" id="L748">        return new OffsetsToClean(firstDirtyOffset, Math.max(firstDirtyOffset, firstUncleanableDirtyOffset), forceUpdateCheckpoint);</span>
+    }
+
+    /**
+     * Given the first dirty offset and an uncleanable offset, calculates the total cleanable bytes for this log.
+     *
+     * @return the biggest uncleanable offset and the total amount of cleanable bytes
+     */
+    public static Map.Entry&lt;Long, Long&gt; calculateCleanableBytes(UnifiedLog log, long firstDirtyOffset, long uncleanableOffset) {
+<span class="nc" id="L757">        List&lt;LogSegment&gt; nonActiveSegments = log.nonActiveLogSegmentsFrom(uncleanableOffset);</span>
+<span class="nc bnc" id="L758" title="All 2 branches missed.">        LogSegment firstUncleanableSegment = nonActiveSegments.isEmpty() ? log.activeSegment() : nonActiveSegments.get(0);</span>
+<span class="nc" id="L759">        long firstUncleanableOffset = firstUncleanableSegment.baseOffset();</span>
+<span class="nc" id="L760">        long cleanableBytes = log.logSegments(Math.min(firstDirtyOffset, firstUncleanableOffset), firstUncleanableOffset).stream()</span>
+<span class="nc" id="L761">                .mapToLong(LogSegment::size)</span>
+<span class="nc" id="L762">                .sum();</span>
+
+<span class="nc" id="L764">        return Map.entry(firstUncleanableOffset, cleanableBytes);</span>
+    }
+
+    private static Optional&lt;Long&gt; findFirstUncleanableSegment(UnifiedLog log, long firstDirtyOffset, long now, long minCompactionLagMs) throws IOException {
+<span class="nc" id="L768">        List&lt;LogSegment&gt; dirtyNonActiveSegments = log.nonActiveLogSegmentsFrom(firstDirtyOffset);</span>
+
+<span class="nc bnc" id="L770" title="All 2 branches missed.">        for (LogSegment segment : dirtyNonActiveSegments) {</span>
+<span class="nc bnc" id="L771" title="All 2 branches missed.">            boolean isUncleanable = segment.largestTimestamp() &gt; now - minCompactionLagMs;</span>
+
+<span class="nc" id="L773">            LOG.debug(&quot;Checking if log segment may be cleaned: log='{}' segment.baseOffset={} &quot; +</span>
+                            &quot;segment.largestTimestamp={}; now - compactionLag={}; is uncleanable={}&quot;,
+<span class="nc" id="L775">                    log.name(), segment.baseOffset(), segment.largestTimestamp(), now - minCompactionLagMs, isUncleanable);</span>
+
+<span class="nc bnc" id="L777" title="All 2 branches missed.">            if (isUncleanable) {</span>
+<span class="nc" id="L778">                return Optional.of(segment.baseOffset());</span>
+            }
+<span class="nc" id="L780">        }</span>
+
+<span class="nc" id="L782">        return Optional.empty();</span>
+    }
+
+    /**
+     * Helper class for the range of cleanable dirty offsets of a log and whether to update the checkpoint associated with
+     * the log.
+     *
+     * @param firstDirtyOffset            the lower (inclusive) offset to begin cleaning from
+     * @param firstUncleanableDirtyOffset the upper(exclusive) offset to clean to
+     * @param forceUpdateCheckpoint       whether to update the checkpoint associated with this log. if true, checkpoint should be
+     *                                    reset to firstDirtyOffset
+     */
+<span class="nc" id="L794">    record OffsetsToClean(long firstDirtyOffset, long firstUncleanableDirtyOffset, boolean forceUpdateCheckpoint) {</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

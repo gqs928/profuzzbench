@@ -1,0 +1,300 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Authorizer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.authorizer</a> &gt; <span class="el_source">Authorizer.java</span></div><h1>Authorizer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.server.authorizer;
+
+import org.apache.kafka.common.Configurable;
+import org.apache.kafka.common.Endpoint;
+import org.apache.kafka.common.acl.AccessControlEntryFilter;
+import org.apache.kafka.common.acl.AclBinding;
+import org.apache.kafka.common.acl.AclBindingFilter;
+import org.apache.kafka.common.acl.AclOperation;
+import org.apache.kafka.common.acl.AclPermissionType;
+import org.apache.kafka.common.annotation.InterfaceAudience;
+import org.apache.kafka.common.resource.PatternType;
+import org.apache.kafka.common.resource.ResourcePattern;
+import org.apache.kafka.common.resource.ResourcePatternFilter;
+import org.apache.kafka.common.resource.ResourceType;
+import org.apache.kafka.common.security.auth.KafkaPrincipal;
+import org.apache.kafka.common.utils.internals.SecurityUtils;
+import org.apache.kafka.server.authorizer.internals.CidrUtils;
+
+import java.io.Closeable;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletionStage;
+
+/**
+ *
+ * Pluggable authorizer interface for Kafka brokers.
+ *
+ * Startup sequence in brokers:
+ * &lt;ol&gt;
+ *   &lt;li&gt;Broker creates authorizer instance if configured in `authorizer.class.name`.&lt;/li&gt;
+ *   &lt;li&gt;Broker configures and starts authorizer instance. Authorizer implementation starts loading its metadata.&lt;/li&gt;
+ *   &lt;li&gt;Broker starts SocketServer to accept connections and process requests.&lt;/li&gt;
+ *   &lt;li&gt;For each listener, SocketServer waits for authorization metadata to be available in the
+ *       authorizer before accepting connections. The future returned by {@link #start(AuthorizerServerInfo)}
+ *       for each listener must return only when authorizer is ready to authorize requests on the listener.&lt;/li&gt;
+ *   &lt;li&gt;Broker accepts connections. For each connection, broker performs authentication and then accepts Kafka requests.
+ *       For each request, broker invokes {@link #authorize(AuthorizableRequestContext, List)} to authorize
+ *       actions performed by the request.&lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ * Authorizer implementation class may optionally implement @{@link org.apache.kafka.common.Reconfigurable}
+ * to enable dynamic reconfiguration without restarting the broker.
+ * &lt;p&gt;Authorizer implementation class may also optionally implement {@link org.apache.kafka.common.metrics.Monitorable}
+ * to enable the authorizer to register metrics. The following tags are automatically added to all metrics registered:
+ * &lt;code&gt;config&lt;/code&gt; set to &lt;code&gt;authorizer.class.name&lt;/code&gt;, &lt;code&gt;class&lt;/code&gt; set to the Authorizer class name,
+ * and &lt;code&gt;role&lt;/code&gt; set to either &lt;code&gt;broker&lt;/code&gt; or &lt;code&gt;controller&lt;/code&gt;.
+ * &lt;p&gt;
+ * &lt;b&gt;Threading model:&lt;/b&gt;
+ * &lt;ul&gt;
+ *   &lt;li&gt;All authorizer operations including authorization and ACL updates must be thread-safe.&lt;/li&gt;
+ *   &lt;li&gt;ACL update methods are asynchronous. Implementations with low update latency may return a
+ *       completed future using {@link java.util.concurrent.CompletableFuture#completedFuture(Object)}.
+ *       This ensures that the request will be handled synchronously by the caller without using a
+ *       purgatory to wait for the result. If ACL updates require remote communication which may block,
+ *       return a future that is completed asynchronously when the remote operation completes. This enables
+ *       the caller to process other requests on the request threads without blocking.&lt;/li&gt;
+ *   &lt;li&gt;Any threads or thread pools used for processing remote operations asynchronously can be started during
+ *       {@link #start(AuthorizerServerInfo)}. These threads must be shutdown during {@link Authorizer#close()}.&lt;/li&gt;
+ * &lt;/ul&gt;
+ * &lt;/p&gt;
+ */
+@InterfaceAudience.Public
+public interface Authorizer extends Configurable, Closeable {
+
+    /**
+     * Starts loading authorization metadata and returns futures that can be used to wait until
+     * metadata for authorizing requests on each listener is available. Each listener will be
+     * started only after its metadata is available and authorizer is ready to start authorizing
+     * requests on that listener.
+     *
+     * @param serverInfo Metadata for the broker including broker id and listener endpoints
+     * @return CompletionStage for each endpoint that completes when authorizer is ready to
+     *         start authorizing requests on that listener.
+     */
+    Map&lt;Endpoint, ? extends CompletionStage&lt;Void&gt;&gt; start(AuthorizerServerInfo serverInfo);
+
+    /**
+     * Authorizes the specified action. Additional metadata for the action is specified
+     * in `requestContext`.
+     * &lt;p&gt;
+     * This is a synchronous API designed for use with locally cached ACLs. Since this method is invoked on the
+     * request thread while processing each request, implementations of this method should avoid time-consuming
+     * remote communication that may block request threads.
+     *
+     * @param requestContext Request context including request type, security protocol and listener name
+     * @param actions Actions being authorized including resource and operation for each action
+     * @return List of authorization results for each action in the same order as the provided actions
+     */
+    List&lt;AuthorizationResult&gt; authorize(AuthorizableRequestContext requestContext, List&lt;Action&gt; actions);
+
+    /**
+     * Creates new ACL bindings.
+     * &lt;p&gt;
+     * This is an asynchronous API that enables the caller to avoid blocking during the update. Implementations of this
+     * API can return completed futures using {@link java.util.concurrent.CompletableFuture#completedFuture(Object)}
+     * to process the update synchronously on the request thread.
+     *
+     * @param requestContext Request context if the ACL is being created by a broker to handle
+     *        a client request to create ACLs.
+     * @param aclBindings ACL bindings to create
+     *
+     * @return Create result for each ACL binding in the same order as in the input list. Each result
+     *         is returned as a CompletionStage that completes when the result is available.
+     */
+    List&lt;? extends CompletionStage&lt;AclCreateResult&gt;&gt; createAcls(AuthorizableRequestContext requestContext, List&lt;AclBinding&gt; aclBindings);
+
+    /**
+     * Deletes all ACL bindings that match the provided filters.
+     * &lt;p&gt;
+     * This is an asynchronous API that enables the caller to avoid blocking during the update. Implementations of this
+     * API can return completed futures using {@link java.util.concurrent.CompletableFuture#completedFuture(Object)}
+     * to process the update synchronously on the request thread.
+     * &lt;p&gt;
+     * Refer to the authorizer implementation docs for details on concurrent update guarantees.
+     *
+     * @param requestContext Request context if the ACL is being deleted by a broker to handle
+     *        a client request to delete ACLs.
+     * @param aclBindingFilters Filters to match ACL bindings that are to be deleted
+     *
+     * @return Delete result for each filter in the same order as in the input list.
+     *         Each result indicates which ACL bindings were actually deleted as well as any
+     *         bindings that matched but could not be deleted. Each result is returned as a
+     *         CompletionStage that completes when the result is available.
+     */
+    List&lt;? extends CompletionStage&lt;AclDeleteResult&gt;&gt; deleteAcls(AuthorizableRequestContext requestContext, List&lt;AclBindingFilter&gt; aclBindingFilters);
+
+    /**
+     * Returns ACL bindings which match the provided filter.
+     * &lt;p&gt;
+     * This is a synchronous API designed for use with locally cached ACLs. This method is invoked on the request
+     * thread while processing DescribeAcls requests and should avoid time-consuming remote communication that may
+     * block request threads.
+     *
+     * @return Iterator for ACL bindings, which may be populated lazily.
+     */
+    Iterable&lt;AclBinding&gt; acls(AclBindingFilter filter);
+
+    /**
+     * Get the current number of ACLs, for the purpose of metrics. Authorizers that don't implement this function
+     * will simply return -1.
+     */
+    default int aclCount() {
+<span class="nc" id="L164">        return -1;</span>
+    }
+
+    /**
+     * Check if the caller is authorized to perform the given ACL operation on at least one
+     * resource of the given type.
+     *
+     * Custom authorizer implementations should consider overriding this default implementation because:
+     * 1. The default implementation iterates all AclBindings multiple times, without any caching
+     *    by principal, host, operation, permission types, and resource types. More efficient
+     *    implementations may be added in custom authorizers that directly access cached entries.
+     * 2. The default implementation cannot integrate with any audit logging included in the
+     *    authorizer implementation.
+     * 3. The default implementation does not support any custom authorizer configs or other access
+     *    rules apart from ACLs.
+     *
+     * @param requestContext Request context including request resourceType, security protocol and listener name
+     * @param op             The ACL operation to check
+     * @param resourceType   The resource type to check
+     * @return               Return {@link AuthorizationResult#ALLOWED} if the caller is authorized
+     *                       to perform the given ACL operation on at least one resource of the
+     *                       given type. Return {@link AuthorizationResult#DENIED} otherwise.
+     */
+    default AuthorizationResult authorizeByResourceType(AuthorizableRequestContext requestContext, AclOperation op, ResourceType resourceType) {
+<span class="nc" id="L188">        SecurityUtils.authorizeByResourceTypeCheckArgs(op, resourceType);</span>
+
+        // Check a hard-coded name to ensure that super users are granted
+        // access regardless of DENY ACLs.
+<span class="nc" id="L192">        if (authorize(requestContext, Collections.singletonList(new Action(</span>
+                op, new ResourcePattern(resourceType, &quot;hardcode&quot;, PatternType.LITERAL),
+                0, true, false)))
+<span class="nc bnc" id="L195" title="All 2 branches missed.">                .get(0) == AuthorizationResult.ALLOWED) {</span>
+<span class="nc" id="L196">            return AuthorizationResult.ALLOWED;</span>
+        }
+
+        // Filter out all the resource pattern corresponding to the RequestContext,
+        // AclOperation, and ResourceType
+<span class="nc" id="L201">        ResourcePatternFilter resourceTypeFilter = new ResourcePatternFilter(</span>
+            resourceType, null, PatternType.ANY);
+<span class="nc" id="L203">        AclBindingFilter aclFilter = new AclBindingFilter(</span>
+            resourceTypeFilter, AccessControlEntryFilter.ANY);
+
+<span class="nc" id="L206">        EnumMap&lt;PatternType, Set&lt;String&gt;&gt; denyPatterns =</span>
+<span class="nc" id="L207">            new EnumMap&lt;&gt;(PatternType.class) {{</span>
+<span class="nc" id="L208">                    put(PatternType.LITERAL, new HashSet&lt;&gt;());</span>
+<span class="nc" id="L209">                    put(PatternType.PREFIXED, new HashSet&lt;&gt;());</span>
+                }};
+<span class="nc" id="L211">        EnumMap&lt;PatternType, Set&lt;String&gt;&gt; allowPatterns =</span>
+<span class="nc" id="L212">            new EnumMap&lt;&gt;(PatternType.class) {{</span>
+<span class="nc" id="L213">                    put(PatternType.LITERAL, new HashSet&lt;&gt;());</span>
+<span class="nc" id="L214">                    put(PatternType.PREFIXED, new HashSet&lt;&gt;());</span>
+                }};
+
+<span class="nc" id="L217">        boolean hasWildCardAllow = false;</span>
+
+<span class="nc" id="L219">        KafkaPrincipal principal = new KafkaPrincipal(</span>
+<span class="nc" id="L220">            requestContext.principal().getPrincipalType(),</span>
+<span class="nc" id="L221">            requestContext.principal().getName());</span>
+<span class="nc" id="L222">        String hostAddr = requestContext.clientAddress().getHostAddress();</span>
+
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        for (AclBinding binding : acls(aclFilter)) {</span>
+<span class="nc" id="L225">            String aclHost = binding.entry().host();</span>
+<span class="nc bnc" id="L226" title="All 6 branches missed.">            if (!aclHost.equals(hostAddr) &amp;&amp; !aclHost.equals(&quot;*&quot;) &amp;&amp; !CidrUtils.isInRange(hostAddr, aclHost))</span>
+<span class="nc" id="L227">                continue;</span>
+
+<span class="nc bnc" id="L229" title="All 2 branches missed.">            if (!SecurityUtils.parseKafkaPrincipal(binding.entry().principal()).equals(principal)</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">                    &amp;&amp; !binding.entry().principal().equals(&quot;User:*&quot;))</span>
+<span class="nc" id="L231">                continue;</span>
+
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            if (binding.entry().operation() != op</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                    &amp;&amp; binding.entry().operation() != AclOperation.ALL)</span>
+<span class="nc" id="L235">                continue;</span>
+
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            if (binding.entry().permissionType() == AclPermissionType.DENY) {</span>
+<span class="nc bnc" id="L238" title="All 3 branches missed.">                switch (binding.pattern().patternType()) {</span>
+                    case LITERAL:
+                        // If wildcard deny exists, return deny directly
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                        if (binding.pattern().name().equals(ResourcePattern.WILDCARD_RESOURCE))</span>
+<span class="nc" id="L242">                            return AuthorizationResult.DENIED;</span>
+<span class="nc" id="L243">                        denyPatterns.get(PatternType.LITERAL).add(binding.pattern().name());</span>
+<span class="nc" id="L244">                        break;</span>
+                    case PREFIXED:
+<span class="nc" id="L246">                        denyPatterns.get(PatternType.PREFIXED).add(binding.pattern().name());</span>
+<span class="nc" id="L247">                        break;</span>
+                    default:
+                }
+<span class="nc" id="L250">                continue;</span>
+            }
+
+<span class="nc bnc" id="L253" title="All 2 branches missed.">            if (binding.entry().permissionType() != AclPermissionType.ALLOW)</span>
+<span class="nc" id="L254">                continue;</span>
+
+<span class="nc bnc" id="L256" title="All 3 branches missed.">            switch (binding.pattern().patternType()) {</span>
+                case LITERAL:
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                    if (binding.pattern().name().equals(ResourcePattern.WILDCARD_RESOURCE)) {</span>
+<span class="nc" id="L259">                        hasWildCardAllow = true;</span>
+<span class="nc" id="L260">                        continue;</span>
+                    }
+<span class="nc" id="L262">                    allowPatterns.get(PatternType.LITERAL).add(binding.pattern().name());</span>
+<span class="nc" id="L263">                    break;</span>
+                case PREFIXED:
+<span class="nc" id="L265">                    allowPatterns.get(PatternType.PREFIXED).add(binding.pattern().name());</span>
+<span class="nc" id="L266">                    break;</span>
+                default:
+            }
+<span class="nc" id="L269">        }</span>
+
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        if (hasWildCardAllow) {</span>
+<span class="nc" id="L272">            return AuthorizationResult.ALLOWED;</span>
+        }
+
+        // For any literal allowed, if there's no dominant literal and prefix denied, return allow.
+        // For any prefix allowed, if there's no dominant prefix denied, return allow.
+<span class="nc bnc" id="L277" title="All 2 branches missed.">        for (Map.Entry&lt;PatternType, Set&lt;String&gt;&gt; entry : allowPatterns.entrySet()) {</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">            for (String allowStr : entry.getValue()) {</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">                if (entry.getKey() == PatternType.LITERAL</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">                        &amp;&amp; denyPatterns.get(PatternType.LITERAL).contains(allowStr))</span>
+<span class="nc" id="L281">                    continue;</span>
+<span class="nc" id="L282">                StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L283">                boolean hasDominatedDeny = false;</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">                for (char ch : allowStr.toCharArray()) {</span>
+<span class="nc" id="L285">                    sb.append(ch);</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">                    if (denyPatterns.get(PatternType.PREFIXED).contains(sb.toString())) {</span>
+<span class="nc" id="L287">                        hasDominatedDeny = true;</span>
+<span class="nc" id="L288">                        break;</span>
+                    }
+                }
+<span class="nc bnc" id="L291" title="All 2 branches missed.">                if (!hasDominatedDeny)</span>
+<span class="nc" id="L292">                    return AuthorizationResult.ALLOWED;</span>
+<span class="nc" id="L293">            }</span>
+<span class="nc" id="L294">        }</span>
+
+<span class="nc" id="L296">        return AuthorizationResult.DENIED;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

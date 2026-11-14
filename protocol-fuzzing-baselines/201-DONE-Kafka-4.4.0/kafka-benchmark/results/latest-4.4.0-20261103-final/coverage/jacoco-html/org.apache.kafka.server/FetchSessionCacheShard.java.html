@@ -1,0 +1,298 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FetchSessionCacheShard.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server</a> &gt; <span class="el_source">FetchSessionCacheShard.java</span></div><h1>FetchSessionCacheShard.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server;
+
+import org.apache.kafka.common.requests.FetchMetadata;
+import org.apache.kafka.common.utils.internals.ImplicitLinkedHashCollection;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.server.FetchSession.EvictableKey;
+import org.apache.kafka.server.FetchSession.LastUsedKey;
+
+import com.yammer.metrics.core.Meter;
+
+import org.slf4j.Logger;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.common.requests.FetchMetadata.INITIAL_EPOCH;
+import static org.apache.kafka.common.requests.FetchMetadata.INVALID_SESSION_ID;
+
+/**
+ * Caches fetch sessions.
+ * &lt;p&gt;
+ * See {@link #tryEvict} for an explanation of the cache eviction strategy.
+ * &lt;p&gt;
+ * The FetchSessionCache is thread-safe because all of its methods are synchronized.
+ * Note that individual fetch sessions have their own locks which are separate from the
+ * FetchSessionCache lock.  In order to avoid deadlock, the FetchSessionCache lock
+ * must never be acquired while an individual FetchSession lock is already held.
+ */
+public class FetchSessionCacheShard {
+    private final Logger logger;
+
+<span class="nc" id="L53">    private long numPartitions = 0;</span>
+
+    /**
+     * A map of session ID to FetchSession.
+     */
+<span class="nc" id="L58">    private final Map&lt;Integer, FetchSession&gt; sessions = new HashMap&lt;&gt;();</span>
+
+    /**
+     * Maps last used times to sessions.
+     */
+<span class="nc" id="L63">    private final TreeMap&lt;LastUsedKey, FetchSession&gt; lastUsed = new TreeMap&lt;&gt;();</span>
+
+    /**
+     * A map containing sessions which can be evicted by both privileged and unprivileged sessions.
+     */
+<span class="nc" id="L68">    private final TreeMap&lt;EvictableKey, FetchSession&gt; evictableByAll = new TreeMap&lt;&gt;();</span>
+
+    /**
+     * A map containing sessions which can be evicted by privileged sessions.
+     */
+<span class="nc" id="L73">    private final TreeMap&lt;EvictableKey, FetchSession&gt; evictableByPrivileged = new TreeMap&lt;&gt;();</span>
+
+    /**
+     * This metric is shared across all shards because newMeter returns an existing metric
+     * if one exists with the same name. It's safe for concurrent use because Meter is thread-safe.
+     */
+<span class="nc" id="L79">    private final Meter evictionsMeter = FetchSession.FetchSessionCache.METRICS_GROUP.newMeter(</span>
+        FetchSession.INCREMENTAL_FETCH_SESSIONS_EVICTIONS_PER_SEC,
+        FetchSession.EVICTIONS,
+        TimeUnit.SECONDS
+    );
+
+    private final int maxEntries;
+    private final long evictionMs;
+    private final int sessionIdRange;
+    private final int shardNum;
+
+    /**
+     * @param maxEntries The maximum number of entries that can be in the cache
+     * @param evictionMs The minimum time that an entry must be unused in order to be evictable
+     * @param sessionIdRange The number of sessionIds each cache shard handles.
+     *                       For a given instance, Math.max(1, shardNum * sessionIdRange) &lt;= sessionId &lt; (shardNum + 1) * sessionIdRange always holds.
+     * @param shardNum Identifier for this shard
+     */
+    public FetchSessionCacheShard(int maxEntries,
+                                  long evictionMs,
+                                  int sessionIdRange,
+<span class="nc" id="L100">                                  int shardNum) {</span>
+<span class="nc" id="L101">        this.maxEntries = maxEntries;</span>
+<span class="nc" id="L102">        this.evictionMs = evictionMs;</span>
+<span class="nc" id="L103">        this.sessionIdRange = sessionIdRange;</span>
+<span class="nc" id="L104">        this.shardNum = shardNum;</span>
+<span class="nc" id="L105">        this.logger = new LogContext(&quot;[Shard &quot; + shardNum + &quot;] &quot;).logger(FetchSessionCacheShard.class);</span>
+<span class="nc" id="L106">    }</span>
+
+    int sessionIdRange() {
+<span class="nc" id="L109">        return sessionIdRange;</span>
+    }
+
+    // Only for testing
+    Meter evictionsMeter() {
+<span class="nc" id="L114">        return evictionsMeter;</span>
+    }
+
+    /**
+     * Get a session by session ID.
+     *
+     * @param sessionId  The session ID.
+     * @return           The session, or an empty Optional if no such session was found.
+     */
+    synchronized Optional&lt;FetchSession&gt; get(int sessionId) {
+<span class="nc" id="L124">        return Optional.ofNullable(sessions.get(sessionId));</span>
+    }
+
+    /**
+     * Get the number of entries currently in the fetch session cache.
+     */
+    synchronized int size() {
+<span class="nc" id="L131">        return sessions.size();</span>
+    }
+
+    /**
+     * Get the total number of cached partitions.
+     */
+    synchronized long totalPartitions() {
+<span class="nc" id="L138">        return numPartitions;</span>
+    }
+
+    /**
+     * Creates a new random session ID.  The new session ID will be positive and unique on this broker.
+     *
+     * @return   The new session ID.
+     */
+    synchronized int newSessionId() {
+        int id;
+        do {
+<span class="nc" id="L149">            id = ThreadLocalRandom.current().nextInt(Math.max(1, shardNum * sessionIdRange), (shardNum + 1) * sessionIdRange);</span>
+<span class="nc bnc" id="L150" title="All 4 branches missed.">        } while (sessions.containsKey(id) || id == INVALID_SESSION_ID);</span>
+
+<span class="nc" id="L152">        return id;</span>
+    }
+
+    /**
+     * Try to create a new session.
+     *
+     * @param now                The current time in milliseconds.
+     * @param privileged         True if the new entry we are trying to create is privileged.
+     * @param size               The number of cached partitions in the new entry we are trying to create.
+     * @param usesTopicIds       True if this session should use topic IDs.
+     * @param createPartitions   A callback function which creates the map of cached partitions and the mapping from
+     *                           topic name to topic ID for the topics.
+     * @return                   If we created a session, the ID; INVALID_SESSION_ID otherwise.
+     */
+    synchronized int maybeCreateSession(long now,
+                                        boolean privileged,
+                                        int size,
+                                        boolean usesTopicIds,
+                                        Supplier&lt;ImplicitLinkedHashCollection&lt;FetchSession.CachedPartition&gt;&gt; createPartitions) {
+        // If there is room, create a new session entry.
+<span class="nc bnc" id="L172" title="All 4 branches missed.">        if ((sessions.size() &lt; maxEntries) || tryEvict(privileged, new EvictableKey(privileged, size, 0), now)) {</span>
+<span class="nc" id="L173">            ImplicitLinkedHashCollection&lt;FetchSession.CachedPartition&gt; partitionMap = createPartitions.get();</span>
+<span class="nc" id="L174">            FetchSession session = new FetchSession(newSessionId(), privileged, partitionMap, usesTopicIds,</span>
+<span class="nc" id="L175">                now, now, FetchMetadata.nextEpoch(INITIAL_EPOCH));</span>
+<span class="nc" id="L176">            logger.debug(&quot;Created fetch session {}&quot;, session);</span>
+<span class="nc" id="L177">            sessions.put(session.id(), session);</span>
+<span class="nc" id="L178">            touch(session, now);</span>
+
+<span class="nc" id="L180">            return session.id();</span>
+        } else {
+<span class="nc" id="L182">            logger.debug(&quot;No fetch session created for privileged={}, size={}.&quot;, privileged, size);</span>
+<span class="nc" id="L183">            return INVALID_SESSION_ID;</span>
+        }
+    }
+
+    /**
+     * Try to evict an entry from the session cache.
+     * &lt;p&gt;
+     * A proposed new element A may evict an existing element B if:
+     * 1. A is privileged and B is not, or
+     * 2. B is considered &quot;stale&quot; because it has been inactive for a long time, or
+     * 3. A contains more partitions than B, and B is not recently created.
+     * &lt;p&gt;
+     * Prior to KAFKA-9401, the session cache was not sharded, and we looked at all
+     * entries while considering those eligible for eviction. Now eviction is done
+     * by considering entries on a per-shard basis.
+     *
+     * @param privileged True if the new entry we would like to add is privileged
+     * @param key        The EvictableKey for the new entry we would like to add
+     * @param now        The current time in milliseconds
+     * @return           True if an entry was evicted; false otherwise.
+     */
+    private synchronized boolean tryEvict(boolean privileged, EvictableKey key, long now) {
+        // Try to evict an entry which is stale.
+<span class="nc" id="L206">        Map.Entry&lt;LastUsedKey, FetchSession&gt; lastUsedEntry = lastUsed.firstEntry();</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        if (lastUsedEntry == null) {</span>
+<span class="nc" id="L208">            logger.trace(&quot;There are no cache entries to evict.&quot;);</span>
+<span class="nc" id="L209">            return false;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        } else if (now - lastUsedEntry.getKey().lastUsedMs() &gt; evictionMs) {</span>
+<span class="nc" id="L211">            FetchSession session = lastUsedEntry.getValue();</span>
+<span class="nc" id="L212">            logger.trace(&quot;Evicting stale FetchSession {}.&quot;, session.id());</span>
+<span class="nc" id="L213">            remove(session);</span>
+<span class="nc" id="L214">            evictionsMeter.mark();</span>
+<span class="nc" id="L215">            return true;</span>
+        } else {
+            // If there are no stale entries, check the first evictable entry.
+            // If it is less valuable than our proposed entry, evict it.
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            TreeMap&lt;EvictableKey, FetchSession&gt; map = privileged ? evictableByPrivileged : evictableByAll;</span>
+<span class="nc" id="L220">            Map.Entry&lt;EvictableKey, FetchSession&gt; evictableEntry = map.firstEntry();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            if (evictableEntry == null) {</span>
+<span class="nc" id="L222">                logger.trace(&quot;No evictable entries found.&quot;);</span>
+<span class="nc" id="L223">                return false;</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            } else if (key.compareTo(evictableEntry.getKey()) &lt; 0) {</span>
+<span class="nc" id="L225">                logger.trace(&quot;Can't evict {} with {}&quot;, evictableEntry.getKey(), key);</span>
+<span class="nc" id="L226">                return false;</span>
+            } else {
+<span class="nc" id="L228">                logger.trace(&quot;Evicting {} with {}.&quot;, evictableEntry.getKey(), key);</span>
+<span class="nc" id="L229">                remove(evictableEntry.getValue());</span>
+<span class="nc" id="L230">                evictionsMeter.mark();</span>
+<span class="nc" id="L231">                return true;</span>
+            }
+        }
+    }
+
+    synchronized Optional&lt;FetchSession&gt; remove(int sessionId) {
+<span class="nc" id="L237">        Optional&lt;FetchSession&gt; session = get(sessionId);</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        return session.isPresent() ? remove(session.get()) : Optional.empty();</span>
+    }
+
+    /**
+     * Remove an entry from the session cache.
+     *
+     * @param session  The session.
+     *
+     * @return         The removed session, or an empty Optional if there was no such session.
+     */
+    synchronized Optional&lt;FetchSession&gt; remove(FetchSession session) {
+        EvictableKey evictableKey;
+<span class="nc" id="L250">        synchronized (session) {</span>
+<span class="nc" id="L251">            lastUsed.remove(session.lastUsedKey());</span>
+<span class="nc" id="L252">            evictableKey = session.evictableKey();</span>
+<span class="nc" id="L253">        }</span>
+
+<span class="nc" id="L255">        evictableByAll.remove(evictableKey);</span>
+<span class="nc" id="L256">        evictableByPrivileged.remove(evictableKey);</span>
+<span class="nc" id="L257">        Optional&lt;FetchSession&gt; removeResult = Optional.ofNullable(sessions.remove(session.id()));</span>
+
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        if (removeResult.isPresent())</span>
+<span class="nc" id="L260">            numPartitions = numPartitions - session.cachedSize();</span>
+
+<span class="nc" id="L262">        return removeResult;</span>
+    }
+
+    /**
+     * Update a session's position in the lastUsed and evictable trees.
+     *
+     * @param session  The session
+     * @param now      The current time in milliseconds
+     */
+    synchronized void touch(FetchSession session, long now) {
+<span class="nc" id="L272">        synchronized (session) {</span>
+            // Update the lastUsed map.
+<span class="nc" id="L274">            lastUsed.remove(session.lastUsedKey());</span>
+<span class="nc" id="L275">            session.setLastUsedMs(now);</span>
+<span class="nc" id="L276">            lastUsed.put(session.lastUsedKey(), session);</span>
+
+<span class="nc" id="L278">            int oldSize = session.cachedSize();</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">            if (oldSize != -1) {</span>
+<span class="nc" id="L280">                EvictableKey oldEvictableKey = session.evictableKey();</span>
+<span class="nc" id="L281">                evictableByPrivileged.remove(oldEvictableKey);</span>
+<span class="nc" id="L282">                evictableByAll.remove(oldEvictableKey);</span>
+<span class="nc" id="L283">                numPartitions = numPartitions - oldSize;</span>
+            }
+<span class="nc" id="L285">            session.setCachedSize(session.size());</span>
+<span class="nc" id="L286">            EvictableKey newEvictableKey = session.evictableKey();</span>
+
+<span class="nc bnc" id="L288" title="All 4 branches missed.">            if ((!session.privileged()) || (now - session.creationMs() &gt; evictionMs))</span>
+<span class="nc" id="L289">                evictableByPrivileged.put(newEvictableKey, session);</span>
+
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (now - session.creationMs() &gt; evictionMs)</span>
+<span class="nc" id="L292">                evictableByAll.put(newEvictableKey, session);</span>
+
+<span class="nc" id="L294">            numPartitions = numPartitions + session.cachedSize();</span>
+<span class="nc" id="L295">        }</span>
+<span class="nc" id="L296">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

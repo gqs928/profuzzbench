@@ -1,0 +1,699 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TopologyMetadata.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">TopologyMetadata.java</span></div><h1>TopologyMetadata.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.consumer.internals.AutoOffsetResetStrategy;
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.internals.KafkaFutureImpl;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.TopologyConfig.TaskConfig;
+import org.apache.kafka.streams.errors.TopologyException;
+import org.apache.kafka.streams.errors.UnknownTopologyException;
+import org.apache.kafka.streams.internals.StreamsConfigUtils;
+import org.apache.kafka.streams.internals.StreamsConfigUtils.ProcessingMode;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.InternalTopologyBuilder.TopicsInfo;
+import org.apache.kafka.streams.processor.internals.namedtopology.NamedTopology;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentNavigableMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static java.util.Collections.emptySet;
+
+public class TopologyMetadata {
+    private Logger log;
+
+    // the &quot;__&quot; (double underscore) string is not allowed for topology names, so it's safe to use to indicate
+    // that it's not a named topology
+    public static final String UNNAMED_TOPOLOGY = &quot;__UNNAMED_TOPOLOGY__&quot;;
+<span class="nc" id="L70">    private static final Pattern EMPTY_ZERO_LENGTH_PATTERN = Pattern.compile(&quot;&quot;);</span>
+
+    private final StreamsConfig config;
+    private final ProcessingMode processingMode;
+    private final TopologyVersion version;
+    private final TaskExecutionMetadata taskExecutionMetadata;
+    private final Set&lt;String&gt; pausedTopologies;
+
+    private final ConcurrentNavigableMap&lt;String, InternalTopologyBuilder&gt; builders; // Keep sorted by topology name for readability
+
+    private ProcessorTopology globalTopology;
+<span class="nc" id="L81">    private final Map&lt;String, StateStore&gt; globalStateStores = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L82">    private final Set&lt;String&gt; allInputTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L83">    private final Map&lt;String, Long&gt; threadVersions = new ConcurrentHashMap&lt;&gt;();</span>
+
+<span class="nc" id="L85">    public static class TopologyVersion {</span>
+<span class="nc" id="L86">        public AtomicLong topologyVersion = new AtomicLong(0L); // the local topology version</span>
+<span class="nc" id="L87">        public ReentrantLock topologyLock = new ReentrantLock();</span>
+<span class="nc" id="L88">        public Condition topologyCV = topologyLock.newCondition();</span>
+<span class="nc" id="L89">        public List&lt;TopologyVersionListener&gt; activeTopologyUpdateListeners = new LinkedList&lt;&gt;();</span>
+    }
+
+    public static class TopologyVersionListener {
+        final long topologyVersion; // the (minimum) version to wait for these threads to cross
+        final KafkaFutureImpl&lt;Void&gt; future; // the future waiting on all threads to be updated
+
+<span class="nc" id="L96">        public TopologyVersionListener(final long topologyVersion, final KafkaFutureImpl&lt;Void&gt; future) {</span>
+<span class="nc" id="L97">            this.topologyVersion = topologyVersion;</span>
+<span class="nc" id="L98">            this.future = future;</span>
+<span class="nc" id="L99">        }</span>
+    }
+
+    public TopologyMetadata(final InternalTopologyBuilder builder,
+<span class="nc" id="L103">                            final StreamsConfig config) {</span>
+<span class="nc" id="L104">        this.version = new TopologyVersion();</span>
+<span class="nc" id="L105">        this.processingMode = StreamsConfigUtils.processingMode(config);</span>
+<span class="nc" id="L106">        this.config = config;</span>
+<span class="nc" id="L107">        this.log = LoggerFactory.getLogger(getClass());</span>
+<span class="nc" id="L108">        this.pausedTopologies = ConcurrentHashMap.newKeySet();</span>
+
+<span class="nc" id="L110">        builders = new ConcurrentSkipListMap&lt;&gt;();</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        if (builder.hasNamedTopology()) {</span>
+<span class="nc" id="L112">            builders.put(builder.topologyName(), builder);</span>
+        } else {
+<span class="nc" id="L114">            builders.put(UNNAMED_TOPOLOGY, builder);</span>
+        }
+<span class="nc" id="L116">        this.taskExecutionMetadata = new TaskExecutionMetadata(builders.keySet(), pausedTopologies, processingMode);</span>
+<span class="nc" id="L117">    }</span>
+
+    public TopologyMetadata(final ConcurrentNavigableMap&lt;String, InternalTopologyBuilder&gt; builders,
+<span class="nc" id="L120">                            final StreamsConfig config) {</span>
+<span class="nc" id="L121">        this.version = new TopologyVersion();</span>
+<span class="nc" id="L122">        this.processingMode = StreamsConfigUtils.processingMode(config);</span>
+<span class="nc" id="L123">        this.config = config;</span>
+<span class="nc" id="L124">        this.log = LoggerFactory.getLogger(getClass());</span>
+<span class="nc" id="L125">        this.pausedTopologies = ConcurrentHashMap.newKeySet();</span>
+
+<span class="nc" id="L127">        this.builders = builders;</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        if (builders.isEmpty()) {</span>
+<span class="nc" id="L129">            log.info(&quot;Created an empty KafkaStreams app with no topology&quot;);</span>
+        }
+<span class="nc" id="L131">        this.taskExecutionMetadata = new TaskExecutionMetadata(builders.keySet(), pausedTopologies, processingMode);</span>
+<span class="nc" id="L132">    }</span>
+
+    // Need to (re)set the log here to pick up the `processId` part of the clientId in the prefix
+    public void setLog(final LogContext logContext) {
+<span class="nc" id="L136">        log = logContext.logger(getClass());</span>
+<span class="nc" id="L137">    }</span>
+    
+    public ProcessingMode processingMode() {
+<span class="nc" id="L140">        return processingMode;</span>
+    }
+
+    public boolean streamsProtocolEnabled() {
+<span class="nc" id="L144">        return StreamsConfigUtils.streamsProtocolEnabled(config);</span>
+    }
+
+    public long topologyVersion() {
+<span class="nc" id="L148">        return version.topologyVersion.get();</span>
+    }
+
+    private void lock() {
+<span class="nc" id="L152">        version.topologyLock.lock();</span>
+<span class="nc" id="L153">    }</span>
+
+    private void unlock() {
+<span class="nc" id="L156">        version.topologyLock.unlock();</span>
+<span class="nc" id="L157">    }</span>
+
+    public Collection&lt;String&gt; sourceTopicsForTopology(final String name) {
+<span class="nc" id="L160">        return builders.get(name).fullSourceTopicNames();</span>
+    }
+
+    public boolean needsUpdate(final String threadName) {
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        return threadVersions.get(threadName) &lt; topologyVersion();</span>
+    }
+
+    public void registerThread(final String threadName) {
+<span class="nc" id="L168">        threadVersions.put(threadName, 0L);</span>
+<span class="nc" id="L169">    }</span>
+
+    public void unregisterThread(final String threadName) {
+<span class="nc" id="L172">        threadVersions.remove(threadName);</span>
+<span class="nc" id="L173">        maybeNotifyTopologyVersionListeners();</span>
+<span class="nc" id="L174">    }</span>
+
+    public TaskExecutionMetadata taskExecutionMetadata() {
+<span class="nc" id="L177">        return taskExecutionMetadata;</span>
+    }
+
+    public void executeTopologyUpdatesAndBumpThreadVersion(final Consumer&lt;Set&lt;String&gt;&gt; handleTopologyAdditions,
+                                                           final Consumer&lt;Set&lt;String&gt;&gt; handleTopologyRemovals) {
+        try {
+<span class="nc" id="L183">            version.topologyLock.lock();</span>
+<span class="nc" id="L184">            final long latestTopologyVersion = topologyVersion();</span>
+<span class="nc" id="L185">            handleTopologyAdditions.accept(namedTopologiesView());</span>
+<span class="nc" id="L186">            handleTopologyRemovals.accept(namedTopologiesView());</span>
+<span class="nc" id="L187">            threadVersions.put(Thread.currentThread().getName(), latestTopologyVersion);</span>
+        } finally {
+<span class="nc" id="L189">            version.topologyLock.unlock();</span>
+        }
+<span class="nc" id="L191">    }</span>
+
+    public void maybeNotifyTopologyVersionListeners() {
+        try {
+<span class="nc" id="L195">            lock();</span>
+<span class="nc" id="L196">            final long minThreadVersion = minimumThreadVersion();</span>
+<span class="nc" id="L197">            final Iterator&lt;TopologyVersionListener&gt; iterator = version.activeTopologyUpdateListeners.listIterator();</span>
+            TopologyVersionListener topologyVersionListener;
+<span class="nc bnc" id="L199" title="All 2 branches missed.">            while (iterator.hasNext()) {</span>
+<span class="nc" id="L200">                topologyVersionListener = iterator.next();</span>
+<span class="nc" id="L201">                final long topologyVersionWaitersVersion = topologyVersionListener.topologyVersion;</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">                if (minThreadVersion &gt;= topologyVersionWaitersVersion) {</span>
+<span class="nc" id="L203">                    topologyVersionListener.future.complete(null);</span>
+<span class="nc" id="L204">                    iterator.remove();</span>
+<span class="nc" id="L205">                    log.info(&quot;All threads are now on topology version {}&quot;, topologyVersionListener.topologyVersion);</span>
+                }
+<span class="nc" id="L207">            }</span>
+        } finally {
+<span class="nc" id="L209">            unlock();</span>
+        }
+<span class="nc" id="L211">    }</span>
+
+    // Return the minimum version across all live threads, or Long.MAX_VALUE if there are no threads running
+    private long minimumThreadVersion() {
+<span class="nc" id="L215">        final Optional&lt;Long&gt; minVersion = threadVersions.values().stream().min(Long::compare);</span>
+<span class="nc" id="L216">        return minVersion.orElse(Long.MAX_VALUE);</span>
+    }
+
+    public void wakeupThreads() {
+        try {
+<span class="nc" id="L221">            lock();</span>
+<span class="nc" id="L222">            version.topologyCV.signalAll();</span>
+        } finally {
+<span class="nc" id="L224">            unlock();</span>
+        }
+<span class="nc" id="L226">    }</span>
+
+    public void maybeWaitForNonEmptyTopology(final Supplier&lt;StreamThread.State&gt; threadState) {
+<span class="nc bnc" id="L229" title="All 4 branches missed.">        if (isEmpty() &amp;&amp; threadState.get().isAlive()) {</span>
+            try {
+<span class="nc" id="L231">                lock();</span>
+<span class="nc bnc" id="L232" title="All 4 branches missed.">                while (isEmpty() &amp;&amp; threadState.get().isAlive()) {</span>
+                    try {
+<span class="nc" id="L234">                        log.debug(&quot;Detected that the topology is currently empty, waiting for something to process&quot;);</span>
+<span class="nc" id="L235">                        version.topologyCV.await();</span>
+<span class="nc" id="L236">                    } catch (final InterruptedException e) {</span>
+<span class="nc" id="L237">                        Thread.currentThread().interrupt();</span>
+<span class="nc" id="L238">                        log.warn(&quot;StreamThread was interrupted while waiting on empty topology&quot;, e);</span>
+<span class="nc" id="L239">                        break;</span>
+<span class="nc" id="L240">                    }</span>
+                }
+            } finally {
+<span class="nc" id="L243">                unlock();</span>
+            }
+        }
+<span class="nc" id="L246">    }</span>
+
+    /**
+     * Adds the topology and registers a future that listens for all threads on the older version to see the update
+     */
+    public void registerAndBuildNewTopology(final KafkaFutureImpl&lt;Void&gt; future, final InternalTopologyBuilder newTopologyBuilder) {
+        try {
+<span class="nc" id="L253">            lock();</span>
+<span class="nc" id="L254">            buildAndVerifyTopology(newTopologyBuilder);</span>
+<span class="nc" id="L255">            log.info(&quot;New NamedTopology {} passed validation and will be added, old topology version is {}&quot;, newTopologyBuilder.topologyName(), version.topologyVersion.get());</span>
+<span class="nc" id="L256">            version.topologyVersion.incrementAndGet();</span>
+<span class="nc" id="L257">            version.activeTopologyUpdateListeners.add(new TopologyVersionListener(topologyVersion(), future));</span>
+<span class="nc" id="L258">            builders.put(newTopologyBuilder.topologyName(), newTopologyBuilder);</span>
+<span class="nc" id="L259">            wakeupThreads();</span>
+<span class="nc" id="L260">            log.info(&quot;Added NamedTopology {} and updated topology version to {}&quot;, newTopologyBuilder.topologyName(), version.topologyVersion.get());</span>
+<span class="nc" id="L261">        } catch (final Throwable throwable) {</span>
+<span class="nc" id="L262">            log.error(&quot;Failed to add NamedTopology {}, please retry the operation.&quot;, newTopologyBuilder.topologyName());</span>
+<span class="nc" id="L263">            future.completeExceptionally(throwable);</span>
+        } finally {
+<span class="nc" id="L265">            unlock();</span>
+        }
+<span class="nc" id="L267">    }</span>
+
+    /**
+     * Pauses a topology by name
+     * @param topologyName Name of the topology to pause
+     */
+    public void pauseTopology(final String topologyName) {
+<span class="nc" id="L274">        pausedTopologies.add(topologyName);</span>
+<span class="nc" id="L275">    }</span>
+
+    /**
+     * Checks if a given topology is paused.
+     * @param topologyName If null, assume that we are checking the `UNNAMED_TOPOLOGY`.
+     * @return A boolean indicating if the topology is paused.
+     */
+    public boolean isPaused(final String topologyName) {
+<span class="nc" id="L283">        return pausedTopologies.contains(getTopologyNameOrElseUnnamed(topologyName));</span>
+    }
+
+    /**
+     * Resumes a topology by name
+     * @param topologyName Name of the topology to resume
+     */
+    public void resumeTopology(final String topologyName) {
+<span class="nc" id="L291">        pausedTopologies.remove(topologyName);</span>
+<span class="nc" id="L292">    }</span>
+
+    /**
+     * Removes the topology and registers a future that listens for all threads on the older version to see the update
+     */
+    public KafkaFuture&lt;Void&gt; unregisterTopology(final KafkaFutureImpl&lt;Void&gt; removeTopologyFuture,
+                                                final String topologyName) {
+        try {
+<span class="nc" id="L300">            lock();</span>
+<span class="nc" id="L301">            log.info(&quot;Beginning removal of NamedTopology {}, old topology version is {}&quot;, topologyName, version.topologyVersion.get());</span>
+<span class="nc" id="L302">            version.topologyVersion.incrementAndGet();</span>
+<span class="nc" id="L303">            version.activeTopologyUpdateListeners.add(new TopologyVersionListener(topologyVersion(), removeTopologyFuture));</span>
+<span class="nc" id="L304">            final InternalTopologyBuilder removedBuilder = builders.remove(topologyName);</span>
+<span class="nc" id="L305">            removedBuilder.fullSourceTopicNames().forEach(allInputTopics::remove);</span>
+<span class="nc" id="L306">            removedBuilder.allSourcePatternStrings().forEach(allInputTopics::remove);</span>
+<span class="nc" id="L307">            log.info(&quot;Finished removing NamedTopology {}, topology version was updated to {}&quot;, topologyName, version.topologyVersion.get());</span>
+<span class="nc" id="L308">        } catch (final Throwable throwable) {</span>
+<span class="nc" id="L309">            log.error(&quot;Failed to remove NamedTopology {}, please retry.&quot;, topologyName);</span>
+<span class="nc" id="L310">            removeTopologyFuture.completeExceptionally(throwable);</span>
+        } finally {
+<span class="nc" id="L312">            unlock();</span>
+        }
+<span class="nc" id="L314">        return removeTopologyFuture;</span>
+    }
+
+    public TaskConfig taskConfig(final TaskId taskId) {
+<span class="nc" id="L318">        final InternalTopologyBuilder builder = lookupBuilderForTask(taskId);</span>
+<span class="nc" id="L319">        return builder.topologyConfigs().getTaskConfig();</span>
+    }
+
+    public void buildAndRewriteTopology() {
+<span class="nc" id="L323">        applyToEachBuilder(this::buildAndVerifyTopology);</span>
+<span class="nc" id="L324">    }</span>
+
+    private void buildAndVerifyTopology(final InternalTopologyBuilder builder) {
+<span class="nc" id="L327">        builder.rewriteTopology(config);</span>
+<span class="nc" id="L328">        builder.buildTopology();</span>
+
+<span class="nc" id="L330">        final Set&lt;String&gt; allInputTopicsCopy = new HashSet&lt;&gt;(allInputTopics);</span>
+
+        // As we go, check each topology for overlap in the set of input topics/patterns
+<span class="nc" id="L333">        final int numInputTopics = allInputTopicsCopy.size();</span>
+<span class="nc" id="L334">        final List&lt;String&gt; inputTopics = builder.fullSourceTopicNames();</span>
+<span class="nc" id="L335">        final Collection&lt;String&gt; inputPatterns = builder.allSourcePatternStrings();</span>
+
+<span class="nc" id="L337">        final Set&lt;String&gt; newInputTopics = new HashSet&lt;&gt;(inputTopics);</span>
+<span class="nc" id="L338">        newInputTopics.addAll(inputPatterns);</span>
+
+<span class="nc" id="L340">        final int numNewInputTopics = newInputTopics.size();</span>
+<span class="nc" id="L341">        allInputTopicsCopy.addAll(newInputTopics);</span>
+
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        if (allInputTopicsCopy.size() != numInputTopics + numNewInputTopics) {</span>
+<span class="nc" id="L344">            inputTopics.retainAll(allInputTopicsCopy);</span>
+<span class="nc" id="L345">            inputPatterns.retainAll(allInputTopicsCopy);</span>
+<span class="nc" id="L346">            log.error(&quot;Tried to add the NamedTopology {} but it had overlap with other input topics {} or patterns {}&quot;,</span>
+<span class="nc" id="L347">                      builder.topologyName(), inputTopics, inputPatterns);</span>
+<span class="nc" id="L348">            throw new TopologyException(&quot;Named Topologies may not subscribe to the same input topics or patterns&quot;);</span>
+        }
+
+<span class="nc" id="L351">        final ProcessorTopology globalTopology = builder.buildGlobalStateTopology();</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        if (globalTopology != null) {</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">            if (builder.topologyName() != null) {</span>
+<span class="nc" id="L354">                throw new IllegalStateException(&quot;Global state stores are not supported with Named Topologies&quot;);</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">            } else if (this.globalTopology != null) {</span>
+<span class="nc" id="L356">                throw new TopologyException(&quot;Topology builder had global state, but global topology has already been set&quot;);</span>
+            } else {
+<span class="nc" id="L358">                this.globalTopology = globalTopology;</span>
+<span class="nc" id="L359">                globalStateStores.putAll(builder.globalStateStores());</span>
+            }
+        }
+<span class="nc" id="L362">        allInputTopics.addAll(newInputTopics);</span>
+<span class="nc" id="L363">    }</span>
+
+    public int numStreamThreads(final StreamsConfig config) {
+<span class="nc" id="L366">        final int configuredNumStreamThreads = config.getInt(StreamsConfig.NUM_STREAM_THREADS_CONFIG);</span>
+
+        // If there are named topologies but some are empty, this indicates a bug in user code
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        if (hasNamedTopologies()) {</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">            if (hasNoLocalTopology()) {</span>
+<span class="nc" id="L371">                log.error(&quot;Detected a named topology with no input topics, a named topology may not be empty.&quot;);</span>
+<span class="nc" id="L372">                throw new TopologyException(&quot;Topology has no stream threads and no global threads, &quot; +</span>
+                                                &quot;must subscribe to at least one source topic or pattern.&quot;);
+            }
+        } else {
+            // If both the global and non-global topologies are empty, this indicates a bug in user code
+<span class="nc bnc" id="L377" title="All 4 branches missed.">            if (hasNoLocalTopology() &amp;&amp; !hasGlobalTopology()) {</span>
+<span class="nc" id="L378">                log.error(&quot;Topology with no input topics will create no stream threads and no global thread.&quot;);</span>
+<span class="nc" id="L379">                throw new TopologyException(&quot;Topology has no stream threads and no global threads, &quot; +</span>
+                                                &quot;must subscribe to at least one source topic or global table.&quot;);
+            }
+        }
+
+        // Lastly we check for an empty non-global topology and override the threads to zero if set otherwise
+<span class="nc bnc" id="L385" title="All 4 branches missed.">        if (configuredNumStreamThreads != 0 &amp;&amp; hasNoLocalTopology()) {</span>
+<span class="nc" id="L386">            log.info(&quot;Overriding number of StreamThreads to zero for global-only topology&quot;);</span>
+<span class="nc" id="L387">            return 0;</span>
+        }
+
+<span class="nc" id="L390">        return configuredNumStreamThreads;</span>
+    }
+
+    /**
+     * @return true iff the app is using named topologies, or was started up with no topology at all
+     */
+    public boolean hasNamedTopologies() {
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        return !builders.containsKey(UNNAMED_TOPOLOGY);</span>
+    }
+
+    public Set&lt;String&gt; namedTopologiesView() {
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        return hasNamedTopologies() ? Collections.unmodifiableSet(builders.keySet()) : emptySet();</span>
+    }
+
+    /**
+     * @return true iff any of the topologies have a global topology
+     */
+    public boolean hasGlobalTopology() {
+<span class="nc" id="L408">        return evaluateConditionIsTrueForAnyBuilders(InternalTopologyBuilder::hasGlobalStores);</span>
+    }
+
+    /**
+     * @return true iff any of the topologies have no local (aka non-global) topology
+     */
+    public boolean hasNoLocalTopology() {
+<span class="nc" id="L415">        return evaluateConditionIsTrueForAnyBuilders(InternalTopologyBuilder::hasNoLocalTopology);</span>
+    }
+
+    public boolean hasPersistentStores() {
+        // If the app is using named topologies, there may not be any persistent state when it first starts up
+        // but a new NamedTopology may introduce it later, so we must return true
+<span class="nc bnc" id="L421" title="All 2 branches missed.">        if (hasNamedTopologies()) {</span>
+<span class="nc" id="L422">            return true;</span>
+        }
+<span class="nc" id="L424">        return evaluateConditionIsTrueForAnyBuilders(InternalTopologyBuilder::hasPersistentStores);</span>
+    }
+
+    public boolean hasStore(final String name) {
+<span class="nc" id="L428">        return evaluateConditionIsTrueForAnyBuilders(b -&gt; b.hasStore(name));</span>
+    }
+
+    public boolean hasOffsetResetOverrides() {
+        // Return true if using named topologies, as there may be named topologies added later which do have overrides
+<span class="nc bnc" id="L433" title="All 4 branches missed.">        return hasNamedTopologies() || evaluateConditionIsTrueForAnyBuilders(InternalTopologyBuilder::hasOffsetResetOverrides);</span>
+    }
+
+    public Optional&lt;AutoOffsetResetStrategy&gt; offsetResetStrategy(final String topic) {
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        for (final InternalTopologyBuilder builder : builders.values()) {</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            if (builder.containsTopic(topic)) {</span>
+<span class="nc" id="L439">                return Optional.ofNullable(builder.offsetResetStrategy(topic));</span>
+            }
+<span class="nc" id="L441">        }</span>
+<span class="nc" id="L442">        log.warn(&quot;Unable to look up offset reset strategy for topic {} &quot; +</span>
+            &quot;as this topic does not appear in the sources of any of the current topologies: {}\n &quot; +
+                &quot;This may be due to natural race condition when removing a topology but it should not &quot; +
+                &quot;persist or appear frequently.&quot;,
+<span class="nc" id="L446">            topic, namedTopologiesView()</span>
+        );
+        // returning `null` for an Optional return type triggers spotbugs
+        // we added an exception for NP_OPTIONAL_RETURN_NULL for this method
+        // when we remove NamedTopologies, we can remove this exception
+<span class="nc" id="L451">        return null;</span>
+    }
+
+
+    public Collection&lt;String&gt; fullSourceTopicNamesForTopology(final String topologyName) {
+<span class="nc" id="L456">        Objects.requireNonNull(topologyName, &quot;topology name must not be null&quot;);</span>
+<span class="nc" id="L457">        return lookupBuilderForNamedTopology(topologyName).fullSourceTopicNames();</span>
+    }
+
+    public Collection&lt;String&gt; allFullSourceTopicNames() {
+<span class="nc" id="L461">        final List&lt;String&gt; sourceTopics = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L462">        applyToEachBuilder(b -&gt; sourceTopics.addAll(b.fullSourceTopicNames()));</span>
+<span class="nc" id="L463">        return sourceTopics;</span>
+    }
+
+    Pattern sourceTopicPattern() {
+<span class="nc" id="L467">        final StringBuilder patternBuilder = new StringBuilder();</span>
+
+<span class="nc" id="L469">        applyToEachBuilder(b -&gt; {</span>
+<span class="nc" id="L470">            final String patternString = b.sourceTopicPatternString();</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            if (!patternString.isEmpty()) {</span>
+<span class="nc" id="L472">                patternBuilder.append(patternString).append(&quot;|&quot;);</span>
+            }
+<span class="nc" id="L474">        });</span>
+
+<span class="nc bnc" id="L476" title="All 2 branches missed.">        if (patternBuilder.length() &gt; 0) {</span>
+<span class="nc" id="L477">            patternBuilder.setLength(patternBuilder.length() - 1);</span>
+<span class="nc" id="L478">            return Pattern.compile(patternBuilder.toString());</span>
+        } else {
+<span class="nc" id="L480">            return EMPTY_ZERO_LENGTH_PATTERN;</span>
+        }
+    }
+
+    public boolean usesPatternSubscription() {
+<span class="nc" id="L485">        return evaluateConditionIsTrueForAnyBuilders(InternalTopologyBuilder::usesPatternSubscription);</span>
+    }
+
+    // Can be empty if app is started up with no Named Topologies, in order to add them on later
+    public boolean isEmpty() {
+<span class="nc" id="L490">        return builders.isEmpty();</span>
+    }
+
+    public String topologyDescriptionString() {
+<span class="nc bnc" id="L494" title="All 2 branches missed.">        if (isEmpty()) {</span>
+<span class="nc" id="L495">            return &quot;&quot;;</span>
+        }
+<span class="nc" id="L497">        final StringBuilder sb = new StringBuilder();</span>
+
+<span class="nc" id="L499">        applyToEachBuilder(b -&gt; sb.append(b.describe().toString()));</span>
+
+<span class="nc" id="L501">        return sb.toString();</span>
+    }
+
+    /**
+     * @return the {@link ProcessorTopology subtopology} built for this task, guaranteed to be non-null
+     *
+     * @throws UnknownTopologyException  if the task is from a named topology that this client isn't aware of
+     */
+    public ProcessorTopology buildSubtopology(final TaskId task) {
+<span class="nc" id="L510">        final InternalTopologyBuilder builder = lookupBuilderForTask(task);</span>
+<span class="nc" id="L511">        return builder.buildSubtopology(task.subtopology());</span>
+    }
+
+    public ProcessorTopology globalTaskTopology() {
+<span class="nc bnc" id="L515" title="All 2 branches missed.">        if (hasNamedTopologies()) {</span>
+<span class="nc" id="L516">            throw new IllegalStateException(&quot;Global state stores are not supported with Named Topologies&quot;);</span>
+        }
+<span class="nc" id="L518">        return globalTopology;</span>
+    }
+
+    public Map&lt;String, StateStore&gt; globalStateStores() {
+<span class="nc" id="L522">        return globalStateStores;</span>
+    }
+
+    public Map&lt;String, List&lt;String&gt;&gt; stateStoreNameToSourceTopicsForTopology(final String topologyName) {
+<span class="nc" id="L526">        return lookupBuilderForNamedTopology(topologyName).stateStoreNameToFullSourceTopicNames();</span>
+    }
+
+    public Set&lt;String&gt; stateStoreNamesForSubtopology(final String topologyName, final int subtopologyId) {
+<span class="nc" id="L530">        return lookupBuilderForNamedTopology(topologyName).stateStoreNamesForSubtopology(subtopologyId);</span>
+    }
+
+    public Map&lt;String, List&lt;String&gt;&gt; stateStoreNameToSourceTopics() {
+<span class="nc" id="L534">        final Map&lt;String, List&lt;String&gt;&gt; stateStoreNameToSourceTopics = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L535">        applyToEachBuilder(b -&gt; stateStoreNameToSourceTopics.putAll(b.stateStoreNameToFullSourceTopicNames()));</span>
+<span class="nc" id="L536">        return stateStoreNameToSourceTopics;</span>
+    }
+
+    public String storeForChangelogTopic(final String topicName) {
+<span class="nc bnc" id="L540" title="All 2 branches missed.">        for (final InternalTopologyBuilder builder : builders.values()) {</span>
+<span class="nc" id="L541">            final String store = builder.storeForChangelogTopic(topicName);</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">            if (store != null) {</span>
+<span class="nc" id="L543">                return store;</span>
+            }
+<span class="nc" id="L545">        }</span>
+<span class="nc" id="L546">        log.warn(&quot;Unable to locate any store for topic {}&quot;, topicName);</span>
+<span class="nc" id="L547">        return &quot;&quot;;</span>
+    }
+
+    /**
+     * @param storeName       the name of the state store
+     * @param topologyName    the name of the topology to search for stores within
+     * @return topics subscribed from source processors that are connected to these state stores
+     */
+    public Collection&lt;String&gt; sourceTopicsForStore(final String storeName, final String topologyName) {
+<span class="nc" id="L556">        return lookupBuilderForNamedTopology(topologyName).sourceTopicsForStore(storeName);</span>
+    }
+
+    public static String getTopologyNameOrElseUnnamed(final String topologyName) {
+<span class="nc bnc" id="L560" title="All 2 branches missed.">        return topologyName == null ? UNNAMED_TOPOLOGY : topologyName;</span>
+    }
+
+    /**
+     * @param topologiesToExclude the names of any topologies to exclude from the returned topic groups,
+     *                            eg because they have missing source topics and can't be processed yet
+     *
+     * @return                    flattened map of all subtopologies (from all topologies) to topics info
+     */
+    public Map&lt;Subtopology, TopicsInfo&gt; subtopologyTopicsInfoMapExcluding(final Set&lt;String&gt; topologiesToExclude) {
+<span class="nc" id="L570">        final Map&lt;Subtopology, TopicsInfo&gt; subtopologyTopicsInfo = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L571">        applyToEachBuilder(b -&gt; {</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">            if (!topologiesToExclude.contains(b.topologyName())) {</span>
+<span class="nc" id="L573">                subtopologyTopicsInfo.putAll(b.subtopologyToTopicsInfo());</span>
+            }
+<span class="nc" id="L575">        });</span>
+<span class="nc" id="L576">        return subtopologyTopicsInfo;</span>
+    }
+
+    /**
+     * @return    map from topology to its subtopologies and their topics info
+     */
+    public Map&lt;String, Map&lt;Subtopology, TopicsInfo&gt;&gt; topologyToSubtopologyTopicsInfoMap() {
+<span class="nc" id="L583">        final Map&lt;String, Map&lt;Subtopology, TopicsInfo&gt;&gt; topologyToSubtopologyTopicsInfoMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L584">        applyToEachBuilder(b -&gt; topologyToSubtopologyTopicsInfoMap.put(b.topologyName(), b.subtopologyToTopicsInfo()));</span>
+<span class="nc" id="L585">        return  topologyToSubtopologyTopicsInfoMap;</span>
+    }
+
+    public Map&lt;String, List&lt;String&gt;&gt; nodeToSourceTopics(final TaskId task) {
+<span class="nc" id="L589">        return lookupBuilderForTask(task).nodeToSourceTopics();</span>
+    }
+
+    void addSubscribedTopicsFromMetadata(final Set&lt;String&gt; topics, final String logPrefix) {
+<span class="nc" id="L593">        applyToEachBuilder(b -&gt; b.addSubscribedTopicsFromMetadata(topics, logPrefix));</span>
+<span class="nc" id="L594">    }</span>
+
+    void addSubscribedTopicsFromAssignment(final Set&lt;TopicPartition&gt; partitions, final String logPrefix) {
+<span class="nc" id="L597">        applyToEachBuilder(b -&gt; b.addSubscribedTopicsFromAssignment(partitions, logPrefix));</span>
+<span class="nc" id="L598">    }</span>
+
+    public Collection&lt;Set&lt;String&gt;&gt; copartitionGroups() {
+<span class="nc" id="L601">        final List&lt;Set&lt;String&gt;&gt; copartitionGroups = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L602">        applyToEachBuilder(b -&gt; copartitionGroups.addAll(b.copartitionGroups()));</span>
+<span class="nc" id="L603">        return copartitionGroups;</span>
+    }
+
+    /**
+     * @return the {@link InternalTopologyBuilder} for this task's topology, guaranteed to be non-null
+     *
+     * @throws UnknownTopologyException  if the task is from a named topology that this client isn't aware of
+     */
+    private InternalTopologyBuilder lookupBuilderForTask(final TaskId task) {
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        final InternalTopologyBuilder builder = task.topologyName() == null ?</span>
+<span class="nc" id="L613">            builders.get(UNNAMED_TOPOLOGY) :</span>
+<span class="nc" id="L614">            builders.get(task.topologyName());</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">        if (builder == null) {</span>
+<span class="nc" id="L616">            throw new UnknownTopologyException(&quot;Unable to locate topology builder&quot;, task.topologyName());</span>
+        } else {
+<span class="nc" id="L618">            return builder;</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    public Collection&lt;NamedTopology&gt; allNamedTopologies() {
+<span class="nc" id="L624">        return builders.values()</span>
+<span class="nc" id="L625">            .stream()</span>
+<span class="nc" id="L626">            .map(InternalTopologyBuilder::namedTopology)</span>
+<span class="nc" id="L627">            .collect(Collectors.toSet());</span>
+    }
+
+
+    /**
+     * @return the InternalTopologyBuilder for the NamedTopology with the given {@code topologyName}
+     *         or the builder for a regular Topology if {@code topologyName} is {@code null},
+     *         else returns {@code null} if {@code topologyName} is non-null but no such NamedTopology exists
+     */
+    public InternalTopologyBuilder lookupBuilderForNamedTopology(final String topologyName) {
+<span class="nc" id="L637">        return builders.get(getTopologyNameOrElseUnnamed(topologyName));</span>
+    }
+
+    private boolean evaluateConditionIsTrueForAnyBuilders(final Function&lt;InternalTopologyBuilder, Boolean&gt; condition) {
+<span class="nc bnc" id="L641" title="All 2 branches missed.">        for (final InternalTopologyBuilder builder : builders.values()) {</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">            if (condition.apply(builder)) {</span>
+<span class="nc" id="L643">                return true;</span>
+            }
+<span class="nc" id="L645">        }</span>
+<span class="nc" id="L646">        return false;</span>
+    }
+
+    private void applyToEachBuilder(final Consumer&lt;InternalTopologyBuilder&gt; function) {
+<span class="nc bnc" id="L650" title="All 2 branches missed.">        for (final InternalTopologyBuilder builder : builders.values()) {</span>
+<span class="nc" id="L651">            function.accept(builder);</span>
+<span class="nc" id="L652">        }</span>
+<span class="nc" id="L653">    }</span>
+
+    public static class Subtopology implements Comparable&lt;Subtopology&gt; {
+        final int nodeGroupId;
+        final String namedTopology;
+
+<span class="nc" id="L659">        public Subtopology(final int nodeGroupId, final String namedTopology) {</span>
+<span class="nc" id="L660">            this.nodeGroupId = nodeGroupId;</span>
+<span class="nc" id="L661">            this.namedTopology = namedTopology;</span>
+<span class="nc" id="L662">        }</span>
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L666" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L667">                return true;</span>
+            }
+<span class="nc bnc" id="L669" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L670">                return false;</span>
+            }
+<span class="nc" id="L672">            final Subtopology that = (Subtopology) o;</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">            return nodeGroupId == that.nodeGroupId &amp;&amp;</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">                    Objects.equals(namedTopology, that.namedTopology);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L679">            return Objects.hash(nodeGroupId, namedTopology);</span>
+        }
+
+        @Override
+        public int compareTo(final Subtopology other) {
+<span class="nc bnc" id="L684" title="All 2 branches missed.">            if (nodeGroupId != other.nodeGroupId) {</span>
+<span class="nc" id="L685">                return Integer.compare(nodeGroupId, other.nodeGroupId);</span>
+            }
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            if (namedTopology == null) {</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">                return other.namedTopology == null ? 0 : -1;</span>
+            }
+<span class="nc bnc" id="L690" title="All 2 branches missed.">            if (other.namedTopology == null) {</span>
+<span class="nc" id="L691">                return 1;</span>
+            }
+
+            // Both not null
+<span class="nc" id="L695">            return namedTopology.compareTo(other.namedTopology);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

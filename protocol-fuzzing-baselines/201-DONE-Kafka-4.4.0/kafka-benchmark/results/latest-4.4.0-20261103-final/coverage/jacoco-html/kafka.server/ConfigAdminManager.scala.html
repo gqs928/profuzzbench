@@ -1,0 +1,465 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConfigAdminManager.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">ConfigAdminManager.scala</span></div><h1>ConfigAdminManager.scala</h1><pre class="source lang-java linenums">/**
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+  * this work for additional information regarding copyright ownership.
+  * The ASF licenses this file to You under the Apache License, Version 2.0
+  * (the &quot;License&quot;); you may not use this file except in compliance with
+  * the License.  You may obtain a copy of the License at
+  *
+  *    http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+package kafka.server
+
+import java.util
+import java.util.Properties
+import kafka.utils._
+import org.apache.kafka.clients.admin.{AlterConfigOp, ConfigEntry}
+import org.apache.kafka.clients.admin.AlterConfigOp.OpType
+import org.apache.kafka.common.config.ConfigDef.ConfigKey
+import org.apache.kafka.common.config.ConfigResource.Type.{BROKER, BROKER_LOGGER, CLIENT_METRICS, GROUP, TOPIC}
+import org.apache.kafka.common.config.{ConfigDef, ConfigResource}
+import org.apache.kafka.common.errors.{ApiException, ClusterAuthorizationException, InvalidConfigurationException, InvalidRequestException}
+import org.apache.kafka.common.message.{AlterConfigsRequestData, AlterConfigsResponseData, IncrementalAlterConfigsRequestData, IncrementalAlterConfigsResponseData}
+import org.apache.kafka.common.message.AlterConfigsRequestData.{AlterConfigsResource =&gt; LAlterConfigsResource}
+import org.apache.kafka.common.message.AlterConfigsResponseData.{AlterConfigsResourceResponse =&gt; LAlterConfigsResourceResponse}
+import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData.{AlterConfigsResource =&gt; IAlterConfigsResource}
+import org.apache.kafka.common.message.IncrementalAlterConfigsResponseData.{AlterConfigsResourceResponse =&gt; IAlterConfigsResourceResponse}
+import org.apache.kafka.common.protocol.Errors
+import org.apache.kafka.common.protocol.Errors.{INVALID_REQUEST, UNKNOWN_SERVER_ERROR}
+import org.apache.kafka.common.requests.ApiError
+import org.apache.kafka.common.resource.{Resource, ResourceType}
+import org.apache.kafka.metadata.ConfigRepository
+import org.apache.kafka.server.config.AbstractKafkaConfig
+import org.apache.kafka.server.logger.RuntimeLoggerManager
+import org.slf4j.{Logger, LoggerFactory}
+
+import scala.collection.{Map, Seq}
+import scala.jdk.CollectionConverters._
+
+/**
+ * Manages dynamic configuration operations on the broker.
+ *
+ * There are two RPCs that alter KIP-226 dynamic configurations: alterConfigs, and
+ * incrementalAlterConfigs. The main difference between the two is that alterConfigs sets
+ * all configurations related to a specific config resource, whereas
+ * incrementalAlterConfigs makes only designated changes.
+ *
+ * The original, non-incremental AlterConfigs is deprecated because there are inherent
+ * race conditions when multiple clients use it. It deletes any resource configuration
+ * keys that are not specified. This leads to clients trying to do read-modify-write
+ * cycles when they only want to change one config key. (But even read-modify-write doesn't
+ * work correctly, since &quot;sensitive&quot; configurations are omitted when read.)
+ *
+ * KIP-412 added support for changing log4j log levels via IncrementalAlterConfigs, but
+ * not via the original AlterConfigs. In retrospect, this would have been better off as a
+ * separate RPC, since the semantics are quite different. In particular, KIP-226 configs
+ * are stored durably and persist across broker restarts, but KIP-412 log4j levels do not. 
+ * However, we have to handle it here now in order to maintain compatibility.
+ *
+ * Configuration processing is split into two parts.
+ * - The first step, called &quot;preprocessing,&quot; handles setting KIP-412 log levels, validating
+ * BROKER configurations. We also filter out some other things here like UNKNOWN resource
+ * types, etc.
+ * - The second step is &quot;persistence,&quot; and handles storing the configurations durably to our
+ * metadata store.
+ *
+ * The active controller performs its own configuration validation step in
+ * [[kafka.server.ControllerConfigurationValidator]]. This is mainly important for
+ * TOPIC resources, since we already validated changes to BROKER resources on the
+ * forwarding broker. The controller is also responsible for enforcing the configured
+ * [[org.apache.kafka.server.policy.AlterConfigPolicy]].
+ */
+<span class="nc bnc" id="L78" title="All 4 branches missed.">class ConfigAdminManager(nodeId: Int,</span>
+<span class="nc" id="L79">                         conf: KafkaConfig,</span>
+<span class="nc" id="L80">                         configRepository: ConfigRepository) extends Logging {</span>
+  import ConfigAdminManager._
+
+<span class="nc" id="L83">  this.logIdent = &quot;[ConfigAdminManager[nodeId=&quot; + nodeId + &quot;]: &quot;</span>
+
+<span class="nc" id="L85">  val runtimeLoggerManager = new RuntimeLoggerManager(nodeId, logger.underlying)</span>
+
+  /**
+   * Preprocess an incremental configuration operation on the broker. This step handles
+   * setting log4j levels, as well as filtering out some invalid resource requests that
+   * should not be forwarded to the controller.
+   *
+   * @param request     The request data.
+   * @param authorize   A callback which is invoked when we need to authorize an operation.
+   *                    The arguments are the type and name of the resource to be authorized.
+   *
+   * @return            A map from resources to errors. If a resource appears in this map,
+   *                    it has been preprocessed and does not need further processing.
+   */
+  def preprocess(
+    request: IncrementalAlterConfigsRequestData,
+    authorize: (ResourceType, String) =&gt; Boolean
+  ): util.IdentityHashMap[IAlterConfigsResource, ApiError] = {
+<span class="nc" id="L103">    val results = new util.IdentityHashMap[IAlterConfigsResource, ApiError]()</span>
+<span class="nc" id="L104">    val resourceIds = new util.HashMap[(Byte, String), IAlterConfigsResource]</span>
+<span class="nc" id="L105">    request.resources().forEach(resource =&gt; {</span>
+<span class="nc" id="L106">      val preexisting = resourceIds.put((resource.resourceType(), resource.resourceName()), resource)</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">      if (preexisting != null) {</span>
+<span class="nc" id="L108">        Seq(preexisting, resource).foreach(</span>
+<span class="nc" id="L109">          r =&gt; results.put(r, new ApiError(INVALID_REQUEST, &quot;Each resource must appear at most once.&quot;)))</span>
+      }
+    })
+<span class="nc" id="L112">    request.resources().forEach(resource =&gt; {</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">      if (!results.containsKey(resource)) {</span>
+<span class="nc" id="L114">        val resourceType = ConfigResource.Type.forId(resource.resourceType())</span>
+<span class="nc" id="L115">        val configResource = new ConfigResource(resourceType, resource.resourceName())</span>
+        try {
+<span class="nc bnc" id="L117" title="All 2 branches missed.">          if (containsDuplicates(resource.configs().asScala.map(_.name()))) {</span>
+<span class="nc" id="L118">            throw new InvalidRequestException(&quot;Error due to duplicate config keys&quot;)</span>
+          }
+<span class="nc" id="L120">          val nullUpdates = new util.ArrayList[String]()</span>
+<span class="nc" id="L121">          resource.configs().forEach { config =&gt;</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">            if (config.configOperation() != AlterConfigOp.OpType.DELETE.id() &amp;&amp;</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">              config.value() == null) {</span>
+<span class="nc" id="L124">              nullUpdates.add(config.name())</span>
+            }
+          }
+<span class="nc bnc" id="L127" title="All 2 branches missed.">          if (!nullUpdates.isEmpty) {</span>
+<span class="nc" id="L128">            throw new InvalidRequestException(&quot;Null value not supported for : &quot; +</span>
+<span class="nc" id="L129">              String.join(&quot;, &quot;, nullUpdates))</span>
+          }
+          resourceType match {
+<span class="nc bnc" id="L132" title="All 2 branches missed.">            case BROKER_LOGGER =&gt;</span>
+<span class="nc" id="L133">              runtimeLoggerManager.applyChangesForResource(</span>
+<span class="nc" id="L134">                  authorize(ResourceType.CLUSTER, Resource.CLUSTER_NAME),</span>
+<span class="nc" id="L135">                  request.validateOnly(),</span>
+<span class="nc" id="L136">                  resource)</span>
+<span class="nc" id="L137">              results.put(resource, ApiError.NONE)</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            case BROKER =&gt;</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">              if (!authorize(ResourceType.CLUSTER, Resource.CLUSTER_NAME)) {</span>
+<span class="nc" id="L140">                throw new ClusterAuthorizationException(Errors.CLUSTER_AUTHORIZATION_FAILED.message())</span>
+              }
+              // The resource name must be either blank (if setting a cluster config) or
+              // the ID of this specific broker.
+<span class="nc bnc" id="L144" title="All 2 branches missed.">              if (configResource.name().nonEmpty) {</span>
+<span class="nc" id="L145">                validateResourceNameIsCurrentNodeId(resource.resourceName())</span>
+              }
+<span class="nc" id="L147">              validateBrokerConfigChange(resource, configResource)</span>
+<span class="nc bnc" id="L148" title="All 8 branches missed.">            case TOPIC | CLIENT_METRICS | GROUP =&gt;</span>
+            // Nothing to do.
+            case _ =&gt;
+<span class="nc" id="L151">              throw new InvalidRequestException(s&quot;Unknown resource type ${resource.resourceType().toInt}&quot;)</span>
+          }
+        } catch {
+          case t: Throwable =&gt;
+<span class="nc" id="L155">            val err = ApiError.fromThrowable(t)</span>
+<span class="nc" id="L156">            error(s&quot;Error preprocessing incrementalAlterConfigs request on $configResource&quot;, t)</span>
+<span class="nc" id="L157">            results.put(resource, err)</span>
+        }
+      }
+    })
+<span class="nc" id="L161">    results</span>
+  }
+
+  private def validateBrokerConfigChange(
+    resource: IAlterConfigsResource,
+    configResource: ConfigResource
+  ): Unit = {
+<span class="nc" id="L168">    val perBrokerConfig = configResource.name().nonEmpty</span>
+<span class="nc" id="L169">    val persistentProps = configRepository.config(configResource)</span>
+<span class="nc" id="L170">    val configProps = conf.dynamicConfig.fromPersistentProps(persistentProps, perBrokerConfig)</span>
+<span class="nc" id="L171">    val alterConfigOps = resource.configs().asScala.map {</span>
+<span class="nc" id="L172">      config =&gt;</span>
+<span class="nc" id="L173">        val opType = AlterConfigOp.OpType.forId(config.configOperation())</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (opType == null) {</span>
+<span class="nc" id="L175">          throw new InvalidRequestException(s&quot;Unknown operations type ${config.configOperation}&quot;)</span>
+        }
+<span class="nc" id="L177">        new AlterConfigOp(new ConfigEntry(config.name(), config.value()), opType)</span>
+    }.toSeq
+<span class="nc" id="L179">    prepareIncrementalConfigs(alterConfigOps, configProps, KafkaConfig.configKeys)</span>
+    try {
+<span class="nc" id="L181">      validateBrokerConfigChange(configProps, configResource)</span>
+    } catch {
+<span class="nc" id="L183">      case t: Throwable =&gt; error(s&quot;validation of configProps $configProps for $configResource failed with exception&quot;, t)</span>
+<span class="nc" id="L184">        throw t</span>
+    }
+  }
+
+  private def validateBrokerConfigChange(
+    props: Properties,
+    configResource: ConfigResource
+  ): Unit = {
+    try {
+<span class="nc" id="L193">      conf.dynamicConfig.validate(props, configResource.name().nonEmpty)</span>
+    } catch {
+<span class="nc" id="L195">      case e: ApiException =&gt; throw e</span>
+      //KAFKA-13609: InvalidRequestException is not really the right exception here if the
+      // configuration fails validation. The configuration is still well-formed, but just
+      // can't be applied. It should probably throw InvalidConfigurationException. However,
+      // we should probably only change this in a KIP since it has compatibility implications.
+<span class="nc" id="L200">      case e: Throwable =&gt; throw new InvalidRequestException(e.getMessage)</span>
+    }
+ }
+
+  /**
+   * Preprocess a legacy configuration operation on the broker.
+   *
+   * @param request     The request data.
+   * @param authorize   A callback which is invoked when we need to authorize an operation.
+   *                    The arguments are the type and name of the resource to be authorized.
+   *
+   * @return
+   */
+  def preprocess(
+    request: AlterConfigsRequestData,
+    authorize: (ResourceType, String) =&gt; Boolean
+  ): util.IdentityHashMap[LAlterConfigsResource, ApiError] = {
+<span class="nc" id="L217">    val results = new util.IdentityHashMap[LAlterConfigsResource, ApiError]()</span>
+<span class="nc" id="L218">    val resourceIds = new util.HashMap[(Byte, String), LAlterConfigsResource]</span>
+<span class="nc" id="L219">    request.resources().forEach(resource =&gt; {</span>
+<span class="nc" id="L220">      val preexisting = resourceIds.put((resource.resourceType(), resource.resourceName()), resource)</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">      if (preexisting != null) {</span>
+<span class="nc" id="L222">        Seq(preexisting, resource).foreach(</span>
+<span class="nc" id="L223">          r =&gt; results.put(r, new ApiError(INVALID_REQUEST, &quot;Each resource must appear at most once.&quot;)))</span>
+      }
+    })
+<span class="nc" id="L226">    request.resources().forEach(resource =&gt; {</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">      if (!results.containsKey(resource)) {</span>
+<span class="nc" id="L228">        val resourceType = ConfigResource.Type.forId(resource.resourceType())</span>
+<span class="nc" id="L229">        val configResource = new ConfigResource(resourceType, resource.resourceName())</span>
+        try {
+<span class="nc bnc" id="L231" title="All 2 branches missed.">          if (containsDuplicates(resource.configs().asScala.map(_.name()))) {</span>
+<span class="nc" id="L232">            throw new InvalidRequestException(&quot;Error due to duplicate config keys&quot;)</span>
+          }
+<span class="nc" id="L234">          val nullUpdates = new util.ArrayList[String]()</span>
+<span class="nc" id="L235">          resource.configs().forEach { config =&gt;</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">            if (config.value() == null) {</span>
+<span class="nc" id="L237">              nullUpdates.add(config.name())</span>
+            }
+          }
+<span class="nc bnc" id="L240" title="All 2 branches missed.">          if (!nullUpdates.isEmpty) {</span>
+<span class="nc" id="L241">            throw new InvalidRequestException(&quot;Null value not supported for : &quot; +</span>
+<span class="nc" id="L242">              String.join(&quot;, &quot;, nullUpdates))</span>
+          }
+          resourceType match {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">            case BROKER =&gt;</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">              if (!authorize(ResourceType.CLUSTER, Resource.CLUSTER_NAME)) {</span>
+<span class="nc" id="L247">                throw new ClusterAuthorizationException(Errors.CLUSTER_AUTHORIZATION_FAILED.message())</span>
+              }
+<span class="nc bnc" id="L249" title="All 2 branches missed.">              if (configResource.name().nonEmpty) {</span>
+<span class="nc" id="L250">                validateResourceNameIsCurrentNodeId(resource.resourceName())</span>
+              }
+<span class="nc" id="L252">              validateBrokerConfigChange(resource, configResource)</span>
+<span class="nc bnc" id="L253" title="All 8 branches missed.">            case TOPIC | CLIENT_METRICS | GROUP =&gt;</span>
+            // Nothing to do.
+            case _ =&gt;
+              // Since legacy AlterConfigs does not support BROKER_LOGGER, any attempt to use it
+              // gets caught by this clause.
+<span class="nc" id="L258">              throw new InvalidRequestException(s&quot;Unknown resource type ${resource.resourceType().toInt}&quot;)</span>
+          }
+        } catch {
+          case t: Throwable =&gt;
+<span class="nc" id="L262">            val err = ApiError.fromThrowable(t)</span>
+<span class="nc" id="L263">            error(s&quot;Error preprocessing alterConfigs request on ${configResource}: ${err}&quot;)</span>
+<span class="nc" id="L264">            results.put(resource, err)</span>
+        }
+      }
+    })
+<span class="nc" id="L268">    results</span>
+  }
+
+  private def validateBrokerConfigChange(
+    resource: LAlterConfigsResource,
+    configResource: ConfigResource
+  ): Unit = {
+<span class="nc" id="L275">    val props = new Properties()</span>
+<span class="nc" id="L276">    resource.configs().forEach {</span>
+<span class="nc" id="L277">      config =&gt; props.setProperty(config.name(), config.value())</span>
+    }
+<span class="nc" id="L279">    validateBrokerConfigChange(props, configResource)</span>
+  }
+
+  def validateResourceNameIsCurrentNodeId(name: String): Unit = {
+<span class="nc" id="L283">    val id = try name.toInt catch {</span>
+      case _: NumberFormatException =&gt;
+<span class="nc" id="L285">        throw new InvalidRequestException(s&quot;Node id must be an integer, but it is: $name&quot;)</span>
+    }
+<span class="nc bnc" id="L287" title="All 2 branches missed.">    if (id != nodeId) {</span>
+<span class="nc" id="L288">      throw new InvalidRequestException(s&quot;Unexpected broker id, expected $nodeId, but received $name&quot;)</span>
+    }
+  }
+}
+
+<span class="nc" id="L293">object ConfigAdminManager {</span>
+<span class="nc" id="L294">  val log: Logger = LoggerFactory.getLogger(classOf[ConfigAdminManager])</span>
+
+  /**
+   * Copy the incremental configs request data without any already-processed elements.
+   *
+   * @param request   The input request. Will not be modified.
+   * @param processed A map containing the resources that have already been processed.
+   * @return          A new request object.
+   */
+  def copyWithoutPreprocessed(
+    request: IncrementalAlterConfigsRequestData,
+    processed: util.IdentityHashMap[IAlterConfigsResource, ApiError]
+  ): IncrementalAlterConfigsRequestData = {
+<span class="nc" id="L307">    val copy = new IncrementalAlterConfigsRequestData().</span>
+<span class="nc" id="L308">      setValidateOnly(request.validateOnly())</span>
+<span class="nc" id="L309">    request.resources().forEach(resource =&gt; {</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">      if (!processed.containsKey(resource)) {</span>
+<span class="nc" id="L311">        copy.resources().mustAdd(resource.duplicate())</span>
+      }
+    })
+<span class="nc" id="L314">    copy</span>
+  }
+
+  /**
+   * Copy the legacy alter configs request data without any already-processed elements.
+   *
+   * @param request   The input request. Will not be modified.
+   * @param processed A map containing the resources that have already been processed.
+   * @return          A new request object.
+   */
+  def copyWithoutPreprocessed(
+    request: AlterConfigsRequestData,
+    processed: util.IdentityHashMap[LAlterConfigsResource, ApiError]
+  ): AlterConfigsRequestData = {
+<span class="nc" id="L328">    val copy = new AlterConfigsRequestData().</span>
+<span class="nc" id="L329">      setValidateOnly(request.validateOnly())</span>
+<span class="nc" id="L330">    request.resources().forEach(resource =&gt; {</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">      if (!processed.containsKey(resource)) {</span>
+<span class="nc" id="L332">        copy.resources().mustAdd(resource.duplicate())</span>
+      }
+    })
+<span class="nc" id="L335">    copy</span>
+  }
+
+  def reassembleIncrementalResponse(
+    original: IncrementalAlterConfigsRequestData,
+    preprocessingResponses: util.IdentityHashMap[IAlterConfigsResource, ApiError],
+    persistentResponses: IncrementalAlterConfigsResponseData
+  ): IncrementalAlterConfigsResponseData = {
+<span class="nc" id="L343">    val response = new IncrementalAlterConfigsResponseData()</span>
+<span class="nc" id="L344">    val responsesByResource = persistentResponses.responses().iterator().asScala.map(r =&gt; (r.resourceName(), r.resourceType()) -&gt; new ApiError(r.errorCode(), r.errorMessage())).toMap</span>
+<span class="nc" id="L345">    original.resources().forEach(r =&gt; {</span>
+<span class="nc" id="L346">      val err = Option(preprocessingResponses.get(r)) match {</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        case None =&gt;</span>
+<span class="nc" id="L348">          responsesByResource.get((r.resourceName(), r.resourceType())) match {</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">            case None =&gt; log.error(&quot;The controller returned fewer results than we &quot; +</span>
+<span class="nc" id="L350">              s&quot;expected. No response found for $r.&quot;)</span>
+<span class="nc" id="L351">              new ApiError(UNKNOWN_SERVER_ERROR)</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            case Some(err) =&gt; err</span>
+          }
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        case Some(err) =&gt; err</span>
+      }
+<span class="nc" id="L356">      response.responses().add(new IAlterConfigsResourceResponse().</span>
+<span class="nc" id="L357">        setResourceName(r.resourceName()).</span>
+<span class="nc" id="L358">        setResourceType(r.resourceType()).</span>
+<span class="nc" id="L359">        setErrorCode(err.error().code()).</span>
+<span class="nc" id="L360">        setErrorMessage(err.message()))</span>
+    })
+<span class="nc" id="L362">    response</span>
+  }
+
+  def reassembleLegacyResponse(
+    original: AlterConfigsRequestData,
+    preprocessingResponses: util.IdentityHashMap[LAlterConfigsResource, ApiError],
+    persistentResponses: AlterConfigsResponseData
+  ): AlterConfigsResponseData = {
+<span class="nc" id="L370">    val response = new AlterConfigsResponseData()</span>
+<span class="nc" id="L371">    val responsesByResource = persistentResponses.responses().iterator().asScala.map(r =&gt; (r.resourceName(), r.resourceType()) -&gt; new ApiError(r.errorCode(), r.errorMessage())).toMap</span>
+<span class="nc" id="L372">    original.resources().forEach(r =&gt; {</span>
+<span class="nc" id="L373">      val err = Option(preprocessingResponses.get(r)) match {</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        case None =&gt;</span>
+<span class="nc" id="L375">          responsesByResource.get((r.resourceName(), r.resourceType())) match {</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">            case None =&gt; log.error(&quot;The controller returned fewer results than we &quot; +</span>
+<span class="nc" id="L377">              s&quot;expected. No response found for $r.&quot;)</span>
+<span class="nc" id="L378">              new ApiError(UNKNOWN_SERVER_ERROR)</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            case Some(err) =&gt; err</span>
+          }
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        case Some(err) =&gt; err</span>
+      }
+<span class="nc" id="L383">      response.responses().add(new LAlterConfigsResourceResponse().</span>
+<span class="nc" id="L384">        setResourceName(r.resourceName()).</span>
+<span class="nc" id="L385">        setResourceType(r.resourceType()).</span>
+<span class="nc" id="L386">        setErrorCode(err.error().code()).</span>
+<span class="nc" id="L387">        setErrorMessage(err.message()))</span>
+    })
+<span class="nc" id="L389">    response</span>
+  }
+
+  def containsDuplicates[T](
+    iterable: Iterable[T]
+  ): Boolean = {
+<span class="nc" id="L395">    val previous = new util.HashSet[T]()</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">    !iterable.forall(previous.add)</span>
+  }
+
+  /**
+   * Convert the configuration properties for an object (broker, topic, etc.) to a Scala
+   * map. Sensitive configurations will be redacted, so that the output is suitable for
+   * logging.
+   *
+   * @param resource      The configuration resource.
+   * @param configProps   The configuration as a Properties object.
+   * @return              A map containing all the configuration keys and values, as they
+   *                      should be logged.
+   */
+  def toLoggableProps(resource: ConfigResource, configProps: Properties): Map[String, String] = {
+<span class="nc" id="L410">    configProps.asScala.map {</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">      case (key, value) =&gt; (key, AbstractKafkaConfig.loggableValue(resource.`type`, key, value))</span>
+    }
+  }
+
+  /**
+   * Apply a series of incremental configuration operations to a set of resource properties.
+   *
+   * @param alterConfigOps  The incremental configuration operations to apply.
+   * @param configProps     The resource properties. This will be modified by this function.
+   * @param configKeys      Information about configuration key types.
+   */
+  def prepareIncrementalConfigs(
+    alterConfigOps: Seq[AlterConfigOp],
+    configProps: Properties,
+    configKeys: Map[String, ConfigKey]
+  ): Unit = {
+    def listType(configName: String, configKeys: Map[String, ConfigKey]): Boolean = {
+<span class="nc" id="L428">      configKeys.get(configName) match {</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">        case Some(configKey) =&gt;</span>
+<span class="nc bnc" id="L430" title="All 6 branches missed.">          configKey.`type` == ConfigDef.Type.LIST</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        case None =&gt;</span>
+<span class="nc" id="L432">          throw new InvalidConfigurationException(s&quot;Unknown config name: $configName&quot;)</span>
+      }
+    }
+
+<span class="nc" id="L436">    alterConfigOps.foreach { alterConfigOp =&gt;</span>
+<span class="nc" id="L437">      val configPropName = alterConfigOp.configEntry.name</span>
+<span class="nc" id="L438">      alterConfigOp.opType() match {</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">        case OpType.SET =&gt; configProps.setProperty(alterConfigOp.configEntry.name, alterConfigOp.configEntry.value)</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">        case OpType.DELETE =&gt; configProps.remove(alterConfigOp.configEntry.name)</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        case OpType.APPEND =&gt;</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">          if (!listType(alterConfigOp.configEntry.name, configKeys))</span>
+<span class="nc" id="L443">            throw new InvalidConfigurationException(s&quot;Config value append is not allowed for config key: ${alterConfigOp.configEntry.name}&quot;)</span>
+<span class="nc" id="L444">          val oldValueList = Option(configProps.getProperty(alterConfigOp.configEntry.name))</span>
+<span class="nc" id="L445">            .orElse(Option(ConfigDef.convertToString(configKeys(configPropName).defaultValue, ConfigDef.Type.LIST)))</span>
+<span class="nc" id="L446">            .filter(s =&gt; s.nonEmpty)</span>
+<span class="nc" id="L447">            .map(_.split(&quot;,&quot;).toList)</span>
+<span class="nc" id="L448">            .getOrElse(List.empty)</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">          val appendingValueList = alterConfigOp.configEntry.value.split(&quot;,&quot;).toList.filter(value =&gt; !oldValueList.contains(value))</span>
+<span class="nc" id="L450">          val newValueList = oldValueList ::: appendingValueList</span>
+<span class="nc" id="L451">          configProps.setProperty(alterConfigOp.configEntry.name, newValueList.mkString(&quot;,&quot;))</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        case OpType.SUBTRACT =&gt;</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">          if (!listType(alterConfigOp.configEntry.name, configKeys))</span>
+<span class="nc" id="L454">            throw new InvalidConfigurationException(s&quot;Config value subtract is not allowed for config key: ${alterConfigOp.configEntry.name}&quot;)</span>
+<span class="nc" id="L455">          val oldValueList = Option(configProps.getProperty(alterConfigOp.configEntry.name))</span>
+<span class="nc" id="L456">            .orElse(Option(ConfigDef.convertToString(configKeys(configPropName).defaultValue, ConfigDef.Type.LIST)))</span>
+<span class="nc" id="L457">            .getOrElse(&quot;&quot;)</span>
+<span class="nc" id="L458">            .split(&quot;,&quot;).toList</span>
+<span class="nc" id="L459">          val newValueList = oldValueList.diff(alterConfigOp.configEntry.value.split(&quot;,&quot;).toList)</span>
+<span class="nc" id="L460">          configProps.setProperty(alterConfigOp.configEntry.name, newValueList.mkString(&quot;,&quot;))</span>
+      }
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

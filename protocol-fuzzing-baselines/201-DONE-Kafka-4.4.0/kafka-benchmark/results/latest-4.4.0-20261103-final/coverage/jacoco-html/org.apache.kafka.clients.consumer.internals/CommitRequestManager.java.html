@@ -1,0 +1,1593 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CommitRequestManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">CommitRequestManager.java</span></div><h1>CommitRequestManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.consumer.CommitFailedException;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.RetriableCommitFailedException;
+import org.apache.kafka.clients.consumer.internals.metrics.OffsetCommitMetricsManager;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.errors.GroupAuthorizationException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.StaleMemberEpochException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.errors.UnstableOffsetCommitException;
+import org.apache.kafka.common.message.OffsetCommitRequestData;
+import org.apache.kafka.common.message.OffsetCommitResponseData;
+import org.apache.kafka.common.message.OffsetFetchRequestData;
+import org.apache.kafka.common.message.OffsetFetchResponseData;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.requests.OffsetCommitRequest;
+import org.apache.kafka.common.requests.OffsetCommitResponse;
+import org.apache.kafka.common.requests.OffsetFetchRequest;
+import org.apache.kafka.common.requests.OffsetFetchResponse;
+import org.apache.kafka.common.requests.RequestUtils;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.THROW_ON_FETCH_STABLE_OFFSET_UNSUPPORTED;
+import static org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.PollResult.EMPTY;
+import static org.apache.kafka.common.protocol.Errors.COORDINATOR_LOAD_IN_PROGRESS;
+
+public class CommitRequestManager implements RequestManager, MemberStateListener {
+    private final Time time;
+    private final SubscriptionState subscriptions;
+    private final ConsumerMetadata metadata;
+    private final LogContext logContext;
+    private final Logger log;
+    private final Optional&lt;AutoCommitState&gt; autoCommitState;
+    private final CoordinatorRequestManager coordinatorRequestManager;
+    private final OffsetCommitCallbackInvoker offsetCommitCallbackInvoker;
+    private final OffsetCommitMetricsManager metricsManager;
+    private final long retryBackoffMs;
+    private final String groupId;
+    private final Optional&lt;String&gt; groupInstanceId;
+    private final long retryBackoffMaxMs;
+    // For testing only
+    private final OptionalDouble jitter;
+    private final boolean throwOnFetchStableOffsetUnsupported;
+    final PendingRequests pendingRequests;
+<span class="nc" id="L94">    private boolean closing = false;</span>
+
+    /**
+     * Last member epoch sent in a commit request. Empty if no epoch was included in the last
+     * request. Used for logging.
+     */
+    private Optional&lt;Integer&gt; lastEpochSentOnCommit;
+
+    /**
+     *  The member ID and latest member epoch received via the {@link MemberStateListener#onMemberEpochUpdated(Optional, String)},
+     *  to be included in the OffsetFetch and OffsetCommit requests. This will have
+     *  the latest memberEpoch received from the broker.
+     */
+    private final MemberInfo memberInfo;
+
+    public CommitRequestManager(
+        final Time time,
+        final LogContext logContext,
+        final SubscriptionState subscriptions,
+        final ConsumerConfig config,
+        final CoordinatorRequestManager coordinatorRequestManager,
+        final OffsetCommitCallbackInvoker offsetCommitCallbackInvoker,
+        final String groupId,
+        final Optional&lt;String&gt; groupInstanceId,
+        final Metrics metrics,
+        final ConsumerMetadata metadata) {
+<span class="nc" id="L120">        this(time,</span>
+            logContext,
+            subscriptions,
+            config,
+            coordinatorRequestManager,
+            offsetCommitCallbackInvoker,
+            groupId,
+            groupInstanceId,
+<span class="nc" id="L128">            config.getLong(ConsumerConfig.RETRY_BACKOFF_MS_CONFIG),</span>
+<span class="nc" id="L129">            config.getLong(ConsumerConfig.RETRY_BACKOFF_MAX_MS_CONFIG),</span>
+<span class="nc" id="L130">            OptionalDouble.empty(),</span>
+            metrics,
+            metadata);
+<span class="nc" id="L133">    }</span>
+
+    // Visible for testing
+    CommitRequestManager(
+        final Time time,
+        final LogContext logContext,
+        final SubscriptionState subscriptions,
+        final ConsumerConfig config,
+        final CoordinatorRequestManager coordinatorRequestManager,
+        final OffsetCommitCallbackInvoker offsetCommitCallbackInvoker,
+        final String groupId,
+        final Optional&lt;String&gt; groupInstanceId,
+        final long retryBackoffMs,
+        final long retryBackoffMaxMs,
+        final OptionalDouble jitter,
+        final Metrics metrics,
+<span class="nc" id="L149">        final ConsumerMetadata metadata) {</span>
+<span class="nc" id="L150">        Objects.requireNonNull(coordinatorRequestManager, &quot;Coordinator is needed upon committing offsets&quot;);</span>
+<span class="nc" id="L151">        this.time = time;</span>
+<span class="nc" id="L152">        this.logContext = logContext;</span>
+<span class="nc" id="L153">        this.log = logContext.logger(getClass());</span>
+<span class="nc" id="L154">        this.pendingRequests = new PendingRequests();</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        if (config.getBoolean(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG)) {</span>
+<span class="nc" id="L156">            final long autoCommitInterval =</span>
+<span class="nc" id="L157">                Integer.toUnsignedLong(config.getInt(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG));</span>
+<span class="nc" id="L158">            this.autoCommitState = Optional.of(new AutoCommitState(time, autoCommitInterval, logContext));</span>
+<span class="nc" id="L159">        } else {</span>
+<span class="nc" id="L160">            this.autoCommitState = Optional.empty();</span>
+        }
+<span class="nc" id="L162">        this.coordinatorRequestManager = coordinatorRequestManager;</span>
+<span class="nc" id="L163">        this.groupId = groupId;</span>
+<span class="nc" id="L164">        this.groupInstanceId = groupInstanceId;</span>
+<span class="nc" id="L165">        this.subscriptions = subscriptions;</span>
+<span class="nc" id="L166">        this.metadata = metadata;</span>
+<span class="nc" id="L167">        this.retryBackoffMs = retryBackoffMs;</span>
+<span class="nc" id="L168">        this.retryBackoffMaxMs = retryBackoffMaxMs;</span>
+<span class="nc" id="L169">        this.jitter = jitter;</span>
+<span class="nc" id="L170">        this.throwOnFetchStableOffsetUnsupported = config.getBoolean(THROW_ON_FETCH_STABLE_OFFSET_UNSUPPORTED);</span>
+<span class="nc" id="L171">        this.memberInfo = new MemberInfo();</span>
+<span class="nc" id="L172">        this.metricsManager = new OffsetCommitMetricsManager(metrics);</span>
+<span class="nc" id="L173">        this.offsetCommitCallbackInvoker = offsetCommitCallbackInvoker;</span>
+<span class="nc" id="L174">        this.lastEpochSentOnCommit = Optional.empty();</span>
+<span class="nc" id="L175">    }</span>
+
+    /**
+     * Poll for the {@link OffsetFetchRequest} and {@link OffsetCommitRequest} request if there's any.
+     */
+    @Override
+    public NetworkClientDelegate.PollResult poll(final long currentTimeMs) {
+        // poll when the coordinator node is known and fatal error is not present
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        if (coordinatorRequestManager.coordinator().isEmpty()) {</span>
+<span class="nc" id="L184">            pendingRequests.maybeFailOnCoordinatorFatalError();</span>
+
+<span class="nc bnc" id="L186" title="All 4 branches missed.">            if (closing &amp;&amp; pendingRequests.hasUnsentRequests()) {</span>
+<span class="nc" id="L187">                CommitFailedException exception = new CommitFailedException(</span>
+                        &quot;Failed to commit offsets: Coordinator unknown and consumer is closing&quot;);
+<span class="nc" id="L189">                pendingRequests.drainPendingCommits()</span>
+<span class="nc" id="L190">                        .forEach(request -&gt; request.future().completeExceptionally(exception));</span>
+            }
+
+<span class="nc" id="L193">            return EMPTY;</span>
+        }
+
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        if (closing) {</span>
+<span class="nc" id="L197">            return drainPendingOffsetCommitRequests();</span>
+        }
+
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (!pendingRequests.hasUnsentRequests())</span>
+<span class="nc" id="L201">            return EMPTY;</span>
+
+<span class="nc" id="L203">        List&lt;NetworkClientDelegate.UnsentRequest&gt; requests = pendingRequests.drain(currentTimeMs);</span>
+        // min of the remainingBackoffMs of all the request that are still backing off
+<span class="nc" id="L205">        final long timeUntilNextPoll = Math.min(</span>
+<span class="nc" id="L206">            findMinTime(unsentOffsetCommitRequests(), currentTimeMs),</span>
+<span class="nc" id="L207">            findMinTime(unsentOffsetFetchRequests(), currentTimeMs));</span>
+<span class="nc" id="L208">        return new NetworkClientDelegate.PollResult(timeUntilNextPoll, requests);</span>
+    }
+
+    @Override
+    public void signalClose() {
+<span class="nc" id="L213">        closing = true;</span>
+<span class="nc" id="L214">    }</span>
+
+    /**
+     * Returns the delay for which the application thread can safely wait before it should be responsive
+     * to results from the request managers. For example, the subscription state can change when heartbeats
+     * are sent, so blocking for longer than the heartbeat interval might mean the application thread is not
+     * responsive to changes.
+     */
+    @Override
+    public long maximumTimeToWait(long currentTimeMs) {
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (autoCommitState.isEmpty()) {</span>
+<span class="nc" id="L225">            return Long.MAX_VALUE;</span>
+        }
+<span class="nc" id="L227">        AutoCommitState autoCommit = autoCommitState.get();</span>
+        // An auto-commit is only sent when the coordinator is known; poll() returns EMPTY otherwise.
+        // If the coordinator is unavailable (e.g. bootstrap DNS resolution is still in progress),
+        // falling through to the timer-based remainingMs() would return 0 once the auto-commit interval
+        // elapses, since the auto-commit timer remains permanently expired. This would cause both the
+        // application and network threads to busy-spin. Wait a retry backoff instead of the auto-commit
+        // interval, which may be configured to zero and is consistent with the other request managers.
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        if (coordinatorRequestManager.coordinator().isEmpty()) {</span>
+<span class="nc" id="L235">            return retryBackoffMs;</span>
+        }
+<span class="nc" id="L237">        return autoCommit.remainingMs(currentTimeMs);</span>
+    }
+
+    private static long findMinTime(final Collection&lt;? extends RequestState&gt; requests, final long currentTimeMs) {
+<span class="nc" id="L241">        return requests.stream()</span>
+<span class="nc" id="L242">            .mapToLong(request -&gt; request.remainingBackoffMs(currentTimeMs))</span>
+<span class="nc" id="L243">            .min()</span>
+<span class="nc" id="L244">            .orElse(Long.MAX_VALUE);</span>
+    }
+
+    private KafkaException maybeWrapAsTimeoutException(Throwable t) {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        if (t instanceof TimeoutException)</span>
+<span class="nc" id="L249">            return (TimeoutException) t;</span>
+        else
+<span class="nc" id="L251">            return new TimeoutException(t);</span>
+    }
+
+    /**
+     * Generate a request to commit consumed offsets. Add the request to the queue of pending
+     * requests to be sent out on the next call to {@link #poll(long)}. If there are empty
+     * offsets to commit, no request will be generated and a completed future will be returned.
+     *
+     * @param requestState Commit request
+     * @return Future containing the offsets that were committed, or an error if the request
+     * failed.
+     */
+    private CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; requestAutoCommit(final OffsetCommitRequestState requestState) {
+<span class="nc" id="L264">        AutoCommitState autocommit = autoCommitState.get();</span>
+        CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; result;
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (requestState.offsets.isEmpty()) {</span>
+<span class="nc" id="L267">            result = CompletableFuture.completedFuture(Collections.emptyMap());</span>
+        } else {
+<span class="nc" id="L269">            autocommit.setInflightCommitStatus(true);</span>
+<span class="nc" id="L270">            OffsetCommitRequestState request = pendingRequests.addOffsetCommitRequest(requestState);</span>
+<span class="nc" id="L271">            result = request.future;</span>
+<span class="nc" id="L272">            result.whenComplete(autoCommitCallback(request.offsets));</span>
+        }
+<span class="nc" id="L274">        return result;</span>
+    }
+
+    /**
+     * If auto-commit is enabled, and the auto-commit interval has expired, this will generate and
+     * enqueue a request to commit all consumed offsets, and will reset the auto-commit timer to the
+     * interval. The request will be sent on the next call to {@link #poll(long)}.
+     * &lt;p/&gt;
+     * If the request completes with a retriable error, this will reset the auto-commit timer with
+     * the exponential backoff. If it fails with a non-retriable error, no action is taken, so
+     * the next commit will be generated when the interval expires.
+     * &lt;p/&gt;
+     * This will not generate a new commit request if a previous one hasn't received a response.
+     * In that case, the next auto-commit request will be sent on the next call to poll, after a
+     * response for the in-flight is received.
+     */
+    private void maybeAutoCommitAsync() {
+<span class="nc bnc" id="L291" title="All 4 branches missed.">        if (autoCommitEnabled() &amp;&amp; autoCommitState.get().shouldAutoCommit()) {</span>
+<span class="nc" id="L292">            OffsetCommitRequestState requestState = createOffsetCommitRequest(</span>
+<span class="nc" id="L293">                subscriptions.allConsumed(),</span>
+                Long.MAX_VALUE);
+<span class="nc" id="L295">            CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; result = requestAutoCommit(requestState);</span>
+            // Reset timer to the interval (even if no request was generated), but ensure that if
+            // the request completes with a retriable error, the timer is reset to send the next
+            // auto-commit after the backoff expires.
+<span class="nc" id="L299">            resetAutoCommitTimer();</span>
+<span class="nc" id="L300">            maybeResetTimerWithBackoff(result);</span>
+        }
+<span class="nc" id="L302">    }</span>
+
+    /**
+     * Reset auto-commit timer to retry with backoff if the future failed with a RetriableCommitFailedException.
+     */
+    private void maybeResetTimerWithBackoff(final CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; result) {
+<span class="nc" id="L308">        result.whenComplete((offsets, error) -&gt; {</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">                if (error instanceof RetriableCommitFailedException) {</span>
+<span class="nc" id="L311">                    log.debug(&quot;Asynchronous auto-commit of offsets {} failed due to retriable error.&quot;, offsets, error);</span>
+<span class="nc" id="L312">                    resetAutoCommitTimer(retryBackoffMs);</span>
+                } else {
+<span class="nc" id="L314">                    log.debug(&quot;Asynchronous auto-commit of offsets {} failed: {}&quot;, offsets, error.getMessage());</span>
+                }
+            } else {
+<span class="nc" id="L317">                log.debug(&quot;Completed asynchronous auto-commit of offsets {}&quot;, offsets);</span>
+            }
+<span class="nc" id="L319">        });</span>
+<span class="nc" id="L320">    }</span>
+
+    /**
+     * Commit consumed offsets if auto-commit is enabled, regardless of the auto-commit interval.
+     * This is used for committing offsets before rebalance. This will retry committing
+     * the latest offsets until the request succeeds, fails with a fatal error, or the timeout
+     * expires. Note that:
+     * &lt;ul&gt;
+     *     &lt;li&gt;Considers {@link Errors#STALE_MEMBER_EPOCH} as a retriable error, and will retry it
+     *     including the member ID and latest member epoch received from the broker.&lt;/li&gt;
+     *     &lt;li&gt;Considers {@link Errors#UNKNOWN_TOPIC_OR_PARTITION} as a fatal error, and will not
+     *     retry it although the error extends RetriableException. The reason is that if a topic
+     *     or partition is deleted, rebalance would not finish in time since the auto commit would keep retrying.&lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * Also note that this will generate a commit request even if there is another one in-flight,
+     * generated by the auto-commit on the interval logic, to ensure that the latest offsets are
+     * committed before rebalance.
+     *
+     * @return Future that will complete when the offsets are successfully committed. It will
+     * complete exceptionally if the commit fails with a non-retriable error, or if the retry
+     * timeout expires.
+     */
+    public CompletableFuture&lt;Void&gt; maybeAutoCommitSyncBeforeRebalance(final long deadlineMs) {
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (!autoCommitEnabled()) {</span>
+<span class="nc" id="L345">            return CompletableFuture.completedFuture(null);</span>
+        }
+
+<span class="nc" id="L348">        CompletableFuture&lt;Void&gt; result = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L349">        OffsetCommitRequestState requestState =</span>
+<span class="nc" id="L350">            createOffsetCommitRequest(subscriptions.allConsumed(), deadlineMs);</span>
+<span class="nc" id="L351">        autoCommitSyncBeforeRebalanceWithRetries(requestState, result);</span>
+<span class="nc" id="L352">        return result;</span>
+    }
+
+    private void autoCommitSyncBeforeRebalanceWithRetries(OffsetCommitRequestState requestAttempt,
+                                                          CompletableFuture&lt;Void&gt; result) {
+<span class="nc" id="L357">        CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; commitAttempt = requestAutoCommit(requestAttempt);</span>
+<span class="nc" id="L358">        commitAttempt.whenComplete((committedOffsets, error) -&gt; {</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">            if (error == null) {</span>
+<span class="nc" id="L360">                result.complete(null);</span>
+            } else {
+<span class="nc bnc" id="L362" title="All 4 branches missed.">                if (error instanceof RetriableException || isStaleEpochErrorAndValidEpochAvailable(error)) {</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                    if (requestAttempt.isExpired()) {</span>
+<span class="nc" id="L364">                        log.debug(&quot;Auto-commit sync before rebalance timed out and won't be retried anymore&quot;);</span>
+<span class="nc" id="L365">                        result.completeExceptionally(maybeWrapAsTimeoutException(error));</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">                    } else if (error instanceof UnknownTopicOrPartitionException) {</span>
+<span class="nc" id="L367">                        log.debug(&quot;Auto-commit sync before rebalance failed because topic or partition were deleted&quot;);</span>
+<span class="nc" id="L368">                        result.completeExceptionally(error);</span>
+                    } else {
+                        // Make sure the auto-commit is retried with the latest offsets
+<span class="nc" id="L371">                        log.debug(&quot;Member {} will retry auto-commit of latest offsets after receiving retriable error {}&quot;,</span>
+                            memberInfo.memberId,
+<span class="nc" id="L373">                            error.getMessage());</span>
+<span class="nc" id="L374">                        requestAttempt.offsets = subscriptions.allConsumed();</span>
+<span class="nc" id="L375">                        requestAttempt.resetFuture();</span>
+<span class="nc" id="L376">                        autoCommitSyncBeforeRebalanceWithRetries(requestAttempt, result);</span>
+                    }
+                } else {
+<span class="nc" id="L379">                    log.debug(&quot;Auto-commit sync before rebalance failed with non-retriable error&quot;, error);</span>
+<span class="nc" id="L380">                    result.completeExceptionally(error);</span>
+                }
+            }
+<span class="nc" id="L383">        });</span>
+<span class="nc" id="L384">    }</span>
+
+    /**
+     * Clear the inflight auto-commit flag and log auto-commit completion status.
+     */
+    private BiConsumer&lt;? super Map&lt;TopicPartition, OffsetAndMetadata&gt;, ? super Throwable&gt; autoCommitCallback(final Map&lt;TopicPartition, OffsetAndMetadata&gt; allConsumedOffsets) {
+<span class="nc" id="L390">        return (response, throwable) -&gt; {</span>
+<span class="nc" id="L391">            autoCommitState.ifPresent(autoCommitState -&gt; autoCommitState.setInflightCommitStatus(false));</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            if (throwable == null) {</span>
+<span class="nc" id="L393">                offsetCommitCallbackInvoker.enqueueInterceptorInvocation(allConsumedOffsets);</span>
+<span class="nc" id="L394">                log.debug(&quot;Completed auto-commit of offsets {}&quot;, allConsumedOffsets);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">            } else if (throwable instanceof RetriableCommitFailedException) {</span>
+<span class="nc" id="L396">                log.debug(&quot;Auto-commit of offsets {} failed due to retriable error: {}&quot;,</span>
+<span class="nc" id="L397">                        allConsumedOffsets, throwable.getMessage());</span>
+            } else {
+<span class="nc" id="L399">                log.warn(&quot;Auto-commit of offsets {} failed&quot;, allConsumedOffsets, throwable);</span>
+            }
+<span class="nc" id="L401">        };</span>
+    }
+
+    /**
+     * Generate a request to commit offsets without retrying, even if it fails with a retriable
+     * error. The generated request will be added to the queue to be sent on the next call to
+     * {@link #poll(long)}.
+     *
+     * @param offsets Offsets to commit per partition.
+     * @return Future that will complete when a response is received, successfully or
+     * exceptionally depending on the response. If the request fails with a retriable error, the
+     * future will be completed with a {@link RetriableCommitFailedException}.
+     */
+    public CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; commitAsync(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets) {
+<span class="nc bnc" id="L415" title="All 2 branches missed.">        if (offsets.isEmpty()) {</span>
+<span class="nc" id="L416">            log.debug(&quot;Skipping commit of empty offsets&quot;);</span>
+<span class="nc" id="L417">            return CompletableFuture.completedFuture(Map.of());</span>
+        }
+<span class="nc" id="L419">        maybeUpdateLastSeenEpochIfNewer(offsets);</span>
+<span class="nc" id="L420">        OffsetCommitRequestState commitRequest = createOffsetCommitRequest(offsets, Long.MAX_VALUE);</span>
+<span class="nc" id="L421">        pendingRequests.addOffsetCommitRequest(commitRequest);</span>
+
+<span class="nc" id="L423">        CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; asyncCommitResult = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L424">        commitRequest.future.whenComplete((committedOffsets, error) -&gt; {</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L426">                asyncCommitResult.completeExceptionally(commitAsyncExceptionForError(error));</span>
+            } else {
+<span class="nc" id="L428">                asyncCommitResult.complete(offsets);</span>
+            }
+<span class="nc" id="L430">        });</span>
+<span class="nc" id="L431">        return asyncCommitResult;</span>
+    }
+
+    /**
+     * Commit offsets, retrying on expected retriable errors while the retry timeout hasn't expired.
+     *
+     * @param offsets    Offsets to commit
+     * @param deadlineMs Time until which the request will be retried if it fails with
+     *                   an expected retriable error.
+     * @return Future that will complete when a successful response
+     */
+    public CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; commitSync(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets,
+                                                                                final long deadlineMs) {
+<span class="nc bnc" id="L444" title="All 2 branches missed.">        if (offsets.isEmpty()) {</span>
+<span class="nc" id="L445">            return CompletableFuture.completedFuture(Map.of());</span>
+        }
+<span class="nc" id="L447">        maybeUpdateLastSeenEpochIfNewer(offsets);</span>
+<span class="nc" id="L448">        CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; result = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L449">        OffsetCommitRequestState requestState = createOffsetCommitRequest(offsets, deadlineMs);</span>
+<span class="nc" id="L450">        commitSyncWithRetries(requestState, result);</span>
+<span class="nc" id="L451">        return result;</span>
+    }
+
+    private OffsetCommitRequestState createOffsetCommitRequest(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets,
+                                                               final long deadlineMs) {
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        return jitter.isPresent() ?</span>
+<span class="nc" id="L457">            new OffsetCommitRequestState(</span>
+                offsets,
+                groupId,
+                groupInstanceId,
+                deadlineMs,
+                retryBackoffMs,
+                retryBackoffMaxMs,
+<span class="nc" id="L464">                jitter.getAsDouble(),</span>
+                memberInfo) :
+<span class="nc" id="L466">            new OffsetCommitRequestState(</span>
+                offsets,
+                groupId,
+                groupInstanceId,
+                deadlineMs,
+                retryBackoffMs,
+                retryBackoffMaxMs,
+                memberInfo);
+    }
+
+    private void commitSyncWithRetries(OffsetCommitRequestState requestAttempt,
+                                       CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; result) {
+<span class="nc" id="L478">        pendingRequests.addOffsetCommitRequest(requestAttempt);</span>
+
+        // Retry the same commit request while it fails with RetriableException and the retry
+        // timeout hasn't expired.
+<span class="nc" id="L482">        requestAttempt.future.whenComplete((res, error) -&gt; {</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">            if (error == null) {</span>
+<span class="nc" id="L484">                result.complete(requestAttempt.offsets);</span>
+            } else {
+<span class="nc bnc" id="L486" title="All 2 branches missed.">                if (error instanceof RetriableException) {</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">                    if (requestAttempt.isExpired()) {</span>
+<span class="nc" id="L488">                        log.info(&quot;OffsetCommit timeout expired so it won't be retried anymore&quot;);</span>
+<span class="nc" id="L489">                        result.completeExceptionally(maybeWrapAsTimeoutException(error));</span>
+                    } else {
+<span class="nc" id="L491">                        requestAttempt.resetFuture();</span>
+<span class="nc" id="L492">                        commitSyncWithRetries(requestAttempt, result);</span>
+                    }
+                } else {
+<span class="nc" id="L495">                    result.completeExceptionally(commitSyncExceptionForError(error));</span>
+                }
+            }
+<span class="nc" id="L498">        });</span>
+<span class="nc" id="L499">    }</span>
+
+    private Throwable commitSyncExceptionForError(Throwable error) {
+<span class="nc bnc" id="L502" title="All 2 branches missed.">        if (error instanceof StaleMemberEpochException) {</span>
+<span class="nc" id="L503">            return new CommitFailedException(&quot;OffsetCommit failed with stale member epoch. &quot;</span>
+<span class="nc" id="L504">                + Errors.STALE_MEMBER_EPOCH.message());</span>
+        }
+<span class="nc" id="L506">        return error;</span>
+    }
+
+    private Throwable commitAsyncExceptionForError(Throwable error) {
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        if (error instanceof RetriableException) {</span>
+<span class="nc" id="L511">            return new RetriableCommitFailedException(error);</span>
+        }
+<span class="nc" id="L513">        return error;</span>
+    }
+
+    /**
+     * Enqueue a request to fetch committed offsets, that will be sent on the next call to {@link #poll(long)}.
+     * This is used when initializing positions on poll,
+     * and for fetching committed offsets from API calls to consumer.committed.
+     * This function will retry upon expected retriable errors while the timeout hasn't expired.
+     * It will fail fatally with KafkaException for all unexpected errors.
+     *
+     * @param partitions Partitions to fetch offsets for.
+     * @param deadlineMs Time until which the request should be retried if it fails
+     *                   with expected retriable errors.
+     * @return Future that will complete when a successful response is received, or the request
+     * fails and cannot be retried. The result contains both successful offsets and any retriable
+     * partition errors (like UNKNOWN_TOPIC_ID) that occurred. Note that the request is retried
+     * whenever it fails with expected retriable errors and the retry timeout hasn't expired.
+     */
+    public CompletableFuture&lt;OffsetFetchResult&gt; fetchOffsets(
+        final Set&lt;TopicPartition&gt; partitions,
+        final long deadlineMs) {
+<span class="nc bnc" id="L534" title="All 2 branches missed.">        if (partitions.isEmpty()) {</span>
+<span class="nc" id="L535">            return CompletableFuture.completedFuture(new OffsetFetchResult(Collections.emptyMap(), Collections.emptyMap()));</span>
+        }
+<span class="nc" id="L537">        CompletableFuture&lt;OffsetFetchResult&gt; result = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L538">        OffsetFetchRequestState request = createOffsetFetchRequest(partitions, deadlineMs);</span>
+<span class="nc" id="L539">        fetchOffsetsWithRetries(request, result);</span>
+<span class="nc" id="L540">        return result;</span>
+    }
+
+    // Visible for testing
+    OffsetFetchRequestState createOffsetFetchRequest(final Set&lt;TopicPartition&gt; partitions,
+                                                             final long deadlineMs) {
+<span class="nc bnc" id="L546" title="All 2 branches missed.">        return jitter.isPresent() ?</span>
+<span class="nc" id="L547">            new OffsetFetchRequestState(</span>
+                partitions,
+                retryBackoffMs,
+                retryBackoffMaxMs,
+                deadlineMs,
+<span class="nc" id="L552">                jitter.getAsDouble(),</span>
+                memberInfo) :
+<span class="nc" id="L554">            new OffsetFetchRequestState(</span>
+                partitions,
+                retryBackoffMs,
+                retryBackoffMaxMs,
+                deadlineMs,
+                memberInfo);
+    }
+
+    private void fetchOffsetsWithRetries(final OffsetFetchRequestState fetchRequest,
+                                         final CompletableFuture&lt;OffsetFetchResult&gt; result) {
+<span class="nc" id="L564">        CompletableFuture&lt;OffsetFetchResult&gt; currentResult = pendingRequests.addOffsetFetchRequest(fetchRequest);</span>
+
+        // Retry the same fetch request while it fails with RetriableException and the retry timeout hasn't expired.
+<span class="nc" id="L567">        currentResult.whenComplete((res, error) -&gt; {</span>
+<span class="nc" id="L568">            boolean inflightRemoved = pendingRequests.inflightOffsetFetches.remove(fetchRequest);</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">            if (!inflightRemoved) {</span>
+                // A completed request may legitimately not be in the in-flight buffer for a few
+                // reasons: it was deduplicated and chained onto an existing request (so it was never
+                // added to the buffers), or it completed before it was ever sent (e.g. while there
+                // was no coordinator available). In all these cases there is nothing to remove here.
+<span class="nc" id="L574">                log.debug(&quot;Completed offset fetch request was not found in the in-flight buffer: {}&quot;,</span>
+                    fetchRequest);
+            }
+
+            // Group-level error
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L580">                handleGroupLevelError(fetchRequest, result, error);</span>
+<span class="nc" id="L581">                return;</span>
+            }
+
+            // Partition-level errors
+<span class="nc bnc" id="L585" title="All 2 branches missed.">            if (res.hasRetriablePartitionErrors()) {</span>
+<span class="nc" id="L586">                handleRetriablePartitionErrors(fetchRequest, result, res);</span>
+<span class="nc" id="L587">                return;</span>
+            }
+
+<span class="nc" id="L590">            handleSuccessfulOffsetFetch(result, res);</span>
+
+<span class="nc" id="L592">        });</span>
+<span class="nc" id="L593">    }</span>
+
+    /**
+     * Handles a successful offset fetch response with no errors.
+     */
+    private void handleSuccessfulOffsetFetch(final CompletableFuture&lt;OffsetFetchResult&gt; result,
+                                             final OffsetFetchResult res) {
+<span class="nc" id="L600">        maybeUpdateLastSeenEpochIfNewer(res.offsets());</span>
+<span class="nc" id="L601">        result.complete(res);</span>
+<span class="nc" id="L602">    }</span>
+
+    /**
+     * Handles group-level errors from an offset fetch request.
+     * Group-level errors indicate the entire request failed (e.g., coordinator unavailable).
+     */
+    private void handleGroupLevelError(final OffsetFetchRequestState fetchRequest,
+                                       final CompletableFuture&lt;OffsetFetchResult&gt; result,
+                                       final Throwable error) {
+<span class="nc bnc" id="L611" title="All 2 branches missed.">        boolean isRetriable = (error instanceof RetriableException) ||</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">            isStaleEpochErrorAndValidEpochAvailable(error);</span>
+
+<span class="nc bnc" id="L614" title="All 2 branches missed.">        if (!isRetriable) {</span>
+<span class="nc" id="L615">            result.completeExceptionally(error);</span>
+<span class="nc" id="L616">            return;</span>
+        }
+
+<span class="nc bnc" id="L619" title="All 2 branches missed.">        if (fetchRequest.isExpired()) {</span>
+<span class="nc" id="L620">            log.debug(&quot;OffsetFetch request for {} timed out and won't be retried anymore&quot;,</span>
+                fetchRequest.requestedPartitions);
+<span class="nc" id="L622">            result.completeExceptionally(maybeWrapAsTimeoutException(error));</span>
+<span class="nc" id="L623">            return;</span>
+        }
+
+<span class="nc" id="L626">        retryOffsetFetchOnError(fetchRequest, result, &quot;retriable error: &quot; + error.getMessage());</span>
+<span class="nc" id="L627">    }</span>
+
+    /**
+     * Handles retriable partition-level errors from an offset fetch response.
+     *
+     * &lt;p&gt;The only retriable partition errors are UNKNOWN_TOPIC_ID and UNKNOWN_TOPIC_OR_PARTITION.
+     * When expired or not enough time for another retry, we return partial results with null for
+     * the errored partitions. We check against {@code remainingBackoffMs} to ensure we complete
+     * before the {@link org.apache.kafka.clients.consumer.internals.events.CompletableEventReaper}
+     * expires the event with TimeoutException.
+     */
+    private void handleRetriablePartitionErrors(final OffsetFetchRequestState fetchRequest,
+                                            final CompletableFuture&lt;OffsetFetchResult&gt; result,
+                                            final OffsetFetchResult res) {
+<span class="nc" id="L641">        long currentTimeMs = time.milliseconds();</span>
+
+        // Return partial results if there is no time for another retry.
+        // We check against remainingBackoffMs to ensure we complete before the
+        // CompletableEventReaper expires the event with TimeoutException.
+<span class="nc bnc" id="L646" title="All 4 branches missed.">        if (fetchRequest.isExpired() || fetchRequest.remainingMs() &lt;= fetchRequest.remainingBackoffMs(currentTimeMs)) {</span>
+<span class="nc" id="L647">            log.debug(&quot;OffsetFetch request for partitions {} returning partial results with some partition errors {}&quot;,</span>
+<span class="nc" id="L648">                fetchRequest.requestedPartitions, res.retriablePartitionErrors().keySet());</span>
+<span class="nc" id="L649">            maybeUpdateLastSeenEpochIfNewer(res.offsets());</span>
+<span class="nc" id="L650">            result.complete(res);</span>
+<span class="nc" id="L651">            return;</span>
+        }
+
+<span class="nc" id="L654">        retryOffsetFetchOnError(fetchRequest, result,</span>
+<span class="nc" id="L655">            &quot;retriable partition errors: &quot; + res.retriablePartitionErrors().keySet());</span>
+<span class="nc" id="L656">    }</span>
+
+    /**
+     * Retries an offset fetch request after an error.
+     */
+    private void retryOffsetFetchOnError(final OffsetFetchRequestState fetchRequest,
+                                         final CompletableFuture&lt;OffsetFetchResult&gt; result,
+                                         final String reason) {
+<span class="nc" id="L664">        log.debug(&quot;OffsetFetch request for {} retrying due to {}&quot;,</span>
+            fetchRequest.requestedPartitions, reason);
+<span class="nc" id="L666">        fetchRequest.resetFuture();</span>
+<span class="nc" id="L667">        fetchOffsetsWithRetries(fetchRequest, result);</span>
+<span class="nc" id="L668">    }</span>
+
+    private boolean isStaleEpochErrorAndValidEpochAvailable(Throwable error) {
+<span class="nc bnc" id="L671" title="All 4 branches missed.">        return error instanceof StaleMemberEpochException &amp;&amp; memberInfo.memberEpoch.isPresent();</span>
+    }
+
+    private void updateAutoCommitTimer(final long currentTimeMs) {
+<span class="nc" id="L675">        this.autoCommitState.ifPresent(t -&gt; t.updateTimer(currentTimeMs));</span>
+<span class="nc" id="L676">    }</span>
+
+    // Visible for testing
+    Queue&lt;OffsetCommitRequestState&gt; unsentOffsetCommitRequests() {
+<span class="nc" id="L680">        return pendingRequests.unsentOffsetCommits;</span>
+    }
+
+    private List&lt;OffsetFetchRequestState&gt; unsentOffsetFetchRequests() {
+<span class="nc" id="L684">        return pendingRequests.unsentOffsetFetches;</span>
+    }
+
+    /**
+     * Update latest member epoch used by the member.
+     *
+     * @param memberEpoch New member epoch received. To be included in the new request.
+     * @param memberId Current member ID. To be included in the new request.
+     */
+    @Override
+    public void onMemberEpochUpdated(Optional&lt;Integer&gt; memberEpoch, String memberId) {
+<span class="nc bnc" id="L695" title="All 4 branches missed.">        if (memberEpoch.isEmpty() &amp;&amp; memberInfo.memberEpoch.isPresent()) {</span>
+<span class="nc" id="L696">            log.info(&quot;Member {} won't include epoch in following offset &quot; +</span>
+                &quot;commit/fetch requests because it has left the group.&quot;, memberInfo.memberId);
+<span class="nc bnc" id="L698" title="All 2 branches missed.">        } else if (memberEpoch.isPresent()) {</span>
+<span class="nc" id="L699">            log.debug(&quot;Member {} will include new member epoch {} in following offset commit/fetch requests.&quot;, memberId, memberEpoch);</span>
+        }
+<span class="nc" id="L701">        memberInfo.memberId = memberId;</span>
+<span class="nc" id="L702">        memberInfo.memberEpoch = memberEpoch;</span>
+<span class="nc" id="L703">    }</span>
+
+    /**
+     * @return True if auto-commit is enabled as defined in the config {@link ConsumerConfig#ENABLE_AUTO_COMMIT_CONFIG}
+     */
+    public boolean autoCommitEnabled() {
+<span class="nc" id="L709">        return autoCommitState.isPresent();</span>
+    }
+
+    /**
+     * Reset the auto-commit timer to the auto-commit interval, so that the next auto-commit is
+     * sent out on the interval starting from now. If auto-commit is not enabled this will
+     * perform no action.
+     */
+    public void resetAutoCommitTimer() {
+<span class="nc" id="L718">        autoCommitState.ifPresent(AutoCommitState::resetTimer);</span>
+<span class="nc" id="L719">    }</span>
+
+    /**
+     * Reset the auto-commit timer to the provided time (backoff), so that the next auto-commit is
+     * sent out then. If auto-commit is not enabled this will perform no action.
+     */
+    public void resetAutoCommitTimer(long retryBackoffMs) {
+<span class="nc" id="L726">        autoCommitState.ifPresent(s -&gt; s.resetTimer(retryBackoffMs));</span>
+<span class="nc" id="L727">    }</span>
+
+    /**
+     * Drains the inflight offsetCommits during shutdown because we want to make sure all pending commits are sent
+     * before closing.
+     */
+    public NetworkClientDelegate.PollResult drainPendingOffsetCommitRequests() {
+<span class="nc bnc" id="L734" title="All 2 branches missed.">        if (pendingRequests.unsentOffsetCommits.isEmpty())</span>
+<span class="nc" id="L735">            return EMPTY;</span>
+<span class="nc" id="L736">        List&lt;NetworkClientDelegate.UnsentRequest&gt; requests = pendingRequests.drainPendingCommits();</span>
+<span class="nc" id="L737">        return new NetworkClientDelegate.PollResult(Long.MAX_VALUE, requests);</span>
+    }
+
+    private void maybeUpdateLastSeenEpochIfNewer(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets) {
+<span class="nc" id="L741">        offsets.forEach((topicPartition, offsetAndMetadata) -&gt; {</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">            if (offsetAndMetadata != null)</span>
+<span class="nc" id="L743">                offsetAndMetadata.leaderEpoch().ifPresent(epoch -&gt; metadata.updateLastSeenEpochIfNewer(topicPartition, epoch));</span>
+<span class="nc" id="L744">        });</span>
+<span class="nc" id="L745">    }</span>
+
+    /**
+     * This is a non-blocking method to update timer and trigger async auto-commit.
+     * &lt;p&gt;
+     * This method performs two main tasks:
+     * &lt;ol&gt;
+     * &lt;li&gt;Updates the internal timer with the current time.&lt;/li&gt;
+     * &lt;li&gt;Initiate an asynchronous auto-commit operation for all consumed positions if needed.&lt;/li&gt;
+     * &lt;/ol&gt;
+     *
+     * @param currentTimeMs the current timestamp in millisecond
+     * @see CommitRequestManager#updateAutoCommitTimer(long)
+     * @see CommitRequestManager#maybeAutoCommitAsync()
+     */
+    public void updateTimerAndMaybeCommit(final long currentTimeMs) {
+<span class="nc" id="L761">        updateAutoCommitTimer(currentTimeMs);</span>
+<span class="nc" id="L762">        maybeAutoCommitAsync();</span>
+<span class="nc" id="L763">    }</span>
+
+    class OffsetCommitRequestState extends RetriableRequestState {
+        private Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets;
+        private final String groupId;
+        private final Optional&lt;String&gt; groupInstanceId;
+
+        /**
+         * Future containing the offsets that were committed. It completes when a response is
+         * received for the commit request.
+         */
+        private CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; future;
+
+        OffsetCommitRequestState(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets,
+                                 final String groupId,
+                                 final Optional&lt;String&gt; groupInstanceId,
+                                 final long deadlineMs,
+                                 final long retryBackoffMs,
+                                 final long retryBackoffMaxMs,
+<span class="nc" id="L782">                                 final MemberInfo memberInfo) {</span>
+<span class="nc" id="L783">            super(logContext, CommitRequestManager.class.getSimpleName(), retryBackoffMs,</span>
+<span class="nc" id="L784">                retryBackoffMaxMs, memberInfo, deadlineTimer(time, deadlineMs));</span>
+<span class="nc" id="L785">            this.offsets = offsets;</span>
+<span class="nc" id="L786">            this.groupId = groupId;</span>
+<span class="nc" id="L787">            this.groupInstanceId = groupInstanceId;</span>
+<span class="nc" id="L788">            this.future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L789">        }</span>
+
+        // Visible for testing
+        OffsetCommitRequestState(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets,
+                                 final String groupId,
+                                 final Optional&lt;String&gt; groupInstanceId,
+                                 final long deadlineMs,
+                                 final long retryBackoffMs,
+                                 final long retryBackoffMaxMs,
+                                 final double jitter,
+<span class="nc" id="L799">                                 final MemberInfo memberInfo) {</span>
+<span class="nc" id="L800">            super(logContext, CommitRequestManager.class.getSimpleName(), retryBackoffMs, 2,</span>
+<span class="nc" id="L801">                retryBackoffMaxMs, jitter, memberInfo, deadlineTimer(time, deadlineMs));</span>
+<span class="nc" id="L802">            this.offsets = offsets;</span>
+<span class="nc" id="L803">            this.groupId = groupId;</span>
+<span class="nc" id="L804">            this.groupInstanceId = groupInstanceId;</span>
+<span class="nc" id="L805">            this.future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L806">        }</span>
+
+        public NetworkClientDelegate.UnsentRequest toUnsentRequest() {
+<span class="nc" id="L809">            Map&lt;String, Uuid&gt; topicIds = metadata.topicIds();</span>
+<span class="nc" id="L810">            boolean canUseTopicIds = true;</span>
+<span class="nc" id="L811">            Map&lt;String, OffsetCommitRequestData.OffsetCommitRequestTopic&gt; requestTopicDataMap = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L812" title="All 2 branches missed.">            for (Map.Entry&lt;TopicPartition, OffsetAndMetadata&gt; entry : offsets.entrySet()) {</span>
+<span class="nc" id="L813">                TopicPartition topicPartition = entry.getKey();</span>
+<span class="nc" id="L814">                OffsetAndMetadata offsetAndMetadata = entry.getValue();</span>
+<span class="nc" id="L815">                Uuid topicId = topicIds.getOrDefault(topicPartition.topic(), Uuid.ZERO_UUID);</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">                if (topicId.equals(Uuid.ZERO_UUID)) {</span>
+<span class="nc" id="L817">                    canUseTopicIds = false;</span>
+                }
+
+<span class="nc" id="L820">                OffsetCommitRequestData.OffsetCommitRequestTopic topic = requestTopicDataMap</span>
+<span class="nc" id="L821">                    .getOrDefault(topicPartition.topic(),</span>
+                        new OffsetCommitRequestData.OffsetCommitRequestTopic()
+<span class="nc" id="L823">                            .setName(topicPartition.topic())</span>
+<span class="nc" id="L824">                            .setTopicId(topicId)</span>
+                    );
+
+<span class="nc" id="L827">                topic.partitions().add(new OffsetCommitRequestData.OffsetCommitRequestPartition()</span>
+<span class="nc" id="L828">                    .setPartitionIndex(topicPartition.partition())</span>
+<span class="nc" id="L829">                    .setCommittedOffset(offsetAndMetadata.offset())</span>
+<span class="nc" id="L830">                    .setCommittedLeaderEpoch(offsetAndMetadata.leaderEpoch().orElse(RecordBatch.NO_PARTITION_LEADER_EPOCH))</span>
+<span class="nc" id="L831">                    .setCommittedMetadata(offsetAndMetadata.metadata())</span>
+                );
+<span class="nc" id="L833">                requestTopicDataMap.put(topicPartition.topic(), topic);</span>
+<span class="nc" id="L834">            }</span>
+
+<span class="nc" id="L836">            OffsetCommitRequestData data = new OffsetCommitRequestData()</span>
+<span class="nc" id="L837">                    .setGroupId(this.groupId)</span>
+<span class="nc" id="L838">                    .setGroupInstanceId(groupInstanceId.orElse(null))</span>
+<span class="nc" id="L839">                    .setTopics(new ArrayList&lt;&gt;(requestTopicDataMap.values()));</span>
+<span class="nc" id="L840">            data = data.setMemberId(memberInfo.memberId);</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">            if (memberInfo.memberEpoch.isPresent()) {</span>
+<span class="nc" id="L842">                data = data.setGenerationIdOrMemberEpoch(memberInfo.memberEpoch.get());</span>
+<span class="nc" id="L843">                lastEpochSentOnCommit = memberInfo.memberEpoch;</span>
+            } else {
+<span class="nc" id="L845">                lastEpochSentOnCommit = Optional.empty();</span>
+            }
+
+<span class="nc bnc" id="L848" title="All 2 branches missed.">            OffsetCommitRequest.Builder builder = canUseTopicIds</span>
+<span class="nc" id="L849">                    ? OffsetCommitRequest.Builder.forTopicIdsOrNames(data)</span>
+<span class="nc" id="L850">                    : OffsetCommitRequest.Builder.forTopicNames(data);</span>
+
+<span class="nc" id="L852">            return buildRequestWithResponseHandling(builder);</span>
+        }
+
+        /**
+         * Handle OffsetCommitResponse. This will complete the request future successfully if no
+         * errors are found in the response. If the response contains errors, this will:
+         *   - handle expected errors and fail the future with specific exceptions depending on the error
+         *   - fail the future with a non-recoverable KafkaException for all unexpected errors (even if retriable)
+         */
+        @Override
+        @SuppressWarnings(&quot;NPathComplexity&quot;)
+        public void onResponse(final ClientResponse response) {
+<span class="nc" id="L864">            metricsManager.recordRequestLatency(response.requestLatencyMs());</span>
+<span class="nc" id="L865">            long currentTimeMs = response.receivedTimeMs();</span>
+<span class="nc" id="L866">            OffsetCommitResponse commitResponse = (OffsetCommitResponse) response.responseBody();</span>
+<span class="nc" id="L867">            Set&lt;String&gt; unauthorizedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L868">            boolean failedRequestRegistered = false;</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">            for (OffsetCommitResponseData.OffsetCommitResponseTopic topic : commitResponse.data().topics()) {</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">                for (OffsetCommitResponseData.OffsetCommitResponsePartition partition : topic.partitions()) {</span>
+                    // Version 10 drops topic name, and supports topic id.
+                    // We need to find offsetAndMetadata based on topic id and partition index only as
+                    // topic name in the response will be emtpy.
+                    // For older versions, topic id is zero, and we will find the offsetAndMetadata based on the topic name.
+<span class="nc bnc" id="L875" title="All 4 branches missed.">                    TopicPartition tp = (!Uuid.ZERO_UUID.equals(topic.topicId()) &amp;&amp; metadata.topicNames().containsKey(topic.topicId())) ?</span>
+<span class="nc" id="L876">                        new TopicPartition(metadata.topicNames().get(topic.topicId()), partition.partitionIndex()) :</span>
+<span class="nc" id="L877">                        new TopicPartition(topic.name(), partition.partitionIndex());</span>
+
+<span class="nc" id="L879">                    Errors error = Errors.forCode(partition.errorCode());</span>
+<span class="nc bnc" id="L880" title="All 2 branches missed.">                    if (error == Errors.NONE) {</span>
+<span class="nc" id="L881">                        OffsetAndMetadata offsetAndMetadata = offsets.get(tp);</span>
+<span class="nc bnc" id="L882" title="All 2 branches missed.">                        if (offsetAndMetadata == null) {</span>
+<span class="nc" id="L883">                            log.debug(&quot;Can't find metadata for partition {}&quot;, tp);</span>
+                        } else {
+<span class="nc" id="L885">                            log.debug(&quot;OffsetCommit completed successfully for offset {} partition {}&quot;, offsetAndMetadata.offset(), tp);</span>
+                        }
+<span class="nc" id="L887">                        continue;</span>
+                    }
+
+<span class="nc bnc" id="L890" title="All 2 branches missed.">                    if (!failedRequestRegistered) {</span>
+<span class="nc" id="L891">                        onFailedAttempt(currentTimeMs);</span>
+<span class="nc" id="L892">                        failedRequestRegistered = true;</span>
+                    }
+
+<span class="nc bnc" id="L895" title="All 2 branches missed.">                    if (error == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L896">                        future.completeExceptionally(GroupAuthorizationException.forGroupId(groupId));</span>
+<span class="nc" id="L897">                        return;</span>
+<span class="nc bnc" id="L898" title="All 6 branches missed.">                    } else if (error == Errors.COORDINATOR_NOT_AVAILABLE ||</span>
+                        error == Errors.NOT_COORDINATOR ||
+                        error == Errors.REQUEST_TIMED_OUT) {
+<span class="nc" id="L901">                        coordinatorRequestManager.markCoordinatorUnknown(error.message(), currentTimeMs);</span>
+<span class="nc" id="L902">                        future.completeExceptionally(error.exception());</span>
+<span class="nc" id="L903">                        return;</span>
+<span class="nc bnc" id="L904" title="All 4 branches missed.">                    } else if (error == Errors.OFFSET_METADATA_TOO_LARGE ||</span>
+                        error == Errors.INVALID_COMMIT_OFFSET_SIZE) {
+<span class="nc" id="L906">                        future.completeExceptionally(error.exception());</span>
+<span class="nc" id="L907">                        return;</span>
+<span class="nc bnc" id="L908" title="All 6 branches missed.">                    } else if (error == Errors.COORDINATOR_LOAD_IN_PROGRESS ||</span>
+                        error == Errors.UNKNOWN_TOPIC_OR_PARTITION ||
+                        error == Errors.UNKNOWN_TOPIC_ID) {
+                        // just retry
+<span class="nc" id="L912">                        future.completeExceptionally(error.exception());</span>
+<span class="nc" id="L913">                        return;</span>
+<span class="nc bnc" id="L914" title="All 2 branches missed.">                    } else if (error == Errors.UNKNOWN_MEMBER_ID) {</span>
+<span class="nc" id="L915">                        log.error(&quot;OffsetCommit failed with {}&quot;, error);</span>
+<span class="nc" id="L916">                        future.completeExceptionally(new CommitFailedException(&quot;OffsetCommit &quot; +</span>
+<span class="nc" id="L917">                            &quot;failed with unknown member ID. &quot; + error.message()));</span>
+<span class="nc" id="L918">                        return;</span>
+<span class="nc bnc" id="L919" title="All 2 branches missed.">                    } else if (error == Errors.STALE_MEMBER_EPOCH) {</span>
+<span class="nc" id="L920">                        log.error(&quot;OffsetCommit failed for member {} with stale member epoch error. Last epoch sent: {}&quot;,</span>
+                            memberInfo.memberId,
+<span class="nc bnc" id="L922" title="All 2 branches missed.">                            lastEpochSentOnCommit.isPresent() ? lastEpochSentOnCommit.get() : &quot;undefined&quot;);</span>
+<span class="nc" id="L923">                        future.completeExceptionally(error.exception());</span>
+<span class="nc" id="L924">                        return;</span>
+<span class="nc bnc" id="L925" title="All 2 branches missed.">                    } else if (error == Errors.TOPIC_AUTHORIZATION_FAILED) {</span>
+                        // Collect all unauthorized topics before failing
+<span class="nc" id="L927">                        unauthorizedTopics.add(tp.topic());</span>
+                    } else {
+                        // Fail with a non-retriable KafkaException for all unexpected errors
+                        // (even if they are retriable)
+<span class="nc" id="L931">                        future.completeExceptionally(new KafkaException(&quot;Unexpected error in commit: &quot; + error.message()));</span>
+<span class="nc" id="L932">                        return;</span>
+                    }
+<span class="nc" id="L934">                }</span>
+<span class="nc" id="L935">            }</span>
+
+<span class="nc bnc" id="L937" title="All 2 branches missed.">            if (!unauthorizedTopics.isEmpty()) {</span>
+<span class="nc" id="L938">                log.error(&quot;OffsetCommit failed due to not authorized to commit to topics {}&quot;, unauthorizedTopics);</span>
+<span class="nc" id="L939">                future.completeExceptionally(new TopicAuthorizationException(unauthorizedTopics));</span>
+            } else {
+<span class="nc" id="L941">                future.complete(null);</span>
+            }
+<span class="nc" id="L943">        }</span>
+
+        @Override
+        String requestDescription() {
+<span class="nc" id="L947">            return &quot;OffsetCommit request for offsets &quot; + offsets;</span>
+        }
+
+        @Override
+        CompletableFuture&lt;?&gt; future() {
+<span class="nc" id="L952">            return future;</span>
+        }
+
+        void resetFuture() {
+<span class="nc" id="L956">            future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L957">        }</span>
+
+        @Override
+        void removeRequest() {
+<span class="nc bnc" id="L961" title="All 2 branches missed.">            if (!unsentOffsetCommitRequests().remove(this)) {</span>
+<span class="nc" id="L962">                log.warn(&quot;OffsetCommit request to remove not found in the outbound buffer: {}&quot;, this);</span>
+            }
+<span class="nc" id="L964">        }</span>
+    }
+
+    // Visible for testing
+    Optional&lt;Integer&gt; lastEpochSentOnCommit() {
+<span class="nc" id="L969">        return lastEpochSentOnCommit;</span>
+    }
+
+    /**
+     * Represents a request that can be retried or aborted, based on member ID and epoch
+     * information.
+     */
+    abstract class RetriableRequestState extends TimedRequestState {
+
+        /**
+         * Member info (ID and epoch) to be included in the request if present.
+         */
+        final MemberInfo memberInfo;
+
+        RetriableRequestState(LogContext logContext, String owner, long retryBackoffMs,
+<span class="nc" id="L984">                              long retryBackoffMaxMs, MemberInfo memberInfo, Timer timer) {</span>
+<span class="nc" id="L985">            super(logContext, owner, retryBackoffMs, retryBackoffMaxMs, timer);</span>
+<span class="nc" id="L986">            this.memberInfo = memberInfo;</span>
+<span class="nc" id="L987">        }</span>
+
+        // Visible for testing
+        RetriableRequestState(LogContext logContext, String owner, long retryBackoffMs, int retryBackoffExpBase,
+<span class="nc" id="L991">                              long retryBackoffMaxMs, double jitter, MemberInfo memberInfo, Timer timer) {</span>
+<span class="nc" id="L992">            super(logContext, owner, retryBackoffMs, retryBackoffExpBase, retryBackoffMaxMs, jitter, timer);</span>
+<span class="nc" id="L993">            this.memberInfo = memberInfo;</span>
+<span class="nc" id="L994">        }</span>
+
+        /**
+         * @return String containing the request name and arguments, to be used for logging
+         * purposes.
+         */
+        abstract String requestDescription();
+
+        /**
+         * @return Future that will complete with the request response or failure.
+         */
+        abstract CompletableFuture&lt;?&gt; future();
+
+        /**
+         * Complete the request future with a TimeoutException if the request has been sent out
+         * at least once and the timeout has been reached.
+         */
+        void maybeExpire() {
+<span class="nc bnc" id="L1012" title="All 4 branches missed.">            if (numAttempts &gt; 0 &amp;&amp; isExpired()) {</span>
+<span class="nc" id="L1013">                removeRequest();</span>
+<span class="nc" id="L1014">                future().completeExceptionally(new TimeoutException(requestDescription() +</span>
+                    &quot; could not complete before timeout expired.&quot;));
+            }
+<span class="nc" id="L1017">        }</span>
+
+        /**
+         * Build request with the given builder, including response handling logic.
+         */
+        NetworkClientDelegate.UnsentRequest buildRequestWithResponseHandling(final AbstractRequest.Builder&lt;?&gt; builder) {
+<span class="nc" id="L1023">            NetworkClientDelegate.UnsentRequest request = new NetworkClientDelegate.UnsentRequest(</span>
+                builder,
+<span class="nc" id="L1025">                coordinatorRequestManager.coordinator()</span>
+            );
+<span class="nc" id="L1027">            request.whenComplete(</span>
+                (response, throwable) -&gt; {
+<span class="nc" id="L1029">                    long completionTimeMs = request.handler().completionTimeMs();</span>
+<span class="nc" id="L1030">                    handleClientResponse(response, throwable, completionTimeMs);</span>
+<span class="nc" id="L1031">                });</span>
+<span class="nc" id="L1032">            return request;</span>
+        }
+
+        private void handleClientResponse(final ClientResponse response,
+                                          final Throwable error,
+                                          final long requestCompletionTimeMs) {
+            try {
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">                if (error == null) {</span>
+<span class="nc" id="L1040">                    onResponse(response);</span>
+                } else {
+<span class="nc" id="L1042">                    log.debug(&quot;{} completed with error&quot;, requestDescription(), error);</span>
+<span class="nc" id="L1043">                    onFailedAttempt(requestCompletionTimeMs);</span>
+<span class="nc" id="L1044">                    coordinatorRequestManager.handleCoordinatorDisconnect(error, requestCompletionTimeMs);</span>
+<span class="nc" id="L1045">                    future().completeExceptionally(error);</span>
+                }
+<span class="nc" id="L1047">            } catch (Throwable t) {</span>
+<span class="nc" id="L1048">                log.error(&quot;Unexpected error handling response for {}&quot;, requestDescription(), t);</span>
+<span class="nc" id="L1049">                future().completeExceptionally(t);</span>
+<span class="nc" id="L1050">            }</span>
+<span class="nc" id="L1051">        }</span>
+
+        @Override
+        public String toStringBase() {
+<span class="nc" id="L1055">            return super.toStringBase() + &quot;, &quot; + memberInfo;</span>
+        }
+
+        abstract void onResponse(final ClientResponse response);
+
+        abstract void removeRequest();
+    }
+
+    /**
+     * Result of an offset fetch request.
+     * Contains the successfully fetched offsets and any
+     * retriable partition errors (e.g., UNKNOWN_TOPIC_ID).
+     * This allows returning partial results, including offsets and partition errors.
+     */
+    public static class OffsetFetchResult {
+        /**
+         * Partitions with offsets successfully retrieved
+         */
+        private final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets;
+
+        /**
+         * Partitions with retriable errors
+         */
+        private final Map&lt;TopicPartition, Errors&gt; retriablePartitionErrors;
+
+        public OffsetFetchResult(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets,
+<span class="nc" id="L1081">                                  Map&lt;TopicPartition, Errors&gt; retriablePartitionErrors) {</span>
+<span class="nc" id="L1082">            this.offsets = offsets;</span>
+<span class="nc" id="L1083">            this.retriablePartitionErrors = retriablePartitionErrors;</span>
+<span class="nc" id="L1084">        }</span>
+
+        public Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets() {
+<span class="nc" id="L1087">            return offsets;</span>
+        }
+
+        public Map&lt;TopicPartition, Errors&gt; retriablePartitionErrors() {
+<span class="nc" id="L1091">            return retriablePartitionErrors;</span>
+        }
+
+        public boolean hasRetriablePartitionErrors() {
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">            return !retriablePartitionErrors.isEmpty();</span>
+        }
+
+        /**
+         * Converts this result to a map of offsets, using null for partitions that had retriable errors.
+         * This is expected to be used when the caller wants to return partial results to the user, where null indicates
+         * that the offset for that partition could not be fetched.
+         *
+         * @return A new map containing all successfully fetched offsets, plus null entries for partitions
+         *         that had retriable errors.
+         */
+        public Map&lt;TopicPartition, OffsetAndMetadata&gt; toOffsetMapWithNulls() {
+<span class="nc" id="L1107">            Map&lt;TopicPartition, OffsetAndMetadata&gt; result = new HashMap&lt;&gt;(offsets);</span>
+<span class="nc bnc" id="L1108" title="All 2 branches missed.">            for (TopicPartition tp : retriablePartitionErrors.keySet()) {</span>
+<span class="nc" id="L1109">                result.put(tp, null);</span>
+<span class="nc" id="L1110">            }</span>
+<span class="nc" id="L1111">            return result;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1116">            return &quot;OffsetFetchResult{&quot; +</span>
+                &quot;offsets=&quot; + offsets +
+                &quot;, retriablePartitionErrors=&quot; + retriablePartitionErrors +
+                '}';
+        }
+    }
+
+    class OffsetFetchRequestState extends RetriableRequestState {
+
+        /**
+         * Partitions to get committed offsets for.
+         */
+        public final Set&lt;TopicPartition&gt; requestedPartitions;
+
+        /**
+         * Map of topic ID to topic names for the topics included in a request when using topic IDs.
+         * To be used when parsing the response, as topics may be removed from the consumer
+         * metadata before receiving a response.
+         */
+        public Map&lt;Uuid, String&gt; topicNamesCache;
+
+        /**
+         * Future with the result of the request. This can be reset using {@link #resetFuture()}
+         * to get a new result when the request is retried.
+         */
+        private CompletableFuture&lt;OffsetFetchResult&gt; future;
+
+        public OffsetFetchRequestState(final Set&lt;TopicPartition&gt; partitions,
+                                       final long retryBackoffMs,
+                                       final long retryBackoffMaxMs,
+                                       final long deadlineMs,
+<span class="nc" id="L1147">                                       final MemberInfo memberInfo) {</span>
+<span class="nc" id="L1148">            super(logContext, CommitRequestManager.class.getSimpleName(), retryBackoffMs,</span>
+<span class="nc" id="L1149">                retryBackoffMaxMs, memberInfo, deadlineTimer(time, deadlineMs));</span>
+<span class="nc" id="L1150">            this.requestedPartitions = partitions;</span>
+<span class="nc" id="L1151">            this.future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L1152">            this.topicNamesCache = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1153">        }</span>
+
+        public OffsetFetchRequestState(final Set&lt;TopicPartition&gt; partitions,
+                                       final long retryBackoffMs,
+                                       final long retryBackoffMaxMs,
+                                       final long deadlineMs,
+                                       final double jitter,
+<span class="nc" id="L1160">                                       final MemberInfo memberInfo) {</span>
+<span class="nc" id="L1161">            super(logContext, CommitRequestManager.class.getSimpleName(), retryBackoffMs, 2,</span>
+<span class="nc" id="L1162">                retryBackoffMaxMs, jitter, memberInfo, deadlineTimer(time, deadlineMs));</span>
+<span class="nc" id="L1163">            this.requestedPartitions = partitions;</span>
+<span class="nc" id="L1164">            this.future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L1165">            this.topicNamesCache = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1166">        }</span>
+
+        public boolean sameRequest(final OffsetFetchRequestState request) {
+<span class="nc" id="L1169">            return requestedPartitions.equals(request.requestedPartitions);</span>
+        }
+
+        public NetworkClientDelegate.UnsentRequest toUnsentRequest() {
+<span class="nc" id="L1173">            Map&lt;String, Uuid&gt; topicIds = metadata.topicIds();</span>
+<span class="nc" id="L1174">            topicNamesCache.clear();</span>
+<span class="nc" id="L1175">            boolean canUseTopicIds = true;</span>
+<span class="nc" id="L1176">            List&lt;OffsetFetchRequestData.OffsetFetchRequestTopics&gt; topics = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1177">            Map&lt;String, List&lt;TopicPartition&gt;&gt; tps = requestedPartitions.stream().collect(Collectors.groupingBy(TopicPartition::topic));</span>
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">            for (Map.Entry&lt;String, List&lt;TopicPartition&gt;&gt; entry : tps.entrySet()) {</span>
+<span class="nc" id="L1179">                String topic = entry.getKey();</span>
+<span class="nc" id="L1180">                Uuid topicId = topicIds.getOrDefault(topic, Uuid.ZERO_UUID);</span>
+<span class="nc bnc" id="L1181" title="All 2 branches missed.">                if (Uuid.ZERO_UUID.equals(topicId)) {</span>
+<span class="nc" id="L1182">                    canUseTopicIds = false;</span>
+                } else {
+                    // Save topicId-topicName ref to be used when parsing the response
+<span class="nc" id="L1185">                    topicNamesCache.put(topicId, topic);</span>
+                }
+<span class="nc" id="L1187">                topics.add(new OffsetFetchRequestData.OffsetFetchRequestTopics()</span>
+<span class="nc" id="L1188">                    .setName(topic)</span>
+<span class="nc" id="L1189">                    .setTopicId(topicId)</span>
+<span class="nc" id="L1190">                    .setPartitionIndexes(entry.getValue().stream()</span>
+<span class="nc" id="L1191">                        .map(TopicPartition::partition)</span>
+<span class="nc" id="L1192">                        .collect(Collectors.toList())));</span>
+<span class="nc" id="L1193">            }</span>
+
+<span class="nc" id="L1195">            OffsetFetchRequestData.OffsetFetchRequestGroup groupData = new OffsetFetchRequestData.OffsetFetchRequestGroup()</span>
+<span class="nc" id="L1196">                .setGroupId(groupId)</span>
+<span class="nc" id="L1197">                .setTopics(topics);</span>
+<span class="nc bnc" id="L1198" title="All 2 branches missed.">            if (memberInfo.memberEpoch.isPresent()) {</span>
+<span class="nc" id="L1199">                groupData = groupData.setMemberId(memberInfo.memberId)</span>
+<span class="nc" id="L1200">                    .setMemberEpoch(memberInfo.memberEpoch.get());</span>
+            }
+<span class="nc" id="L1202">            OffsetFetchRequestData data = new OffsetFetchRequestData()</span>
+<span class="nc" id="L1203">                .setRequireStable(true)</span>
+<span class="nc" id="L1204">                .setGroups(List.of(groupData));</span>
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">            OffsetFetchRequest.Builder builder = canUseTopicIds</span>
+<span class="nc" id="L1206">                ? OffsetFetchRequest.Builder.forTopicIdsOrNames(data, throwOnFetchStableOffsetUnsupported)</span>
+<span class="nc" id="L1207">                : OffsetFetchRequest.Builder.forTopicNames(data, throwOnFetchStableOffsetUnsupported);</span>
+<span class="nc" id="L1208">            return buildRequestWithResponseHandling(builder);</span>
+        }
+
+        /**
+         * Handle OffsetFetch response, including successful and failed.
+         */
+        @Override
+        void onResponse(final ClientResponse response) {
+<span class="nc" id="L1216">            long currentTimeMs = response.receivedTimeMs();</span>
+<span class="nc" id="L1217">            var fetchResponse = (OffsetFetchResponse) response.responseBody();</span>
+<span class="nc" id="L1218">            var groupResponse = fetchResponse.group(groupId);</span>
+<span class="nc" id="L1219">            var error = Errors.forCode(groupResponse.errorCode());</span>
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">            if (error != Errors.NONE) {</span>
+<span class="nc" id="L1221">                onFailure(currentTimeMs, error);</span>
+<span class="nc" id="L1222">                return;</span>
+            }
+<span class="nc" id="L1224">            onSuccess(currentTimeMs, groupResponse);</span>
+<span class="nc" id="L1225">        }</span>
+
+        /**
+         * Handle failed responses. This will retry if the error is retriable, or complete the
+         * result future exceptionally in the case of non-recoverable or unexpected errors.
+         */
+        private void onFailure(final long currentTimeMs,
+                               final Errors responseError) {
+<span class="nc" id="L1233">            log.debug(&quot;Offset fetch failed: {}&quot;, responseError.message());</span>
+<span class="nc" id="L1234">            onFailedAttempt(currentTimeMs);</span>
+<span class="nc" id="L1235">            ApiException exception = responseError.exception();</span>
+<span class="nc bnc" id="L1236" title="All 2 branches missed.">            if (responseError == COORDINATOR_LOAD_IN_PROGRESS) {</span>
+<span class="nc" id="L1237">                future.completeExceptionally(exception);</span>
+<span class="nc bnc" id="L1238" title="All 2 branches missed.">            } else if (responseError == Errors.UNKNOWN_MEMBER_ID) {</span>
+<span class="nc" id="L1239">                log.error(&quot;OffsetFetch failed with {} because the member is not part of the group&quot; +</span>
+                    &quot; anymore.&quot;, responseError);
+<span class="nc" id="L1241">                future.completeExceptionally(exception);</span>
+<span class="nc bnc" id="L1242" title="All 2 branches missed.">            } else if (responseError == Errors.STALE_MEMBER_EPOCH) {</span>
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">                if (memberInfo.memberEpoch.isPresent()) {</span>
+<span class="nc" id="L1244">                    log.debug(&quot;OffsetFetch failed with {}. The member is still in the group, so the &quot; +</span>
+                        &quot;request can be retried with the latest member epoch as long as it has not expired.&quot;, responseError);
+                } else {
+<span class="nc" id="L1247">                    log.error(&quot;OffsetFetch failed with {} and the consumer is not part &quot; +</span>
+                        &quot;of the group anymore (it probably left the group, got fenced&quot; +
+                        &quot; or failed). The request cannot be retried and will fail.&quot;, responseError);
+                }
+<span class="nc" id="L1251">                future.completeExceptionally(exception);</span>
+<span class="nc bnc" id="L1252" title="All 4 branches missed.">            } else if (responseError == Errors.NOT_COORDINATOR || responseError == Errors.COORDINATOR_NOT_AVAILABLE) {</span>
+                // Re-discover the coordinator and retry
+<span class="nc" id="L1254">                coordinatorRequestManager.markCoordinatorUnknown(&quot;error response &quot; + responseError.name(), currentTimeMs);</span>
+<span class="nc" id="L1255">                future.completeExceptionally(exception);</span>
+<span class="nc bnc" id="L1256" title="All 2 branches missed.">            } else if (exception instanceof RetriableException) {</span>
+<span class="nc" id="L1257">                future.completeExceptionally(exception);</span>
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">            } else if (responseError == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1259">                future.completeExceptionally(GroupAuthorizationException.forGroupId(groupId));</span>
+            } else {
+                // Fail with a non-retriable KafkaException for all unexpected errors
+<span class="nc" id="L1262">                future.completeExceptionally(new KafkaException(&quot;Unexpected error in fetch offset response: &quot; + responseError.message()));</span>
+            }
+<span class="nc" id="L1264">        }</span>
+
+        @Override
+        String requestDescription() {
+<span class="nc" id="L1268">            return &quot;OffsetFetch request for partitions &quot; + requestedPartitions;</span>
+        }
+
+        @Override
+        CompletableFuture&lt;?&gt; future() {
+<span class="nc" id="L1273">            return future;</span>
+        }
+
+        void resetFuture() {
+<span class="nc" id="L1277">            future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L1278">        }</span>
+
+        @Override
+        void removeRequest() {
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">            if (!unsentOffsetFetchRequests().remove(this)) {</span>
+<span class="nc" id="L1283">                log.warn(&quot;OffsetFetch request to remove not found in the outbound buffer: {}&quot;, this);</span>
+            }
+<span class="nc" id="L1285">        }</span>
+
+        /**
+         * Handle OffsetFetch response that has no group level errors. This will look for
+         * partition level errors and fail the future accordingly, also recording a failed request
+         * attempt. If no partition level errors are found, this will complete the future with the
+         * offsets contained in the response, and record a successful request attempt.
+         */
+        private void onSuccess(final long currentTimeMs,
+                               final OffsetFetchResponseData.OffsetFetchResponseGroup response) {
+<span class="nc" id="L1295">            var offsets = new HashMap&lt;TopicPartition, OffsetAndMetadata&gt;();</span>
+<span class="nc" id="L1296">            var retriablePartitionErrors = new HashMap&lt;TopicPartition, Errors&gt;();</span>
+<span class="nc" id="L1297">            var unstableTxnOffsetTopicPartitions = new HashSet&lt;TopicPartition&gt;();</span>
+<span class="nc" id="L1298">            var unauthorizedTopics = new HashSet&lt;String&gt;();</span>
+<span class="nc" id="L1299">            var failedRequestRegistered = false;</span>
+
+<span class="nc bnc" id="L1301" title="All 2 branches missed.">            for (var topic : response.topics()) {</span>
+                // If the topic id is used, the topic name is empty in the response.
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">                String topicName = Uuid.ZERO_UUID.equals(topic.topicId()) ? topic.name() : topicNamesCache.get(topic.topicId());</span>
+<span class="nc bnc" id="L1304" title="All 2 branches missed.">                for (var partition : topic.partitions()) {</span>
+<span class="nc" id="L1305">                    var tp = new TopicPartition(</span>
+                        topicName,
+<span class="nc" id="L1307">                        partition.partitionIndex()</span>
+                    );
+<span class="nc" id="L1309">                    var error = Errors.forCode(partition.errorCode());</span>
+<span class="nc bnc" id="L1310" title="All 2 branches missed.">                    if (error != Errors.NONE) {</span>
+<span class="nc" id="L1311">                        log.debug(&quot;Failed to fetch offset for partition {}: {}&quot;, tp, error.message());</span>
+
+<span class="nc bnc" id="L1313" title="All 2 branches missed.">                        if (!failedRequestRegistered) {</span>
+<span class="nc" id="L1314">                            onFailedAttempt(currentTimeMs);</span>
+<span class="nc" id="L1315">                            failedRequestRegistered = true;</span>
+                        }
+
+<span class="nc bnc" id="L1318" title="All 4 branches missed.">                        if (error == Errors.UNKNOWN_TOPIC_OR_PARTITION || error == Errors.UNKNOWN_TOPIC_ID) {</span>
+                            // Track retriable partition error. Continue processing other partitions.
+                            // The caller can decide to retry and eventually return the partial results only.
+<span class="nc" id="L1321">                            retriablePartitionErrors.put(tp, error);</span>
+<span class="nc bnc" id="L1322" title="All 2 branches missed.">                        } else if (error == Errors.TOPIC_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1323">                            unauthorizedTopics.add(tp.topic());</span>
+<span class="nc bnc" id="L1324" title="All 2 branches missed.">                        } else if (error == Errors.UNSTABLE_OFFSET_COMMIT) {</span>
+<span class="nc" id="L1325">                            unstableTxnOffsetTopicPartitions.add(tp);</span>
+                        } else {
+                            // Fail with a non-retriable KafkaException for all unexpected partition
+                            // errors (even if they are retriable)
+<span class="nc" id="L1329">                            future.completeExceptionally(new KafkaException(&quot;Unexpected error in fetch offset &quot; +</span>
+<span class="nc" id="L1330">                                &quot;response for partition &quot; + tp + &quot;: &quot; + error.message()));</span>
+<span class="nc" id="L1331">                            return;</span>
+                        }
+<span class="nc bnc" id="L1333" title="All 2 branches missed.">                    } else if (partition.committedOffset() &gt;= 0) {</span>
+                        // record the position with the offset (-1 indicates no committed offset to fetch);
+                        // if there's no committed offset, record as null
+<span class="nc" id="L1336">                        offsets.put(tp, new OffsetAndMetadata(</span>
+<span class="nc" id="L1337">                            partition.committedOffset(),</span>
+<span class="nc" id="L1338">                            RequestUtils.getLeaderEpoch(partition.committedLeaderEpoch()),</span>
+<span class="nc" id="L1339">                            partition.metadata()</span>
+                        ));
+                    } else {
+<span class="nc" id="L1342">                        log.info(&quot;Found no committed offset for partition {}&quot;, tp);</span>
+<span class="nc" id="L1343">                        offsets.put(tp, null);</span>
+                    }
+
+<span class="nc" id="L1346">                }</span>
+<span class="nc" id="L1347">            }</span>
+
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">            if (!unauthorizedTopics.isEmpty()) {</span>
+<span class="nc" id="L1350">                future.completeExceptionally(new TopicAuthorizationException(unauthorizedTopics));</span>
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">            } else if (!unstableTxnOffsetTopicPartitions.isEmpty()) {</span>
+                // TODO: Optimization question: Do we need to retry all partitions upon a single partition error?
+<span class="nc" id="L1353">                log.info(&quot;The following partitions still have unstable offsets &quot; +</span>
+                        &quot;which are not cleared on the broker side: {}&quot; +
+                        &quot;, this could be either &quot; +
+                        &quot;transactional offsets waiting for completion, or &quot; +
+                        &quot;normal offsets waiting for replication after appending to local log&quot;, unstableTxnOffsetTopicPartitions);
+<span class="nc" id="L1358">                future.completeExceptionally(new UnstableOffsetCommitException(&quot;There are &quot; +</span>
+                    &quot;unstable offsets for the requested topic partitions&quot;));
+            } else {
+<span class="nc bnc" id="L1361" title="All 2 branches missed.">                if (retriablePartitionErrors.isEmpty()) {</span>
+                    // Register success if there are no partition errors.
+                    // If there were partition errors, a failed attempt has been already registered above.
+<span class="nc" id="L1364">                    onSuccessfulAttempt(currentTimeMs);</span>
+                }
+<span class="nc" id="L1366">                future.complete(new OffsetFetchResult(offsets, retriablePartitionErrors));</span>
+            }
+<span class="nc" id="L1368">        }</span>
+
+        private void chainFuture(
+            final CompletableFuture&lt;OffsetFetchResult&gt; otherFuture) {
+<span class="nc" id="L1372">            this.future.whenComplete((r, t) -&gt; {</span>
+<span class="nc bnc" id="L1373" title="All 2 branches missed.">                if (t != null) {</span>
+<span class="nc" id="L1374">                    otherFuture.completeExceptionally(t);</span>
+                } else {
+<span class="nc" id="L1376">                    otherFuture.complete(r);</span>
+                }
+<span class="nc" id="L1378">            });</span>
+<span class="nc" id="L1379">        }</span>
+
+        @Override
+        public String toStringBase() {
+<span class="nc" id="L1383">            return super.toStringBase() +</span>
+                    &quot;, requestedPartitions=&quot; + requestedPartitions;
+        }
+    }
+
+    /**
+     * &lt;p&gt;This is used to stage the unsent {@link OffsetCommitRequestState} and {@link OffsetFetchRequestState}.
+     * &lt;ul&gt;
+     *   &lt;li&gt;unsentOffsetCommits holds the offset commit requests that have not been sent out&lt;/li&gt;
+     *   &lt;li&gt;unsentOffsetFetches holds the offset fetch requests that have not been sent out&lt;/li&gt;
+     *   &lt;li&gt;inflightOffsetFetches holds the offset fetch requests that have been sent out but not completed&lt;/li&gt;
+     * &lt;/ul&gt;
+     * {@code addOffsetFetchRequest} dedupes the requests to avoid sending the same requests.
+     */
+
+<span class="nc" id="L1398">    class PendingRequests {</span>
+        // Queue is used to ensure the sequence of commit
+<span class="nc" id="L1400">        Queue&lt;OffsetCommitRequestState&gt; unsentOffsetCommits = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L1401">        List&lt;OffsetFetchRequestState&gt; unsentOffsetFetches = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1402">        List&lt;OffsetFetchRequestState&gt; inflightOffsetFetches = new ArrayList&lt;&gt;();</span>
+
+        // Visible for testing
+        boolean hasUnsentRequests() {
+<span class="nc bnc" id="L1406" title="All 4 branches missed.">            return !unsentOffsetCommits.isEmpty() || !unsentOffsetFetches.isEmpty();</span>
+        }
+
+        /**
+         * Add a commit request to the queue, so that it's sent out on the next call to
+         * {@link #poll(long)}. This is used from all commits (sync, async, auto-commit).
+         */
+        OffsetCommitRequestState addOffsetCommitRequest(OffsetCommitRequestState request) {
+<span class="nc" id="L1414">            log.debug(&quot;Enqueuing OffsetCommit request for offsets: {}&quot;, request.offsets);</span>
+<span class="nc" id="L1415">            unsentOffsetCommits.add(request);</span>
+<span class="nc" id="L1416">            return request;</span>
+        }
+
+        /**
+         * &lt;p&gt;Adding an offset fetch request to the outgoing buffer.  If the same request was made and has not
+         * completed yet, we chain the future to the existing one.
+         *
+         * &lt;p&gt;If the request is new, it invokes a callback to remove itself from the {@code inflightOffsetFetches}
+         * upon completion.
+         */
+        private CompletableFuture&lt;OffsetFetchResult&gt; addOffsetFetchRequest(final OffsetFetchRequestState request) {
+            // A request that already completed cannot deliver a result anymore, but may still appear in the
+            // buffers while its completion callbacks run (removal from the buffer is itself one of those
+            // callbacks). Chaining onto it would complete the new request immediately with the stale outcome
+            // instead of sending it (e.g. re-failing the retry of a STALE_MEMBER_EPOCH error in a tight loop).
+<span class="nc" id="L1431">            Optional&lt;OffsetFetchRequestState&gt; dupe =</span>
+<span class="nc bnc" id="L1432" title="All 4 branches missed.">                    unsentOffsetFetches.stream().filter(r -&gt; r.sameRequest(request) &amp;&amp; !r.future.isDone()).findAny();</span>
+<span class="nc" id="L1433">            Optional&lt;OffsetFetchRequestState&gt; inflight =</span>
+<span class="nc bnc" id="L1434" title="All 4 branches missed.">                    inflightOffsetFetches.stream().filter(r -&gt; r.sameRequest(request) &amp;&amp; !r.future.isDone()).findAny();</span>
+
+<span class="nc bnc" id="L1436" title="All 4 branches missed.">            if (dupe.isPresent() || inflight.isPresent()) {</span>
+<span class="nc" id="L1437">                log.debug(&quot;Duplicated unsent offset fetch request found for partitions: {}&quot;, request.requestedPartitions);</span>
+<span class="nc" id="L1438">                dupe.orElseGet(inflight::get).chainFuture(request.future);</span>
+            } else {
+<span class="nc" id="L1440">                log.debug(&quot;Enqueuing offset fetch request for partitions: {}&quot;, request.requestedPartitions);</span>
+<span class="nc" id="L1441">                this.unsentOffsetFetches.add(request);</span>
+            }
+<span class="nc" id="L1443">            return request.future;</span>
+        }
+
+        /**
+         * Clear {@code unsentOffsetCommits} and moves all the sendable request in {@code
+         * unsentOffsetFetches} to the {@code inflightOffsetFetches} to bookkeep all the inflight
+         * requests. Note: Sendable requests are determined by their timer as we are expecting
+         * backoff on failed attempt. See {@link RequestState}.
+         */
+        List&lt;NetworkClientDelegate.UnsentRequest&gt; drain(final long currentTimeMs) {
+            // not ready to sent request
+<span class="nc" id="L1454">            List&lt;OffsetCommitRequestState&gt; unreadyCommitRequests = unsentOffsetCommits.stream()</span>
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">                .filter(request -&gt; !request.canSendRequest(currentTimeMs))</span>
+<span class="nc" id="L1456">                .collect(Collectors.toList());</span>
+
+<span class="nc" id="L1458">            failAndRemoveExpiredCommitRequests();</span>
+
+            // Add all unsent offset commit requests to the unsentRequests list
+<span class="nc" id="L1461">            List&lt;NetworkClientDelegate.UnsentRequest&gt; unsentRequests = unsentOffsetCommits.stream()</span>
+<span class="nc" id="L1462">                .filter(request -&gt; request.canSendRequest(currentTimeMs))</span>
+<span class="nc" id="L1463">                .peek(request -&gt; request.onSendAttempt(currentTimeMs))</span>
+<span class="nc" id="L1464">                .map(OffsetCommitRequestState::toUnsentRequest)</span>
+<span class="nc" id="L1465">                .collect(Collectors.toCollection(ArrayList::new));</span>
+
+            // Partition the unsent offset fetch requests into sendable and non-sendable lists
+<span class="nc" id="L1468">            Map&lt;Boolean, List&lt;OffsetFetchRequestState&gt;&gt; partitionedBySendability =</span>
+<span class="nc" id="L1469">                    unsentOffsetFetches.stream()</span>
+<span class="nc" id="L1470">                            .collect(Collectors.partitioningBy(request -&gt; request.canSendRequest(currentTimeMs)));</span>
+
+            // Add all sendable offset fetch requests to the unsentRequests list and to the inflightOffsetFetches list
+<span class="nc bnc" id="L1473" title="All 2 branches missed.">            for (OffsetFetchRequestState request : partitionedBySendability.get(true)) {</span>
+<span class="nc" id="L1474">                request.onSendAttempt(currentTimeMs);</span>
+<span class="nc" id="L1475">                unsentRequests.add(request.toUnsentRequest());</span>
+<span class="nc" id="L1476">                inflightOffsetFetches.add(request);</span>
+<span class="nc" id="L1477">            }</span>
+
+            // Clear the unsent offset commit and fetch lists and add all non-sendable offset fetch requests to the unsentOffsetFetches list
+<span class="nc" id="L1480">            clearAll();</span>
+<span class="nc" id="L1481">            unsentOffsetFetches.addAll(partitionedBySendability.get(false));</span>
+<span class="nc" id="L1482">            unsentOffsetCommits.addAll(unreadyCommitRequests);</span>
+
+<span class="nc" id="L1484">            return Collections.unmodifiableList(unsentRequests);</span>
+        }
+
+        /**
+         * Find the unsent commit requests that have expired, remove them and complete their
+         * futures with a TimeoutException.
+         */
+        private void failAndRemoveExpiredCommitRequests() {
+<span class="nc" id="L1492">            Queue&lt;OffsetCommitRequestState&gt; requestsToPurge = new LinkedList&lt;&gt;(unsentOffsetCommits);</span>
+<span class="nc" id="L1493">            requestsToPurge.forEach(RetriableRequestState::maybeExpire);</span>
+<span class="nc" id="L1494">        }</span>
+
+        private void clearAll() {
+<span class="nc" id="L1497">            unsentOffsetCommits.clear();</span>
+<span class="nc" id="L1498">            unsentOffsetFetches.clear();</span>
+<span class="nc" id="L1499">        }</span>
+
+        private List&lt;NetworkClientDelegate.UnsentRequest&gt; drainPendingCommits() {
+<span class="nc" id="L1502">            List&lt;NetworkClientDelegate.UnsentRequest&gt; res = unsentOffsetCommits.stream()</span>
+<span class="nc" id="L1503">                .map(OffsetCommitRequestState::toUnsentRequest)</span>
+<span class="nc" id="L1504">                .collect(Collectors.toCollection(ArrayList::new));</span>
+<span class="nc" id="L1505">            clearAll();</span>
+<span class="nc" id="L1506">            return res;</span>
+        }
+
+        private void maybeFailOnCoordinatorFatalError() {
+<span class="nc" id="L1510">            coordinatorRequestManager.fatalError().ifPresent(error -&gt; {</span>
+<span class="nc" id="L1511">                    log.warn(&quot;Failing all unsent commit requests and offset fetches because of coordinator fatal error. &quot;, error);</span>
+<span class="nc" id="L1512">                    unsentOffsetCommits.forEach(request -&gt; request.future.completeExceptionally(error));</span>
+<span class="nc" id="L1513">                    unsentOffsetFetches.forEach(request -&gt; request.future.completeExceptionally(error));</span>
+<span class="nc" id="L1514">                    clearAll();</span>
+<span class="nc" id="L1515">                }</span>
+            );
+<span class="nc" id="L1517">        }</span>
+    }
+
+    /**
+     * Encapsulates the state of auto-committing and manages the auto-commit timer.
+     */
+    private static class AutoCommitState {
+        private final Timer timer;
+        private final long autoCommitInterval;
+        private boolean hasInflightCommit;
+
+        private final Logger log;
+
+        public AutoCommitState(
+                final Time time,
+                final long autoCommitInterval,
+<span class="nc" id="L1533">                final LogContext logContext) {</span>
+<span class="nc" id="L1534">            this.autoCommitInterval = autoCommitInterval;</span>
+<span class="nc" id="L1535">            this.timer = time.timer(autoCommitInterval);</span>
+<span class="nc" id="L1536">            this.hasInflightCommit = false;</span>
+<span class="nc" id="L1537">            this.log = logContext.logger(getClass());</span>
+<span class="nc" id="L1538">        }</span>
+
+        public boolean shouldAutoCommit() {
+<span class="nc bnc" id="L1541" title="All 2 branches missed.">            if (!this.timer.isExpired()) {</span>
+<span class="nc" id="L1542">                return false;</span>
+            }
+<span class="nc bnc" id="L1544" title="All 2 branches missed.">            if (this.hasInflightCommit) {</span>
+<span class="nc" id="L1545">                log.trace(&quot;Skipping auto-commit on the interval because a previous one is still in-flight.&quot;);</span>
+<span class="nc" id="L1546">                return false;</span>
+            }
+<span class="nc" id="L1548">            return true;</span>
+        }
+
+        public void resetTimer() {
+<span class="nc" id="L1552">            this.timer.reset(autoCommitInterval);</span>
+<span class="nc" id="L1553">        }</span>
+
+        public void resetTimer(long retryBackoffMs) {
+<span class="nc" id="L1556">            this.timer.reset(retryBackoffMs);</span>
+<span class="nc" id="L1557">        }</span>
+
+        public long remainingMs(final long currentTimeMs) {
+<span class="nc" id="L1560">            this.timer.update(currentTimeMs);</span>
+            // KAFKA-20253: If the auto-commit interval has elapsed but a previous auto-commit is still
+            // in-flight (for example it cannot complete because the coordinator is unavailable after a
+            // failed re-authentication), a new auto-commit cannot be started yet. Returning 0 here would
+            // busy-spin the application thread, since this value feeds AsyncKafkaConsumer.pollForFetches()
+            // via maximumTimeToWait(). Wait for the interval instead; the network thread still wakes on the
+            // in-flight commit's response, which resets this timer.
+<span class="nc bnc" id="L1567" title="All 4 branches missed.">            if (this.timer.isExpired() &amp;&amp; this.hasInflightCommit) {</span>
+<span class="nc" id="L1568">                return autoCommitInterval;</span>
+            }
+<span class="nc" id="L1570">            return this.timer.remainingMs();</span>
+        }
+
+        public void updateTimer(final long currentTimeMs) {
+<span class="nc" id="L1574">            this.timer.update(currentTimeMs);</span>
+<span class="nc" id="L1575">        }</span>
+
+        public void setInflightCommitStatus(final boolean inflightCommitStatus) {
+<span class="nc" id="L1578">            this.hasInflightCommit = inflightCommitStatus;</span>
+<span class="nc" id="L1579">        }</span>
+    }
+
+<span class="nc" id="L1582">    static class MemberInfo {</span>
+<span class="nc" id="L1583">        String memberId = &quot;&quot;;</span>
+<span class="nc" id="L1584">        Optional&lt;Integer&gt; memberEpoch = Optional.empty();</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1588">            return &quot;memberId=&quot; + memberId +</span>
+<span class="nc bnc" id="L1589" title="All 2 branches missed.">                    &quot;, memberEpoch=&quot; + (memberEpoch.isPresent() ? memberEpoch.get() : &quot;undefined&quot;);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

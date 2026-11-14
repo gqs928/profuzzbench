@@ -1,0 +1,42 @@
+#ifndef IMAP_UTIL_H
+#define IMAP_UTIL_H
+
+#include "seq-range-array.h"
+#include "mail-types.h"
+
+struct imap_arg;
+
+/* Write flags as a space separated string. */
+void imap_write_flags(string_t *dest, enum mail_flags flags,
+		      const char *const *keywords) ATTR_NULL(3);
+/* Parse system flag from a string, or return 0 if it's invalid. */
+enum mail_flags imap_parse_system_flag(const char *str);
+
+/* Write sequence range as IMAP sequence-set */
+void imap_write_seq_range(string_t *dest, const ARRAY_TYPE(seq_range) *array);
+/* Write IMAP arg to the given string. Because IMAP_ARG_LITERAL_SIZE* have no
+   content, they're written as "{size}\r\n<too large>". */
+void imap_write_arg(string_t *dest, const struct imap_arg *arg);
+/* Same as imap_write_arg(), but write all the args until EOL. */
+void imap_write_args(string_t *dest, const struct imap_arg *args);
+/* Write IMAP args in a human-readable format to given string (e.g. for
+   logging). The output is a single valid UTF-8 line without control
+   characters. Multi-line literals are replaced with a generic placeholder. */
+void imap_write_args_for_human(string_t *dest, const struct imap_arg *args);
+/* Like imap_write_args(), but return the string allocated from data stack. */
+const char *imap_args_to_str(const struct imap_arg *args);
+
+/* Writes capabilities from boollist to string.
+   Capabilities beginning with IMAP4 are written first
+   to avoid breaking clients that expect IMAP4rev1 to be the first. */
+void imap_write_capability(string_t *dest, const ARRAY_TYPE(const_string) *capabilities);
+
+/* Match a token-prefix on an IMAP reply line. Returns TRUE if `line` begins
+   (case-insensitively) with `prefix` AND the next character is either
+   end-of-string or a space. On match, `*suffix_r` (when non-NULL) is set to
+   point past the trailing space (or to "" if the line ends right after the
+   prefix). On no match, `*suffix_r` is left untouched. */
+bool imap_reply_begins(const char *line, const char *prefix,
+		       const char **suffix_r);
+
+#endif

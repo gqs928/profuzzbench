@@ -1,0 +1,1179 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>InMemoryWindowStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">InMemoryWindowStore.java</span></div><h1>InMemoryWindowStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.kstream.internals.TimeWindow;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.internals.ChangelogRecordDeserializationHelper;
+import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
+import org.apache.kafka.streams.processor.internals.ProcessorContextUtils;
+import org.apache.kafka.streams.processor.internals.RecordBatchingStateRestoreCallback;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+import org.apache.kafka.streams.processor.internals.metrics.TaskMetrics;
+import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.ReadOnlyWindowStore;
+import org.apache.kafka.streams.state.WindowStore;
+import org.apache.kafka.streams.state.WindowStoreIterator;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.time.Instant;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentNavigableMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.function.Consumer;
+
+import static org.apache.kafka.streams.StreamsConfig.InternalConfig.IQ_CONSISTENCY_OFFSET_VECTOR_ENABLED;
+import static org.apache.kafka.streams.state.internals.WindowKeySchema.extractStoreKeyBytes;
+import static org.apache.kafka.streams.state.internals.WindowKeySchema.extractStoreTimestamp;
+
+public class InMemoryWindowStore implements WindowStore&lt;Bytes, byte[]&gt;, WithRetentionPeriod {
+
+<span class="nc" id="L69">    private static final Logger LOG = LoggerFactory.getLogger(InMemoryWindowStore.class);</span>
+    private static final int SEQNUM_SIZE = 4;
+
+    private final String name;
+    private final String metricScope;
+    private final long retentionPeriod;
+    private final long windowSize;
+    private final boolean retainDuplicates;
+
+<span class="nc" id="L78">    private final ConcurrentNavigableMap&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt; segmentMap = new ConcurrentSkipListMap&lt;&gt;();</span>
+<span class="nc" id="L79">    private final Set&lt;InMemoryWindowStoreIteratorWrapper&gt; openIterators = ConcurrentHashMap.newKeySet();</span>
+<span class="nc" id="L80">    private final Set&lt;KeyValueIterator&lt;?, ?&gt;&gt; openTransactionalIterators = ConcurrentHashMap.newKeySet();</span>
+
+    private InternalProcessorContext&lt;?, ?&gt; internalProcessorContext;
+    private Sensor expiredRecordSensor;
+<span class="nc" id="L84">    private int seqnum = 0;</span>
+<span class="nc" id="L85">    private long observedStreamTime = ConsumerRecord.NO_TIMESTAMP;</span>
+
+<span class="nc" id="L87">    private volatile boolean open = false;</span>
+
+    private final Position position;
+    private InMemoryWindowTransactionBuffer transactionBuffer;
+
+    public InMemoryWindowStore(final String name,
+                               final long retentionPeriod,
+                               final long windowSize,
+                               final boolean retainDuplicates,
+<span class="nc" id="L96">                               final String metricScope) {</span>
+<span class="nc" id="L97">        this.name = name;</span>
+<span class="nc" id="L98">        this.retentionPeriod = retentionPeriod;</span>
+<span class="nc" id="L99">        this.windowSize = windowSize;</span>
+<span class="nc" id="L100">        this.retainDuplicates = retainDuplicates;</span>
+<span class="nc" id="L101">        this.metricScope = metricScope;</span>
+<span class="nc" id="L102">        this.position = Position.emptyPosition();</span>
+<span class="nc" id="L103">    }</span>
+
+    @Override
+    public long retentionPeriod() {
+<span class="nc" id="L107">        return retentionPeriod;</span>
+    }
+
+    @Override
+    public String name() {
+<span class="nc" id="L112">        return name;</span>
+    }
+
+    @Override
+    public void init(final StateStoreContext stateStoreContext,
+                     final StateStore root) {
+<span class="nc" id="L118">        this.internalProcessorContext = ProcessorContextUtils.asInternalProcessorContext(stateStoreContext);</span>
+
+<span class="nc" id="L120">        final StreamsMetricsImpl metrics = ProcessorContextUtils.metricsImpl(stateStoreContext);</span>
+<span class="nc" id="L121">        final String threadId = Thread.currentThread().getName();</span>
+<span class="nc" id="L122">        final String taskName = stateStoreContext.taskId().toString();</span>
+<span class="nc" id="L123">        expiredRecordSensor = TaskMetrics.droppedRecordsSensor(</span>
+            threadId,
+            taskName,
+            metrics
+        );
+
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (root != null) {</span>
+<span class="nc" id="L130">            final boolean consistencyEnabled = StreamsConfig.InternalConfig.getBoolean(</span>
+<span class="nc" id="L131">                stateStoreContext.appConfigs(),</span>
+                IQ_CONSISTENCY_OFFSET_VECTOR_ENABLED,
+                false
+            );
+<span class="nc" id="L135">            stateStoreContext.register(</span>
+                root,
+                (RecordBatchingStateRestoreCallback) records -&gt; {
+<span class="nc" id="L138">                    synchronized (position) {</span>
+<span class="nc" id="L139">                        long expiredRecords = 0;</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">                        for (final ConsumerRecord&lt;byte[], byte[]&gt; record : records) {</span>
+<span class="nc" id="L141">                            final Bytes key = Bytes.wrap(extractStoreKeyBytes(record.key()));</span>
+<span class="nc" id="L142">                            final long windowStartTimestamp = extractStoreTimestamp(record.key());</span>
+<span class="nc" id="L143">                            observedStreamTime = Math.max(observedStreamTime, windowStartTimestamp);</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">                            if (windowStartTimestamp &lt;= observedStreamTime - retentionPeriod) {</span>
+<span class="nc" id="L145">                                expiredRecords++;</span>
+                            } else {
+                                // Write directly to the committed map: restored records are already committed.
+<span class="nc" id="L148">                                putInternal(key, record.value(), windowStartTimestamp);</span>
+                            }
+<span class="nc" id="L150">                            ChangelogRecordDeserializationHelper.applyChecksAndUpdatePosition(</span>
+                                record,
+                                consistencyEnabled,
+                                position
+                            );
+<span class="nc" id="L155">                        }</span>
+<span class="nc" id="L156">                        removeExpiredSegments();</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">                        if (expiredRecords &gt; 0) {</span>
+<span class="nc" id="L158">                            expiredRecordSensor.record(expiredRecords);</span>
+<span class="nc" id="L159">                            LOG.warn(&quot;Skipping {} records for expired segments.&quot;, expiredRecords);</span>
+                        }
+<span class="nc" id="L161">                    }</span>
+<span class="nc" id="L162">                }</span>
+            );
+        }
+<span class="nc" id="L165">        open = true;</span>
+
+<span class="nc" id="L167">        final boolean transactional = StreamsConfig.InternalConfig.getBoolean(</span>
+<span class="nc" id="L168">            stateStoreContext.appConfigs(),</span>
+            StreamsConfig.TRANSACTIONAL_STATE_STORES_CONFIG,
+            false);
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        if (transactional) {</span>
+<span class="nc" id="L172">            this.transactionBuffer = new InMemoryWindowTransactionBuffer(segmentMap, retainDuplicates);</span>
+        }
+<span class="nc" id="L174">    }</span>
+
+    @Override
+    public Position getPosition() {
+        // Mirror RocksDBStore#getPosition: report the uncommitted position (committed + staged) so the
+        // changelog consistency vector, which ChangeLogging*BytesStore writes at put() time via
+        // getPosition(), reflects the input position of the staged write. Otherwise a transactional
+        // store's changelog records carry the stale committed position and the position cannot be
+        // rebuilt when the store is restored from its changelog.
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        if (transactionBuffer != null) {</span>
+<span class="nc" id="L184">            synchronized (position) {</span>
+<span class="nc" id="L185">                return position.copy().merge(transactionBuffer.pendingPosition());</span>
+            }
+        }
+<span class="nc" id="L188">        return position;</span>
+    }
+
+    @Override
+    public void put(final Bytes key, final byte[] value, final long windowStartTimestamp) {
+<span class="nc" id="L193">        removeExpiredSegments();</span>
+<span class="nc" id="L194">        observedStreamTime = Math.max(observedStreamTime, windowStartTimestamp);</span>
+
+<span class="nc" id="L196">        synchronized (position) {</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (windowStartTimestamp &lt;= observedStreamTime - retentionPeriod) {</span>
+<span class="nc" id="L198">                expiredRecordSensor.record();</span>
+<span class="nc" id="L199">                LOG.warn(&quot;Skipping record for expired segment.&quot;);</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            } else if (transactionBuffer != null) {</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">                if (value != null) {</span>
+<span class="nc" id="L202">                    maybeUpdateSeqnumForDups();</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">                    final Bytes keyBytes = retainDuplicates ? wrapForDups(key, seqnum) : key;</span>
+<span class="nc" id="L204">                    transactionBuffer.stage(windowStartTimestamp, keyBytes, value);</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">                } else if (!retainDuplicates) {</span>
+                    // Skip if value is null and duplicates are allowed since this delete is a no-op
+<span class="nc" id="L207">                    transactionBuffer.stage(windowStartTimestamp, key, null);</span>
+                }
+            } else {
+<span class="nc" id="L210">                putInternal(key, value, windowStartTimestamp);</span>
+            }
+
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            if (transactionBuffer != null) {</span>
+<span class="nc" id="L214">                transactionBuffer.updatePosition(internalProcessorContext);</span>
+            } else {
+<span class="nc" id="L216">                StoreQueryUtils.updatePosition(position, internalProcessorContext);</span>
+            }
+<span class="nc" id="L218">        }</span>
+<span class="nc" id="L219">    }</span>
+
+    private void putInternal(final Bytes key, final byte[] value, final long windowStartTimestamp) {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (value != null) {</span>
+<span class="nc" id="L223">            maybeUpdateSeqnumForDups();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            final Bytes keyBytes = retainDuplicates ? wrapForDups(key, seqnum) : key;</span>
+<span class="nc" id="L225">            segmentMap.computeIfAbsent(windowStartTimestamp, t -&gt; new ConcurrentSkipListMap&lt;&gt;());</span>
+<span class="nc" id="L226">            segmentMap.get(windowStartTimestamp).put(keyBytes, value);</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">        } else if (!retainDuplicates) {</span>
+            // Skip if value is null and duplicates are allowed since this delete is a no-op
+<span class="nc" id="L229">            segmentMap.computeIfPresent(windowStartTimestamp, (t, kvMap) -&gt; {</span>
+<span class="nc" id="L230">                kvMap.remove(key);</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">                if (kvMap.isEmpty()) {</span>
+<span class="nc" id="L232">                    segmentMap.remove(windowStartTimestamp);</span>
+                }
+<span class="nc" id="L234">                return kvMap;</span>
+            });
+        }
+<span class="nc" id="L237">    }</span>
+
+    @Override
+    public byte[] fetch(final Bytes key, final long windowStartTimestamp) {
+<span class="nc" id="L241">        return fetch(key, windowStartTimestamp, IsolationLevel.READ_UNCOMMITTED);</span>
+    }
+
+    private byte[] fetch(final Bytes key, final long windowStartTimestamp, final IsolationLevel isolationLevel) {
+<span class="nc" id="L245">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+
+<span class="nc" id="L247">        removeExpiredSegments();</span>
+
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        if (windowStartTimestamp &lt;= observedStreamTime - retentionPeriod) {</span>
+<span class="nc" id="L250">            return null;</span>
+        }
+
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        if (transactionBuffer != null) {</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">            if (isolationLevel == IsolationLevel.READ_UNCOMMITTED) {</span>
+<span class="nc" id="L255">                final Optional&lt;byte[]&gt; staged = transactionBuffer.get(windowStartTimestamp, key);</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">                if (staged != null) {</span>
+<span class="nc" id="L257">                    return staged.orElse(null);</span>
+                }
+            }
+            // Committed read of the base map, taken under the buffer's snapshot read-lock so it
+            // cannot race a concurrent commit.
+<span class="nc" id="L262">            return transactionBuffer.getCommitted(windowStartTimestamp, key);</span>
+        }
+
+<span class="nc" id="L265">        final ConcurrentNavigableMap&lt;Bytes, byte[]&gt; kvMap = segmentMap.get(windowStartTimestamp);</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (kvMap == null) {</span>
+<span class="nc" id="L267">            return null;</span>
+        } else {
+<span class="nc" id="L269">            return kvMap.get(key);</span>
+        }
+    }
+
+    @Override
+    public WindowStoreIterator&lt;byte[]&gt; fetch(final Bytes key, final long timeFrom, final long timeTo) {
+<span class="nc" id="L275">        return fetch(key, timeFrom, timeTo, true);</span>
+    }
+
+    @Override
+    public WindowStoreIterator&lt;byte[]&gt; backwardFetch(final Bytes key, final long timeFrom, final long timeTo) {
+<span class="nc" id="L280">        return fetch(key, timeFrom, timeTo, false);</span>
+    }
+
+    WindowStoreIterator&lt;byte[]&gt; fetch(final Bytes key, final long timeFrom, final long timeTo, final boolean forward) {
+<span class="nc" id="L284">        return fetch(key, timeFrom, timeTo, forward, IsolationLevel.READ_UNCOMMITTED);</span>
+    }
+
+    private WindowStoreIterator&lt;byte[]&gt; fetch(final Bytes key, final long timeFrom, final long timeTo,
+                                              final boolean forward, final IsolationLevel isolationLevel) {
+<span class="nc" id="L289">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+
+<span class="nc" id="L291">        removeExpiredSegments();</span>
+
+        // add one b/c records expire exactly retentionPeriod ms after created
+<span class="nc" id="L294">        final long minTime = Math.max(timeFrom, observedStreamTime - retentionPeriod + 1);</span>
+
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if (timeTo &lt; minTime) {</span>
+<span class="nc" id="L297">            return WrappedInMemoryWindowStoreIterator.emptyIterator();</span>
+        }
+
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (transactionBuffer != null) {</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            final Bytes keyFrom = retainDuplicates ? wrapForDups(key, 0) : key;</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            final Bytes keyTo = retainDuplicates ? wrapForDups(key, Integer.MAX_VALUE) : key;</span>
+<span class="nc" id="L303">            return registerTransactional(new TransactionalWindowStoreIterator(</span>
+                transactionBuffer, keyFrom, keyTo, minTime, timeTo, forward, retainDuplicates, isolationLevel,
+<span class="nc" id="L305">                openTransactionalIterators::remove</span>
+            ));
+        }
+
+<span class="nc bnc" id="L309" title="All 2 branches missed.">        if (forward) {</span>
+<span class="nc" id="L310">            return registerNewWindowStoreIterator(</span>
+                key,
+<span class="nc" id="L312">                segmentMap.subMap(minTime, true, timeTo, true).entrySet().iterator(),</span>
+                true
+            );
+        } else {
+<span class="nc" id="L316">            return registerNewWindowStoreIterator(</span>
+                key,
+<span class="nc" id="L318">                segmentMap.subMap(minTime, true, timeTo, true).descendingMap().entrySet().iterator(),</span>
+                false
+            );
+        }
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetch(final Bytes keyFrom,
+                                                           final Bytes keyTo,
+                                                           final long timeFrom,
+                                                           final long timeTo) {
+<span class="nc" id="L329">        return fetch(keyFrom, keyTo, timeFrom, timeTo, true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetch(final Bytes keyFrom,
+                                                                   final Bytes keyTo,
+                                                                   final long timeFrom,
+                                                                   final long timeTo) {
+<span class="nc" id="L337">        return fetch(keyFrom, keyTo, timeFrom, timeTo, false);</span>
+    }
+
+    KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetch(final Bytes from,
+                                                    final Bytes to,
+                                                    final long timeFrom,
+                                                    final long timeTo,
+                                                    final boolean forward) {
+<span class="nc" id="L345">        return fetch(from, to, timeFrom, timeTo, forward, IsolationLevel.READ_UNCOMMITTED);</span>
+    }
+
+    private KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetch(final Bytes from,
+                                                            final Bytes to,
+                                                            final long timeFrom,
+                                                            final long timeTo,
+                                                            final boolean forward,
+                                                            final IsolationLevel isolationLevel) {
+<span class="nc" id="L354">        removeExpiredSegments();</span>
+
+<span class="nc bnc" id="L356" title="All 6 branches missed.">        if (from != null &amp;&amp; to != null &amp;&amp; from.compareTo(to) &gt; 0) {</span>
+<span class="nc" id="L357">            LOG.warn(&quot;Returning empty iterator for fetch with invalid key range: from &gt; to. &quot; +</span>
+                &quot;This may be due to range arguments set in the wrong order, &quot; +
+                &quot;or serdes that don't preserve ordering when lexicographically comparing the serialized bytes. &quot; +
+                &quot;Note that the built-in numerical serdes do not follow this for negative numbers&quot;);
+<span class="nc" id="L361">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+        // add one b/c records expire exactly retentionPeriod ms after created
+<span class="nc" id="L365">        final long minTime = Math.max(timeFrom, observedStreamTime - retentionPeriod + 1);</span>
+
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        if (timeTo &lt; minTime) {</span>
+<span class="nc" id="L368">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        if (transactionBuffer != null) {</span>
+<span class="nc bnc" id="L372" title="All 4 branches missed.">            final Bytes keyFrom = (retainDuplicates &amp;&amp; from != null) ? wrapForDups(from, 0) : from;</span>
+<span class="nc bnc" id="L373" title="All 4 branches missed.">            final Bytes keyTo = (retainDuplicates &amp;&amp; to != null) ? wrapForDups(to, Integer.MAX_VALUE) : to;</span>
+<span class="nc" id="L374">            return registerTransactional(new TransactionalWindowedKeyValueIterator(</span>
+                transactionBuffer, keyFrom, keyTo, minTime, timeTo, forward, retainDuplicates, windowSize, isolationLevel,
+<span class="nc" id="L376">                openTransactionalIterators::remove</span>
+            ));
+        }
+
+<span class="nc bnc" id="L380" title="All 2 branches missed.">        if (forward) {</span>
+<span class="nc" id="L381">            return registerNewWindowedKeyValueIterator(</span>
+                from,
+                to,
+<span class="nc" id="L384">                segmentMap.subMap(minTime, true, timeTo, true).entrySet().iterator(),</span>
+                true
+            );
+        } else {
+<span class="nc" id="L388">            return registerNewWindowedKeyValueIterator(</span>
+                from,
+                to,
+<span class="nc" id="L391">                segmentMap.subMap(minTime, true, timeTo, true).descendingMap().entrySet().iterator(),</span>
+                false
+            );
+        }
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetchAll(final long timeFrom, final long timeTo) {
+<span class="nc" id="L399">        return fetchAll(timeFrom, timeTo, true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetchAll(final long timeFrom, final long timeTo) {
+<span class="nc" id="L404">        return fetchAll(timeFrom, timeTo, false);</span>
+    }
+
+    KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetchAll(final long timeFrom, final long timeTo, final boolean forward) {
+<span class="nc" id="L408">        return fetchAll(timeFrom, timeTo, forward, IsolationLevel.READ_UNCOMMITTED);</span>
+    }
+
+    private KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetchAll(final long timeFrom, final long timeTo,
+                                                               final boolean forward,
+                                                               final IsolationLevel isolationLevel) {
+<span class="nc" id="L414">        removeExpiredSegments();</span>
+
+        // add one b/c records expire exactly retentionPeriod ms after created
+<span class="nc" id="L417">        final long minTime = Math.max(timeFrom, observedStreamTime - retentionPeriod + 1);</span>
+
+<span class="nc bnc" id="L419" title="All 2 branches missed.">        if (timeTo &lt; minTime) {</span>
+<span class="nc" id="L420">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+<span class="nc bnc" id="L423" title="All 2 branches missed.">        if (transactionBuffer != null) {</span>
+<span class="nc" id="L424">            return registerTransactional(new TransactionalWindowedKeyValueIterator(</span>
+                transactionBuffer, null, null, minTime, timeTo, forward, retainDuplicates, windowSize, isolationLevel,
+<span class="nc" id="L426">                openTransactionalIterators::remove</span>
+            ));
+        }
+
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        if (forward) {</span>
+<span class="nc" id="L431">            return registerNewWindowedKeyValueIterator(</span>
+                null,
+                null,
+<span class="nc" id="L434">                segmentMap.subMap(minTime, true, timeTo, true).entrySet().iterator(),</span>
+                true
+            );
+        } else {
+<span class="nc" id="L438">            return registerNewWindowedKeyValueIterator(</span>
+                null,
+                null,
+<span class="nc" id="L441">                segmentMap.subMap(minTime, true, timeTo, true).descendingMap().entrySet().iterator(),</span>
+                false
+            );
+        }
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; all() {
+<span class="nc" id="L449">        return all(true, IsolationLevel.READ_UNCOMMITTED);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardAll() {
+<span class="nc" id="L454">        return all(false, IsolationLevel.READ_UNCOMMITTED);</span>
+    }
+
+    private KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; all(final boolean forward,
+                                                          final IsolationLevel isolationLevel) {
+<span class="nc" id="L459">        removeExpiredSegments();</span>
+
+<span class="nc" id="L461">        final long minTime = observedStreamTime - retentionPeriod;</span>
+
+<span class="nc bnc" id="L463" title="All 2 branches missed.">        if (transactionBuffer != null) {</span>
+<span class="nc" id="L464">            return registerTransactional(new TransactionalWindowedKeyValueIterator(</span>
+                transactionBuffer, null, null, minTime + 1, Long.MAX_VALUE, forward, retainDuplicates, windowSize, isolationLevel,
+<span class="nc" id="L466">                openTransactionalIterators::remove</span>
+            ));
+        }
+
+<span class="nc bnc" id="L470" title="All 2 branches missed.">        final Iterator&lt;Map.Entry&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt;&gt; segIter = forward</span>
+<span class="nc" id="L471">            ? segmentMap.tailMap(minTime, false).entrySet().iterator()</span>
+<span class="nc" id="L472">            : segmentMap.tailMap(minTime, false).descendingMap().entrySet().iterator();</span>
+<span class="nc" id="L473">        return registerNewWindowedKeyValueIterator(null, null, segIter, forward);</span>
+    }
+
+    @Override
+    public boolean persistent() {
+<span class="nc" id="L478">        return false;</span>
+    }
+
+    @Override
+    public boolean isOpen() {
+<span class="nc" id="L483">        return open;</span>
+    }
+
+    @Override
+    public &lt;R&gt; QueryResult&lt;R&gt; query(final Query&lt;R&gt; query,
+                                    final PositionBound positionBound,
+                                    final QueryConfig config) {
+
+<span class="nc" id="L491">        synchronized (position) {</span>
+            // Mirror RocksDBStore#query: under READ_UNCOMMITTED, expose the writes staged in the
+            // transaction buffer since the last commit by merging the buffer's pending position
+            // deltas into a copy of the committed position. READ_COMMITTED (and the
+            // non-transactional store) query the committed position directly.
+            final Position queryPosition;
+<span class="nc bnc" id="L497" title="All 4 branches missed.">            if (transactionBuffer != null &amp;&amp; config.getIsolationLevel() == IsolationLevel.READ_UNCOMMITTED) {</span>
+<span class="nc" id="L498">                queryPosition = position.copy().merge(transactionBuffer.pendingPosition());</span>
+            } else {
+<span class="nc" id="L500">                queryPosition = position;</span>
+            }
+<span class="nc" id="L502">            return StoreQueryUtils.handleBasicQueries(</span>
+                query,
+                positionBound,
+                config,
+                this,
+                queryPosition,
+                internalProcessorContext
+            );
+        }
+    }
+
+    @Override
+    public ReadOnlyWindowStore&lt;Bytes, byte[]&gt; readOnly(final IsolationLevel isolationLevel) {
+<span class="nc" id="L515">        Objects.requireNonNull(isolationLevel, &quot;isolationLevel cannot be null&quot;);</span>
+<span class="nc" id="L516">        return new ReadOnlyView(isolationLevel);</span>
+    }
+
+    /**
+     * Read-only view of this store. For a transactional store the {@code isolationLevel} is passed
+     * down to the transactional read path (which excludes the staging layer under READ_COMMITTED), so
+     * both isolation levels share the one path and the read is snapshotted under the buffer's
+     * read-lock — an interactive query cannot race a concurrent commit. For a non-transactional store
+     * reads hit {@code segmentMap} directly.
+     */
+    private final class ReadOnlyView implements ReadOnlyWindowStore&lt;Bytes, byte[]&gt; {
+
+        private final IsolationLevel isolationLevel;
+
+<span class="nc" id="L530">        ReadOnlyView(final IsolationLevel isolationLevel) {</span>
+<span class="nc" id="L531">            this.isolationLevel = isolationLevel;</span>
+<span class="nc" id="L532">        }</span>
+
+        @Override
+        public byte[] fetch(final Bytes key, final long time) {
+<span class="nc" id="L536">            return InMemoryWindowStore.this.fetch(key, time, isolationLevel);</span>
+        }
+
+        @Override
+        public WindowStoreIterator&lt;byte[]&gt; fetch(final Bytes key, final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L541">            return InMemoryWindowStore.this.fetch(key, timeFrom.toEpochMilli(), timeTo.toEpochMilli(), true, isolationLevel);</span>
+        }
+
+        @Override
+        public WindowStoreIterator&lt;byte[]&gt; backwardFetch(final Bytes key, final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L546">            return InMemoryWindowStore.this.fetch(key, timeFrom.toEpochMilli(), timeTo.toEpochMilli(), false, isolationLevel);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetch(final Bytes keyFrom, final Bytes keyTo,
+                                                               final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L552">            return InMemoryWindowStore.this.fetch(keyFrom, keyTo, timeFrom.toEpochMilli(), timeTo.toEpochMilli(), true, isolationLevel);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetch(final Bytes keyFrom, final Bytes keyTo,
+                                                                        final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L558">            return InMemoryWindowStore.this.fetch(keyFrom, keyTo, timeFrom.toEpochMilli(), timeTo.toEpochMilli(), false, isolationLevel);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetchAll(final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L563">            return InMemoryWindowStore.this.fetchAll(timeFrom.toEpochMilli(), timeTo.toEpochMilli(), true, isolationLevel);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetchAll(final Instant timeFrom, final Instant timeTo) {
+<span class="nc" id="L568">            return InMemoryWindowStore.this.fetchAll(timeFrom.toEpochMilli(), timeTo.toEpochMilli(), false, isolationLevel);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; all() {
+<span class="nc" id="L573">            return InMemoryWindowStore.this.all(true, isolationLevel);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardAll() {
+<span class="nc" id="L578">            return InMemoryWindowStore.this.all(false, isolationLevel);</span>
+        }
+    }
+
+    @Override
+    public long approximateNumUncommittedBytes() {
+<span class="nc bnc" id="L584" title="All 2 branches missed.">        if (transactionBuffer != null) {</span>
+<span class="nc" id="L585">            return transactionBuffer.approximateNumUncommittedBytes();</span>
+        }
+<span class="nc" id="L587">        return 0;</span>
+    }
+
+    @Override
+    public void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        if (transactionBuffer != null) {</span>
+<span class="nc" id="L593">            synchronized (position) {</span>
+<span class="nc" id="L594">                transactionBuffer.mergePendingPositionInto(position);</span>
+<span class="nc" id="L595">                transactionBuffer.commit();</span>
+<span class="nc" id="L596">            }</span>
+        }
+<span class="nc" id="L598">    }</span>
+
+    @Override
+    public void close() {
+<span class="nc bnc" id="L602" title="All 2 branches missed.">        if (transactionBuffer != null) {</span>
+<span class="nc" id="L603">            transactionBuffer.rollback();</span>
+        }
+
+<span class="nc" id="L606">        final int openCount = openIterators.size() + openTransactionalIterators.size();</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">        if (openCount != 0) {</span>
+<span class="nc" id="L608">            LOG.warn(&quot;Closing {} open iterators for store {}&quot;, openCount, name);</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">            for (final InMemoryWindowStoreIteratorWrapper it : openIterators) {</span>
+<span class="nc" id="L610">                it.close();</span>
+<span class="nc" id="L611">            }</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">            for (final KeyValueIterator&lt;?, ?&gt; it : openTransactionalIterators) {</span>
+<span class="nc" id="L613">                it.close();</span>
+<span class="nc" id="L614">            }</span>
+        }
+
+<span class="nc" id="L617">        segmentMap.clear();</span>
+<span class="nc" id="L618">        openTransactionalIterators.clear();</span>
+<span class="nc" id="L619">        open = false;</span>
+<span class="nc" id="L620">    }</span>
+
+    private &lt;T extends KeyValueIterator&lt;?, ?&gt;&gt; T registerTransactional(final T iterator) {
+<span class="nc" id="L623">        openTransactionalIterators.add(iterator);</span>
+<span class="nc" id="L624">        return iterator;</span>
+    }
+
+    long numEntries() {
+<span class="nc" id="L628">        return segmentMap.values().stream()</span>
+<span class="nc" id="L629">            .mapToLong(Map::size)</span>
+<span class="nc" id="L630">            .sum();</span>
+    }
+
+    private void removeExpiredSegments() {
+<span class="nc" id="L634">        long minLiveTime = Math.max(0L, observedStreamTime - retentionPeriod + 1);</span>
+<span class="nc bnc" id="L635" title="All 2 branches missed.">        for (final InMemoryWindowStoreIteratorWrapper it : openIterators) {</span>
+<span class="nc" id="L636">            minLiveTime = Math.min(minLiveTime, it.minTime());</span>
+<span class="nc" id="L637">        }</span>
+<span class="nc" id="L638">        segmentMap.headMap(minLiveTime, false).clear();</span>
+<span class="nc" id="L639">    }</span>
+
+    private void maybeUpdateSeqnumForDups() {
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        if (retainDuplicates) {</span>
+<span class="nc" id="L643">            seqnum = (seqnum + 1) &amp; 0x7FFFFFFF;</span>
+        }
+<span class="nc" id="L645">    }</span>
+
+    private static Bytes wrapForDups(final Bytes key, final int seqnum) {
+<span class="nc" id="L648">        final ByteBuffer buf = ByteBuffer.allocate(key.get().length + SEQNUM_SIZE);</span>
+<span class="nc" id="L649">        buf.put(key.get());</span>
+<span class="nc" id="L650">        buf.putInt(seqnum);</span>
+
+<span class="nc" id="L652">        return Bytes.wrap(buf.array());</span>
+    }
+
+    private static Bytes getKey(final Bytes keyBytes) {
+<span class="nc" id="L656">        final byte[] bytes = new byte[keyBytes.get().length - SEQNUM_SIZE];</span>
+<span class="nc" id="L657">        System.arraycopy(keyBytes.get(), 0, bytes, 0, bytes.length);</span>
+<span class="nc" id="L658">        return Bytes.wrap(bytes);</span>
+    }
+
+    private WrappedInMemoryWindowStoreIterator registerNewWindowStoreIterator(final Bytes key,
+                                                                              final Iterator&lt;Map.Entry&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt;&gt; segmentIterator,
+                                                                              final boolean forward) {
+<span class="nc bnc" id="L664" title="All 2 branches missed.">        final Bytes keyFrom = retainDuplicates ? wrapForDups(key, 0) : key;</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">        final Bytes keyTo = retainDuplicates ? wrapForDups(key, Integer.MAX_VALUE) : key;</span>
+
+<span class="nc" id="L667">        final WrappedInMemoryWindowStoreIterator iterator =</span>
+<span class="nc" id="L668">            new WrappedInMemoryWindowStoreIterator(keyFrom, keyTo, segmentIterator, openIterators::remove, retainDuplicates, forward);</span>
+
+<span class="nc" id="L670">        openIterators.add(iterator);</span>
+<span class="nc" id="L671">        return iterator;</span>
+    }
+
+    private WrappedWindowedKeyValueIterator registerNewWindowedKeyValueIterator(final Bytes keyFrom,
+                                                                                final Bytes keyTo,
+                                                                                final Iterator&lt;Map.Entry&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt;&gt; segmentIterator,
+                                                                                final boolean forward) {
+<span class="nc bnc" id="L678" title="All 4 branches missed.">        final Bytes from = (retainDuplicates &amp;&amp; keyFrom != null) ? wrapForDups(keyFrom, 0) : keyFrom;</span>
+<span class="nc bnc" id="L679" title="All 4 branches missed.">        final Bytes to = (retainDuplicates &amp;&amp; keyTo != null) ? wrapForDups(keyTo, Integer.MAX_VALUE) : keyTo;</span>
+
+<span class="nc" id="L681">        final WrappedWindowedKeyValueIterator iterator =</span>
+            new WrappedWindowedKeyValueIterator(
+                from,
+                to,
+                segmentIterator,
+<span class="nc" id="L686">                openIterators::remove,</span>
+                retainDuplicates,
+                windowSize,
+                forward);
+<span class="nc" id="L690">        openIterators.add(iterator);</span>
+<span class="nc" id="L691">        return iterator;</span>
+    }
+
+    private static Bytes lowerBoundKey(final Bytes keyFrom) {
+        // The staged composite scan needs a non-null lower bound; empty bytes is the natural minimum.
+<span class="nc bnc" id="L696" title="All 2 branches missed.">        return keyFrom != null ? keyFrom : Bytes.wrap(new byte[0]);</span>
+    }
+
+    private static Bytes unwrapBound(final Bytes wrappedBound, final boolean retainDuplicates) {
+<span class="nc bnc" id="L700" title="All 2 branches missed.">        if (wrappedBound == null) {</span>
+<span class="nc" id="L701">            return null;</span>
+        }
+<span class="nc bnc" id="L703" title="All 2 branches missed.">        return retainDuplicates ? getKey(wrappedBound) : wrappedBound;</span>
+    }
+
+    /**
+     * Whether a stored (possibly seqnum-wrapped) key falls within the original key range. Needed
+     * because the staged composite scan is bounded only by timestamp (and, at the boundary
+     * timestamps, by wrapped-key order, which can admit out-of-range keys); the committed base
+     * iterator is already correctly bounded.
+     */
+    private static boolean keyInRange(final Bytes storedKey,
+                                      final Bytes unwrappedFrom,
+                                      final Bytes unwrappedTo,
+                                      final boolean retainDuplicates) {
+<span class="nc bnc" id="L716" title="All 2 branches missed.">        final Bytes key = retainDuplicates ? getKey(storedKey) : storedKey;</span>
+<span class="nc bnc" id="L717" title="All 6 branches missed.">        return (unwrappedFrom == null || key.compareTo(unwrappedFrom) &gt;= 0)</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">            &amp;&amp; (unwrappedTo == null || key.compareTo(unwrappedTo) &lt;= 0);</span>
+    }
+
+    /**
+     * A WindowStoreIterator over the transaction buffer's merge scan, exposing each entry's
+     * timestamp/value, filtered to the requested key.
+     */
+    private static class TransactionalWindowStoreIterator implements WindowStoreIterator&lt;byte[]&gt; {
+        private final KeyValueIterator&lt;InMemoryWindowTransactionBuffer.WindowEntryKey, byte[]&gt; delegate;
+        private final Bytes unwrappedFrom;
+        private final Bytes unwrappedTo;
+        private final boolean retainDuplicates;
+        private final Consumer&lt;KeyValueIterator&lt;?, ?&gt;&gt; deregister;
+        private KeyValue&lt;Long, byte[]&gt; prefetched;
+<span class="nc" id="L732">        private boolean closed = false;</span>
+
+        TransactionalWindowStoreIterator(
+                final InMemoryWindowTransactionBuffer buffer,
+                final Bytes keyFrom,
+                final Bytes keyTo,
+                final long timeFrom,
+                final long timeTo,
+                final boolean forward,
+                final boolean retainDuplicates,
+                final IsolationLevel isolationLevel,
+<span class="nc" id="L743">                final Consumer&lt;KeyValueIterator&lt;?, ?&gt;&gt; deregister) {</span>
+<span class="nc" id="L744">            this.retainDuplicates = retainDuplicates;</span>
+<span class="nc" id="L745">            this.deregister = deregister;</span>
+<span class="nc" id="L746">            this.unwrappedFrom = unwrapBound(keyFrom, retainDuplicates);</span>
+<span class="nc" id="L747">            this.unwrappedTo = unwrapBound(keyTo, retainDuplicates);</span>
+<span class="nc" id="L748">            final InMemoryWindowTransactionBuffer.WindowEntryKey from =</span>
+<span class="nc" id="L749">                new InMemoryWindowTransactionBuffer.WindowEntryKey(timeFrom, lowerBoundKey(keyFrom));</span>
+<span class="nc" id="L750">            final InMemoryWindowTransactionBuffer.WindowEntryKey to =</span>
+                new InMemoryWindowTransactionBuffer.WindowEntryKey(timeTo, keyTo);
+
+<span class="nc" id="L753">            this.delegate = buffer.range(from, to, forward, true, isolationLevel);</span>
+<span class="nc" id="L754">        }</span>
+
+        @Override
+        public Long peekNextKey() {
+<span class="nc bnc" id="L758" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L759">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L761">            return prefetched.key;</span>
+        }
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L766" title="All 2 branches missed.">            if (closed) {</span>
+<span class="nc" id="L767">                return false;</span>
+            }
+<span class="nc bnc" id="L769" title="All 2 branches missed.">            if (prefetched != null) {</span>
+<span class="nc" id="L770">                return true;</span>
+            }
+<span class="nc" id="L772">            prefetched = computeNext();</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">            return prefetched != null;</span>
+        }
+
+        @Override
+        public KeyValue&lt;Long, byte[]&gt; next() {
+<span class="nc bnc" id="L778" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L779">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L781">            final KeyValue&lt;Long, byte[]&gt; result = prefetched;</span>
+<span class="nc" id="L782">            prefetched = null;</span>
+<span class="nc" id="L783">            return result;</span>
+        }
+
+        @Override
+        public void close() {
+<span class="nc" id="L788">            closed = true;</span>
+<span class="nc" id="L789">            prefetched = null;</span>
+            try {
+<span class="nc" id="L791">                delegate.close();</span>
+            } finally {
+<span class="nc" id="L793">                deregister.accept(this);</span>
+            }
+<span class="nc" id="L795">        }</span>
+
+        private KeyValue&lt;Long, byte[]&gt; computeNext() {
+<span class="nc bnc" id="L798" title="All 2 branches missed.">            while (delegate.hasNext()) {</span>
+<span class="nc" id="L799">                final KeyValue&lt;InMemoryWindowTransactionBuffer.WindowEntryKey, byte[]&gt; entry = delegate.next();</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">                if (keyInRange(entry.key.key(), unwrappedFrom, unwrappedTo, retainDuplicates)) {</span>
+<span class="nc" id="L801">                    return new KeyValue&lt;&gt;(entry.key.timestamp(), entry.value);</span>
+                }
+<span class="nc" id="L803">            }</span>
+<span class="nc" id="L804">            return null;</span>
+        }
+    }
+
+    /**
+     * A Windowed KeyValueIterator over the transaction buffer's merge scan, filtered to the key
+     * range and with the stored (possibly seqnum-wrapped) key unwrapped.
+     */
+    private static class TransactionalWindowedKeyValueIterator implements KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; {
+        private final KeyValueIterator&lt;InMemoryWindowTransactionBuffer.WindowEntryKey, byte[]&gt; delegate;
+        private final Bytes unwrappedFrom;
+        private final Bytes unwrappedTo;
+        private final boolean retainDuplicates;
+        private final long windowSize;
+        private final Consumer&lt;KeyValueIterator&lt;?, ?&gt;&gt; deregister;
+        private KeyValue&lt;Windowed&lt;Bytes&gt;, byte[]&gt; prefetched;
+<span class="nc" id="L820">        private boolean closed = false;</span>
+
+        TransactionalWindowedKeyValueIterator(
+                final InMemoryWindowTransactionBuffer buffer,
+                final Bytes keyFrom,
+                final Bytes keyTo,
+                final long timeFrom,
+                final long timeTo,
+                final boolean forward,
+                final boolean retainDuplicates,
+                final long windowSize,
+                final IsolationLevel isolationLevel,
+<span class="nc" id="L832">                final Consumer&lt;KeyValueIterator&lt;?, ?&gt;&gt; deregister) {</span>
+<span class="nc" id="L833">            this.retainDuplicates = retainDuplicates;</span>
+<span class="nc" id="L834">            this.windowSize = windowSize;</span>
+<span class="nc" id="L835">            this.deregister = deregister;</span>
+<span class="nc" id="L836">            this.unwrappedFrom = unwrapBound(keyFrom, retainDuplicates);</span>
+<span class="nc" id="L837">            this.unwrappedTo = unwrapBound(keyTo, retainDuplicates);</span>
+<span class="nc" id="L838">            final InMemoryWindowTransactionBuffer.WindowEntryKey from =</span>
+<span class="nc" id="L839">                new InMemoryWindowTransactionBuffer.WindowEntryKey(timeFrom, lowerBoundKey(keyFrom));</span>
+<span class="nc" id="L840">            final InMemoryWindowTransactionBuffer.WindowEntryKey to =</span>
+                new InMemoryWindowTransactionBuffer.WindowEntryKey(timeTo, keyTo);
+
+<span class="nc" id="L843">            this.delegate = buffer.range(from, to, forward, true, isolationLevel);</span>
+<span class="nc" id="L844">        }</span>
+
+        @Override
+        public Windowed&lt;Bytes&gt; peekNextKey() {
+<span class="nc bnc" id="L848" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L849">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L851">            return prefetched.key;</span>
+        }
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L856" title="All 2 branches missed.">            if (closed) {</span>
+<span class="nc" id="L857">                return false;</span>
+            }
+<span class="nc bnc" id="L859" title="All 2 branches missed.">            if (prefetched != null) {</span>
+<span class="nc" id="L860">                return true;</span>
+            }
+<span class="nc" id="L862">            prefetched = computeNext();</span>
+<span class="nc bnc" id="L863" title="All 2 branches missed.">            return prefetched != null;</span>
+        }
+
+        @Override
+        public KeyValue&lt;Windowed&lt;Bytes&gt;, byte[]&gt; next() {
+<span class="nc bnc" id="L868" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L869">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L871">            final KeyValue&lt;Windowed&lt;Bytes&gt;, byte[]&gt; result = prefetched;</span>
+<span class="nc" id="L872">            prefetched = null;</span>
+<span class="nc" id="L873">            return result;</span>
+        }
+
+        @Override
+        public void close() {
+<span class="nc" id="L878">            closed = true;</span>
+<span class="nc" id="L879">            prefetched = null;</span>
+            try {
+<span class="nc" id="L881">                delegate.close();</span>
+            } finally {
+<span class="nc" id="L883">                deregister.accept(this);</span>
+            }
+<span class="nc" id="L885">        }</span>
+
+        private KeyValue&lt;Windowed&lt;Bytes&gt;, byte[]&gt; computeNext() {
+<span class="nc bnc" id="L888" title="All 2 branches missed.">            while (delegate.hasNext()) {</span>
+<span class="nc" id="L889">                final KeyValue&lt;InMemoryWindowTransactionBuffer.WindowEntryKey, byte[]&gt; entry = delegate.next();</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">                if (keyInRange(entry.key.key(), unwrappedFrom, unwrappedTo, retainDuplicates)) {</span>
+<span class="nc" id="L891">                    return new KeyValue&lt;&gt;(toWindowed(entry.key), entry.value);</span>
+                }
+<span class="nc" id="L893">            }</span>
+<span class="nc" id="L894">            return null;</span>
+        }
+
+        private Windowed&lt;Bytes&gt; toWindowed(final InMemoryWindowTransactionBuffer.WindowEntryKey entryKey) {
+<span class="nc bnc" id="L898" title="All 2 branches missed.">            final Bytes key = retainDuplicates ? getKey(entryKey.key()) : entryKey.key();</span>
+<span class="nc" id="L899">            long endTime = entryKey.timestamp() + windowSize;</span>
+<span class="nc bnc" id="L900" title="All 2 branches missed.">            if (endTime &lt; 0) {</span>
+<span class="nc" id="L901">                LOG.warn(&quot;Warning: window end time was truncated to Long.MAX&quot;);</span>
+<span class="nc" id="L902">                endTime = Long.MAX_VALUE;</span>
+            }
+<span class="nc" id="L904">            final TimeWindow timeWindow = new TimeWindow(entryKey.timestamp(), endTime);</span>
+<span class="nc" id="L905">            return new Windowed&lt;&gt;(key, timeWindow);</span>
+        }
+    }
+
+
+    interface ClosingCallback {
+        void deregisterIterator(final InMemoryWindowStoreIteratorWrapper iterator);
+    }
+
+    private abstract static class InMemoryWindowStoreIteratorWrapper {
+
+        private Iterator&lt;Map.Entry&lt;Bytes, byte[]&gt;&gt; recordIterator;
+        private KeyValue&lt;Bytes, byte[]&gt; next;
+        private long currentTime;
+
+        private final boolean allKeys;
+        private final Bytes keyFrom;
+        private final Bytes keyTo;
+        private final Iterator&lt;Map.Entry&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt;&gt; segmentIterator;
+        private final ClosingCallback callback;
+        private final boolean retainDuplicates;
+        private final boolean forward;
+
+        InMemoryWindowStoreIteratorWrapper(final Bytes keyFrom,
+                                           final Bytes keyTo,
+                                           final Iterator&lt;Map.Entry&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt;&gt; segmentIterator,
+                                           final ClosingCallback callback,
+                                           final boolean retainDuplicates,
+<span class="nc" id="L933">                                           final boolean forward) {</span>
+<span class="nc" id="L934">            this.keyFrom = keyFrom;</span>
+<span class="nc" id="L935">            this.keyTo = keyTo;</span>
+<span class="nc bnc" id="L936" title="All 4 branches missed.">            allKeys = (keyFrom == null) &amp;&amp; (keyTo == null);</span>
+<span class="nc" id="L937">            this.retainDuplicates = retainDuplicates;</span>
+<span class="nc" id="L938">            this.forward = forward;</span>
+
+<span class="nc" id="L940">            this.segmentIterator = segmentIterator;</span>
+<span class="nc" id="L941">            this.callback = callback;</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">            recordIterator = segmentIterator == null ? null : setRecordIterator();</span>
+<span class="nc" id="L943">        }</span>
+
+        public boolean hasNext() {
+<span class="nc bnc" id="L946" title="All 2 branches missed.">            if (next != null) {</span>
+<span class="nc" id="L947">                return true;</span>
+            }
+<span class="nc bnc" id="L949" title="All 6 branches missed.">            if (recordIterator == null || (!recordIterator.hasNext() &amp;&amp; !segmentIterator.hasNext())) {</span>
+<span class="nc" id="L950">                return false;</span>
+            }
+
+<span class="nc" id="L953">            next = getNext();</span>
+<span class="nc bnc" id="L954" title="All 2 branches missed.">            if (next == null) {</span>
+<span class="nc" id="L955">                return false;</span>
+            }
+
+<span class="nc bnc" id="L958" title="All 4 branches missed.">            if (allKeys || !retainDuplicates) {</span>
+<span class="nc" id="L959">                return true;</span>
+            }
+
+<span class="nc" id="L962">            final Bytes key = getKey(next.key);</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">            if (isKeyWithinRange(key)) {</span>
+<span class="nc" id="L964">                return true;</span>
+            } else {
+<span class="nc" id="L966">                next = null;</span>
+<span class="nc" id="L967">                return hasNext();</span>
+            }
+        }
+
+        private boolean isKeyWithinRange(final Bytes key) {
+            // split all cases for readability and avoid BooleanExpressionComplexity checkstyle warning
+<span class="nc bnc" id="L973" title="All 4 branches missed.">            if (keyFrom == null &amp;&amp; keyTo == null) {</span>
+                // fetch all
+<span class="nc" id="L975">                return true;</span>
+<span class="nc bnc" id="L976" title="All 2 branches missed.">            } else if (keyFrom == null) {</span>
+                // start from the beginning
+<span class="nc bnc" id="L978" title="All 2 branches missed.">                return key.compareTo(getKey(keyTo)) &lt;= 0;</span>
+<span class="nc bnc" id="L979" title="All 2 branches missed.">            } else if (keyTo == null) {</span>
+                // end to the last
+<span class="nc bnc" id="L981" title="All 2 branches missed.">                return key.compareTo(getKey(keyFrom)) &gt;= 0;</span>
+            } else {
+                // key is within the range
+<span class="nc bnc" id="L984" title="All 4 branches missed.">                return key.compareTo(getKey(keyFrom)) &gt;= 0 &amp;&amp; key.compareTo(getKey(keyTo)) &lt;= 0;</span>
+            }
+        }
+
+        public void close() {
+<span class="nc" id="L989">            next = null;</span>
+<span class="nc" id="L990">            recordIterator = null;</span>
+<span class="nc" id="L991">            callback.deregisterIterator(this);</span>
+<span class="nc" id="L992">        }</span>
+
+        // getNext is only called when either recordIterator or segmentIterator has a next
+        // Note this does not guarantee a next record exists as the next segments may not contain any keys in range
+        protected KeyValue&lt;Bytes, byte[]&gt; getNext() {
+<span class="nc bnc" id="L997" title="All 2 branches missed.">            while (!recordIterator.hasNext()) {</span>
+<span class="nc" id="L998">                recordIterator = setRecordIterator();</span>
+<span class="nc bnc" id="L999" title="All 2 branches missed.">                if (recordIterator == null) {</span>
+<span class="nc" id="L1000">                    return null;</span>
+                }
+            }
+<span class="nc" id="L1003">            final Map.Entry&lt;Bytes, byte[]&gt; nextRecord = recordIterator.next();</span>
+<span class="nc" id="L1004">            return new KeyValue&lt;&gt;(nextRecord.getKey(), nextRecord.getValue());</span>
+        }
+
+        // Resets recordIterator to point to the next segment and returns null if there are no more segments
+        // Note it may not actually point to anything if no keys in range exist in the next segment
+        Iterator&lt;Map.Entry&lt;Bytes, byte[]&gt;&gt; setRecordIterator() {
+<span class="nc bnc" id="L1010" title="All 2 branches missed.">            if (!segmentIterator.hasNext()) {</span>
+<span class="nc" id="L1011">                return null;</span>
+            }
+
+<span class="nc" id="L1014">            final Map.Entry&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt; currentSegment = segmentIterator.next();</span>
+<span class="nc" id="L1015">            currentTime = currentSegment.getKey();</span>
+
+            final ConcurrentNavigableMap&lt;Bytes, byte[]&gt; subMap;
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">            if (allKeys) { // keyFrom == null &amp;&amp; keyTo == null</span>
+<span class="nc" id="L1019">                subMap = currentSegment.getValue();</span>
+<span class="nc bnc" id="L1020" title="All 2 branches missed.">            } else if (keyFrom == null) {</span>
+<span class="nc" id="L1021">                subMap = currentSegment.getValue().headMap(keyTo, true);</span>
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">            } else if (keyTo == null) {</span>
+<span class="nc" id="L1023">                subMap = currentSegment.getValue().tailMap(keyFrom, true);</span>
+            } else {
+<span class="nc" id="L1025">                subMap = currentSegment.getValue().subMap(keyFrom, true, keyTo, true);</span>
+            }
+
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">            if (forward) {</span>
+<span class="nc" id="L1029">                return subMap.entrySet().iterator();</span>
+            } else {
+<span class="nc" id="L1031">                return subMap.descendingMap().entrySet().iterator();</span>
+            }
+        }
+
+        Long minTime() {
+<span class="nc" id="L1036">            return currentTime;</span>
+        }
+    }
+
+    private static class WrappedInMemoryWindowStoreIterator extends InMemoryWindowStoreIteratorWrapper implements WindowStoreIterator&lt;byte[]&gt; {
+
+        WrappedInMemoryWindowStoreIterator(final Bytes keyFrom,
+                                           final Bytes keyTo,
+                                           final Iterator&lt;Map.Entry&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt;&gt; segmentIterator,
+                                           final ClosingCallback callback,
+                                           final boolean retainDuplicates,
+                                           final boolean forward) {
+<span class="nc" id="L1048">            super(keyFrom, keyTo, segmentIterator, callback, retainDuplicates, forward);</span>
+<span class="nc" id="L1049">        }</span>
+
+        @Override
+        public Long peekNextKey() {
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L1054">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L1056">            return super.currentTime;</span>
+        }
+
+        @Override
+        public KeyValue&lt;Long, byte[]&gt; next() {
+<span class="nc bnc" id="L1061" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L1062">                throw new NoSuchElementException();</span>
+            }
+
+<span class="nc" id="L1065">            final KeyValue&lt;Long, byte[]&gt; result = new KeyValue&lt;&gt;(super.currentTime, super.next.value);</span>
+<span class="nc" id="L1066">            super.next = null;</span>
+<span class="nc" id="L1067">            return result;</span>
+        }
+
+        public static WrappedInMemoryWindowStoreIterator emptyIterator() {
+<span class="nc" id="L1071">            return new WrappedInMemoryWindowStoreIterator(null, null, null, it -&gt; {</span>
+<span class="nc" id="L1072">            }, false, true);</span>
+        }
+    }
+
+    private static class WrappedWindowedKeyValueIterator
+        extends InMemoryWindowStoreIteratorWrapper
+        implements KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; {
+
+        private final long windowSize;
+
+        WrappedWindowedKeyValueIterator(final Bytes keyFrom,
+                                        final Bytes keyTo,
+                                        final Iterator&lt;Map.Entry&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt;&gt; segmentIterator,
+                                        final ClosingCallback callback,
+                                        final boolean retainDuplicates,
+                                        final long windowSize,
+                                        final boolean forward) {
+<span class="nc" id="L1089">            super(keyFrom, keyTo, segmentIterator, callback, retainDuplicates, forward);</span>
+<span class="nc" id="L1090">            this.windowSize = windowSize;</span>
+<span class="nc" id="L1091">        }</span>
+
+        public Windowed&lt;Bytes&gt; peekNextKey() {
+<span class="nc bnc" id="L1094" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L1095">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L1097">            return getWindowedKey();</span>
+        }
+
+        public KeyValue&lt;Windowed&lt;Bytes&gt;, byte[]&gt; next() {
+<span class="nc bnc" id="L1101" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L1102">                throw new NoSuchElementException();</span>
+            }
+
+<span class="nc" id="L1105">            final KeyValue&lt;Windowed&lt;Bytes&gt;, byte[]&gt; result = new KeyValue&lt;&gt;(getWindowedKey(), super.next.value);</span>
+<span class="nc" id="L1106">            super.next = null;</span>
+<span class="nc" id="L1107">            return result;</span>
+        }
+
+        private Windowed&lt;Bytes&gt; getWindowedKey() {
+<span class="nc bnc" id="L1111" title="All 2 branches missed.">            final Bytes key = super.retainDuplicates ? getKey(super.next.key) : super.next.key;</span>
+<span class="nc" id="L1112">            long endTime = super.currentTime + windowSize;</span>
+
+<span class="nc bnc" id="L1114" title="All 2 branches missed.">            if (endTime &lt; 0) {</span>
+<span class="nc" id="L1115">                LOG.warn(&quot;Warning: window end time was truncated to Long.MAX&quot;);</span>
+<span class="nc" id="L1116">                endTime = Long.MAX_VALUE;</span>
+            }
+
+<span class="nc" id="L1119">            final TimeWindow timeWindow = new TimeWindow(super.currentTime, endTime);</span>
+<span class="nc" id="L1120">            return new Windowed&lt;&gt;(key, timeWindow);</span>
+        }
+    }
+
+    /**
+     * Yields each entry as an {@link InMemoryWindowTransactionBuffer.WindowEntryKey} keyed by the
+     * stored (possibly seqnum-wrapped) key. Reused by {@link InMemoryWindowTransactionBuffer} as the
+     * committed-side base iterator, so it merges in lock-step with the staged composite map; the
+     * store's transactional read wrappers unwrap the key afterwards.
+     */
+    static final class WindowEntryKeyIterator extends InMemoryWindowStoreIteratorWrapper
+        implements ManagedKeyValueIterator&lt;InMemoryWindowTransactionBuffer.WindowEntryKey, byte[]&gt; {
+
+        private Runnable closeCallback;
+
+        WindowEntryKeyIterator(final Bytes keyFrom,
+                               final Bytes keyTo,
+                               final Iterator&lt;Map.Entry&lt;Long, ConcurrentNavigableMap&lt;Bytes, byte[]&gt;&gt;&gt; segmentIterator,
+                               final boolean retainDuplicates,
+                               final boolean forward) {
+<span class="nc" id="L1140">            super(keyFrom, keyTo, segmentIterator, ignored -&gt; { }, retainDuplicates, forward);</span>
+<span class="nc" id="L1141">        }</span>
+
+        @Override
+        public InMemoryWindowTransactionBuffer.WindowEntryKey peekNextKey() {
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L1146">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L1148">            return new InMemoryWindowTransactionBuffer.WindowEntryKey(super.currentTime, super.next.key);</span>
+        }
+
+        @Override
+        public KeyValue&lt;InMemoryWindowTransactionBuffer.WindowEntryKey, byte[]&gt; next() {
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L1154">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L1156">            final KeyValue&lt;InMemoryWindowTransactionBuffer.WindowEntryKey, byte[]&gt; result =</span>
+                new KeyValue&lt;&gt;(new InMemoryWindowTransactionBuffer.WindowEntryKey(super.currentTime, super.next.key), super.next.value);
+<span class="nc" id="L1158">            super.next = null;</span>
+<span class="nc" id="L1159">            return result;</span>
+        }
+
+        @Override
+        public void onClose(final Runnable closeCallback) {
+<span class="nc" id="L1164">            this.closeCallback = closeCallback;</span>
+<span class="nc" id="L1165">        }</span>
+
+        @Override
+        public void close() {
+            try {
+<span class="nc" id="L1170">                super.close();</span>
+            } finally {
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">                if (closeCallback != null) {</span>
+<span class="nc" id="L1173">                    closeCallback.run();</span>
+                }
+            }
+<span class="nc" id="L1176">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

@@ -1,0 +1,1217 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "imap-common.h"
+#include "crc32.h"
+#include "numpack.h"
+#include "net.h"
+#include "ostream.h"
+#include "str.h"
+#include "str-sanitize.h"
+#include "compression.h"
+#include "imap-util.h"
+#include "mail-search-build.h"
+#include "mail-namespace.h"
+#include "mail-storage-private.h"
+#include "mailbox-recent-flags.h"
+#include "imap-client.h"
+#include "imap-feature.h"
+#include "imap-fetch.h"
+#include "imap-search-args.h"
+#include "imap-state.h"
+#include "imap-state-private.h"
+
+enum imap_state_type_public {
+	IMAP_STATE_TYPE_MAILBOX			= 'B',
+	IMAP_STATE_TYPE_COMPRESS		= 'C',
+	IMAP_STATE_TYPE_ENABLED_FEATURE		= 'F',
+	IMAP_STATE_TYPE_SEARCHRES		= '1',
+};
+
+enum imap_state_type_internal {
+	IMAP_STATE_TYPE_NAMESPACES		= 'N',
+	IMAP_STATE_TYPE_ID_LOGGED		= 'I',
+	IMAP_STATE_TYPE_TLS_COMPRESSION		= 'T',
+};
+
+/* The namespace flags that are visible to the client via the LIST and
+   NAMESPACE replies. */
+#define IMAP_STATE_NAMESPACE_FLAGS_MASK \
+	(NAMESPACE_FLAG_INBOX_USER | NAMESPACE_FLAG_INBOX_ANY | \
+	 NAMESPACE_FLAG_HIDDEN | NAMESPACE_FLAG_LIST_PREFIX | \
+	 NAMESPACE_FLAG_LIST_CHILDREN | NAMESPACE_FLAG_SUBSCRIPTIONS)
+
+struct mailbox_import_state {
+	const char *vname;
+	guid_128_t mailbox_guid;
+	bool examined;
+	uint32_t keywords_count, keywords_crc32, uids_crc32;
+	uint32_t uidvalidity, uidnext, messages;
+	uint64_t highest_modseq;
+	ARRAY_TYPE(seq_range) recent_uids;
+};
+
+void imap_state_export_seq_range(buffer_t *dest,
+				 const ARRAY_TYPE(seq_range) *range)
+{
+	const struct seq_range *uids;
+	unsigned int i, count;
+	uint32_t next_uid;
+
+	uids = array_get(range, &count);
+	numpack_encode(dest, count);
+	next_uid = 1;
+	for (i = 0; i < count; i++) {
+		i_assert(uids[i].seq1 >= next_uid);
+		if (uids[i].seq1 == uids[i].seq2) {
+			numpack_encode(dest, (uids[i].seq1 - next_uid) << 1);
+		} else {
+			numpack_encode(dest, 1 | ((uids[i].seq1 - next_uid) << 1));
+			numpack_encode(dest, uids[i].seq2 - uids[i].seq1 - 1);
+		}
+		next_uid = uids[i].seq2 + 1;
+	}
+}
+
+int imap_state_import_seq_range(const unsigned char **data,
+				const unsigned char *end,
+				ARRAY_TYPE(seq_range) *range)
+{
+	uint32_t i, count, next_uid, num, uid1, uid2;
+
+	if (numpack_decode32(data, end, &count) < 0)
+		return -1;
+	next_uid = 1;
+
+	for (i = 0; i < count; i++) {
+		if (numpack_decode32(data, end, &num) < 0)
+			return -1;
+		/* num>>1 is the gap from next_uid to this range's first UID.
+		   Reject if adding it to next_uid would overflow uint32_t. */
+		if ((num >> 1) > UINT32_MAX - next_uid)
+			return -1;
+		uid1 = next_uid + (num >> 1);
+		if ((num & 1) == 0) {
+			uid2 = uid1;
+			seq_range_array_add(range, uid1);
+		} else {
+			if (numpack_decode32(data, end, &num) < 0)
+				return -1;
+			/* uid2 = uid1 + num + 1; reject if that overflows. */
+			if (num >= UINT32_MAX - uid1)
+				return -1;
+			uid2 = uid1 + num + 1;
+			seq_range_array_add_range(range, uid1, uid2);
+		}
+		if (uid2 == UINT32_MAX) {
+			/* would wrap next_uid; only valid as the last range */
+			if (i + 1 != count)
+				return -1;
+			break;
+		}
+		next_uid = uid2 + 1;
+	}
+	return 0;
+}
+
+static int
+imap_state_export_check_delayed_expunges(struct client *client,
+					 const char **error_r)
+{
+	struct mailbox *box = client->mailbox;
+	const struct mail_index_header *view_hdr;
+	struct mail_index_view *head_view;
+	uint32_t seq1, seq2, old_count = 0;
+
+	/* Expunges that haven't been sent to the client yet can't be sent at
+	   unhibernation, so the client would have to relogin. Count how many
+	   of the messages known by the client's view still exist in the
+	   latest index state. Messages added after the view was synced
+	   have UIDs >= the view's UIDNEXT, so they aren't counted. */
+	view_hdr = mail_index_get_header(box->view);
+	/* Make sure expunges committed by other processes are seen. */
+	if (mail_index_refresh(box->index) < 0) {
+		mailbox_set_index_error(box);
+		*error_r = mailbox_get_last_internal_error(box, NULL);
+		return -1;
+	}
+	head_view = mail_index_view_open(box->index);
+	if (view_hdr->next_uid > 1 &&
+	    mail_index_lookup_seq_range(head_view, 1, view_hdr->next_uid - 1,
+					&seq1, &seq2))
+		old_count = seq2 - seq1 + 1;
+	mail_index_view_close(&head_view);
+
+	if (old_count != view_hdr->messages_count) {
+		*error_r = "Expunges not sent to client yet";
+		return 0;
+	}
+	return 1;
+}
+
+static int
+imap_state_export_check_nonidle(struct client *client, const char **error_r)
+{
+	i_assert(!client->syncing);
+
+	if ((client->set->parsed_workarounds & WORKAROUND_DELAY_NEWMAIL) != 0) {
+		/* Unhibernation sends EXISTS before the next command. This
+		   workaround exists to avoid that. */
+		*error_r = "delay-newmail workaround enabled";
+		return 0;
+	}
+	if (client->input_skip_line) {
+		*error_r = "Skipping the rest of a command line";
+		return 0;
+	}
+	if (array_is_created(&client->fetch_failed_uids) &&
+	    array_not_empty(&client->fetch_failed_uids)) {
+		*error_r = "FETCH failures pending";
+		return 0;
+	}
+	if (client->mailbox == NULL)
+		return 1;
+
+	if (mailbox_transaction_get_count(client->mailbox) > 0) {
+		*error_r = "Mailbox transactions open";
+		return 0;
+	}
+	if (client->sync_last_full_modseq == 0) {
+		/* checked again by the mailbox export */
+		*error_r = "No modseq tracking";
+		return 0;
+	}
+	return imap_state_export_check_delayed_expunges(client, error_r);
+}
+
+int imap_state_export_internal(struct client *client, buffer_t *dest,
+			       const char **error_r)
+{
+	int ret;
+
+	/* The only IMAP command we allow running is IDLE. Otherwise there must
+	   not be any commands running. */
+	if (client->command_queue_size > 1) {
+		*error_r = "Multiple commands in progress";
+		return 0;
+	}
+	if (client->command_queue != NULL &&
+	    strcasecmp(client->command_queue->name, "IDLE") != 0) {
+		*error_r = "Command in progress";
+		return 0;
+	}
+	if (client->command_queue == NULL) {
+		ret = imap_state_export_check_nonidle(client, error_r);
+		if (ret <= 0)
+			return ret;
+	}
+	return client->v.state_export(client, TRUE, dest, error_r);
+}
+
+static enum imap_state_result
+imap_state_import(struct client *client, bool internal,
+		  const unsigned char *data, size_t size, const char **error_r)
+{
+	size_t skip;
+
+	while (size > 0) {
+		enum imap_state_result ret = client->v.state_import(client, internal,
+					     data, size, &skip, error_r);
+		if (ret != IMAP_STATE_OK) {
+			i_assert(*error_r != NULL);
+			return ret;
+		}
+		i_assert(skip <= size);
+		data += skip;
+		size -= skip;
+	}
+	return IMAP_STATE_OK;
+}
+
+enum imap_state_result
+imap_state_import_internal(struct client *client,
+			   const unsigned char *data, size_t size,
+			   const char **error_r)
+{
+	return imap_state_import(client, TRUE, data, size, error_r);
+}
+
+enum imap_state_result
+imap_state_import_external(struct client *client,
+			   const unsigned char *data, size_t size,
+			   const char **error_r)
+{
+	return imap_state_import(client, FALSE, data, size, error_r);
+}
+
+static void
+imap_state_append_missing_caps(string_t *dest, const char *prefix,
+			       const char *const *caps,
+			       const char *const *other_caps)
+{
+	bool first = TRUE;
+
+	for (unsigned int i = 0; caps[i] != NULL; i++) {
+		if (str_array_icase_find(other_caps, caps[i]))
+			continue;
+		str_append(dest, first ? prefix : " ");
+		str_append(dest, caps[i]);
+		first = FALSE;
+	}
+}
+
+/* Returns a description of how the hibernated client's CAPABILITY differs
+   from the current one. */
+static const char *
+imap_state_capability_diff(const char *old_capability,
+			   const char *new_capability)
+{
+	const char *const *old_caps = t_strsplit_spaces(old_capability, " ");
+	const char *const *new_caps = t_strsplit_spaces(new_capability, " ");
+	string_t *str = t_str_new(64);
+
+	imap_state_append_missing_caps(str, "removed: ", old_caps, new_caps);
+	imap_state_append_missing_caps(str, str_len(str) == 0 ?
+				       "added: " : ", added: ",
+				       new_caps, old_caps);
+	if (str_len(str) == 0) {
+		/* only the order changed */
+		str_printfa(str, "'%s' -> '%s'", old_capability, new_capability);
+	}
+	return str_c(str);
+}
+
+enum imap_state_result
+imap_state_verify_capability(struct client *client, const char *old_capability,
+			     const char **error_r)
+{
+	const char *capability;
+
+	if (old_capability == NULL) {
+		/* The client was hibernated by an older Dovecot version, which
+		   didn't send the CAPABILITY. It can't be verified to be
+		   unchanged, so don't continue the session. */
+		*error_r = "CAPABILITY missing";
+		return IMAP_STATE_INCONSISTENT;
+	}
+	capability = client->capability_string == NULL ? "" :
+		str_c(client->capability_string);
+	/* capabilities are case-insensitive */
+	if (strcasecmp(old_capability, capability) != 0) {
+		*error_r = t_strdup_printf("CAPABILITY has changed (%s)",
+			imap_state_capability_diff(old_capability, capability));
+		return IMAP_STATE_INCONSISTENT;
+	}
+	return IMAP_STATE_OK;
+}
+
+static int
+imap_state_export_mailbox_mails(buffer_t *dest, struct mailbox *box,
+				const char **error_r)
+{
+	struct mailbox_transaction_context *trans;
+	struct mail_search_args *search_args;
+	struct mail_search_context *search_ctx;
+	struct mail *mail;
+	ARRAY_TYPE(seq_range) recent_uids;
+	uint32_t crc = 0;
+	int ret = 1;
+
+	search_args = mail_search_build_init();
+	mail_search_build_add_all(search_args);
+
+	trans = mailbox_transaction_begin(box, 0,
+				"unhibernate imap_state_export_mailbox_mails");
+	search_ctx = mailbox_search_init(trans, search_args, NULL, 0, NULL);
+	mail_search_args_unref(&search_args);
+
+	t_array_init(&recent_uids, 8);
+	while (mailbox_search_next(search_ctx, &mail)) {
+		crc = crc32_data_more(crc, &mail->uid, sizeof(mail->uid));
+		if ((mail_get_flags(mail) & MAIL_RECENT) != 0)
+			seq_range_array_add(&recent_uids, mail->uid);
+	}
+	if (mailbox_search_deinit(&search_ctx) < 0) {
+		*error_r = mailbox_get_last_internal_error(box, NULL);
+		ret = -1;
+	}
+	(void)mailbox_transaction_commit(&trans);
+
+	numpack_encode(dest, crc);
+	imap_state_export_seq_range(dest, &recent_uids);
+	return ret;
+}
+
+static uint32_t
+mailbox_status_keywords_crc32(const struct mailbox_status *status)
+{
+	const char *str;
+	uint32_t crc = 0;
+
+	array_foreach_elem(status->keywords, str)
+		crc = crc32_str(str);
+	return crc;
+}
+
+static int
+imap_state_export_mailbox(buffer_t *dest, struct client *client,
+			  struct mailbox *box, const char **error_r)
+{
+        struct mailbox_status status;
+	struct mailbox_metadata metadata;
+	const char *vname = mailbox_get_vname(box);
+	enum mail_error mail_error;
+
+	mailbox_get_open_status(box, STATUS_UIDVALIDITY | STATUS_UIDNEXT |
+				STATUS_MESSAGES | STATUS_HIGHESTMODSEQ |
+				STATUS_KEYWORDS,
+				&status);
+	if (status.nonpermanent_modseqs) {
+		*error_r = "Nonpermanent modseqs";
+		return 0;
+	}
+	if (client->sync_last_full_modseq == 0) {
+		*error_r = "No modseq tracking";
+		return 0;
+	}
+
+	if (mailbox_get_metadata(box, MAILBOX_METADATA_GUID, &metadata) < 0) {
+		*error_r = mailbox_get_last_internal_error(box, &mail_error);
+		/* if the selected mailbox can't have a GUID, fail silently */
+		return mail_error == MAIL_ERROR_NOTPOSSIBLE ? 0 : -1;
+	}
+
+	buffer_append_c(dest, IMAP_STATE_TYPE_MAILBOX);
+	buffer_append(dest, vname, strlen(vname)+1);
+	buffer_append(dest, metadata.guid, sizeof(metadata.guid));
+
+	buffer_append_c(dest, client->mailbox_examined ? 1 : 0);
+	numpack_encode(dest, status.uidvalidity);
+	numpack_encode(dest, status.uidnext);
+	numpack_encode(dest, status.messages);
+	/* The view's highest_modseq may already be past expunges that
+	   haven't been sent to the client yet. */
+	numpack_encode(dest, client->sync_last_full_modseq);
+
+	/* keywords count + CRC32 should be enough to figure out if it
+	   needs to be resent */
+	numpack_encode(dest, array_count(status.keywords));
+	numpack_encode(dest, mailbox_status_keywords_crc32(&status));
+
+	/* we're now basically done, but just in case there's a bug add a
+	   checksum of the currently existing UIDs and verify it when
+	   importing. this also writes the list of recent UIDs. */
+	return imap_state_export_mailbox_mails(dest, box, error_r);
+}
+
+/* Returns a string that describes the namespaces as the client sees them. */
+static const char *imap_state_namespaces_string(struct mail_user *user)
+{
+	struct mail_namespace *ns;
+	string_t *str = t_str_new(128);
+
+	for (ns = user->namespaces; ns != NULL; ns = ns->next) {
+		/* Shared namespaces are created on demand, so they don't
+		   necessarily exist in both processes. */
+		if ((ns->flags & NAMESPACE_FLAG_AUTOCREATED) != 0)
+			continue;
+		if (str_len(str) > 0)
+			str_append_c(str, '\n');
+		str_printfa(str, "%u:%x:%c:%s", (unsigned int)ns->type,
+			    (unsigned int)(ns->flags &
+					   IMAP_STATE_NAMESPACE_FLAGS_MASK),
+			    mail_namespace_get_sep(ns), ns->prefix);
+	}
+	return str_c(str);
+}
+
+int imap_state_export_base(struct client *client, bool internal,
+			   buffer_t *dest, const char **error_r)
+{
+	int ret;
+
+	str_append(dest, "base\n");
+	if (array_is_created(&client->search_updates) &&
+	    array_count(&client->search_updates) > 0) {
+		/* these could be tricky */
+		*error_r = "CONTEXT=SEARCH updates not supported currently";
+		return 0;
+	}
+	if (client->notify_ctx != NULL) {
+		/* FIXME: this really should be supported. also IDLE wouldn't
+		   be needed if NOTIFY allows sending EXPUNGEs to selected
+		   mailbox. */
+		*error_r = "NOTIFY not supported currently";
+		return 0;
+	}
+	if (client->compress_handler != NULL &&
+	    client->multiplex_output == NULL && internal) {
+		*error_r = "COMPRESS enabled without multiplex ostream";
+		return 0;
+	}
+
+	if (internal) {
+		/* The client has seen the namespaces' prefixes and separators
+		   in the LIST and NAMESPACE replies. The configuration may be
+		   reloaded while the client is hibernated, so the unhibernating
+		   imap process verifies that they're still the same. */
+		const char *namespaces =
+			imap_state_namespaces_string(client->user);
+		buffer_append_c(dest, IMAP_STATE_TYPE_NAMESPACES);
+		buffer_append(dest, namespaces, strlen(namespaces) + 1);
+	}
+
+	if (client->mailbox != NULL) {
+		ret = imap_state_export_mailbox(dest, client,
+						client->mailbox, error_r);
+		if (ret <= 0)
+			return ret;
+	}
+
+	/* IMAP features */
+	const char *const *features = client_enabled_features(client);
+	if (features != NULL) {
+		for (unsigned int i = 0; features[i] != NULL; i++) {
+			buffer_append_c(dest, IMAP_STATE_TYPE_ENABLED_FEATURE);
+			buffer_append(dest, features[i], strlen(features[i])+1);
+		}
+	}
+	if (internal) {
+		if (client->id_logged)
+			buffer_append_c(dest, IMAP_STATE_TYPE_ID_LOGGED);
+		if (client->tls_compression)
+			buffer_append_c(dest, IMAP_STATE_TYPE_TLS_COMPRESSION);
+	}
+
+	/* IMAP SEARCHRES extension */
+	if (array_is_created(&client->search_saved_uidset) &&
+	    array_count(&client->search_saved_uidset) > 0) {
+		buffer_append_c(dest, IMAP_STATE_TYPE_SEARCHRES);
+		imap_state_export_seq_range(dest, &client->search_saved_uidset);
+	}
+	/* COMPRESS extension */
+	if (client->compress_handler != NULL) {
+		buffer_append_c(dest, IMAP_STATE_TYPE_COMPRESS);
+		buffer_append(dest, client->compress_handler->name,
+			      strlen(client->compress_handler->name) + 1);
+	}
+	return 1;
+}
+
+int imap_state_import_string(const unsigned char **data,
+			     const unsigned char *end, const char **str_r)
+{
+	const unsigned char *p;
+
+	i_assert(*data <= end);
+
+	p = memchr(*data, '\0', end - *data);
+	if (p == NULL)
+		return -1;
+	*str_r = (const void *)*data;
+	*data = p + 1;
+	return 0;
+}
+
+static enum imap_state_result
+import_send_expunges(struct client *client,
+		     const struct mailbox_import_state *state,
+		     unsigned int *expunge_count_r,
+		     const char **error_r)
+{
+	struct mailbox_transaction_context *trans;
+	struct mail_search_args *search_args;
+	struct mail_search_context *search_ctx;
+	struct mail *mail;
+	uint32_t crc = 0, seq, expunged_uid;
+	ARRAY_TYPE(seq_range) uids_filter, expunged_uids;
+	ARRAY_TYPE(uint32_t) expunged_seqs;
+	struct seq_range_iter iter;
+	const uint32_t *seqs;
+	unsigned int i, expunge_count, n = 0;
+	string_t *str;
+	int ret = 0;
+
+	*expunge_count_r = 0;
+
+	if (state->messages == 0) {
+		/* the mailbox was empty originally - there couldn't be any
+		   pending expunges. */
+		return IMAP_STATE_OK;
+	}
+	if (state->uidnext <= 1) {
+		*error_r = "Invalid UIDNEXT";
+		return IMAP_STATE_ERROR;
+	}
+
+	/* get all the message UIDs expunged since the last known modseq */
+	t_array_init(&uids_filter, 1);
+	t_array_init(&expunged_uids, 128);
+	seq_range_array_add_range(&uids_filter, 1, state->uidnext-1);
+	if (!mailbox_get_expunged_uids(client->mailbox, state->highest_modseq,
+				       &uids_filter, &expunged_uids)) {
+		/* The transaction log no longer goes back to the saved
+		   modseq, or reading it failed. lib-index has already logged
+		   the read errors. Either way the expunges can't be found,
+		   so the client must relogin. */
+		*error_r = t_strdup_printf(
+			"Couldn't find expunges since hibernation "
+			"(uidnext=%u highest_modseq=%"PRIu64")",
+			state->uidnext, state->highest_modseq);
+		return IMAP_STATE_INCONSISTENT;
+	}
+	if (client->state_import_nonidle &&
+	    array_not_empty(&expunged_uids)) {
+		/* The client's next command hasn't started yet, so EXPUNGEs
+		   can't be sent. The client's sequence numbers can't be kept
+		   in sync. */
+		*error_r = t_strdup_printf(
+			"%u messages expunged during hibernation",
+			seq_range_count(&expunged_uids));
+		return IMAP_STATE_INCONSISTENT;
+	}
+	seq_range_array_iter_init(&iter, &expunged_uids);
+
+	search_args = mail_search_build_init();
+	mail_search_build_add_all(search_args);
+
+	trans = mailbox_transaction_begin(client->mailbox, 0,
+					  "unhibernate import_send_expunges");
+	search_ctx = mailbox_search_init(trans, search_args, NULL, 0, NULL);
+	mail_search_args_unref(&search_args);
+
+	/* find sequence numbers for the expunged UIDs */
+	t_array_init(&expunged_seqs, array_count(&expunged_uids)+1); seq = 0;
+	while (mailbox_search_next(search_ctx, &mail)) {
+		while (seq_range_array_iter_nth(&iter, n, &expunged_uid) &&
+		       expunged_uid < mail->uid && seq < state->messages) {
+			seq++; n++;
+			array_push_back(&expunged_seqs, &seq);
+			crc = crc32_data_more(crc, &expunged_uid,
+					      sizeof(expunged_uid));
+		}
+		if (seq == state->messages)
+			break;
+		crc = crc32_data_more(crc, &mail->uid, sizeof(mail->uid));
+		if (++seq == state->messages)
+			break;
+	}
+	while (seq_range_array_iter_nth(&iter, n, &expunged_uid) &&
+	       seq < state->messages) {
+		seq++; n++;
+		array_push_back(&expunged_seqs, &seq);
+		crc = crc32_data_more(crc, &expunged_uid,
+				      sizeof(expunged_uid));
+	}
+
+	if (mailbox_search_deinit(&search_ctx) < 0) {
+		*error_r = mailbox_get_last_internal_error(client->mailbox, NULL);
+		ret = -1;
+	} else if (seq != state->messages) {
+		*error_r = t_strdup_printf("Message count mismatch after "
+					   "handling expunges (%u != %u)",
+					   seq, state->messages);
+		ret = -1;
+	}
+	(void)mailbox_transaction_commit(&trans);
+	if (ret < 0)
+		return IMAP_STATE_ERROR;
+
+	seqs = array_get(&expunged_seqs, &expunge_count);
+	if (client->messages_count + expunge_count < state->messages) {
+		*error_r = t_strdup_printf("Message count too low after "
+					   "handling expunges (%u < %u)",
+					   client->messages_count + expunge_count,
+					   state->messages);
+		return IMAP_STATE_ERROR;
+	}
+	if (crc != state->uids_crc32) {
+		*error_r = t_strdup_printf("Message UIDs CRC32 mismatch (%u != %u)",
+					   crc, state->uids_crc32);
+		return IMAP_STATE_ERROR;
+	}
+
+	if (!client_has_enabled(client, imap_feature_qresync)) {
+		str = t_str_new(32);
+		for (i = expunge_count; i > 0; i--) {
+			str_truncate(str, 0);
+			str_printfa(str, "* %u EXPUNGE", seqs[i-1]);
+			client_send_line(client, str_c(str));
+		}
+	} else {
+		str = str_new(default_pool, 128);
+		str_append(str, "* VANISHED ");
+		imap_write_seq_range(str, &expunged_uids);
+		str_append(str, "\r\n");
+		o_stream_nsend(client->output, str_data(str), str_len(str));
+		str_free(&str);
+	}
+	*expunge_count_r = expunge_count;
+	return IMAP_STATE_OK;
+}
+
+static int
+import_send_flag_changes(struct client *client,
+			 const struct mailbox_import_state *state,
+			 unsigned int *flag_change_count_r)
+{
+	bool utf8 = client_has_enabled(client, imap_feature_utf8accept);
+	struct imap_fetch_context *fetch_ctx;
+	struct mail_search_args *search_args;
+	ARRAY_TYPE(seq_range) old_uids;
+	pool_t pool;
+	int ret;
+
+	*flag_change_count_r = 0;
+	if (state->messages == 0)
+		return 0;
+
+	t_array_init(&old_uids, 1);
+	seq_range_array_add_range(&old_uids, 1, state->uidnext-1);
+
+	search_args = mail_search_build_init();
+	search_args->args = p_new(search_args->pool, struct mail_search_arg, 1);
+	search_args->args->type = SEARCH_UIDSET;
+	search_args->args->value.seqset = old_uids;
+	imap_search_add_changed_since(search_args, state->highest_modseq);
+
+	pool = pool_alloconly_create("imap state flag changes", 1024);
+	fetch_ctx = imap_fetch_alloc(client, pool, "unhibernate", utf8);
+	pool_unref(&pool);
+
+	imap_fetch_init_nofail_handler(fetch_ctx, imap_fetch_flags_init);
+	if (client_has_enabled(client, imap_feature_qresync)) {
+		imap_fetch_init_nofail_handler(fetch_ctx, imap_fetch_uid_init);
+		imap_fetch_init_nofail_handler(fetch_ctx, imap_fetch_modseq_init);
+	}
+
+	imap_fetch_begin(fetch_ctx, client->mailbox, search_args);
+	mail_search_args_unref(&search_args);
+
+	/* FIXME: ideally do this asynchronously.. */
+	while (imap_fetch_more_no_lock_update(fetch_ctx) == 0) ;
+
+	ret = imap_fetch_end(fetch_ctx);
+	*flag_change_count_r = fetch_ctx->fetched_mails_count;
+	imap_fetch_free(&fetch_ctx);
+	return ret;
+}
+
+static ssize_t
+import_state_mailbox_struct(const unsigned char *data, size_t size,
+			    struct mailbox_import_state *state_r,
+			    const char **error_r)
+{
+	const unsigned char *p = data, *end = data + size;
+
+	i_zero(state_r);
+	t_array_init(&state_r->recent_uids, 8);
+
+	/* vname */
+	if (imap_state_import_string(&p, end, &state_r->vname) < 0) {
+		*error_r = "Mailbox state truncated at name";
+		return 0;
+	}
+
+	/* GUID */
+	if (end-p < (int)sizeof(state_r->mailbox_guid)) {
+		*error_r = "Mailbox state truncated at GUID";
+		return 0;
+	}
+	memcpy(state_r->mailbox_guid, p, sizeof(state_r->mailbox_guid));
+	p += sizeof(state_r->mailbox_guid);
+
+	if (guid_128_is_empty(state_r->mailbox_guid)) {
+		*error_r = "Empty GUID";
+		return 0;
+	}
+
+	/* EXAMINEd vs SELECTed */
+	if (p == end) {
+		*error_r = "Mailbox state truncated at examined-flag";
+		return 0;
+	}
+	state_r->examined = p[0] != 0;
+	p++;
+
+	/* mailbox state */
+	if (numpack_decode32(&p, end, &state_r->uidvalidity) < 0 ||
+	    numpack_decode32(&p, end, &state_r->uidnext) < 0 ||
+	    numpack_decode32(&p, end, &state_r->messages) < 0 ||
+	    numpack_decode(&p, end, &state_r->highest_modseq) < 0 ||
+	    numpack_decode32(&p, end, &state_r->keywords_count) < 0 ||
+	    numpack_decode32(&p, end, &state_r->keywords_crc32) < 0 ||
+	    numpack_decode32(&p, end, &state_r->uids_crc32) < 0 ||
+	    imap_state_import_seq_range(&p, end, &state_r->recent_uids) < 0) {
+		*error_r = "Mailbox state truncated";
+		return 0;
+	}
+	if (state_r->uidvalidity == 0) {
+		*error_r = "Empty UIDVALIDITY";
+		return 0;
+	}
+	if (state_r->uidnext == 0) {
+		*error_r = "Empty UIDNEXT";
+		return 0;
+	}
+	return p - data;
+}
+
+/* Returns the result for a mailbox operation that failed while unhibernating
+   the client. If the mailbox was deleted, the client's state can't be restored
+   anymore, but it's not an internal error either - the client just needs to
+   relogin. */
+static enum imap_state_result
+import_state_mailbox_error(struct mailbox *box, const char *prefix,
+			   const char **error_r)
+{
+	enum mail_error error;
+	const char *errstr = mailbox_get_last_internal_error(box, &error);
+
+	*error_r = t_strdup_printf("%s: %s", prefix, errstr);
+	return error == MAIL_ERROR_NOTFOUND ?
+		IMAP_STATE_INCONSISTENT : IMAP_STATE_ERROR;
+}
+
+static enum imap_state_result
+import_state_mailbox_open(struct client *client,
+			  const struct mailbox_import_state *state,
+			  const char **error_r)
+{
+	struct mail_namespace *ns;
+	struct mailbox *box;
+	struct mailbox_metadata metadata;
+        struct mailbox_status status;
+	const struct seq_range *range;
+	enum mailbox_flags flags = 0;
+	unsigned int expunge_count, new_mails_count = 0, flag_change_count = 0;
+	enum imap_state_result result;
+	uint32_t uid;
+	int ret = 0;
+
+	ns = mail_namespace_find(client->user->namespaces, state->vname);
+	if (ns == NULL) {
+		*error_r = "Namespace not found for mailbox";
+		return IMAP_STATE_ERROR;
+	}
+
+	if (state->examined)
+		flags |= MAILBOX_FLAG_READONLY;
+	else
+		flags |= MAILBOX_FLAG_DROP_RECENT;
+	box = mailbox_alloc(ns->list, state->vname, flags);
+	if (mailbox_open(box) < 0) {
+		result = import_state_mailbox_error(box, "Couldn't open mailbox",
+						    error_r);
+		mailbox_free(&box);
+		return result;
+	}
+
+	ret = mailbox_enable(box, client_enabled_mailbox_features(client));
+	if (ret < 0 || mailbox_sync(box, 0) < 0) {
+		result = import_state_mailbox_error(box, "Couldn't sync mailbox",
+						    error_r);
+		mailbox_free(&box);
+		return result;
+	}
+	/* verify that this still looks like the same mailbox */
+	if (mailbox_get_metadata(box, MAILBOX_METADATA_GUID, &metadata) < 0) {
+		result = import_state_mailbox_error(box,
+			"Couldn't get mailbox GUID", error_r);
+		mailbox_free(&box);
+		return result;
+	}
+	if (!guid_128_equals(metadata.guid, state->mailbox_guid)) {
+		*error_r = t_strdup_printf("Mailbox GUID has changed %s->%s",
+					   guid_128_to_string(state->mailbox_guid),
+					   guid_128_to_string(metadata.guid));
+		mailbox_free(&box);
+		return IMAP_STATE_ERROR;
+	}
+	mailbox_get_open_status(box, STATUS_UIDVALIDITY | STATUS_UIDNEXT |
+				STATUS_HIGHESTMODSEQ | STATUS_RECENT |
+				STATUS_KEYWORDS, &status);
+	if (status.uidvalidity != state->uidvalidity) {
+		*error_r = t_strdup_printf("Mailbox UIDVALIDITY has changed %u->%u",
+					    state->uidvalidity, status.uidvalidity);
+		mailbox_free(&box);
+		return IMAP_STATE_ERROR;
+	}
+	if (status.uidnext < state->uidnext) {
+		*error_r = t_strdup_printf("Mailbox UIDNEXT shrank %u -> %u",
+					   state->uidnext, status.uidnext);
+		mailbox_free(&box);
+		return IMAP_STATE_ERROR;
+	}
+	if (status.highest_modseq < state->highest_modseq) {
+		*error_r = t_strdup_printf("Mailbox HIGHESTMODSEQ shrank %"PRIu64" -> %"PRIu64,
+					   state->highest_modseq,
+					   status.highest_modseq);
+		mailbox_free(&box);
+		return IMAP_STATE_ERROR;
+	}
+
+	client->mailbox = box;
+	client->mailbox_examined = state->examined;
+	client->messages_count = status.messages;
+	client->uidvalidity = status.uidvalidity;
+	client->notify_uidnext = status.uidnext;
+
+	result = import_send_expunges(client, state, &expunge_count, error_r);
+	if (result != IMAP_STATE_OK)
+		return result;
+	i_assert(expunge_count <= state->messages);
+	if (state->messages - expunge_count > client->messages_count) {
+		*error_r = t_strdup_printf("Mailbox message count shrank %u -> %u",
+					   client->messages_count,
+					   state->messages - expunge_count);
+		return IMAP_STATE_ERROR;
+	}
+
+	client_update_mailbox_flags(client, status.keywords);
+	array_foreach(&state->recent_uids, range) {
+		for (uid = range->seq1; uid <= range->seq2; uid++) {
+			uint32_t seq;
+
+			if (mail_index_lookup_seq(box->view, uid, &seq))
+				mailbox_recent_flags_set_uid_forced(box, uid);
+		}
+	}
+	client->recent_count = mailbox_recent_flags_count(box);
+
+	if (state->messages - expunge_count < client->messages_count) {
+		/* new messages arrived */
+		new_mails_count = client->messages_count -
+			(state->messages - expunge_count);
+		client_send_line(client,
+			t_strdup_printf("* %u EXISTS", client->messages_count));
+		if ((client_enabled_mailbox_features(client) & MAILBOX_FEATURE_IMAP4REV2) == 0)
+			client_send_line(client,
+				t_strdup_printf("* %u RECENT", client->recent_count));
+	}
+
+	if (array_count(status.keywords) == state->keywords_count &&
+	    mailbox_status_keywords_crc32(&status) == state->keywords_crc32) {
+		/* no changes to keywords */
+		client->keywords.announce_count = state->keywords_count;
+	} else {
+		client_send_mailbox_flags(client, TRUE);
+	}
+	if (import_send_flag_changes(client, state, &flag_change_count) < 0) {
+		*error_r = "Couldn't send flag changes";
+		return IMAP_STATE_ERROR;
+	}
+	if (client_has_enabled(client, imap_feature_qresync) &&
+	    !client->nonpermanent_modseqs &&
+	    status.highest_modseq != state->highest_modseq) {
+		client_send_line(client, t_strdup_printf(
+			"* OK [HIGHESTMODSEQ %"PRIu64"] Highest",
+			status.highest_modseq));
+	}
+	/* all expunges have been sent */
+	client->sync_last_full_modseq = status.highest_modseq;
+	e_debug(client->event,
+		"Unhibernation sync: %u expunges, %u new messages, %u flag changes, %"PRIu64" modseq changes",
+		expunge_count, new_mails_count, flag_change_count,
+		status.highest_modseq - state->highest_modseq);
+	return IMAP_STATE_OK;
+}
+
+static enum imap_state_result
+import_state_mailbox(struct client *client, const unsigned char *data,
+		     size_t size, size_t *skip_r, const char **error_r)
+{
+	struct mailbox_import_state state;
+	enum imap_state_result open_result;
+	ssize_t ret;
+
+	if (client->mailbox != NULL) {
+		*error_r = "Duplicate mailbox state";
+		return IMAP_STATE_CORRUPTED;
+	}
+
+	ret = import_state_mailbox_struct(data, size, &state, error_r);
+	if (ret <= 0) {
+		i_assert(*error_r != NULL);
+		return IMAP_STATE_CORRUPTED;
+	}
+	open_result = import_state_mailbox_open(client, &state, error_r);
+	if (open_result != IMAP_STATE_OK) {
+		i_assert(*error_r != NULL);
+		*error_r = t_strdup_printf("Mailbox %s: %s", state.vname, *error_r);
+		return open_result;
+	}
+	*skip_r = ret + 1;
+	return IMAP_STATE_OK;
+}
+
+enum imap_state_result
+imap_state_import_compress(struct client *client, const unsigned char *data,
+			   size_t size, size_t *skip_r, const char **error_r)
+{
+	const unsigned char *p = data, *end = data + size;
+	const char *name;
+
+	if (imap_state_import_string(&p, end, &name) < 0) {
+		*error_r = "COMPRESS name truncated";
+		return IMAP_STATE_CORRUPTED;
+	}
+	if (compression_lookup_handler(name, &client->compress_handler) <= 0) {
+		*error_r = t_strdup_printf("Unknown COMPRESS handler %s", name);
+		return IMAP_STATE_CORRUPTED;
+	}
+	/* Recreate the side channel that cmd-compress would have created in
+	   the previous (now-exited) imap process. It is used to forward
+	   dict_reset commands back to the imap-login proxy after every tagged
+	   reply. */
+	if (client->multiplex_output != NULL &&
+	    client->side_channel_output == NULL)
+		client_create_side_channel_output(client);
+	*skip_r = (p - data) + 1;
+	return IMAP_STATE_OK;
+}
+
+enum imap_state_result
+imap_state_import_enabled_feature(struct client *client,
+				  const unsigned char *data, size_t size,
+				  size_t *skip_r, const char **error_r)
+{
+	const unsigned char *p = data, *end = data + size;
+	const char *name;
+	unsigned int feature_idx;
+
+	if (imap_state_import_string(&p, end, &name) < 0) {
+		*error_r = "Mailbox state truncated at name";
+		return IMAP_STATE_CORRUPTED;
+	}
+	if (!imap_feature_lookup(name, &feature_idx)) {
+		*error_r = t_strdup_printf("Unknown feature '%s'", name);
+		return IMAP_STATE_CORRUPTED;
+	}
+	if (!client_enable(client, feature_idx)) {
+		/* The feature was enabled before the hibernation, so the
+		   configuration must have been changed to disable it. */
+		*error_r = t_strdup_printf("Feature '%s' can't be enabled anymore",
+					   name);
+		return IMAP_STATE_INCONSISTENT;
+	}
+	*skip_r = (p - data) + 1;
+	return IMAP_STATE_OK;
+}
+
+enum imap_state_result
+imap_state_import_searchres(struct client *client, const unsigned char *data,
+			    size_t size, size_t *skip_r, const char **error_r)
+{
+	const unsigned char *p = data;
+
+	if (array_is_created(&client->search_saved_uidset)) {
+		*error_r = "Duplicate SEARCHRES";
+		return IMAP_STATE_CORRUPTED;
+	}
+	i_array_init(&client->search_saved_uidset, 128);
+	if (imap_state_import_seq_range(&p, data+size, &client->search_saved_uidset) < 0) {
+		*error_r = "Invalid SEARCHRES seq-range";
+		return IMAP_STATE_CORRUPTED;
+	}
+	*skip_r = (p - data) + 1;
+	return IMAP_STATE_OK;
+}
+
+static enum imap_state_result
+import_state_namespaces(struct client *client, const unsigned char *data,
+			size_t size, size_t *skip_r, const char **error_r)
+{
+	const unsigned char *p = data, *end = data + size;
+	const char *old_namespaces, *namespaces;
+
+	if (imap_state_import_string(&p, end, &old_namespaces) < 0) {
+		*error_r = "Namespaces state truncated";
+		return IMAP_STATE_CORRUPTED;
+	}
+	namespaces = imap_state_namespaces_string(client->user);
+	if (strcmp(old_namespaces, namespaces) != 0) {
+		*error_r = t_strdup_printf(
+			"Namespaces have changed ('%s' -> '%s')",
+			t_str_replace(old_namespaces, '\n', ' '),
+			t_str_replace(namespaces, '\n', ' '));
+		return IMAP_STATE_INCONSISTENT;
+	}
+	*skip_r = (p - data) + 1;
+	return IMAP_STATE_OK;
+}
+
+static enum imap_state_result
+import_state_id_logged(struct client *client,
+		       const unsigned char *data ATTR_UNUSED,
+		       size_t size ATTR_UNUSED,
+		       size_t *skip_r,
+		       const char **error_r ATTR_UNUSED)
+{
+	client->id_logged = TRUE;
+	*skip_r = 1;
+	return IMAP_STATE_OK;
+}
+
+static enum imap_state_result
+import_state_tls_compression(struct client *client,
+			     const unsigned char *data ATTR_UNUSED,
+			     size_t size ATTR_UNUSED,
+			     size_t *skip_r,
+			     const char **error_r ATTR_UNUSED)
+{
+	client->tls_compression = TRUE;
+	*skip_r = 1;
+	return IMAP_STATE_OK;
+}
+
+void imap_state_import_idle_cmd_tag(struct client *client, const char *tag)
+{
+	if (client->state_import_idle_continue) {
+		/* IDLE command continues */
+		struct client_command_context *cmd;
+		const struct command *command;
+
+		cmd = client_command_alloc(client);
+		cmd->tag = p_strdup(cmd->pool, tag);
+		cmd->name = "IDLE";
+
+		command = command_find("IDLE");
+		i_assert(command != NULL);
+		cmd->func = command->func;
+		cmd->cmd_flags = command->flags;
+		client_command_init_finished(cmd);
+
+		if (command_exec(cmd)) {
+			/* IDLE terminated because of an external change, but
+			   DONE was already buffered */
+			client_command_free(&cmd);
+			client_add_missing_io(client);
+		} else {
+			i_assert(cmd->state == CLIENT_COMMAND_STATE_WAIT_INPUT ||
+				 cmd->state == CLIENT_COMMAND_STATE_WAIT_OUTPUT);
+		}
+	} else {
+		/* we're finishing IDLE command */
+		client_send_line(client, t_strdup_printf(
+			"%s %s Idle completed.", tag,
+			client->state_import_bad_idle_done ? "BAD" : "OK"));
+	}
+}
+
+static struct {
+	enum imap_state_type_public type;
+	enum imap_state_result
+		(*import)(struct client *client, const unsigned char *data,
+			  size_t size, size_t *skip_r, const char **error_r);
+} imap_states_public[] = {
+	{ IMAP_STATE_TYPE_MAILBOX, import_state_mailbox },
+	{ IMAP_STATE_TYPE_COMPRESS, imap_state_import_compress },
+	{ IMAP_STATE_TYPE_ENABLED_FEATURE, imap_state_import_enabled_feature },
+	{ IMAP_STATE_TYPE_SEARCHRES, imap_state_import_searchres }
+};
+
+static struct {
+	enum imap_state_type_internal type;
+	enum imap_state_result
+		(*import)(struct client *client, const unsigned char *data,
+			  size_t size, size_t *skip_r, const char **error_r);
+} imap_states_internal[] = {
+	{ IMAP_STATE_TYPE_NAMESPACES, import_state_namespaces },
+	{ IMAP_STATE_TYPE_ID_LOGGED, import_state_id_logged },
+	{ IMAP_STATE_TYPE_TLS_COMPRESSION, import_state_tls_compression }
+};
+
+static int
+imap_state_try_import_public(struct client *client, const unsigned char *data,
+			     size_t size, size_t *skip_r, const char **error_r,
+			     enum imap_state_result *state_r)
+{
+	unsigned int i;
+
+	i_assert(size > 0);
+
+	for (i = 0; i < N_ELEMENTS(imap_states_public); i++) {
+		if (imap_states_public[i].type == data[0]) {
+			*error_r = NULL;
+			*state_r = imap_states_public[i].
+				import(client, data+1, size-1,
+				       skip_r, error_r);
+			i_assert(*state_r == IMAP_STATE_OK ||
+				 *error_r != NULL);
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static int
+imap_state_try_import_internal(struct client *client, const unsigned char *data,
+			       size_t size, size_t *skip_r, const char **error_r,
+			       enum imap_state_result *state_r)
+{
+	unsigned int i;
+
+	i_assert(size > 0);
+
+	for (i = 0; i < N_ELEMENTS(imap_states_internal); i++) {
+		if (imap_states_internal[i].type == data[0]) {
+			*error_r = NULL;
+			*state_r = imap_states_internal[i].
+				import(client, data+1, size-1,
+				       skip_r, error_r);
+			i_assert(*state_r == IMAP_STATE_OK ||
+				 *error_r != NULL);
+			return 0;
+		}
+	}
+	return -1;
+}
+
+enum imap_state_result
+imap_state_import_base(struct client *client, bool internal,
+		       const unsigned char *data, size_t size,
+		       size_t *skip_r, const char **error_r)
+{
+	const unsigned char *p;
+	size_t pos = 0, skip;
+	enum imap_state_result state;
+
+	i_assert(client->mailbox == NULL);
+
+	*error_r = NULL;
+
+	if (size < 5 || memcmp(data, "base\n", 5) != 0) {
+		p = memchr(data, '\n', size);
+		if (p == NULL)
+			p = data + I_MIN(size, 20);
+		*error_r = t_strdup_printf("Unknown state block '%s'",
+					   str_sanitize(t_strdup_until(data, p), 20));
+		return IMAP_STATE_CORRUPTED;
+	}
+
+	pos = 5;
+	while (pos < size) {
+		size_t remaining = size - pos;
+
+		int ret = imap_state_try_import_public(client, data + pos, remaining,
+						       &skip, error_r, &state);
+
+		if (ret < 0 && internal) {
+			ret = imap_state_try_import_internal(client, data + pos, remaining,
+							     &skip, error_r, &state);
+		}
+
+		if (ret < 0) {
+			*error_r = t_strdup_printf("Unknown type '%c'", data[pos]);
+			state = IMAP_STATE_ERROR;
+		}
+		if (state != IMAP_STATE_OK) {
+			i_assert(*error_r != NULL);
+			return state;
+		}
+		i_assert(skip <= remaining);
+		pos += skip;
+	}
+	*skip_r = pos;
+	return IMAP_STATE_OK;
+}

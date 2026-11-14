@@ -1,0 +1,34 @@
+#ifndef LMTP_LOCAL_H
+#define LMTP_LOCAL_H
+
+#include "net.h"
+
+struct mail_storage;
+struct mail_deliver_context;
+struct mail_deliver_session;
+struct smtp_server_cmd_ctx;
+struct smtp_server_cmd_rcpt;
+struct lmtp_local;
+struct lmtp_local_deliver_context;
+struct client;
+
+void lmtp_local_deinit(struct lmtp_local **_local);
+
+int lmtp_local_rcpt(struct lmtp_recipient *lrcpt);
+
+void lmtp_local_add_headers(struct lmtp_local *local,
+			    struct smtp_server_transaction *trans,
+			    string_t *headers);
+
+int lmtp_local_default_deliver(struct client *client,
+			       struct lmtp_recipient *lrcpt,
+			       struct smtp_server_cmd_ctx *cmd,
+			       struct smtp_server_transaction *trans,
+			       struct lmtp_local_deliver_context *lldctx);
+
+void lmtp_local_data(struct client *client,
+		     struct smtp_server_cmd_ctx *cmd,
+		     struct smtp_server_transaction *trans,
+		     struct istream *input);
+
+#endif

@@ -1,0 +1,70 @@
+/*
+ * LOGIN authentication mechanism.
+ *
+ * Copyright (c) 2004 Andrey Panin <pazke@donpac.ru>
+ *
+ * This software is released under the MIT license.
+ */
+
+#include "lib.h"
+#include "safe-memset.h"
+
+#include "sasl-server-protected.h"
+
+static void
+mech_login_auth_continue(struct sasl_server_mech_request *request,
+			 const unsigned char *data, size_t data_size)
+{
+	static const char prompt2[] = "Password:";
+	const char *username;
+
+	if (request->authid == NULL) {
+		username = t_strndup(data, data_size);
+
+		if (!sasl_server_request_set_authid(
+				request, SASL_SERVER_AUTHID_TYPE_USERNAME,
+				username)) {
+			sasl_server_request_failure(request);
+			return;
+		}
+
+		sasl_server_request_output(request, prompt2, strlen(prompt2));
+	} else {
+		char *pass = p_strndup(unsafe_data_stack_pool, data, data_size);
+		sasl_server_request_verify_plain(
+			request, pass, sasl_server_mech_plain_verify_callback);
+		safe_memset(pass, 0, strlen(pass));
+	}
+}
+
+static void
+mech_login_auth_initial(struct sasl_server_mech_request *request,
+			const unsigned char *data, size_t data_size)
+{
+	static const char prompt1[] = "Username:";
+
+	if (data_size == 0) {
+		sasl_server_request_output(request, prompt1, strlen(prompt1));
+	} else {
+		mech_login_auth_continue(request, data, data_size);
+	}
+}
+
+static const struct sasl_server_mech_funcs mech_login_funcs = {
+	.auth_initial = mech_login_auth_initial,
+	.auth_continue = mech_login_auth_continue,
+};
+
+static const struct sasl_server_mech_def mech_login = {
+	.name = SASL_MECH_NAME_LOGIN,
+
+	.flags = SASL_MECH_SEC_PLAINTEXT,
+	.passdb_need = SASL_MECH_PASSDB_NEED_VERIFY_PLAIN,
+
+	.funcs = &mech_login_funcs,
+};
+
+void sasl_server_mech_register_login(struct sasl_server_instance *sinst)
+{
+	sasl_server_mech_register(sinst, &mech_login, NULL);
+}

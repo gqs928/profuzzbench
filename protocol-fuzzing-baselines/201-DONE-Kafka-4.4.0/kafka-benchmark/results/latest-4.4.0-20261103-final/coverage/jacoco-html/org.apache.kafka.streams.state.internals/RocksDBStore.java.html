@@ -1,0 +1,1614 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RocksDBStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">RocksDBStore.java</span></div><h1>RocksDBStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.Sensor.RecordingLevel;
+import org.apache.kafka.common.serialization.Serializer;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.ByteUtils;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.errors.InvalidStateStoreException;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.errors.TaskCorruptedException;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.ChangelogRecordDeserializationHelper;
+import org.apache.kafka.streams.processor.internals.RecordBatchingStateRestoreCallback;
+import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.KeyValueStore;
+import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
+import org.apache.kafka.streams.state.RocksDBConfigSetter;
+import org.apache.kafka.streams.state.internals.metrics.RocksDBMetricsRecorder;
+
+import org.rocksdb.BlockBasedTableConfig;
+import org.rocksdb.BloomFilter;
+import org.rocksdb.Cache;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.CompactionStyle;
+import org.rocksdb.CompressionType;
+import org.rocksdb.DBOptions;
+import org.rocksdb.FlushOptions;
+import org.rocksdb.InfoLogLevel;
+import org.rocksdb.LRUCache;
+import org.rocksdb.Options;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.RocksIterator;
+import org.rocksdb.Snapshot;
+import org.rocksdb.Statistics;
+import org.rocksdb.TableFormatConfig;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteBatchInterface;
+import org.rocksdb.WriteBatchWithIndex;
+import org.rocksdb.WriteOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.streams.StreamsConfig.EXACTLY_ONCE_V2;
+import static org.apache.kafka.streams.StreamsConfig.InternalConfig.IQ_CONSISTENCY_OFFSET_VECTOR_ENABLED;
+import static org.apache.kafka.streams.StreamsConfig.METRICS_RECORDING_LEVEL_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.PROCESSING_GUARANTEE_CONFIG;
+import static org.apache.kafka.streams.processor.internals.ProcessorContextUtils.metricsImpl;
+
+/**
+ * A persistent key-value store based on RocksDB.
+ */
+public class RocksDBStore implements KeyValueStore&lt;Bytes, byte[]&gt;, BatchWritingStore {
+<span class="nc" id="L104">    private static final Logger log = LoggerFactory.getLogger(RocksDBStore.class);</span>
+
+<span class="nc" id="L106">    private static final CompressionType COMPRESSION_TYPE = CompressionType.NO_COMPRESSION;</span>
+<span class="nc" id="L107">    private static final CompactionStyle COMPACTION_STYLE = CompactionStyle.UNIVERSAL;</span>
+<span class="nc" id="L108">    protected static final byte[] OFFSETS_COLUMN_FAMILY_NAME = &quot;offsets&quot;.getBytes(StandardCharsets.UTF_8);</span>
+    private static final long WRITE_BUFFER_SIZE = 16 * 1024 * 1024L;
+    private static final long BLOCK_CACHE_SIZE = 50 * 1024 * 1024L;
+    private static final long BLOCK_SIZE = 4096L;
+    private static final int MAX_WRITE_BUFFERS = 3;
+    static final String DB_FILE_DIR = &quot;rocksdb&quot;;
+
+    final String name;
+    private final String parentDir;
+<span class="nc" id="L117">    final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators = Collections.synchronizedSet(new HashSet&lt;&gt;());</span>
+<span class="nc" id="L118">    private boolean consistencyEnabled = false;</span>
+
+    // VisibleForTesting
+    protected File dbDir;
+    RocksDB db;
+    DBAccessor dbAccessor;
+    ColumnFamilyAccessor cfAccessor;
+<span class="nc" id="L125">    protected final AtomicBoolean open = new AtomicBoolean(false);</span>
+    // package-private: read by DualColumnFamilyAccessor
+    boolean isTransactional;
+
+    // the following option objects will be created in openDB and closed in the close() method
+    private RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter userSpecifiedOptions;
+    WriteOptions wOptions;
+    FlushOptions fOptions;
+    private Cache cache;
+    private BloomFilter filter;
+    private Statistics statistics;
+    private ColumnFamilyOptions offsetsCfOptions;
+
+    private RocksDBConfigSetter configSetter;
+<span class="nc" id="L139">    private boolean userSpecifiedStatistics = false;</span>
+
+    private final RocksDBMetricsRecorder metricsRecorder;
+    // if true, then open iterators (for range, prefix scan, and other operations) will be
+    // managed automatically (by this store instance). if false, then these iterators must be
+    // managed elsewhere (by the caller of those methods).
+    private final boolean autoManagedIterators;
+
+
+    protected StateStoreContext context;
+    // VisibleForTesting
+    Position position;
+    private TaskId taskId;
+
+    public RocksDBStore(final String name,
+                        final String metricsScope) {
+<span class="nc" id="L155">        this(name, DB_FILE_DIR, new RocksDBMetricsRecorder(metricsScope, name));</span>
+<span class="nc" id="L156">    }</span>
+
+    RocksDBStore(final String name,
+                 final String parentDir,
+                 final RocksDBMetricsRecorder metricsRecorder) {
+<span class="nc" id="L161">        this(name, parentDir, metricsRecorder, true);</span>
+<span class="nc" id="L162">    }</span>
+
+    RocksDBStore(final String name,
+                 final String parentDir,
+                 final RocksDBMetricsRecorder metricsRecorder,
+<span class="nc" id="L167">                 final boolean autoManagedIterators) {</span>
+<span class="nc" id="L168">        this.name = name;</span>
+<span class="nc" id="L169">        this.parentDir = parentDir;</span>
+<span class="nc" id="L170">        this.metricsRecorder = metricsRecorder;</span>
+<span class="nc" id="L171">        this.autoManagedIterators = autoManagedIterators;</span>
+<span class="nc" id="L172">    }</span>
+
+    @Override
+    public void init(final StateStoreContext stateStoreContext,
+                     final StateStore root) {
+<span class="nc" id="L177">        this.taskId = stateStoreContext.taskId();</span>
+        // open the DB dir
+<span class="nc" id="L179">        metricsRecorder.init(metricsImpl(stateStoreContext), stateStoreContext.taskId());</span>
+<span class="nc" id="L180">        openDB(stateStoreContext.appConfigs(), stateStoreContext.stateDir());</span>
+<span class="nc" id="L181">        StoreQueryUtils.maybeMigrateExistingPositionFile(stateStoreContext.stateDir(), name(), position);</span>
+
+        // value getter should always read directly from rocksDB
+        // since it is only for values that are already flushed
+<span class="nc" id="L185">        this.context = stateStoreContext;</span>
+<span class="nc" id="L186">        stateStoreContext.register(</span>
+            root,
+            (RecordBatchingStateRestoreCallback) this::restoreBatch,
+            this::writePosition
+        );
+<span class="nc" id="L191">        consistencyEnabled = StreamsConfig.InternalConfig.getBoolean(</span>
+<span class="nc" id="L192">            stateStoreContext.appConfigs(),</span>
+            IQ_CONSISTENCY_OFFSET_VECTOR_ENABLED,
+            false);
+<span class="nc" id="L195">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    void openDB(final Map&lt;String, Object&gt; configs, final File stateDir) {
+<span class="nc" id="L199">        final boolean eosEnabled = Objects.equals(configs.get(PROCESSING_GUARANTEE_CONFIG), EXACTLY_ONCE_V2);</span>
+        // initialize the default rocksdb options
+<span class="nc" id="L201">        final DBOptions dbOptions = new DBOptions();</span>
+        // Defaults to true. Supports offset managements: KAFKA-20212
+<span class="nc" id="L203">        dbOptions.setAtomicFlush(true);</span>
+<span class="nc" id="L204">        final ColumnFamilyOptions columnFamilyOptions = new ColumnFamilyOptions();</span>
+<span class="nc" id="L205">        userSpecifiedOptions = new RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter(dbOptions, columnFamilyOptions);</span>
+
+<span class="nc" id="L207">        final BlockBasedTableConfigWithAccessibleCache tableConfig = new BlockBasedTableConfigWithAccessibleCache();</span>
+<span class="nc" id="L208">        cache = new LRUCache(BLOCK_CACHE_SIZE);</span>
+<span class="nc" id="L209">        tableConfig.setBlockCache(cache);</span>
+<span class="nc" id="L210">        tableConfig.setBlockSize(BLOCK_SIZE);</span>
+
+<span class="nc" id="L212">        filter = new BloomFilter();</span>
+<span class="nc" id="L213">        tableConfig.setFilterPolicy(filter);</span>
+
+<span class="nc" id="L215">        userSpecifiedOptions.setOptimizeFiltersForHits(true);</span>
+<span class="nc" id="L216">        userSpecifiedOptions.setTableFormatConfig(tableConfig);</span>
+<span class="nc" id="L217">        userSpecifiedOptions.setWriteBufferSize(WRITE_BUFFER_SIZE);</span>
+<span class="nc" id="L218">        userSpecifiedOptions.setCompressionType(COMPRESSION_TYPE);</span>
+<span class="nc" id="L219">        userSpecifiedOptions.setCompactionStyle(COMPACTION_STYLE);</span>
+<span class="nc" id="L220">        userSpecifiedOptions.setMaxWriteBufferNumber(MAX_WRITE_BUFFERS);</span>
+<span class="nc" id="L221">        userSpecifiedOptions.setCreateIfMissing(true);</span>
+<span class="nc" id="L222">        userSpecifiedOptions.setErrorIfExists(false);</span>
+<span class="nc" id="L223">        userSpecifiedOptions.setInfoLogLevel(InfoLogLevel.ERROR_LEVEL);</span>
+        // this is the recommended way to increase parallelism in RocksDb
+        // note that the current implementation of setIncreaseParallelism affects the number
+        // of compaction threads but not flush threads (the latter remains one). Also,
+        // the parallelism value needs to be at least two because of the code in
+        // https://github.com/facebook/rocksdb/blob/62ad0a9b19f0be4cefa70b6b32876e764b7f3c11/util/options.cc#L580
+        // subtracts one from the value passed to determine the number of compaction threads
+        // (this could be a bug in the RocksDB code and their devs have been contacted).
+<span class="nc" id="L231">        userSpecifiedOptions.setIncreaseParallelism(Math.max(Runtime.getRuntime().availableProcessors(), 2));</span>
+
+<span class="nc" id="L233">        wOptions = new WriteOptions();</span>
+<span class="nc" id="L234">        wOptions.setDisableWAL(true);</span>
+
+<span class="nc" id="L236">        fOptions = new FlushOptions();</span>
+<span class="nc" id="L237">        fOptions.setWaitForFlush(true);</span>
+
+        // The offsets CF stores only a small number of key-value pairs (one per changelog
+        // partition), so it does not need the heavyweight options used for the data CF;
+<span class="nc" id="L241">        offsetsCfOptions = new ColumnFamilyOptions();</span>
+<span class="nc" id="L242">        offsetsCfOptions.setCompressionType(CompressionType.NO_COMPRESSION);</span>
+<span class="nc" id="L243">        offsetsCfOptions.setWriteBufferSize(1024 * 1024L); // 1MB — sufficient for offset metadata</span>
+
+<span class="nc" id="L245">        final Class&lt;RocksDBConfigSetter&gt; configSetterClass =</span>
+<span class="nc" id="L246">                (Class&lt;RocksDBConfigSetter&gt;) configs.get(StreamsConfig.ROCKSDB_CONFIG_SETTER_CLASS_CONFIG);</span>
+
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        if (configSetterClass != null) {</span>
+<span class="nc" id="L249">            configSetter = Utils.newInstance(configSetterClass);</span>
+<span class="nc" id="L250">            configSetter.setConfig(name, userSpecifiedOptions, configs);</span>
+        }
+
+<span class="nc" id="L253">        dbDir = new File(new File(stateDir, parentDir), name);</span>
+        try {
+<span class="nc" id="L255">            Files.createDirectories(dbDir.getParentFile().toPath());</span>
+<span class="nc" id="L256">            Files.createDirectories(dbDir.getAbsoluteFile().toPath());</span>
+<span class="nc" id="L257">        } catch (final IOException fatal) {</span>
+<span class="nc" id="L258">            throw new ProcessorStateException(fatal);</span>
+<span class="nc" id="L259">        }</span>
+
+<span class="nc" id="L261">        isTransactional = StreamsConfig.InternalConfig.getBoolean(configs, StreamsConfig.TRANSACTIONAL_STATE_STORES_CONFIG, false);</span>
+
+        // Setup statistics before the database is opened, otherwise the statistics are not updated
+        // with the measurements from Rocks DB
+<span class="nc" id="L265">        setupStatistics(configs, dbOptions);</span>
+        try {
+<span class="nc" id="L267">            openRocksDB(dbOptions, columnFamilyOptions);</span>
+<span class="nc" id="L268">            dbAccessor = new DirectDBAccessor(db, fOptions, wOptions);</span>
+            try {
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                final Position existingPositionOrEmpty = cfAccessor.open(dbAccessor, !eosEnabled);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">                if (position == null) {</span>
+<span class="nc" id="L272">                    position = existingPositionOrEmpty;</span>
+                } else {
+                    // For segmented stores, the overall position is composed of multiple underlying stores, so merge this store's position into it.
+<span class="nc" id="L275">                    position.merge(existingPositionOrEmpty);</span>
+                }
+<span class="nc" id="L277">            } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L278">                final String message = &quot;State store &quot; + name + &quot; didn't find a valid state, since under EOS it has the risk of getting uncommitted data in stores&quot;;</span>
+<span class="nc" id="L279">                throw new TaskCorruptedException(Set.of(taskId), new ProcessorStateException(message, e));</span>
+<span class="nc" id="L280">            }  catch (final StreamsException fatal) {</span>
+<span class="nc" id="L281">                final String fatalMessage = &quot;Fatal error while opening store &quot; + name;</span>
+<span class="nc" id="L282">                throw new ProcessorStateException(fatalMessage, fatal);</span>
+<span class="nc" id="L283">            } catch (final RocksDBException fatal) {</span>
+<span class="nc" id="L284">                final String fatalMessage = &quot;Error opening store &quot; + name;</span>
+<span class="nc" id="L285">                throw new ProcessorStateException(fatalMessage, fatal);</span>
+<span class="nc" id="L286">            }</span>
+<span class="nc" id="L287">        } catch (final RuntimeException e) {</span>
+<span class="nc" id="L288">            closeNativeResources();</span>
+<span class="nc" id="L289">            throw e;</span>
+<span class="nc" id="L290">        }</span>
+
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        if (isTransactional) {</span>
+<span class="nc" id="L293">            dbAccessor = new TransactionalDBAccessor(dbAccessor, db, cfAccessor.dataColumnFamily(), cfAccessor.offsetsColumnFamily(), wOptions, name);</span>
+        }
+
+<span class="nc" id="L296">        addValueProvidersToMetricsRecorder();</span>
+<span class="nc" id="L297">    }</span>
+
+    private void setupStatistics(final Map&lt;String, Object&gt; configs, final DBOptions dbOptions) {
+<span class="nc" id="L300">        statistics = userSpecifiedOptions.statistics();</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        if (statistics == null) {</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            if (RecordingLevel.forName((String) configs.get(METRICS_RECORDING_LEVEL_CONFIG)) == RecordingLevel.DEBUG) {</span>
+<span class="nc" id="L303">                statistics = new Statistics();</span>
+<span class="nc" id="L304">                dbOptions.setStatistics(statistics);</span>
+            }
+<span class="nc" id="L306">            userSpecifiedStatistics = false;</span>
+        } else {
+<span class="nc" id="L308">            userSpecifiedStatistics = true;</span>
+        }
+<span class="nc" id="L310">    }</span>
+
+    void setTaskId(final TaskId taskId) {
+<span class="nc" id="L313">        this.taskId = taskId;</span>
+<span class="nc" id="L314">    }</span>
+
+    private void addValueProvidersToMetricsRecorder() {
+<span class="nc" id="L317">        final TableFormatConfig tableFormatConfig = userSpecifiedOptions.tableFormatConfig();</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">        if (tableFormatConfig instanceof BlockBasedTableConfigWithAccessibleCache) {</span>
+<span class="nc" id="L319">            final Cache cache = ((BlockBasedTableConfigWithAccessibleCache) tableFormatConfig).blockCache();</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">            metricsRecorder.addValueProviders(name, db, cache, userSpecifiedStatistics ? null : statistics);</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        } else if (tableFormatConfig instanceof BlockBasedTableConfig) {</span>
+<span class="nc" id="L322">            throw new ProcessorStateException(&quot;The used block-based table format configuration does not expose the &quot; +</span>
+                    &quot;block cache. Use the BlockBasedTableConfig instance provided by Options#tableFormatConfig() to configure &quot; +
+                    &quot;the block-based table format of RocksDB. Do not provide a new instance of BlockBasedTableConfig to &quot; +
+                    &quot;the RocksDB options.&quot;);
+        } else {
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            metricsRecorder.addValueProviders(name, db, null, userSpecifiedStatistics ? null : statistics);</span>
+        }
+<span class="nc" id="L329">    }</span>
+
+    /**
+     * Returns the single read-only {@link ColumnFamilyOptions} instance used for the offsets CF.
+     *
+     * &lt;p&gt;The instance is created in {@link #openDB} before the open path runs
+     * {@code ColumnFamilyDescriptor} and is freed once in {@link #close()} /
+     * {@link #closeNativeResources()}.
+     */
+    protected ColumnFamilyOptions offsetsCFOptions() {
+<span class="nc" id="L339">        return offsetsCfOptions;</span>
+    }
+
+    void openRocksDB(final DBOptions dbOptions,
+                     final ColumnFamilyOptions columnFamilyOptions) {
+<span class="nc" id="L344">        final List&lt;ColumnFamilyHandle&gt; columnFamilies = openRocksDB(</span>
+                dbOptions,
+                new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, columnFamilyOptions),
+<span class="nc" id="L347">                new ColumnFamilyDescriptor(OFFSETS_COLUMN_FAMILY_NAME, offsetsCFOptions())</span>
+        );
+
+<span class="nc" id="L350">        cfAccessor = new SingleColumnFamilyAccessor(columnFamilies.get(1), columnFamilies.get(0));</span>
+<span class="nc" id="L351">    }</span>
+
+    /**
+     * Open RocksDB while automatically creating any requested column families that don't yet exist.
+     */
+    protected List&lt;ColumnFamilyHandle&gt; openRocksDB(final DBOptions dbOptions,
+                                                   final ColumnFamilyDescriptor defaultColumnFamilyDescriptor,
+                                                   final ColumnFamilyDescriptor... columnFamilyDescriptors) {
+<span class="nc" id="L359">        final String absolutePath = dbDir.getAbsolutePath();</span>
+<span class="nc" id="L360">        final List&lt;ColumnFamilyDescriptor&gt; extraDescriptors = Arrays.asList(columnFamilyDescriptors);</span>
+<span class="nc" id="L361">        final List&lt;ColumnFamilyDescriptor&gt; allDescriptors = new ArrayList&lt;&gt;(1 + columnFamilyDescriptors.length);</span>
+<span class="nc" id="L362">        allDescriptors.add(defaultColumnFamilyDescriptor);</span>
+<span class="nc" id="L363">        allDescriptors.addAll(extraDescriptors);</span>
+
+        try {
+<span class="nc" id="L366">            final List&lt;byte[]&gt; allExisting = RocksDB.listColumnFamilies(userSpecifiedOptions, absolutePath);</span>
+
+            // Check for unexpected column families
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            for (final byte[] existingFamily : allExisting) {</span>
+<span class="nc" id="L370">                final boolean isExpected = allDescriptors.stream()</span>
+<span class="nc" id="L371">                        .anyMatch(descriptor -&gt; Arrays.equals(descriptor.getName(), existingFamily));</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                if (!isExpected) {</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">                    if (Arrays.equals(existingFamily, RocksDBTimestampedStore.TIMESTAMPED_VALUES_COLUMN_FAMILY_NAME)) {</span>
+<span class="nc" id="L374">                        throw new ProcessorStateException(</span>
+                                &quot;Store &quot; + name + &quot; is a timestamped key-value store and cannot be opened as a regular key-value store. &quot; +
+                                &quot;Downgrade from timestamped to regular store is not supported directly. &quot; +
+                                &quot;To downgrade, you can delete the local state in the state directory, and rebuild the store as regular key-value store from the changelog.&quot;);
+                    }
+<span class="nc bnc" id="L379" title="All 2 branches missed.">                    if (Arrays.equals(existingFamily, RocksDBTimestampedStoreWithHeaders.TIMESTAMPED_VALUES_WITH_HEADERS_CF_NAME)) {</span>
+<span class="nc" id="L380">                        final boolean openingAsTimestampedStore = allDescriptors.stream()</span>
+<span class="nc" id="L381">                                .anyMatch(descriptor -&gt; Arrays.equals(descriptor.getName(), RocksDBTimestampedStore.TIMESTAMPED_VALUES_COLUMN_FAMILY_NAME));</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                        if (openingAsTimestampedStore) {</span>
+<span class="nc" id="L383">                            throw new ProcessorStateException(</span>
+                                    &quot;Store &quot; + name + &quot; is a headers-aware store and cannot be opened as a timestamped store. &quot; +
+                                    &quot;Downgrade from headers-aware to timestamped store is not supported. &quot; +
+                                    &quot;To downgrade, you can delete the local state in the state directory, and rebuild the store as timestamped store from the changelog.&quot;);
+                        } else {
+<span class="nc" id="L388">                            throw new ProcessorStateException(</span>
+                                    &quot;Store &quot; + name + &quot; is a headers-aware store and cannot be opened as a regular key-value store. &quot; +
+                                    &quot;Downgrade from headers-aware to regular store is not supported.&quot;);
+                        }
+                    }
+
+<span class="nc" id="L394">                    final String unexpectedFamily = new String(existingFamily, StandardCharsets.UTF_8);</span>
+<span class="nc" id="L395">                    throw new ProcessorStateException(</span>
+                            &quot;Unexpected column family '&quot; + unexpectedFamily + &quot;' found in store &quot; + name + &quot;. &quot; +
+                            &quot;The store may have been created with incompatible settings.&quot;);
+                }
+<span class="nc" id="L399">            }</span>
+
+<span class="nc" id="L401">            final List&lt;ColumnFamilyDescriptor&gt; existingDescriptors = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L402">            existingDescriptors.add(defaultColumnFamilyDescriptor);</span>
+<span class="nc" id="L403">            existingDescriptors.addAll(extraDescriptors.stream()</span>
+<span class="nc" id="L404">                    .filter(descriptor -&gt; allExisting.stream().anyMatch(existing -&gt; Arrays.equals(existing, descriptor.getName())))</span>
+<span class="nc" id="L405">                    .collect(Collectors.toList()));</span>
+<span class="nc" id="L406">            final List&lt;ColumnFamilyDescriptor&gt; toCreate = extraDescriptors.stream()</span>
+<span class="nc" id="L407">                    .filter(descriptor -&gt; allExisting.stream().noneMatch(existing -&gt; Arrays.equals(existing, descriptor.getName())))</span>
+<span class="nc" id="L408">                    .collect(Collectors.toList());</span>
+<span class="nc" id="L409">            final List&lt;ColumnFamilyHandle&gt; existingColumnFamilies = new ArrayList&lt;&gt;(existingDescriptors.size());</span>
+<span class="nc" id="L410">            final List&lt;ColumnFamilyHandle&gt; createdColumnFamilies = new ArrayList&lt;&gt;();</span>
+            try {
+<span class="nc" id="L412">                db = RocksDB.open(dbOptions, absolutePath, existingDescriptors, existingColumnFamilies);</span>
+<span class="nc" id="L413">                createdColumnFamilies.addAll(db.createColumnFamilies(toCreate));</span>
+<span class="nc" id="L414">                return mergeColumnFamilyHandleLists(existingColumnFamilies, createdColumnFamilies, allDescriptors);</span>
+<span class="nc" id="L415">            } catch (final Exception e) {</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                for (final ColumnFamilyHandle handle : existingColumnFamilies) {</span>
+<span class="nc" id="L417">                    handle.close();</span>
+<span class="nc" id="L418">                }</span>
+<span class="nc bnc" id="L419" title="All 2 branches missed.">                for (final ColumnFamilyHandle handle : createdColumnFamilies) {</span>
+<span class="nc" id="L420">                    handle.close();</span>
+<span class="nc" id="L421">                }</span>
+<span class="nc" id="L422">                throw e;</span>
+            }
+
+<span class="nc" id="L425">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L426">            throw new ProcessorStateException(&quot;Error opening store &quot; + name + &quot; at location &quot; + dbDir.toString(), e);</span>
+        }
+    }
+
+    /**
+     * match up the existing and created ColumnFamilyHandles with the existing/created ColumnFamilyDescriptors
+     * so that the order of the resultant List matches the order of the allDescriptors argument
+     */
+    private List&lt;ColumnFamilyHandle&gt; mergeColumnFamilyHandleLists(final List&lt;ColumnFamilyHandle&gt; existingColumnFamilyHandles,
+                                                                  final List&lt;ColumnFamilyHandle&gt; createdColumnFamilyHandles,
+                                                                  final List&lt;ColumnFamilyDescriptor&gt; allDescriptors) throws RocksDBException {
+<span class="nc" id="L437">        final List&lt;ColumnFamilyHandle&gt; columnFamilies = new ArrayList&lt;&gt;(allDescriptors.size());</span>
+<span class="nc" id="L438">        int existing = 0;</span>
+<span class="nc" id="L439">        int created = 0;</span>
+
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        while (existing + created &lt; allDescriptors.size()) {</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">            final ColumnFamilyHandle existingHandle = existing &lt; existingColumnFamilyHandles.size() ? existingColumnFamilyHandles.get(existing) : null;</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            final ColumnFamilyHandle createdHandle = created &lt; createdColumnFamilyHandles.size() ? createdColumnFamilyHandles.get(created) : null;</span>
+<span class="nc bnc" id="L444" title="All 4 branches missed.">            if (existingHandle != null &amp;&amp; Arrays.equals(existingHandle.getName(), allDescriptors.get(existing + created).getName())) {</span>
+<span class="nc" id="L445">                columnFamilies.add(existingHandle);</span>
+<span class="nc" id="L446">                existing++;</span>
+<span class="nc bnc" id="L447" title="All 4 branches missed.">            } else if (createdHandle != null &amp;&amp; Arrays.equals(createdHandle.getName(), allDescriptors.get(existing + created).getName())) {</span>
+<span class="nc" id="L448">                columnFamilies.add(createdHandle);</span>
+<span class="nc" id="L449">                created++;</span>
+            } else {
+<span class="nc" id="L451">                throw new IllegalStateException(&quot;Unable to match up column family handles with descriptors.&quot;);</span>
+            }
+<span class="nc" id="L453">        }</span>
+<span class="nc" id="L454">        return columnFamilies;</span>
+    }
+
+    public final void writePosition() {
+        // Position is now committed atomically inside commit(); this method is a no-op.
+<span class="nc" id="L459">    }</span>
+
+    @Override
+    public String name() {
+<span class="nc" id="L463">        return name;</span>
+    }
+
+    @Override
+    public boolean persistent() {
+<span class="nc" id="L468">        return true;</span>
+    }
+
+    @Override
+    public boolean isOpen() {
+<span class="nc" id="L473">        return open.get();</span>
+    }
+
+    private void validateStoreOpen() {
+<span class="nc bnc" id="L477" title="All 2 branches missed.">        if (!isOpen()) {</span>
+<span class="nc" id="L478">            throw new InvalidStateStoreException(&quot;Store &quot; + name + &quot; is currently closed&quot;);</span>
+        }
+<span class="nc" id="L480">    }</span>
+
+    public Snapshot snapshot() {
+<span class="nc" id="L483">        return db.getSnapshot();</span>
+    }
+
+    public void releaseSnapshot(final Snapshot snapshot) {
+<span class="nc" id="L487">        db.releaseSnapshot(snapshot);</span>
+<span class="nc" id="L488">    }</span>
+
+    @Override
+    public synchronized void put(final Bytes key,
+                                 final byte[] value) {
+<span class="nc" id="L493">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L494">        validateStoreOpen();</span>
+
+<span class="nc" id="L496">        synchronized (position) {</span>
+<span class="nc" id="L497">            cfAccessor.put(dbAccessor, key.get(), value);</span>
+<span class="nc" id="L498">            dbAccessor.updatePosition(position, context);</span>
+<span class="nc" id="L499">        }</span>
+<span class="nc" id="L500">    }</span>
+
+    @Override
+    public synchronized byte[] putIfAbsent(final Bytes key,
+                                           final byte[] value) {
+<span class="nc" id="L505">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L506">        final byte[] originalValue = get(key);</span>
+<span class="nc bnc" id="L507" title="All 4 branches missed.">        if (originalValue == null &amp;&amp; value != null) {</span>
+<span class="nc" id="L508">            put(key, value);</span>
+        }
+<span class="nc" id="L510">        return originalValue;</span>
+    }
+
+    @Override
+    public synchronized void putAll(final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; entries) {
+<span class="nc" id="L515">        Objects.requireNonNull(entries, &quot;entries cannot be null&quot;);</span>
+        // Validate up front so a null key rejects the whole batch. An accessor may apply the entries
+        // one at a time, and failing part-way through would otherwise leave the batch half-applied.
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        for (final KeyValue&lt;Bytes, byte[]&gt; entry : entries) {</span>
+<span class="nc" id="L519">            Objects.requireNonNull(entry, &quot;entry cannot be null&quot;);</span>
+<span class="nc" id="L520">            Objects.requireNonNull(entry.key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L521">        }</span>
+<span class="nc" id="L522">        validateStoreOpen();</span>
+<span class="nc" id="L523">        synchronized (position) {</span>
+            try {
+<span class="nc" id="L525">                dbAccessor.putAll(cfAccessor, entries);</span>
+<span class="nc" id="L526">                dbAccessor.updatePosition(position, context);</span>
+<span class="nc" id="L527">            } catch (final RocksDBException e) {</span>
+<span class="nc" id="L528">                throw new ProcessorStateException(&quot;Error while batch writing to store &quot; + name, e);</span>
+<span class="nc" id="L529">            }</span>
+<span class="nc" id="L530">        }</span>
+<span class="nc" id="L531">    }</span>
+
+    @Override
+    public &lt;R&gt; QueryResult&lt;R&gt; query(
+        final Query&lt;R&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config) {
+
+<span class="nc" id="L539">        synchronized (position) {</span>
+            final Position queryPosition;
+<span class="nc bnc" id="L541" title="All 2 branches missed.">            if (config.getIsolationLevel() == IsolationLevel.READ_COMMITTED) {</span>
+<span class="nc" id="L542">                queryPosition = position;</span>
+            } else {
+<span class="nc" id="L544">                queryPosition = position.copy().merge(dbAccessor.uncommittedPositionDeltas());</span>
+            }
+<span class="nc" id="L546">            return StoreQueryUtils.handleBasicQueries(</span>
+                query,
+                positionBound,
+                config,
+                this,
+                queryPosition,
+                context
+            );
+        }
+    }
+
+    @Override
+    public &lt;PS extends Serializer&lt;P&gt;, P&gt; KeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final P prefix,
+                                                                                    final PS prefixKeySerializer) {
+<span class="nc bnc" id="L560" title="All 2 branches missed.">        if (!autoManagedIterators) {</span>
+<span class="nc" id="L561">            throw new IllegalStateException(&quot;Must specify openIterators in call to prefixScan()&quot;);</span>
+        }
+<span class="nc" id="L563">        return doPrefixScan(prefix, prefixKeySerializer, openIterators);</span>
+    }
+
+    &lt;PS extends Serializer&lt;P&gt;, P&gt; KeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final P prefix,
+                                                                             final PS prefixKeySerializer,
+                                                                             final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators) {
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        if (autoManagedIterators) {</span>
+<span class="nc" id="L570">            throw new IllegalStateException(&quot;Cannot specify openIterators when using auto-managed iterators&quot;);</span>
+        }
+<span class="nc" id="L572">        return doPrefixScan(prefix, prefixKeySerializer, openIterators);</span>
+    }
+
+    &lt;PS extends Serializer&lt;P&gt;, P&gt; KeyValueIterator&lt;Bytes, byte[]&gt; doPrefixScan(final P prefix,
+                                                                               final PS prefixKeySerializer,
+                                                                               final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators) {
+<span class="nc" id="L578">        validateStoreOpen();</span>
+<span class="nc" id="L579">        Objects.requireNonNull(prefix, &quot;prefix cannot be null&quot;);</span>
+<span class="nc" id="L580">        Objects.requireNonNull(prefixKeySerializer, &quot;prefixKeySerializer cannot be null&quot;);</span>
+<span class="nc" id="L581">        final Bytes prefixBytes = Bytes.wrap(prefixKeySerializer.serialize(null, prefix));</span>
+
+<span class="nc" id="L583">        final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; rocksDbPrefixSeekIterator = cfAccessor.prefixScan(dbAccessor, prefixBytes);</span>
+<span class="nc" id="L584">        openIterators.add(rocksDbPrefixSeekIterator);</span>
+<span class="nc" id="L585">        rocksDbPrefixSeekIterator.onClose(() -&gt; openIterators.remove(rocksDbPrefixSeekIterator));</span>
+
+<span class="nc" id="L587">        return rocksDbPrefixSeekIterator;</span>
+    }
+
+    @Override
+    public synchronized byte[] get(final Bytes key) {
+<span class="nc" id="L592">        return get(key, Optional.empty());</span>
+    }
+
+    public synchronized byte[] get(final Bytes key, final ReadOptions readOptions) {
+<span class="nc" id="L596">        return get(key, Optional.of(readOptions));</span>
+    }
+
+    private synchronized byte[] get(final Bytes key, final Optional&lt;ReadOptions&gt; readOptions) {
+<span class="nc" id="L600">        validateStoreOpen();</span>
+        try {
+<span class="nc bnc" id="L602" title="All 2 branches missed.">            return readOptions.isPresent() ? cfAccessor.get(dbAccessor, key.get(), readOptions.get()) : cfAccessor.get(dbAccessor, key.get());</span>
+<span class="nc" id="L603">        } catch (final RocksDBException e) {</span>
+            // String format is happening in wrapping stores. So formatted message is thrown from wrapping stores.
+<span class="nc" id="L605">            throw new ProcessorStateException(&quot;Error while getting value for key from store &quot; + name, e);</span>
+        }
+    }
+
+    @Override
+    public synchronized byte[] delete(final Bytes key) {
+<span class="nc" id="L611">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+        final byte[] oldValue;
+        try {
+<span class="nc" id="L614">            oldValue = cfAccessor.getOnly(dbAccessor, key.get());</span>
+<span class="nc" id="L615">        } catch (final RocksDBException e) {</span>
+            // String format is happening in wrapping stores. So formatted message is thrown from wrapping stores.
+<span class="nc" id="L617">            throw new ProcessorStateException(&quot;Error while getting value for key from store &quot; + name, e);</span>
+<span class="nc" id="L618">        }</span>
+<span class="nc" id="L619">        put(key, null);</span>
+<span class="nc" id="L620">        return oldValue;</span>
+    }
+
+    void deleteRange(final Bytes keyFrom, final Bytes keyTo) {
+<span class="nc" id="L624">        Objects.requireNonNull(keyFrom, &quot;keyFrom cannot be null&quot;);</span>
+<span class="nc" id="L625">        Objects.requireNonNull(keyTo, &quot;keyTo cannot be null&quot;);</span>
+
+<span class="nc" id="L627">        validateStoreOpen();</span>
+
+        // End of key is exclusive, so we increment it by 1 byte to make keyTo inclusive.
+        // RocksDB's deleteRange() does not support a null upper bound so in the event
+        // of overflow from increment(), the operation cannot be performed and an
+        // IndexOutOfBoundsException will be thrown.
+<span class="nc" id="L633">        cfAccessor.deleteRange(dbAccessor, keyFrom.get(), ByteUtils.increment(keyTo).get());</span>
+<span class="nc" id="L634">    }</span>
+
+    @Override
+    public synchronized KeyValueIterator&lt;Bytes, byte[]&gt; range(final Bytes from,
+                                                              final Bytes to) {
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (!autoManagedIterators) {</span>
+<span class="nc" id="L640">            throw new IllegalStateException(&quot;Must specify openIterators in call to range()&quot;);</span>
+        }
+<span class="nc" id="L642">        return range(from, to, true, openIterators);</span>
+    }
+
+    synchronized KeyValueIterator&lt;Bytes, byte[]&gt; range(final Bytes from,
+                                                       final Bytes to,
+                                                       final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators) {
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        if (autoManagedIterators) {</span>
+<span class="nc" id="L649">            throw new IllegalStateException(&quot;Cannot specify openIterators when using auto-managed iterators&quot;);</span>
+        }
+<span class="nc" id="L651">        return range(from, to, true, openIterators);</span>
+    }
+
+    @Override
+    public synchronized KeyValueIterator&lt;Bytes, byte[]&gt; reverseRange(final Bytes from,
+                                                                     final Bytes to) {
+<span class="nc bnc" id="L657" title="All 2 branches missed.">        if (!autoManagedIterators) {</span>
+<span class="nc" id="L658">            throw new IllegalStateException(&quot;Must specify openIterators in call to reverseRange()&quot;);</span>
+        }
+<span class="nc" id="L660">        return range(from, to, false, openIterators);</span>
+    }
+
+    synchronized KeyValueIterator&lt;Bytes, byte[]&gt; reverseRange(final Bytes from,
+                                                              final Bytes to,
+                                                              final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators) {
+<span class="nc bnc" id="L666" title="All 2 branches missed.">        if (autoManagedIterators) {</span>
+<span class="nc" id="L667">            throw new IllegalStateException(&quot;Cannot specify openIterators when using auto-managed iterators&quot;);</span>
+        }
+<span class="nc" id="L669">        return range(from, to, false, openIterators);</span>
+    }
+
+    private KeyValueIterator&lt;Bytes, byte[]&gt; range(final Bytes from,
+                                                  final Bytes to,
+                                                  final boolean forward,
+                                                  final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators) {
+<span class="nc bnc" id="L676" title="All 6 branches missed.">        if (Objects.nonNull(from) &amp;&amp; Objects.nonNull(to) &amp;&amp; from.compareTo(to) &gt; 0) {</span>
+<span class="nc" id="L677">            log.warn(&quot;Returning empty iterator for fetch with invalid key range: from &gt; to. &quot;</span>
+                    + &quot;This may be due to range arguments set in the wrong order, &quot; +
+                    &quot;or serdes that don't preserve ordering when lexicographically comparing the serialized bytes. &quot; +
+                    &quot;Note that the built-in numerical serdes do not follow this for negative numbers&quot;);
+<span class="nc" id="L681">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+<span class="nc" id="L684">        validateStoreOpen();</span>
+
+<span class="nc" id="L686">        final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; rocksDBRangeIterator = cfAccessor.range(dbAccessor, from, to, forward);</span>
+<span class="nc" id="L687">        openIterators.add(rocksDBRangeIterator);</span>
+<span class="nc" id="L688">        rocksDBRangeIterator.onClose(() -&gt; openIterators.remove(rocksDBRangeIterator));</span>
+
+<span class="nc" id="L690">        return rocksDBRangeIterator;</span>
+    }
+
+    @Override
+    public synchronized KeyValueIterator&lt;Bytes, byte[]&gt; all() {
+<span class="nc bnc" id="L695" title="All 2 branches missed.">        if (!autoManagedIterators) {</span>
+<span class="nc" id="L696">            throw new IllegalStateException(&quot;Must specify openIterators in call to all()&quot;);</span>
+        }
+<span class="nc" id="L698">        return all(true, openIterators);</span>
+    }
+
+    synchronized KeyValueIterator&lt;Bytes, byte[]&gt; all(final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators) {
+<span class="nc bnc" id="L702" title="All 2 branches missed.">        if (autoManagedIterators) {</span>
+<span class="nc" id="L703">            throw new IllegalStateException(&quot;Cannot specify openIterators when using auto-managed iterators&quot;);</span>
+        }
+<span class="nc" id="L705">        return all(true, openIterators);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; reverseAll() {
+<span class="nc bnc" id="L710" title="All 2 branches missed.">        if (!autoManagedIterators) {</span>
+<span class="nc" id="L711">            throw new IllegalStateException(&quot;Must specify openIterators in call to reverseAll()&quot;);</span>
+        }
+<span class="nc" id="L713">        return all(false, openIterators);</span>
+    }
+
+    KeyValueIterator&lt;Bytes, byte[]&gt; reverseAll(final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators) {
+<span class="nc bnc" id="L717" title="All 2 branches missed.">        if (autoManagedIterators) {</span>
+<span class="nc" id="L718">            throw new IllegalStateException(&quot;Cannot specify openIterators when using auto-managed iterators&quot;);</span>
+        }
+<span class="nc" id="L720">        return all(false, openIterators);</span>
+    }
+
+    private KeyValueIterator&lt;Bytes, byte[]&gt; all(final boolean forward,
+                                                final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators) {
+<span class="nc" id="L725">        validateStoreOpen();</span>
+<span class="nc" id="L726">        final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; rocksDbIterator = cfAccessor.all(dbAccessor, forward);</span>
+<span class="nc" id="L727">        openIterators.add(rocksDbIterator);</span>
+<span class="nc" id="L728">        rocksDbIterator.onClose(() -&gt; openIterators.remove(rocksDbIterator));</span>
+<span class="nc" id="L729">        return rocksDbIterator;</span>
+    }
+
+    /**
+     * Return an approximate count of key-value mappings in this store.
+     *
+     * &lt;code&gt;RocksDB&lt;/code&gt; cannot return an exact entry count without doing a
+     * full scan, so this method relies on the &lt;code&gt;rocksdb.estimate-num-keys&lt;/code&gt;
+     * property to get an approximate count. The returned size also includes
+     * a count of dirty keys in the store's in-memory cache, which may lead to some
+     * double-counting of entries and inflate the estimate.
+     * &lt;p&gt;
+     * The &lt;code&gt;rocksdb.estimate-num-keys&lt;/code&gt; property reflects the raw LSM-tree
+     * state (memtable plus SSTables) prior to background compaction. Repeated
+     * writes to the same key and tombstones (null-value writes) each count toward
+     * the estimate until RocksDB compacts them away. Consequently, immediately
+     * after the store has been restored from its changelog topic (for example,
+     * inside the first invocations of
+     * {@link org.apache.kafka.streams.processor.api.Processor#init} or
+     * {@link org.apache.kafka.streams.processor.api.Processor#process}), this
+     * estimate is typically inflated by every duplicate update and tombstone
+     * replayed during restoration. The estimate converges toward the live-key
+     * count as background compaction proceeds; iterating the store via
+     * {@link #all()} is the only way to obtain an exact count.
+     *
+     * @return an approximate count of key-value mappings in the store.
+     */
+    @Override
+    public long approximateNumUncommittedBytes() {
+<span class="nc bnc" id="L758" title="All 2 branches missed.">        if (dbAccessor instanceof TransactionalDBAccessor) {</span>
+<span class="nc" id="L759">            return ((TransactionalDBAccessor) dbAccessor).buffer.approximateNumUncommittedBytes();</span>
+        }
+<span class="nc" id="L761">        return 0;</span>
+    }
+
+    @Override
+    public ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; readOnly(final IsolationLevel isolationLevel) {
+<span class="nc" id="L766">        validateStoreOpen();</span>
+<span class="nc" id="L767">        return new ReadOnlyView(dbAccessor.readOnly(isolationLevel));</span>
+    }
+
+    // Read helpers for isolation-level views that sit above this store (e.g. LogicalKeyValueSegment.readOnly).
+    byte[] get(final Bytes key, final DBAccessor accessor) {
+<span class="nc" id="L772">        validateStoreOpen();</span>
+        try {
+<span class="nc" id="L774">            return cfAccessor.get(accessor, key.get());</span>
+<span class="nc" id="L775">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L776">            throw new ProcessorStateException(&quot;Error while getting value for key from store &quot; + name, e);</span>
+        }
+    }
+
+    byte[] get(final Bytes key, final ReadOptions readOptions, final DBAccessor accessor) {
+<span class="nc" id="L781">        validateStoreOpen();</span>
+        try {
+<span class="nc" id="L783">            return cfAccessor.get(accessor, key.get(), readOptions);</span>
+<span class="nc" id="L784">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L785">            throw new ProcessorStateException(&quot;Error while getting value for key from store &quot; + name, e);</span>
+        }
+    }
+
+    /**
+     * Read-only view of this store bound to a specific {@link DBAccessor}. Reads go through the
+     * chosen accessor so IQ callers can pick {@code READ_COMMITTED} (direct) or
+     * {@code READ_UNCOMMITTED} (through the transaction buffer) without affecting the
+     * processor-thread's view of the store.
+     */
+    private final class ReadOnlyView implements ReadOnlyKeyValueStore&lt;Bytes, byte[]&gt; {
+
+        private final DBAccessor viewAccessor;
+
+<span class="nc" id="L799">        ReadOnlyView(final DBAccessor viewAccessor) {</span>
+<span class="nc" id="L800">            this.viewAccessor = viewAccessor;</span>
+<span class="nc" id="L801">        }</span>
+
+        @Override
+        public byte[] get(final Bytes key) {
+<span class="nc" id="L805">            Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L806">            validateStoreOpen();</span>
+            try {
+<span class="nc" id="L808">                return cfAccessor.get(viewAccessor, key.get());</span>
+<span class="nc" id="L809">            } catch (final RocksDBException e) {</span>
+<span class="nc" id="L810">                throw new ProcessorStateException(&quot;Error while getting value for key from store &quot; + name, e);</span>
+            }
+        }
+
+        @Override
+        public KeyValueIterator&lt;Bytes, byte[]&gt; range(final Bytes from, final Bytes to) {
+<span class="nc" id="L816">            return doRange(from, to, true);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Bytes, byte[]&gt; reverseRange(final Bytes from, final Bytes to) {
+<span class="nc" id="L821">            return doRange(from, to, false);</span>
+        }
+
+        private KeyValueIterator&lt;Bytes, byte[]&gt; doRange(final Bytes from, final Bytes to, final boolean forward) {
+<span class="nc bnc" id="L825" title="All 6 branches missed.">            if (Objects.nonNull(from) &amp;&amp; Objects.nonNull(to) &amp;&amp; from.compareTo(to) &gt; 0) {</span>
+<span class="nc" id="L826">                return KeyValueIterators.emptyIterator();</span>
+            }
+<span class="nc" id="L828">            validateStoreOpen();</span>
+<span class="nc" id="L829">            final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; iter = cfAccessor.range(viewAccessor, from, to, forward);</span>
+<span class="nc" id="L830">            openIterators.add(iter);</span>
+<span class="nc" id="L831">            iter.onClose(() -&gt; openIterators.remove(iter));</span>
+<span class="nc" id="L832">            return iter;</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Bytes, byte[]&gt; all() {
+<span class="nc" id="L837">            return doAll(true);</span>
+        }
+
+        @Override
+        public KeyValueIterator&lt;Bytes, byte[]&gt; reverseAll() {
+<span class="nc" id="L842">            return doAll(false);</span>
+        }
+
+        private KeyValueIterator&lt;Bytes, byte[]&gt; doAll(final boolean forward) {
+<span class="nc" id="L846">            validateStoreOpen();</span>
+<span class="nc" id="L847">            final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; iter = cfAccessor.all(viewAccessor, forward);</span>
+<span class="nc" id="L848">            openIterators.add(iter);</span>
+<span class="nc" id="L849">            iter.onClose(() -&gt; openIterators.remove(iter));</span>
+<span class="nc" id="L850">            return iter;</span>
+        }
+
+        @Override
+        public &lt;PS extends Serializer&lt;P&gt;, P&gt; KeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final P prefix,
+                                                                                        final PS prefixKeySerializer) {
+<span class="nc" id="L856">            Objects.requireNonNull(prefix, &quot;prefix cannot be null&quot;);</span>
+<span class="nc" id="L857">            Objects.requireNonNull(prefixKeySerializer, &quot;prefixKeySerializer cannot be null&quot;);</span>
+<span class="nc" id="L858">            validateStoreOpen();</span>
+<span class="nc" id="L859">            final Bytes prefixBytes = Bytes.wrap(prefixKeySerializer.serialize(null, prefix));</span>
+<span class="nc" id="L860">            final ManagedKeyValueIterator&lt;Bytes, byte[]&gt; iter = cfAccessor.prefixScan(viewAccessor, prefixBytes);</span>
+<span class="nc" id="L861">            openIterators.add(iter);</span>
+<span class="nc" id="L862">            iter.onClose(() -&gt; openIterators.remove(iter));</span>
+<span class="nc" id="L863">            return iter;</span>
+        }
+
+        @Override
+        public long approximateNumEntries() {
+<span class="nc" id="L868">            validateStoreOpen();</span>
+            try {
+<span class="nc" id="L870">                final long n = cfAccessor.approximateNumEntries(viewAccessor);</span>
+<span class="nc bnc" id="L871" title="All 2 branches missed.">                return isOverflowing(n) ? Long.MAX_VALUE : n;</span>
+<span class="nc" id="L872">            } catch (final RocksDBException e) {</span>
+<span class="nc" id="L873">                throw new ProcessorStateException(&quot;Error fetching property from store &quot; + name, e);</span>
+            }
+        }
+    }
+
+    @Override
+    public long approximateNumEntries() {
+<span class="nc" id="L880">        validateStoreOpen();</span>
+        final long numEntries;
+        try {
+<span class="nc" id="L883">            numEntries = cfAccessor.approximateNumEntries(dbAccessor);</span>
+<span class="nc" id="L884">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L885">            throw new ProcessorStateException(&quot;Error fetching property from store &quot; + name, e);</span>
+<span class="nc" id="L886">        }</span>
+<span class="nc bnc" id="L887" title="All 2 branches missed.">        if (isOverflowing(numEntries)) {</span>
+<span class="nc" id="L888">            return Long.MAX_VALUE;</span>
+        }
+<span class="nc" id="L890">        return numEntries;</span>
+    }
+
+    private boolean isOverflowing(final long value) {
+        // RocksDB returns an unsigned 8-byte integer, which could overflow long
+        // and manifest as a negative value.
+<span class="nc bnc" id="L896" title="All 2 branches missed.">        return value &lt; 0;</span>
+    }
+
+    @Override
+    public Long committedOffset(final TopicPartition partition) {
+<span class="nc" id="L901">        validateStoreOpen();</span>
+        try {
+<span class="nc" id="L903">            return cfAccessor.getCommittedOffset(dbAccessor, partition);</span>
+<span class="nc" id="L904">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L905">            throw new ProcessorStateException(&quot;Error while getting committed offset for partition &quot; + partition, e);</span>
+        }
+    }
+
+    @Override
+    @SuppressWarnings(&quot;deprecation&quot;)
+    public boolean managesOffsets() {
+<span class="nc" id="L912">        return true;</span>
+    }
+
+    @Override
+    public synchronized void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc bnc" id="L917" title="All 2 branches missed.">        if (db == null) {</span>
+<span class="nc" id="L918">            return;</span>
+        }
+        try {
+<span class="nc" id="L921">            synchronized (position) {</span>
+<span class="nc" id="L922">                cfAccessor.commit(dbAccessor, position, changelogOffsets);</span>
+<span class="nc" id="L923">            }</span>
+<span class="nc" id="L924">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L925">            throw new ProcessorStateException(&quot;Error while executing commit from store &quot; + name, e);</span>
+<span class="nc" id="L926">        }</span>
+<span class="nc" id="L927">    }</span>
+
+    @Override
+    public void addToBatch(final KeyValue&lt;byte[], byte[]&gt; record,
+                           final WriteBatchInterface batch) throws RocksDBException {
+<span class="nc" id="L932">        cfAccessor.addToBatch(record.key, record.value, batch);</span>
+<span class="nc" id="L933">    }</span>
+
+    @Override
+    public void write(final WriteBatchInterface batch) throws RocksDBException {
+<span class="nc bnc" id="L937" title="All 2 branches missed.">        if (batch instanceof WriteBatch) {</span>
+<span class="nc" id="L938">            db.write(wOptions, (WriteBatch) batch);</span>
+<span class="nc bnc" id="L939" title="All 2 branches missed.">        } else if (batch instanceof WriteBatchWithIndex) {</span>
+<span class="nc" id="L940">            db.write(wOptions, (WriteBatchWithIndex) batch);</span>
+        } else {
+<span class="nc" id="L942">            log.error(&quot;Unknown type of batch {}. This is a bug in Kafka Streams. &quot; +</span>
+                    &quot;Please file a bug report at https://issues.apache.org/jira/projects/KAFKA.&quot;,
+<span class="nc" id="L944">                    batch.getClass().getCanonicalName());</span>
+<span class="nc" id="L945">            throw new IllegalStateException(&quot;Unknown type of batch &quot; + batch.getClass().getCanonicalName());</span>
+        }
+<span class="nc" id="L947">    }</span>
+
+    @Override
+    public synchronized void close() {
+<span class="nc bnc" id="L951" title="All 2 branches missed.">        if (!isOpen()) {</span>
+<span class="nc" id="L952">            return;</span>
+        }
+
+<span class="nc" id="L955">        closeOpenIterators();</span>
+
+<span class="nc bnc" id="L957" title="All 2 branches missed.">        if (configSetter != null) {</span>
+<span class="nc" id="L958">            configSetter.close(name, userSpecifiedOptions);</span>
+<span class="nc" id="L959">            configSetter = null;</span>
+        }
+
+<span class="nc" id="L962">        metricsRecorder.removeValueProviders(name);</span>
+
+        // Important: do not rearrange the order in which the below objects are closed!
+        // Order of closing must follow: ColumnFamilyHandle &gt; RocksDB &gt; DBOptions &gt; ColumnFamilyOptions
+        try {
+<span class="nc" id="L967">            cfAccessor.close(dbAccessor);</span>
+<span class="nc" id="L968">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L969">            log.error(&quot;Error while closing column family handles for store &quot; + name, e);</span>
+<span class="nc" id="L970">        }</span>
+<span class="nc" id="L971">        dbAccessor.close();</span>
+<span class="nc" id="L972">        db.close();</span>
+<span class="nc" id="L973">        userSpecifiedOptions.close();</span>
+<span class="nc bnc" id="L974" title="All 2 branches missed.">        if (offsetsCfOptions != null) {</span>
+<span class="nc" id="L975">            offsetsCfOptions.close();</span>
+        }
+<span class="nc" id="L977">        wOptions.close();</span>
+<span class="nc" id="L978">        fOptions.close();</span>
+<span class="nc" id="L979">        filter.close();</span>
+<span class="nc" id="L980">        cache.close();</span>
+<span class="nc bnc" id="L981" title="All 2 branches missed.">        if (statistics != null) {</span>
+<span class="nc" id="L982">            statistics.close();</span>
+        }
+
+<span class="nc" id="L985">        cfAccessor = null;</span>
+<span class="nc" id="L986">        dbAccessor = null;</span>
+<span class="nc" id="L987">        userSpecifiedOptions = null;</span>
+<span class="nc" id="L988">        offsetsCfOptions = null;</span>
+<span class="nc" id="L989">        wOptions = null;</span>
+<span class="nc" id="L990">        fOptions = null;</span>
+<span class="nc" id="L991">        db = null;</span>
+<span class="nc" id="L992">        filter = null;</span>
+<span class="nc" id="L993">        cache = null;</span>
+<span class="nc" id="L994">        statistics = null;</span>
+<span class="nc" id="L995">    }</span>
+
+    /**
+     * Close all native RocksDB resources with null-safety.
+     * Used only by the error cleanup path in {@link #openDB} where some resources
+     * may not have been initialized yet.
+     */
+    private void closeNativeResources() {
+<span class="nc" id="L1003">        closeDbAndAccessors();</span>
+<span class="nc" id="L1004">        closeOptionsAndFilters();</span>
+<span class="nc" id="L1005">    }</span>
+
+    private void closeDbAndAccessors() {
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">        if (cfAccessor != null) {</span>
+            try {
+<span class="nc bnc" id="L1010" title="All 2 branches missed.">                if (dbAccessor != null) {</span>
+<span class="nc" id="L1011">                    cfAccessor.close(dbAccessor);</span>
+                }
+<span class="nc" id="L1013">            } catch (final Exception e) {</span>
+<span class="nc" id="L1014">                log.error(&quot;Error while closing column family handles for store &quot; + name, e);</span>
+<span class="nc" id="L1015">            }</span>
+<span class="nc" id="L1016">            cfAccessor = null;</span>
+        }
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">        if (dbAccessor != null) {</span>
+<span class="nc" id="L1019">            dbAccessor.close();</span>
+<span class="nc" id="L1020">            dbAccessor = null;</span>
+        }
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">        if (db != null) {</span>
+<span class="nc" id="L1023">            db.close();</span>
+<span class="nc" id="L1024">            db = null;</span>
+        }
+<span class="nc" id="L1026">    }</span>
+
+    private void closeOptionsAndFilters() {
+<span class="nc bnc" id="L1029" title="All 2 branches missed.">        if (userSpecifiedOptions != null) {</span>
+<span class="nc" id="L1030">            userSpecifiedOptions.close();</span>
+<span class="nc" id="L1031">            userSpecifiedOptions = null;</span>
+        }
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">        if (offsetsCfOptions != null) {</span>
+<span class="nc" id="L1034">            offsetsCfOptions.close();</span>
+<span class="nc" id="L1035">            offsetsCfOptions = null;</span>
+        }
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">        if (wOptions != null) {</span>
+<span class="nc" id="L1038">            wOptions.close();</span>
+<span class="nc" id="L1039">            wOptions = null;</span>
+        }
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">        if (fOptions != null) {</span>
+<span class="nc" id="L1042">            fOptions.close();</span>
+<span class="nc" id="L1043">            fOptions = null;</span>
+        }
+<span class="nc bnc" id="L1045" title="All 2 branches missed.">        if (filter != null) {</span>
+<span class="nc" id="L1046">            filter.close();</span>
+<span class="nc" id="L1047">            filter = null;</span>
+        }
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">        if (cache != null) {</span>
+<span class="nc" id="L1050">            cache.close();</span>
+<span class="nc" id="L1051">            cache = null;</span>
+        }
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">        if (statistics != null) {</span>
+<span class="nc" id="L1054">            statistics.close();</span>
+<span class="nc" id="L1055">            statistics = null;</span>
+        }
+<span class="nc" id="L1057">    }</span>
+
+    private void closeOpenIterators() {
+        final HashSet&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; iterators;
+<span class="nc" id="L1061">        synchronized (openIterators) {</span>
+<span class="nc" id="L1062">            iterators = new HashSet&lt;&gt;(openIterators);</span>
+<span class="nc" id="L1063">        }</span>
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">        if (iterators.size() != 0) {</span>
+<span class="nc" id="L1065">            log.warn(&quot;Closing {} open iterators for store {}&quot;, iterators.size(), name);</span>
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">            for (final KeyValueIterator&lt;Bytes, byte[]&gt; iterator : iterators) {</span>
+<span class="nc" id="L1067">                iterator.close();</span>
+<span class="nc" id="L1068">            }</span>
+        }
+<span class="nc" id="L1070">    }</span>
+
+    interface DBAccessor {
+        byte[] get(final ColumnFamilyHandle columnFamily, final byte[] key) throws RocksDBException;
+        byte[] get(final ColumnFamilyHandle columnFamily, final ReadOptions readOptions, final byte[] key) throws RocksDBException;
+        RocksIterator newIterator(final ColumnFamilyHandle columnFamily);
+        void put(final ColumnFamilyHandle columnFamily, final byte[] key, final byte[] value) throws RocksDBException;
+        void delete(final ColumnFamilyHandle columnFamily, final byte[] key) throws RocksDBException;
+        void deleteRange(final ColumnFamilyHandle columnFamily, final byte[] from, final byte[] to) throws RocksDBException;
+        long approximateNumEntries(final ColumnFamilyHandle columnFamily) throws RocksDBException;
+        void flush(final ColumnFamilyHandle... columnFamilies) throws RocksDBException;
+        void reset();
+        void close();
+
+        /**
+         * Applies a batch of writes through {@code cfAccessor}, which owns the column-family layout.
+         * Deliberately has no default. Each accessor must state how it makes the batch atomic — a single
+         * batch write, or staging it.
+         */
+        void putAll(final ColumnFamilyAccessor cfAccessor,
+                    final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; entries) throws RocksDBException;
+
+        default DBAccessor readOnly(final IsolationLevel isolationLevel) {
+<span class="nc" id="L1093">            Objects.requireNonNull(isolationLevel, &quot;isolationLevel cannot be null&quot;);</span>
+<span class="nc" id="L1094">            return this;</span>
+        }
+
+        default ManagedKeyValueIterator&lt;Bytes, byte[]&gt; all(final ColumnFamilyHandle cf, final String storeName, final boolean forward) {
+<span class="nc" id="L1098">            final RocksIterator iter = newIterator(cf);</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">            if (forward) {</span>
+<span class="nc" id="L1100">                iter.seekToFirst();</span>
+            } else {
+<span class="nc" id="L1102">                iter.seekToLast();</span>
+            }
+<span class="nc" id="L1104">            return new RocksDbIterator(storeName, iter, forward);</span>
+        }
+
+        default ManagedKeyValueIterator&lt;Bytes, byte[]&gt; range(final ColumnFamilyHandle cf, final String storeName,
+                                                             final Bytes from, final Bytes to,
+                                                             final boolean forward, final boolean toInclusive) {
+<span class="nc" id="L1110">            return new RocksDBRangeIterator(storeName, newIterator(cf), from, to, forward, toInclusive);</span>
+        }
+
+        default ManagedKeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final ColumnFamilyHandle cf, final String storeName,
+                                                                  final Bytes prefix, final Bytes to) {
+<span class="nc" id="L1115">            return new RocksDBRangeIterator(storeName, newIterator(cf), prefix, to, true, false);</span>
+        }
+
+        default void commitStagedWrites() throws RocksDBException {
+            // no-op for non-transactional accessors
+<span class="nc" id="L1120">        }</span>
+
+        default void rollbackStagedWrites() {
+            // no-op for non-transactional accessors
+<span class="nc" id="L1124">        }</span>
+
+        // Position tracking. A non-transactional accessor writes straight to the store's committed
+        // position and has no uncommitted deltas; the transactional accessor stages them in its
+        // buffer until commit. (committedPosition is unused by the transactional override.)
+        default void updatePosition(final Position committedPosition, final StateStoreContext context) {
+<span class="nc" id="L1130">            StoreQueryUtils.updatePosition(committedPosition, context);</span>
+<span class="nc" id="L1131">        }</span>
+
+        default Position uncommittedPositionDeltas() {
+<span class="nc" id="L1134">            return Position.emptyPosition();</span>
+        }
+
+        default void mergeUncommittedPositionInto(final Position committedPosition) {
+            // no-op for non-transactional accessors
+<span class="nc" id="L1139">        }</span>
+    }
+
+    static class DirectDBAccessor implements DBAccessor {
+
+        private final RocksDB db;
+        private final FlushOptions flushOptions;
+        private final WriteOptions wOptions;
+
+<span class="nc" id="L1148">        DirectDBAccessor(final RocksDB db, final FlushOptions flushOptions, final WriteOptions wOptions) {</span>
+<span class="nc" id="L1149">            this.db = db;</span>
+<span class="nc" id="L1150">            this.flushOptions = flushOptions;</span>
+<span class="nc" id="L1151">            this.wOptions = wOptions;</span>
+<span class="nc" id="L1152">        }</span>
+
+        @Override
+        public byte[] get(final ColumnFamilyHandle columnFamily, final byte[] key) throws RocksDBException {
+<span class="nc" id="L1156">            return db.get(columnFamily, key);</span>
+        }
+
+        @Override
+        public byte[] get(final ColumnFamilyHandle columnFamily, final ReadOptions readOptions, final byte[] key) throws RocksDBException {
+<span class="nc" id="L1161">            return db.get(columnFamily, readOptions, key);</span>
+        }
+
+        @Override
+        public RocksIterator newIterator(final ColumnFamilyHandle columnFamily) {
+<span class="nc" id="L1166">            return db.newIterator(columnFamily);</span>
+        }
+
+        @Override
+        public void put(final ColumnFamilyHandle columnFamily, final byte[] key, final byte[] value) throws RocksDBException {
+<span class="nc" id="L1171">            db.put(columnFamily, wOptions, key, value);</span>
+<span class="nc" id="L1172">        }</span>
+
+        @Override
+        public void delete(final ColumnFamilyHandle columnFamily, final byte[] key) throws RocksDBException {
+<span class="nc" id="L1176">            db.delete(columnFamily, wOptions, key);</span>
+<span class="nc" id="L1177">        }</span>
+
+        @Override
+        public void deleteRange(final ColumnFamilyHandle columnFamily, final byte[] from, final byte[] to) throws RocksDBException {
+<span class="nc" id="L1181">            db.deleteRange(columnFamily, wOptions, from, to);</span>
+<span class="nc" id="L1182">        }</span>
+
+        @Override
+        public void putAll(final ColumnFamilyAccessor cfAccessor,
+                           final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; entries) throws RocksDBException {
+            // A single atomic batch write, so a crash part-way through leaves nothing behind.
+<span class="nc" id="L1188">            try (final WriteBatch batch = new WriteBatch()) {</span>
+<span class="nc" id="L1189">                cfAccessor.prepareBatch(entries, batch);</span>
+<span class="nc" id="L1190">                db.write(wOptions, batch);</span>
+            }
+<span class="nc" id="L1192">        }</span>
+
+        @Override
+        public long approximateNumEntries(final ColumnFamilyHandle columnFamily) throws RocksDBException {
+<span class="nc" id="L1196">            return db.getLongProperty(columnFamily, &quot;rocksdb.estimate-num-keys&quot;);</span>
+        }
+
+        @Override
+        public void flush(final ColumnFamilyHandle... columnFamilies) throws RocksDBException {
+<span class="nc bnc" id="L1201" title="All 2 branches missed.">            if (columnFamilies.length == 0) {</span>
+<span class="nc" id="L1202">                db.flush(flushOptions);</span>
+            } else {
+<span class="nc" id="L1204">                db.flush(flushOptions, Arrays.asList(columnFamilies));</span>
+            }
+<span class="nc" id="L1206">        }</span>
+
+        @Override
+        public void reset() {
+            // no state to reset
+<span class="nc" id="L1211">        }</span>
+
+        @Override
+        public void close() {
+            // nothing to close
+<span class="nc" id="L1216">        }</span>
+    }
+
+
+    static class TransactionalDBAccessor implements DBAccessor {
+
+        private final DBAccessor underlying;
+        private final RocksDBTransactionBuffer buffer;
+        private final ColumnFamilyHandle offsetsColumnFamily;
+
+        TransactionalDBAccessor(final DBAccessor underlying,
+                                final RocksDB db,
+                                final ColumnFamilyHandle dataColumnFamily,
+                                final ColumnFamilyHandle offsetsColumnFamily,
+                                final WriteOptions wOptions,
+<span class="nc" id="L1231">                                final String storeName) {</span>
+<span class="nc" id="L1232">            this.underlying = underlying;</span>
+<span class="nc" id="L1233">            this.offsetsColumnFamily = offsetsColumnFamily;</span>
+<span class="nc" id="L1234">            this.buffer = new RocksDBTransactionBuffer(db, dataColumnFamily, wOptions, storeName);</span>
+<span class="nc" id="L1235">        }</span>
+
+        @Override
+        public byte[] get(final ColumnFamilyHandle columnFamily, final byte[] key) throws RocksDBException {
+<span class="nc bnc" id="L1239" title="All 2 branches missed.">            if (!columnFamily.equals(offsetsColumnFamily)) {</span>
+<span class="nc" id="L1240">                final java.util.Optional&lt;byte[]&gt; staged = buffer.get(Bytes.wrap(key));</span>
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">                if (staged != null) {</span>
+<span class="nc" id="L1242">                    return staged.orElse(null);</span>
+                }
+            }
+<span class="nc" id="L1245">            return underlying.get(columnFamily, key);</span>
+        }
+
+        @Override
+        public byte[] get(final ColumnFamilyHandle columnFamily, final ReadOptions readOptions, final byte[] key) throws RocksDBException {
+<span class="nc bnc" id="L1250" title="All 2 branches missed.">            if (!columnFamily.equals(offsetsColumnFamily)) {</span>
+<span class="nc" id="L1251">                final java.util.Optional&lt;byte[]&gt; staged = buffer.get(Bytes.wrap(key));</span>
+<span class="nc bnc" id="L1252" title="All 2 branches missed.">                if (staged != null) {</span>
+<span class="nc" id="L1253">                    return staged.orElse(null);</span>
+                }
+            }
+<span class="nc" id="L1256">            return underlying.get(columnFamily, readOptions, key);</span>
+        }
+
+        @Override
+        public RocksIterator newIterator(final ColumnFamilyHandle columnFamily) {
+<span class="nc" id="L1261">            return underlying.newIterator(columnFamily);</span>
+        }
+
+        @Override
+        public void put(final ColumnFamilyHandle columnFamily, final byte[] key, final byte[] value) throws RocksDBException {
+<span class="nc" id="L1266">            buffer.stage(columnFamily, Bytes.wrap(key), value);</span>
+<span class="nc" id="L1267">        }</span>
+
+        @Override
+        public void delete(final ColumnFamilyHandle columnFamily, final byte[] key) throws RocksDBException {
+<span class="nc" id="L1271">            buffer.stage(columnFamily, Bytes.wrap(key), null);</span>
+<span class="nc" id="L1272">        }</span>
+
+        @Override
+        public void deleteRange(final ColumnFamilyHandle columnFamily, final byte[] from, final byte[] to) throws RocksDBException {
+<span class="nc" id="L1276">            buffer.stageDeleteRange(columnFamily, Bytes.wrap(from), Bytes.wrap(to));</span>
+<span class="nc" id="L1277">        }</span>
+
+        @Override
+        public void putAll(final ColumnFamilyAccessor cfAccessor,
+                           final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; entries) {
+            // Batch writes must be staged like single-key puts. If written directly to RocksDB
+            // (what the direct accessor does), the uncommitted data would sit in the store rather
+            // than the buffer so would not get removed on error. Staging under one write-lock
+            // acquisition also hides the batch from a concurrent IQ reader until complete,
+            // matching the atomicity of the direct accessor's single db.write(batch). Reusing
+            // cfAccessor.put() keeps the column-family layout — including the dual-CF upgrade
+            // path — identical to a single-key put.
+<span class="nc" id="L1289">            buffer.stageAll(() -&gt; {</span>
+<span class="nc bnc" id="L1290" title="All 2 branches missed.">                for (final KeyValue&lt;Bytes, byte[]&gt; entry : entries) {</span>
+<span class="nc" id="L1291">                    cfAccessor.put(this, entry.key.get(), entry.value);</span>
+<span class="nc" id="L1292">                }</span>
+<span class="nc" id="L1293">            });</span>
+<span class="nc" id="L1294">        }</span>
+
+        @Override
+        public long approximateNumEntries(final ColumnFamilyHandle columnFamily) throws RocksDBException {
+<span class="nc" id="L1298">            return underlying.approximateNumEntries(columnFamily);</span>
+        }
+
+        @Override
+        public void flush(final ColumnFamilyHandle... columnFamilies) throws RocksDBException {
+<span class="nc" id="L1303">            underlying.flush(columnFamilies);</span>
+<span class="nc" id="L1304">        }</span>
+
+        @Override
+        public void reset() {
+<span class="nc" id="L1308">            underlying.reset();</span>
+<span class="nc" id="L1309">        }</span>
+
+        @Override
+        public void close() {
+<span class="nc" id="L1313">            buffer.close();</span>
+<span class="nc" id="L1314">            underlying.close();</span>
+<span class="nc" id="L1315">        }</span>
+
+        @Override
+        public DBAccessor readOnly(final IsolationLevel isolationLevel) {
+<span class="nc" id="L1319">            Objects.requireNonNull(isolationLevel, &quot;isolationLevel cannot be null&quot;);</span>
+<span class="nc bnc" id="L1320" title="All 2 branches missed.">            if (isolationLevel == IsolationLevel.READ_COMMITTED) {</span>
+<span class="nc" id="L1321">                return underlying;</span>
+            } else {
+<span class="nc" id="L1323">                return this;</span>
+            }
+        }
+
+        @Override
+        public ManagedKeyValueIterator&lt;Bytes, byte[]&gt; all(final ColumnFamilyHandle cf, final String storeName, final boolean forward) {
+<span class="nc" id="L1329">            return buffer.all(cf, forward);</span>
+        }
+
+        @Override
+        public ManagedKeyValueIterator&lt;Bytes, byte[]&gt; range(final ColumnFamilyHandle cf, final String storeName,
+                                                              final Bytes from, final Bytes to,
+                                                              final boolean forward, final boolean toInclusive) {
+<span class="nc" id="L1336">            return buffer.range(cf, from, to, forward, toInclusive);</span>
+        }
+
+        @Override
+        public ManagedKeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final ColumnFamilyHandle cf, final String storeName,
+                                                                    final Bytes prefix, final Bytes to) {
+<span class="nc" id="L1342">            return buffer.range(cf, prefix, to, true, false);</span>
+        }
+
+        @Override
+        public void commitStagedWrites() {
+<span class="nc" id="L1347">            buffer.commit();</span>
+<span class="nc" id="L1348">        }</span>
+
+        @Override
+        public void rollbackStagedWrites() {
+<span class="nc" id="L1352">            buffer.rollback();</span>
+<span class="nc" id="L1353">        }</span>
+
+        @Override
+        public void updatePosition(final Position committedPosition, final StateStoreContext context) {
+<span class="nc" id="L1357">            buffer.updatePosition(context);</span>
+<span class="nc" id="L1358">        }</span>
+
+        @Override
+        public Position uncommittedPositionDeltas() {
+<span class="nc" id="L1362">            return buffer.pendingPosition();</span>
+        }
+
+        @Override
+        public void mergeUncommittedPositionInto(final Position committedPosition) {
+<span class="nc" id="L1367">            buffer.mergePendingPositionInto(committedPosition);</span>
+<span class="nc" id="L1368">        }</span>
+
+    }
+
+    interface ColumnFamilyAccessor {
+
+        void put(final DBAccessor accessor, final byte[] key, final byte[] value);
+
+        void prepareBatch(final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; entries,
+                          final WriteBatchInterface batch) throws RocksDBException;
+
+        byte[] get(final DBAccessor accessor, final byte[] key) throws RocksDBException;
+
+        byte[] get(final DBAccessor accessor, final byte[] key, final ReadOptions readOptions) throws RocksDBException;
+
+        /**
+         * In contrast to get(), we don't migrate the key to new CF.
+         * &lt;p&gt;
+         * Use for get() within delete() -- no need to migrate, as it's deleted anyway
+         */
+        byte[] getOnly(final DBAccessor accessor, final byte[] key) throws RocksDBException;
+
+        ManagedKeyValueIterator&lt;Bytes, byte[]&gt; range(final DBAccessor accessor,
+                                              final Bytes from,
+                                              final Bytes to,
+                                              final boolean forward);
+
+        /**
+         * Deletes keys entries in the range ['from', 'to'], including 'from' and excluding 'to'.
+         */
+        void deleteRange(final DBAccessor accessor, final byte[] from, final byte[] to);
+
+        ManagedKeyValueIterator&lt;Bytes, byte[]&gt; all(final DBAccessor accessor, final boolean forward);
+
+        ManagedKeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final DBAccessor accessor, final Bytes prefix);
+
+        long approximateNumEntries(final DBAccessor accessor) throws RocksDBException;
+
+        void commit(final DBAccessor accessor,
+                    final Position position,
+                    final Map&lt;TopicPartition, Long&gt; changelogOffsets) throws RocksDBException;
+
+        void addToBatch(final byte[] key,
+                        final byte[] value,
+                        final WriteBatchInterface batch) throws RocksDBException;
+
+        void close(final RocksDBStore.DBAccessor accessor) throws RocksDBException;
+
+        /**
+         * Initializes the ColumnFamily.
+         * @return the position of the store based on the data in the ColumnFamily. If no offset position is found, an empty position is returned.
+         * @throws ProcessorStateException if an invalid state is found and ignoreInvalidState is false
+         */
+        Position open(final RocksDBStore.DBAccessor accessor, final boolean ignoreInvalidState) throws RocksDBException, StreamsException;
+
+        Long getCommittedOffset(final RocksDBStore.DBAccessor accessor, final TopicPartition partition) throws RocksDBException;
+
+        /**
+         * Returns the primary data column family handle.
+         *
+         * &lt;p&gt;This is the CF that all live puts target. It is passed to the transaction buffer
+         * as its default CF for WriteBatch staging.
+         *
+         * &lt;p&gt;For dual-CF (upgrade-mode) stores this is the new-format CF, since all puts
+         * land there and reads check it first.
+         */
+        ColumnFamilyHandle dataColumnFamily();
+
+        /**
+         * Returns the column family handle used to persist offset metadata.
+         *
+         * &lt;p&gt;Reads from this CF must bypass the staged-write buffer so they always reflect
+         * committed state, guarding against the case where a data key coincidentally matches
+         * an offset key in the buffer.
+         */
+        ColumnFamilyHandle offsetsColumnFamily();
+    }
+
+    class SingleColumnFamilyAccessor extends AbstractColumnFamilyAccessor {
+        private final ColumnFamilyHandle columnFamily;
+
+<span class="nc" id="L1449">        SingleColumnFamilyAccessor(final ColumnFamilyHandle offsetsColumnFamily, final ColumnFamilyHandle columnFamily) {</span>
+<span class="nc" id="L1450">            super(offsetsColumnFamily, open, isTransactional);</span>
+<span class="nc" id="L1451">            this.columnFamily = columnFamily;</span>
+<span class="nc" id="L1452">        }</span>
+
+        @Override
+        public void put(final DBAccessor accessor,
+                        final byte[] key,
+                        final byte[] value) {
+<span class="nc bnc" id="L1458" title="All 2 branches missed.">            if (value == null) {</span>
+                try {
+<span class="nc" id="L1460">                    accessor.delete(columnFamily, key);</span>
+<span class="nc" id="L1461">                } catch (final RocksDBException e) {</span>
+                    // String format is happening in wrapping stores. So formatted message is thrown from wrapping stores.
+<span class="nc" id="L1463">                    throw new ProcessorStateException(&quot;Error while removing key from store &quot; + name, e);</span>
+<span class="nc" id="L1464">                }</span>
+            } else {
+                try {
+<span class="nc" id="L1467">                    accessor.put(columnFamily, key, value);</span>
+<span class="nc" id="L1468">                } catch (final RocksDBException e) {</span>
+                    // String format is happening in wrapping stores. So formatted message is thrown from wrapping stores.
+<span class="nc" id="L1470">                    throw new ProcessorStateException(&quot;Error while putting key/value into store &quot; + name, e);</span>
+<span class="nc" id="L1471">                }</span>
+            }
+<span class="nc" id="L1473">        }</span>
+
+        @Override
+        public void prepareBatch(final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; entries,
+                                 final WriteBatchInterface batch) throws RocksDBException {
+<span class="nc bnc" id="L1478" title="All 2 branches missed.">            for (final KeyValue&lt;Bytes, byte[]&gt; entry : entries) {</span>
+<span class="nc" id="L1479">                Objects.requireNonNull(entry.key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L1480">                addToBatch(entry.key.get(), entry.value, batch);</span>
+<span class="nc" id="L1481">            }</span>
+<span class="nc" id="L1482">        }</span>
+
+        @Override
+        public byte[] get(final DBAccessor accessor, final byte[] key) throws RocksDBException {
+<span class="nc" id="L1486">            return accessor.get(columnFamily, key);</span>
+        }
+
+        @Override
+        public byte[] get(final DBAccessor accessor, final byte[] key, final ReadOptions readOptions) throws RocksDBException {
+<span class="nc" id="L1491">            return accessor.get(columnFamily, readOptions, key);</span>
+        }
+
+        @Override
+        public byte[] getOnly(final DBAccessor accessor, final byte[] key) throws RocksDBException {
+<span class="nc" id="L1496">            return get(accessor, key);</span>
+        }
+
+        @Override
+        public ManagedKeyValueIterator&lt;Bytes, byte[]&gt; range(final DBAccessor accessor,
+                                                            final Bytes from,
+                                                            final Bytes to,
+                                                            final boolean forward) {
+<span class="nc" id="L1504">            return accessor.range(columnFamily, name, from, to, forward, true);</span>
+        }
+
+        @Override
+        public void deleteRange(final DBAccessor accessor, final byte[] from, final byte[] to) {
+            try {
+<span class="nc" id="L1510">                accessor.deleteRange(columnFamily, from, to);</span>
+<span class="nc" id="L1511">            } catch (final RocksDBException e) {</span>
+                // String format is happening in wrapping stores. So formatted message is thrown from wrapping stores.
+<span class="nc" id="L1513">                throw new ProcessorStateException(&quot;Error while removing key from store &quot; + name, e);</span>
+<span class="nc" id="L1514">            }</span>
+<span class="nc" id="L1515">        }</span>
+
+        @Override
+        public ManagedKeyValueIterator&lt;Bytes, byte[]&gt; all(final DBAccessor accessor, final boolean forward) {
+<span class="nc" id="L1519">            return accessor.all(columnFamily, name, forward);</span>
+        }
+
+        @Override
+        public ManagedKeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final DBAccessor accessor, final Bytes prefix) {
+<span class="nc" id="L1524">            final Bytes to = incrementWithoutOverflow(prefix);</span>
+<span class="nc" id="L1525">            return accessor.prefixScan(columnFamily, name, prefix, to);</span>
+        }
+
+        @Override
+        public long approximateNumEntries(final DBAccessor accessor) throws RocksDBException {
+<span class="nc" id="L1530">            return accessor.approximateNumEntries(columnFamily);</span>
+        }
+
+        @Override
+        public void addToBatch(final byte[] key,
+                               final byte[] value,
+                               final WriteBatchInterface batch) throws RocksDBException {
+<span class="nc bnc" id="L1537" title="All 2 branches missed.">            if (value == null) {</span>
+<span class="nc" id="L1538">                batch.delete(columnFamily, key);</span>
+            } else {
+<span class="nc" id="L1540">                batch.put(columnFamily, key, value);</span>
+            }
+<span class="nc" id="L1542">        }</span>
+
+        @Override
+        public void close(final RocksDBStore.DBAccessor accessor) throws RocksDBException {
+            try {
+<span class="nc" id="L1547">                super.close(accessor);</span>
+            } finally {
+<span class="nc" id="L1549">                columnFamily.close();</span>
+            }
+<span class="nc" id="L1551">        }</span>
+
+        @Override
+        public ColumnFamilyHandle dataColumnFamily() {
+<span class="nc" id="L1555">            return columnFamily;</span>
+        }
+
+        // Visible for testing
+        ColumnFamilyHandle columnFamily() {
+<span class="nc" id="L1560">            return columnFamily;</span>
+        }
+    }
+
+    void restoreBatch(final Collection&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; records) {
+<span class="nc" id="L1565">        synchronized (position) {</span>
+<span class="nc" id="L1566">            try (final WriteBatch batch = new WriteBatch()) {</span>
+<span class="nc bnc" id="L1567" title="All 2 branches missed.">                for (final ConsumerRecord&lt;byte[], byte[]&gt; record : records) {</span>
+                    // Restore writes go straight to the base store (write(batch) below bypasses the
+                    // transaction buffer), so the restored data is already committed — its position
+                    // updates `position` directly, never the buffer's pending deltas.
+<span class="nc" id="L1571">                    ChangelogRecordDeserializationHelper.applyChecksAndUpdatePosition(</span>
+                        record,
+                        consistencyEnabled,
+                        position
+                    );
+                    // If version headers are not present or version is V0
+<span class="nc" id="L1577">                    cfAccessor.addToBatch(record.key(), record.value(), batch);</span>
+<span class="nc" id="L1578">                }</span>
+<span class="nc" id="L1579">                write(batch);</span>
+<span class="nc" id="L1580">            } catch (final RocksDBException e) {</span>
+<span class="nc" id="L1581">                throw new ProcessorStateException(&quot;Error restoring batch to store &quot; + name, e);</span>
+<span class="nc" id="L1582">            }</span>
+<span class="nc" id="L1583">        }</span>
+<span class="nc" id="L1584">    }</span>
+
+    // for testing
+    public Options getOptions() {
+<span class="nc" id="L1588">        return userSpecifiedOptions;</span>
+    }
+
+    @Override
+    public Position getPosition() {
+<span class="nc" id="L1593">        synchronized (position) {</span>
+<span class="nc" id="L1594">            return position.copy().merge(dbAccessor.uncommittedPositionDeltas());</span>
+        }
+    }
+
+    /**
+     * Same as {@link ByteUtils#increment(Bytes)} but {@code null} is returned instead of throwing
+     * {@code IndexOutOfBoundsException} in the event of overflow.
+     *
+     * @param input bytes to increment
+     * @return A new copy of the incremented byte array, or {@code null} if incrementing would
+     *         result in overflow.
+     */
+    static Bytes incrementWithoutOverflow(final Bytes input) {
+        try {
+<span class="nc" id="L1608">            return ByteUtils.increment(input);</span>
+<span class="nc" id="L1609">        } catch (final IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L1610">            return null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

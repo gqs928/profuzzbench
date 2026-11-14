@@ -1,0 +1,752 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DefaultRecordBatch.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.record.internal</a> &gt; <span class="el_source">DefaultRecordBatch.java</span></div><h1>DefaultRecordBatch.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.record.internal;
+
+import org.apache.kafka.common.InvalidRecordException;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.errors.CorruptRecordException;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.utils.internals.BufferSupplier;
+import org.apache.kafka.common.utils.internals.ByteBufferOutputStream;
+import org.apache.kafka.common.utils.internals.ByteUtils;
+import org.apache.kafka.common.utils.internals.CloseableIterator;
+import org.apache.kafka.common.utils.internals.Crc32C;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.BufferUnderflowException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.OptionalLong;
+
+import static org.apache.kafka.common.record.internal.Records.LOG_OVERHEAD;
+
+/**
+ * RecordBatch implementation for magic 2 and above. The schema is given below:
+ *
+ * RecordBatch =&gt;
+ *  BaseOffset =&gt; Int64
+ *  Length =&gt; Int32
+ *  PartitionLeaderEpoch =&gt; Int32
+ *  Magic =&gt; Int8
+ *  CRC =&gt; Uint32
+ *  Attributes =&gt; Int16
+ *  LastOffsetDelta =&gt; Int32 // also serves as LastSequenceDelta
+ *  BaseTimestamp =&gt; Int64
+ *  MaxTimestamp =&gt; Int64
+ *  ProducerId =&gt; Int64
+ *  ProducerEpoch =&gt; Int16
+ *  BaseSequence =&gt; Int32
+ *  RecordsCount =&gt; Int32
+ *  Records =&gt; [Record]
+ *
+ * Note that when compression is enabled (see attributes below), the compressed record data is serialized
+ * directly following the count of the number of records.
+ *
+ * The CRC covers the data from the attributes to the end of the batch (i.e. all the bytes that follow the CRC). It is
+ * located after the magic byte, which means that clients must parse the magic byte before deciding how to interpret
+ * the bytes between the batch length and the magic byte. The partition leader epoch field is not included in the CRC
+ * computation to avoid the need to recompute the CRC when this field is assigned for every batch that is received by
+ * the broker. The CRC-32C (Castagnoli) polynomial is used for the computation.
+ *
+ * On Compaction: Unlike the older message formats, magic v2 and above preserves the first and last offset/sequence
+ * numbers from the original batch when the log is cleaned. This is required in order to be able to restore the
+ * producer's state when the log is reloaded. If we did not retain the last sequence number, then following
+ * a partition leader failure, once the new leader has rebuilt the producer state from the log, the next sequence
+ * expected number would no longer be in sync with what was written by the client. This would cause an
+ * unexpected OutOfOrderSequence error, which is typically fatal. The base sequence number must be preserved for
+ * duplicate checking: the broker checks incoming Produce requests for duplicates by verifying that the first and
+ * last sequence numbers of the incoming batch match the last from that producer.
+ *
+ * Note that if all of the records in a batch are removed during compaction, the broker may still retain an empty
+ * batch header in order to preserve the producer sequence information as described above. These empty batches
+ * are retained only until either a new sequence number is written by the corresponding producer or the producerId
+ * is expired from lack of activity.
+ *
+ * There is no similar need to preserve the timestamp from the original batch after compaction. The BaseTimestamp
+ * field therefore reflects the timestamp of the first record in the batch in most cases. If the batch is empty, the
+ * BaseTimestamp will be set to -1 (NO_TIMESTAMP). If the delete horizon flag is set to 1, the BaseTimestamp
+ * will be set to the time at which tombstone records and aborted transaction markers in the batch should be removed.
+ *
+ * Similarly, the MaxTimestamp field reflects the maximum timestamp of the current records if the timestamp type
+ * is CREATE_TIME. For LOG_APPEND_TIME, on the other hand, the MaxTimestamp field reflects the timestamp set
+ * by the broker and is preserved after compaction. Additionally, the MaxTimestamp of an empty batch always retains
+ * the previous value prior to becoming empty.
+ *
+ * The current attributes are given below:
+ *
+ *  ---------------------------------------------------------------------------------------------------------------------------
+ *  | Unused (7-15) | Delete Horizon Flag (6) | Control (5) | Transactional (4) | Timestamp Type (3) | Compression Type (0-2) |
+ *  ---------------------------------------------------------------------------------------------------------------------------
+ */
+public class DefaultRecordBatch extends AbstractRecordBatch implements MutableRecordBatch {
+    static final int BASE_OFFSET_OFFSET = 0;
+    static final int BASE_OFFSET_LENGTH = 8;
+    static final int LENGTH_OFFSET = BASE_OFFSET_OFFSET + BASE_OFFSET_LENGTH;
+    static final int LENGTH_LENGTH = 4;
+    static final int PARTITION_LEADER_EPOCH_OFFSET = LENGTH_OFFSET + LENGTH_LENGTH;
+    static final int PARTITION_LEADER_EPOCH_LENGTH = 4;
+    static final int MAGIC_OFFSET = PARTITION_LEADER_EPOCH_OFFSET + PARTITION_LEADER_EPOCH_LENGTH;
+    static final int MAGIC_LENGTH = 1;
+    public static final int CRC_OFFSET = MAGIC_OFFSET + MAGIC_LENGTH;
+    static final int CRC_LENGTH = 4;
+    static final int ATTRIBUTES_OFFSET = CRC_OFFSET + CRC_LENGTH;
+    static final int ATTRIBUTE_LENGTH = 2;
+    public static final int LAST_OFFSET_DELTA_OFFSET = ATTRIBUTES_OFFSET + ATTRIBUTE_LENGTH;
+    static final int LAST_OFFSET_DELTA_LENGTH = 4;
+    static final int BASE_TIMESTAMP_OFFSET = LAST_OFFSET_DELTA_OFFSET + LAST_OFFSET_DELTA_LENGTH;
+    static final int BASE_TIMESTAMP_LENGTH = 8;
+    static final int MAX_TIMESTAMP_OFFSET = BASE_TIMESTAMP_OFFSET + BASE_TIMESTAMP_LENGTH;
+    static final int MAX_TIMESTAMP_LENGTH = 8;
+    static final int PRODUCER_ID_OFFSET = MAX_TIMESTAMP_OFFSET + MAX_TIMESTAMP_LENGTH;
+    static final int PRODUCER_ID_LENGTH = 8;
+    static final int PRODUCER_EPOCH_OFFSET = PRODUCER_ID_OFFSET + PRODUCER_ID_LENGTH;
+    static final int PRODUCER_EPOCH_LENGTH = 2;
+    static final int BASE_SEQUENCE_OFFSET = PRODUCER_EPOCH_OFFSET + PRODUCER_EPOCH_LENGTH;
+    static final int BASE_SEQUENCE_LENGTH = 4;
+    public static final int RECORDS_COUNT_OFFSET = BASE_SEQUENCE_OFFSET + BASE_SEQUENCE_LENGTH;
+    static final int RECORDS_COUNT_LENGTH = 4;
+    static final int RECORDS_OFFSET = RECORDS_COUNT_OFFSET + RECORDS_COUNT_LENGTH;
+    public static final int RECORD_BATCH_OVERHEAD = RECORDS_OFFSET;
+
+    private static final byte COMPRESSION_CODEC_MASK = 0x07;
+    private static final byte TRANSACTIONAL_FLAG_MASK = 0x10;
+    private static final int CONTROL_FLAG_MASK = 0x20;
+    private static final byte DELETE_HORIZON_FLAG_MASK = 0x40;
+    private static final byte TIMESTAMP_TYPE_MASK = 0x08;
+
+    private final ByteBuffer buffer;
+
+<span class="nc" id="L141">    DefaultRecordBatch(ByteBuffer buffer) {</span>
+<span class="nc" id="L142">        this.buffer = buffer;</span>
+<span class="nc" id="L143">    }</span>
+
+    @Override
+    public byte magic() {
+<span class="nc" id="L147">        return buffer.get(MAGIC_OFFSET);</span>
+    }
+
+    @Override
+    public void ensureValid() {
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if (sizeInBytes() &lt; RECORD_BATCH_OVERHEAD)</span>
+<span class="nc" id="L153">            throw new CorruptRecordException(&quot;Record batch is corrupt (the size &quot; + sizeInBytes() +</span>
+                    &quot; is smaller than the minimum allowed overhead &quot; + RECORD_BATCH_OVERHEAD + &quot;)&quot;);
+
+<span class="nc bnc" id="L156" title="All 2 branches missed.">        if (!isValid())</span>
+<span class="nc" id="L157">            throw new CorruptRecordException(&quot;Record is corrupt (stored crc = &quot; + checksum()</span>
+<span class="nc" id="L158">                    + &quot;, computed crc = &quot; + computeChecksum() + &quot;)&quot;);</span>
+<span class="nc" id="L159">    }</span>
+
+    /**
+     * Gets the base timestamp of the batch which is used to calculate the record timestamps from the deltas.
+     *
+     * @return The base timestamp
+     */
+    public long baseTimestamp() {
+<span class="nc" id="L167">        return buffer.getLong(BASE_TIMESTAMP_OFFSET);</span>
+    }
+
+    @Override
+    public long maxTimestamp() {
+<span class="nc" id="L172">        return buffer.getLong(MAX_TIMESTAMP_OFFSET);</span>
+    }
+
+    @Override
+    public TimestampType timestampType() {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        return (attributes() &amp; TIMESTAMP_TYPE_MASK) == 0 ? TimestampType.CREATE_TIME : TimestampType.LOG_APPEND_TIME;</span>
+    }
+
+    @Override
+    public long baseOffset() {
+<span class="nc" id="L182">        return buffer.getLong(BASE_OFFSET_OFFSET);</span>
+    }
+
+    @Override
+    public long lastOffset() {
+<span class="nc" id="L187">        return baseOffset() + lastOffsetDelta();</span>
+    }
+
+    @Override
+    public long producerId() {
+<span class="nc" id="L192">        return buffer.getLong(PRODUCER_ID_OFFSET);</span>
+    }
+
+    @Override
+    public short producerEpoch() {
+<span class="nc" id="L197">        return buffer.getShort(PRODUCER_EPOCH_OFFSET);</span>
+    }
+
+    @Override
+    public int baseSequence() {
+<span class="nc" id="L202">        return buffer.getInt(BASE_SEQUENCE_OFFSET);</span>
+    }
+
+    private int lastOffsetDelta() {
+<span class="nc" id="L206">        return buffer.getInt(LAST_OFFSET_DELTA_OFFSET);</span>
+    }
+
+    @Override
+    public int lastSequence() {
+<span class="nc" id="L211">        int baseSequence = baseSequence();</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        if (baseSequence == RecordBatch.NO_SEQUENCE)</span>
+<span class="nc" id="L213">            return RecordBatch.NO_SEQUENCE;</span>
+<span class="nc" id="L214">        return incrementSequence(baseSequence, lastOffsetDelta());</span>
+    }
+
+    @Override
+    public CompressionType compressionType() {
+<span class="nc" id="L219">        return CompressionType.forId(attributes() &amp; COMPRESSION_CODEC_MASK);</span>
+    }
+
+    @Override
+    public int sizeInBytes() {
+<span class="nc" id="L224">        return LOG_OVERHEAD + buffer.getInt(LENGTH_OFFSET);</span>
+    }
+
+    private int count() {
+<span class="nc" id="L228">        return buffer.getInt(RECORDS_COUNT_OFFSET);</span>
+    }
+
+    @Override
+    public Integer countOrNull() {
+<span class="nc" id="L233">        return count();</span>
+    }
+
+    @Override
+    public void writeTo(ByteBuffer buffer) {
+<span class="nc" id="L238">        buffer.put(this.buffer.duplicate());</span>
+<span class="nc" id="L239">    }</span>
+
+    @Override
+    public void writeTo(ByteBufferOutputStream outputStream) {
+<span class="nc" id="L243">        outputStream.write(this.buffer.duplicate());</span>
+<span class="nc" id="L244">    }</span>
+
+    @Override
+    public boolean isTransactional() {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        return (attributes() &amp; TRANSACTIONAL_FLAG_MASK) &gt; 0;</span>
+    }
+
+    private boolean hasDeleteHorizonMs() {
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        return (attributes() &amp; DELETE_HORIZON_FLAG_MASK) &gt; 0;</span>
+    }
+
+    @Override
+    public OptionalLong deleteHorizonMs() {
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        if (hasDeleteHorizonMs())</span>
+<span class="nc" id="L258">            return OptionalLong.of(buffer.getLong(BASE_TIMESTAMP_OFFSET));</span>
+        else
+<span class="nc" id="L260">            return OptionalLong.empty();</span>
+    }
+
+    @Override
+    public boolean isControlBatch() {
+<span class="nc bnc" id="L265" title="All 2 branches missed.">        return (attributes() &amp; CONTROL_FLAG_MASK) &gt; 0;</span>
+    }
+
+    @Override
+    public int partitionLeaderEpoch() {
+<span class="nc" id="L270">        return buffer.getInt(PARTITION_LEADER_EPOCH_OFFSET);</span>
+    }
+
+    public InputStream recordInputStream(BufferSupplier bufferSupplier) {
+<span class="nc" id="L274">        final ByteBuffer buffer = this.buffer.duplicate();</span>
+<span class="nc" id="L275">        buffer.position(RECORDS_OFFSET);</span>
+<span class="nc" id="L276">        return Compression.of(compressionType()).build().wrapForInput(buffer, magic(), bufferSupplier);</span>
+    }
+
+    private CloseableIterator&lt;Record&gt; compressedIterator(BufferSupplier bufferSupplier, boolean skipKeyValue, int maxRecordBodySize) {
+<span class="nc" id="L280">        final InputStream inputStream = recordInputStream(bufferSupplier);</span>
+
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        if (skipKeyValue) {</span>
+<span class="nc" id="L283">            return new StreamRecordIterator(inputStream) {</span>
+                @Override
+                protected Record doReadRecord(long baseOffset, long baseTimestamp, int baseSequence, Long logAppendTime) throws IOException {
+<span class="nc" id="L286">                    return DefaultRecord.readPartiallyFrom(inputStream, baseOffset, baseTimestamp, baseSequence, logAppendTime, maxRecordBodySize);</span>
+                }
+            };
+        } else {
+<span class="nc" id="L290">            return new StreamRecordIterator(inputStream) {</span>
+                @Override
+                protected Record doReadRecord(long baseOffset, long baseTimestamp, int baseSequence, Long logAppendTime) throws IOException {
+<span class="nc" id="L293">                    return DefaultRecord.readFrom(inputStream, baseOffset, baseTimestamp, baseSequence, logAppendTime, maxRecordBodySize);</span>
+                }
+            };
+        }
+    }
+
+    private CloseableIterator&lt;Record&gt; uncompressedIterator() {
+<span class="nc" id="L300">        final ByteBuffer buffer = this.buffer.duplicate();</span>
+<span class="nc" id="L301">        buffer.position(RECORDS_OFFSET);</span>
+<span class="nc" id="L302">        return new RecordIterator() {</span>
+            @Override
+            protected Record readNext(long baseOffset, long baseTimestamp, int baseSequence, Long logAppendTime) {
+                try {
+<span class="nc" id="L306">                    return DefaultRecord.readFrom(buffer, baseOffset, baseTimestamp, baseSequence, logAppendTime);</span>
+<span class="nc" id="L307">                } catch (BufferUnderflowException e) {</span>
+<span class="nc" id="L308">                    throw new InvalidRecordException(&quot;Incorrect declared batch size, premature EOF reached&quot;);</span>
+                }
+            }
+            @Override
+            protected boolean ensureNoneRemaining() {
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                return !buffer.hasRemaining();</span>
+            }
+            @Override
+<span class="nc" id="L316">            public void close() {}</span>
+        };
+    }
+
+    @Override
+    public Iterator&lt;Record&gt; iterator() {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        if (count() == 0)</span>
+<span class="nc" id="L323">            return Collections.emptyIterator();</span>
+
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (!isCompressed())</span>
+<span class="nc" id="L326">            return uncompressedIterator();</span>
+
+        // for a normal iterator, we cannot ensure that the underlying compression stream is closed,
+        // so we decompress the full record set here. Use cases which call for a lower memory footprint
+        // can use `streamingIterator` at the cost of additional complexity
+<span class="nc" id="L331">        try (CloseableIterator&lt;Record&gt; iterator = compressedIterator(BufferSupplier.NO_CACHING, false, Records.SOFT_MAX_ARRAY_LENGTH)) {</span>
+<span class="nc" id="L332">            List&lt;Record&gt; records = new ArrayList&lt;&gt;(count());</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">            while (iterator.hasNext())</span>
+<span class="nc" id="L334">                records.add(iterator.next());</span>
+<span class="nc" id="L335">            return records.iterator();</span>
+        }
+    }
+
+    @Override
+    public CloseableIterator&lt;Record&gt; skipKeyValueIterator(BufferSupplier bufferSupplier) {
+<span class="nc" id="L341">        return skipKeyValueIterator(bufferSupplier, Records.SOFT_MAX_ARRAY_LENGTH);</span>
+    }
+
+    @Override
+    public CloseableIterator&lt;Record&gt; skipKeyValueIterator(BufferSupplier bufferSupplier, int maxRecordBodySize) {
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (count() == 0) {</span>
+<span class="nc" id="L347">            return CloseableIterator.wrap(Collections.emptyIterator());</span>
+        }
+
+        /*
+         * For uncompressed iterator, it is actually not worth skipping key / value / headers at all since
+         * its ByteBufferInputStream's skip() function is less efficient compared with just reading it actually
+         * as it will allocate new byte array.
+         */
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        if (!isCompressed())</span>
+<span class="nc" id="L356">            return uncompressedIterator();</span>
+
+        // we define this to be a closable iterator so that caller (i.e. the log validator) needs to close it
+        // while we can save memory footprint of not decompressing the full record set ahead of time
+<span class="nc" id="L360">        return compressedIterator(bufferSupplier, true, maxRecordBodySize);</span>
+    }
+
+    @Override
+    public CloseableIterator&lt;Record&gt; streamingIterator(BufferSupplier bufferSupplier) {
+<span class="nc" id="L365">        return streamingIterator(bufferSupplier, Records.SOFT_MAX_ARRAY_LENGTH);</span>
+    }
+
+    @Override
+    public CloseableIterator&lt;Record&gt; streamingIterator(BufferSupplier bufferSupplier, int maxRecordBodySize) {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        if (isCompressed())</span>
+<span class="nc" id="L371">            return compressedIterator(bufferSupplier, false, maxRecordBodySize);</span>
+        else
+<span class="nc" id="L373">            return uncompressedIterator();</span>
+    }
+
+    @Override
+    public void setLastOffset(long offset) {
+<span class="nc" id="L378">        buffer.putLong(BASE_OFFSET_OFFSET, offset - lastOffsetDelta());</span>
+<span class="nc" id="L379">    }</span>
+
+    @Override
+    public void setMaxTimestamp(TimestampType timestampType, long maxTimestamp) {
+<span class="nc" id="L383">        long currentMaxTimestamp = maxTimestamp();</span>
+        // We don't need to recompute crc if the timestamp is not updated.
+<span class="nc bnc" id="L385" title="All 4 branches missed.">        if (timestampType() == timestampType &amp;&amp; currentMaxTimestamp == maxTimestamp)</span>
+<span class="nc" id="L386">            return;</span>
+
+<span class="nc" id="L388">        byte attributes = computeAttributes(compressionType(), timestampType, isTransactional(), isControlBatch(), hasDeleteHorizonMs());</span>
+<span class="nc" id="L389">        buffer.putShort(ATTRIBUTES_OFFSET, attributes);</span>
+<span class="nc" id="L390">        buffer.putLong(MAX_TIMESTAMP_OFFSET, maxTimestamp);</span>
+<span class="nc" id="L391">        long crc = computeChecksum();</span>
+<span class="nc" id="L392">        ByteUtils.writeUnsignedInt(buffer, CRC_OFFSET, crc);</span>
+<span class="nc" id="L393">    }</span>
+
+    @Override
+    public void setPartitionLeaderEpoch(int epoch) {
+<span class="nc" id="L397">        buffer.putInt(PARTITION_LEADER_EPOCH_OFFSET, epoch);</span>
+<span class="nc" id="L398">    }</span>
+
+    @Override
+    public long checksum() {
+<span class="nc" id="L402">        return ByteUtils.readUnsignedInt(buffer, CRC_OFFSET);</span>
+    }
+
+    public boolean isValid() {
+<span class="nc bnc" id="L406" title="All 4 branches missed.">        return sizeInBytes() &gt;= RECORD_BATCH_OVERHEAD &amp;&amp; checksum() == computeChecksum();</span>
+    }
+
+    private long computeChecksum() {
+<span class="nc" id="L410">        return Crc32C.compute(buffer, ATTRIBUTES_OFFSET, buffer.limit() - ATTRIBUTES_OFFSET);</span>
+    }
+
+    private byte attributes() {
+        // note we're not using the second byte of attributes
+<span class="nc" id="L415">        return (byte) buffer.getShort(ATTRIBUTES_OFFSET);</span>
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        if (this == o)</span>
+<span class="nc" id="L421">            return true;</span>
+<span class="nc bnc" id="L422" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass())</span>
+<span class="nc" id="L423">            return false;</span>
+
+<span class="nc" id="L425">        DefaultRecordBatch that = (DefaultRecordBatch) o;</span>
+<span class="nc" id="L426">        return Objects.equals(buffer, that.buffer);</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        return buffer != null ? buffer.hashCode() : 0;</span>
+    }
+
+    private static byte computeAttributes(CompressionType type, TimestampType timestampType,
+                                          boolean isTransactional, boolean isControl, boolean isDeleteHorizonSet) {
+<span class="nc bnc" id="L436" title="All 2 branches missed.">        if (timestampType == TimestampType.NO_TIMESTAMP_TYPE)</span>
+<span class="nc" id="L437">            throw new IllegalArgumentException(&quot;Timestamp type must be provided to compute attributes for message &quot; +</span>
+                    &quot;format v2 and above&quot;);
+
+<span class="nc bnc" id="L440" title="All 2 branches missed.">        byte attributes = isTransactional ? TRANSACTIONAL_FLAG_MASK : 0;</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        if (isControl)</span>
+<span class="nc" id="L442">            attributes |= CONTROL_FLAG_MASK;</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        if (type.id &gt; 0)</span>
+<span class="nc" id="L444">            attributes |= (byte) (COMPRESSION_CODEC_MASK &amp; type.id);</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">        if (timestampType == TimestampType.LOG_APPEND_TIME)</span>
+<span class="nc" id="L446">            attributes |= TIMESTAMP_TYPE_MASK;</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        if (isDeleteHorizonSet)</span>
+<span class="nc" id="L448">            attributes |= DELETE_HORIZON_FLAG_MASK;</span>
+<span class="nc" id="L449">        return attributes;</span>
+    }
+
+    public static void writeEmptyHeader(ByteBuffer buffer,
+                                        byte magic,
+                                        long producerId,
+                                        short producerEpoch,
+                                        int baseSequence,
+                                        long baseOffset,
+                                        long lastOffset,
+                                        int partitionLeaderEpoch,
+                                        TimestampType timestampType,
+                                        long timestamp,
+                                        boolean isTransactional,
+                                        boolean isControlRecord) {
+<span class="nc" id="L464">        int offsetDelta = (int) (lastOffset - baseOffset);</span>
+<span class="nc" id="L465">        writeHeader(buffer, baseOffset, offsetDelta, DefaultRecordBatch.RECORD_BATCH_OVERHEAD, magic,</span>
+                    CompressionType.NONE, timestampType, RecordBatch.NO_TIMESTAMP, timestamp, producerId,
+                    producerEpoch, baseSequence, isTransactional, isControlRecord, false, partitionLeaderEpoch, 0);
+<span class="nc" id="L468">    }</span>
+
+    public static void writeHeader(ByteBuffer buffer,
+                                   long baseOffset,
+                                   int lastOffsetDelta,
+                                   int sizeInBytes,
+                                   byte magic,
+                                   CompressionType compressionType,
+                                   TimestampType timestampType,
+                                   long baseTimestamp,
+                                   long maxTimestamp,
+                                   long producerId,
+                                   short epoch,
+                                   int sequence,
+                                   boolean isTransactional,
+                                   boolean isControlBatch,
+                                   boolean isDeleteHorizonSet,
+                                   int partitionLeaderEpoch,
+                                   int numRecords) {
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        if (magic &lt; RecordBatch.CURRENT_MAGIC_VALUE)</span>
+<span class="nc" id="L488">            throw new IllegalArgumentException(&quot;Invalid magic value &quot; + magic);</span>
+<span class="nc bnc" id="L489" title="All 4 branches missed.">        if (baseTimestamp &lt; 0 &amp;&amp; baseTimestamp != NO_TIMESTAMP)</span>
+<span class="nc" id="L490">            throw new IllegalArgumentException(&quot;Invalid message timestamp &quot; + baseTimestamp);</span>
+
+<span class="nc" id="L492">        short attributes = computeAttributes(compressionType, timestampType, isTransactional, isControlBatch, isDeleteHorizonSet);</span>
+
+<span class="nc" id="L494">        int position = buffer.position();</span>
+<span class="nc" id="L495">        buffer.putLong(position + BASE_OFFSET_OFFSET, baseOffset);</span>
+<span class="nc" id="L496">        buffer.putInt(position + LENGTH_OFFSET, sizeInBytes - LOG_OVERHEAD);</span>
+<span class="nc" id="L497">        buffer.putInt(position + PARTITION_LEADER_EPOCH_OFFSET, partitionLeaderEpoch);</span>
+<span class="nc" id="L498">        buffer.put(position + MAGIC_OFFSET, magic);</span>
+<span class="nc" id="L499">        buffer.putShort(position + ATTRIBUTES_OFFSET, attributes);</span>
+<span class="nc" id="L500">        buffer.putLong(position + BASE_TIMESTAMP_OFFSET, baseTimestamp);</span>
+<span class="nc" id="L501">        buffer.putLong(position + MAX_TIMESTAMP_OFFSET, maxTimestamp);</span>
+<span class="nc" id="L502">        buffer.putInt(position + LAST_OFFSET_DELTA_OFFSET, lastOffsetDelta);</span>
+<span class="nc" id="L503">        buffer.putLong(position + PRODUCER_ID_OFFSET, producerId);</span>
+<span class="nc" id="L504">        buffer.putShort(position + PRODUCER_EPOCH_OFFSET, epoch);</span>
+<span class="nc" id="L505">        buffer.putInt(position + BASE_SEQUENCE_OFFSET, sequence);</span>
+<span class="nc" id="L506">        buffer.putInt(position + RECORDS_COUNT_OFFSET, numRecords);</span>
+<span class="nc" id="L507">        long crc = Crc32C.compute(buffer, ATTRIBUTES_OFFSET, sizeInBytes - ATTRIBUTES_OFFSET);</span>
+<span class="nc" id="L508">        buffer.putInt(position + CRC_OFFSET, (int) crc);</span>
+<span class="nc" id="L509">        buffer.position(position + RECORD_BATCH_OVERHEAD);</span>
+<span class="nc" id="L510">    }</span>
+
+    @Override
+    public String toString() {
+<span class="nc" id="L514">        return &quot;RecordBatch(magic=&quot; + magic() + &quot;, offsets=[&quot; + baseOffset() + &quot;, &quot; + lastOffset() + &quot;], &quot; +</span>
+<span class="nc" id="L515">                &quot;sequence=[&quot; + baseSequence() + &quot;, &quot; + lastSequence() + &quot;], &quot; +</span>
+<span class="nc" id="L516">                &quot;partitionLeaderEpoch=&quot; + partitionLeaderEpoch() + &quot;, &quot; +</span>
+<span class="nc" id="L517">                &quot;isTransactional=&quot; + isTransactional() + &quot;, isControlBatch=&quot; + isControlBatch() + &quot;, &quot; +</span>
+<span class="nc" id="L518">                &quot;compression=&quot; + compressionType() + &quot;, timestampType=&quot; + timestampType() + &quot;, crc=&quot; + checksum() + &quot;)&quot;;</span>
+    }
+
+    public static int sizeInBytes(long baseOffset, Iterable&lt;Record&gt; records) {
+<span class="nc" id="L522">        Iterator&lt;Record&gt; iterator = records.iterator();</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        if (!iterator.hasNext())</span>
+<span class="nc" id="L524">            return 0;</span>
+
+<span class="nc" id="L526">        int size = RECORD_BATCH_OVERHEAD;</span>
+<span class="nc" id="L527">        Long baseTimestamp = null;</span>
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        while (iterator.hasNext()) {</span>
+<span class="nc" id="L529">            Record record = iterator.next();</span>
+<span class="nc" id="L530">            int offsetDelta = (int) (record.offset() - baseOffset);</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">            if (baseTimestamp == null)</span>
+<span class="nc" id="L532">                baseTimestamp = record.timestamp();</span>
+<span class="nc" id="L533">            long timestampDelta = record.timestamp() - baseTimestamp;</span>
+<span class="nc" id="L534">            size += DefaultRecord.sizeInBytes(offsetDelta, timestampDelta, record.key(), record.value(),</span>
+<span class="nc" id="L535">                    record.headers());</span>
+<span class="nc" id="L536">        }</span>
+<span class="nc" id="L537">        return size;</span>
+    }
+
+    public static int sizeInBytes(Iterable&lt;SimpleRecord&gt; records) {
+<span class="nc" id="L541">        Iterator&lt;SimpleRecord&gt; iterator = records.iterator();</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">        if (!iterator.hasNext())</span>
+<span class="nc" id="L543">            return 0;</span>
+
+<span class="nc" id="L545">        int size = RECORD_BATCH_OVERHEAD;</span>
+<span class="nc" id="L546">        int offsetDelta = 0;</span>
+<span class="nc" id="L547">        Long baseTimestamp = null;</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">        while (iterator.hasNext()) {</span>
+<span class="nc" id="L549">            SimpleRecord record = iterator.next();</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">            if (baseTimestamp == null)</span>
+<span class="nc" id="L551">                baseTimestamp = record.timestamp();</span>
+<span class="nc" id="L552">            long timestampDelta = record.timestamp() - baseTimestamp;</span>
+<span class="nc" id="L553">            size += DefaultRecord.sizeInBytes(offsetDelta++, timestampDelta, record.key(), record.value(),</span>
+<span class="nc" id="L554">                    record.headers());</span>
+<span class="nc" id="L555">        }</span>
+<span class="nc" id="L556">        return size;</span>
+    }
+
+    /**
+     * Get an upper bound on the size of a batch with only a single record using a given key and value. This
+     * is only an estimate because it does not take into account additional overhead from the compression
+     * algorithm used.
+     */
+    static int estimateBatchSizeUpperBound(ByteBuffer key, ByteBuffer value, Header[] headers) {
+<span class="nc" id="L565">        return RECORD_BATCH_OVERHEAD + DefaultRecord.recordSizeUpperBound(key, value, headers);</span>
+    }
+
+    public static int incrementSequence(int sequence, int increment) {
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        if (sequence &gt; Integer.MAX_VALUE - increment)</span>
+<span class="nc" id="L570">            return increment - (Integer.MAX_VALUE - sequence) - 1;</span>
+<span class="nc" id="L571">        return sequence + increment;</span>
+    }
+
+    public static int decrementSequence(int sequence, int decrement) {
+<span class="nc bnc" id="L575" title="All 2 branches missed.">        if (sequence &lt; decrement)</span>
+<span class="nc" id="L576">            return Integer.MAX_VALUE - (decrement - sequence) + 1;</span>
+<span class="nc" id="L577">        return sequence - decrement;</span>
+    }
+
+    // visible for testing
+    abstract class RecordIterator implements CloseableIterator&lt;Record&gt; {
+        private final Long logAppendTime;
+        private final long baseOffset;
+        private final long baseTimestamp;
+        private final int baseSequence;
+        private final int numRecords;
+<span class="nc" id="L587">        private int readRecords = 0;</span>
+
+<span class="nc" id="L589">        RecordIterator() {</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            this.logAppendTime = timestampType() == TimestampType.LOG_APPEND_TIME ? maxTimestamp() : null;</span>
+<span class="nc" id="L591">            this.baseOffset = baseOffset();</span>
+<span class="nc" id="L592">            this.baseTimestamp = baseTimestamp();</span>
+<span class="nc" id="L593">            this.baseSequence = baseSequence();</span>
+<span class="nc" id="L594">            int numRecords = count();</span>
+<span class="nc bnc" id="L595" title="All 2 branches missed.">            if (numRecords &lt; 0)</span>
+<span class="nc" id="L596">                throw new InvalidRecordException(&quot;Found invalid record count &quot; + numRecords + &quot; in magic v&quot; +</span>
+<span class="nc" id="L597">                        magic() + &quot; batch&quot;);</span>
+<span class="nc" id="L598">            this.numRecords = numRecords;</span>
+<span class="nc" id="L599">        }</span>
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L603" title="All 2 branches missed.">            return readRecords &lt; numRecords;</span>
+        }
+
+        @Override
+        public Record next() {
+<span class="nc bnc" id="L608" title="All 2 branches missed.">            if (readRecords &gt;= numRecords)</span>
+<span class="nc" id="L609">                throw new NoSuchElementException();</span>
+
+<span class="nc" id="L611">            readRecords++;</span>
+<span class="nc" id="L612">            Record rec = readNext(baseOffset, baseTimestamp, baseSequence, logAppendTime);</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">            if (readRecords == numRecords) {</span>
+                // Validate that the actual size of the batch is equal to declared size
+                // by checking that after reading declared number of items, there no items left
+                // (overflow case, i.e. reading past buffer end is checked elsewhere).
+<span class="nc bnc" id="L617" title="All 2 branches missed.">                if (!ensureNoneRemaining())</span>
+<span class="nc" id="L618">                    throw new InvalidRecordException(&quot;Incorrect declared batch size, records still remaining in file&quot;);</span>
+            }
+<span class="nc" id="L620">            return rec;</span>
+        }
+
+        protected abstract Record readNext(long baseOffset, long baseTimestamp, int baseSequence, Long logAppendTime);
+
+        protected abstract boolean ensureNoneRemaining();
+
+        @Override
+        public void remove() {
+<span class="nc" id="L629">            throw new UnsupportedOperationException();</span>
+        }
+
+    }
+
+    // visible for testing
+    abstract class StreamRecordIterator extends RecordIterator {
+        private final InputStream inputStream;
+
+<span class="nc" id="L638">        StreamRecordIterator(InputStream inputStream) {</span>
+<span class="nc" id="L639">            super();</span>
+<span class="nc" id="L640">            this.inputStream = inputStream;</span>
+<span class="nc" id="L641">        }</span>
+
+        abstract Record doReadRecord(long baseOffset, long baseTimestamp, int baseSequence, Long logAppendTime) throws IOException;
+
+        @Override
+        protected Record readNext(long baseOffset, long baseTimestamp, int baseSequence, Long logAppendTime) {
+            try {
+<span class="nc" id="L648">                return doReadRecord(baseOffset, baseTimestamp, baseSequence, logAppendTime);</span>
+<span class="nc" id="L649">            } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L650">                throw new InvalidRecordException(&quot;Incorrect declared batch size, premature EOF reached&quot;, e);</span>
+<span class="nc" id="L651">            } catch (IOException e) {</span>
+<span class="nc" id="L652">                throw new KafkaException(&quot;Failed to decompress record stream&quot;, e);</span>
+            }
+        }
+
+        @Override
+        protected boolean ensureNoneRemaining() {
+            try {
+<span class="nc bnc" id="L659" title="All 2 branches missed.">                return inputStream.read() == -1;</span>
+<span class="nc" id="L660">            } catch (IOException e) {</span>
+<span class="nc" id="L661">                throw new KafkaException(&quot;Error checking for remaining bytes after reading batch&quot;, e);</span>
+            }
+        }
+
+        @Override
+        public void close() {
+            try {
+<span class="nc" id="L668">                inputStream.close();</span>
+<span class="nc" id="L669">            } catch (IOException e) {</span>
+<span class="nc" id="L670">                throw new KafkaException(&quot;Failed to close record stream&quot;, e);</span>
+<span class="nc" id="L671">            }</span>
+<span class="nc" id="L672">        }</span>
+    }
+
+    static class DefaultFileChannelRecordBatch extends FileLogInputStream.FileChannelRecordBatch {
+
+        DefaultFileChannelRecordBatch(long offset,
+                                      byte magic,
+                                      FileRecords fileRecords,
+                                      int position,
+                                      int batchSize) {
+<span class="nc" id="L682">            super(offset, magic, fileRecords, position, batchSize);</span>
+<span class="nc" id="L683">        }</span>
+
+        @Override
+        protected RecordBatch toMemoryRecordBatch(ByteBuffer buffer) {
+<span class="nc" id="L687">            return new DefaultRecordBatch(buffer);</span>
+        }
+
+        @Override
+        public long baseOffset() {
+<span class="nc" id="L692">            return offset;</span>
+        }
+
+        @Override
+        public long lastOffset() {
+<span class="nc" id="L697">            return loadBatchHeader().lastOffset();</span>
+        }
+
+        @Override
+        public long producerId() {
+<span class="nc" id="L702">            return loadBatchHeader().producerId();</span>
+        }
+
+        @Override
+        public short producerEpoch() {
+<span class="nc" id="L707">            return loadBatchHeader().producerEpoch();</span>
+        }
+
+        @Override
+        public int baseSequence() {
+<span class="nc" id="L712">            return loadBatchHeader().baseSequence();</span>
+        }
+
+        @Override
+        public int lastSequence() {
+<span class="nc" id="L717">            return loadBatchHeader().lastSequence();</span>
+        }
+
+        @Override
+        public Integer countOrNull() {
+<span class="nc" id="L722">            return loadBatchHeader().countOrNull();</span>
+        }
+
+        @Override
+        public boolean isTransactional() {
+<span class="nc" id="L727">            return loadBatchHeader().isTransactional();</span>
+        }
+
+        @Override
+        public OptionalLong deleteHorizonMs() {
+<span class="nc" id="L732">            return loadBatchHeader().deleteHorizonMs();</span>
+        }
+
+        @Override
+        public boolean isControlBatch() {
+<span class="nc" id="L737">            return loadBatchHeader().isControlBatch();</span>
+        }
+
+        @Override
+        public int partitionLeaderEpoch() {
+<span class="nc" id="L742">            return loadBatchHeader().partitionLeaderEpoch();</span>
+        }
+
+        @Override
+        protected int headerSize() {
+<span class="nc" id="L747">            return RECORD_BATCH_OVERHEAD;</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

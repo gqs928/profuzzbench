@@ -1,0 +1,1896 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.storage.internals.log</a> &gt; <span class="el_source">LogManager.java</span></div><h1>LogManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.storage.internals.log;
+
+import org.apache.kafka.common.DirectoryId;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.InconsistentTopicIdException;
+import org.apache.kafka.common.errors.KafkaStorageException;
+import org.apache.kafka.common.errors.LogDirNotFoundException;
+import org.apache.kafka.common.internals.Topic;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.Exit;
+import org.apache.kafka.common.utils.internals.KafkaThread;
+import org.apache.kafka.metadata.ConfigRepository;
+import org.apache.kafka.metadata.properties.MetaProperties;
+import org.apache.kafka.metadata.properties.MetaPropertiesEnsemble;
+import org.apache.kafka.metadata.properties.PropertiesUtils;
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+import org.apache.kafka.server.util.FileLock;
+import org.apache.kafka.server.util.Scheduler;
+import org.apache.kafka.storage.internals.checkpoint.CleanShutdownFileHandler;
+import org.apache.kafka.storage.internals.checkpoint.OffsetCheckpointFile;
+import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+
+public class LogManager {
+
+<span class="nc" id="L83">    private static final Logger LOG = LoggerFactory.getLogger(LogManager.class);</span>
+    public static final String LOCK_FILE_NAME = &quot;.lock&quot;;
+    public static final String RECOVERY_POINT_CHECKPOINT_FILE = &quot;recovery-point-offset-checkpoint&quot;;
+    public static final String LOG_START_OFFSET_CHECKPOINT_FILE = &quot;log-start-offset-checkpoint&quot;;
+
+    // Changing the package or class name may cause incompatibility with existing code and metrics configuration
+<span class="nc" id="L89">    private final KafkaMetricsGroup metricsGroup = new KafkaMetricsGroup(&quot;kafka.log&quot;, &quot;LogManager&quot;);</span>
+
+<span class="nc" id="L91">    private final Object logCreationOrDeletionLock = new Object();</span>
+<span class="nc" id="L92">    private final ConcurrentHashMap&lt;TopicPartition, UnifiedLog&gt; currentLogs = new ConcurrentHashMap&lt;&gt;();</span>
+    // Future logs are put in the directory with &quot;-future&quot; suffix. Future log is created when user wants to move replica
+    // from one log directory to another log directory on the same broker. The directory of the future log will be renamed
+    // to replace the current log of the partition after the future log catches up with the current log
+<span class="nc" id="L96">    private final ConcurrentHashMap&lt;TopicPartition, UnifiedLog&gt; futureLogs = new ConcurrentHashMap&lt;&gt;();</span>
+    private final List&lt;File&gt; logDirs;
+    private final ConfigRepository configRepository;
+    private final LogConfig initialDefaultConfig;
+    private final CleanerConfig cleanerConfig;
+    private final long flushCheckMs;
+    private final long flushRecoveryOffsetCheckpointMs;
+    private final long flushStartOffsetCheckpointMs;
+    private final long retentionCheckMs;
+    private final int maxTransactionTimeoutMs;
+    private final ProducerStateManagerConfig producerStateManagerConfig;
+    private final int producerIdExpirationCheckIntervalMs;
+    private final Scheduler scheduler;
+    private final BrokerTopicStats brokerTopicStats;
+    private final LogDirFailureChannel logDirFailureChannel;
+    private final Time time;
+    private final boolean remoteStorageSystemEnable;
+    private final long initialTaskDelayMs;
+    private final LogCleanerBuilder cleanerFactory;
+
+    // Each element in the queue contains the log object to be deleted and the time it is scheduled for deletion.
+<span class="nc" id="L117">    private final LinkedBlockingQueue&lt;Map.Entry&lt;UnifiedLog, Long&gt;&gt; logsToBeDeleted = new LinkedBlockingQueue&lt;&gt;();</span>
+
+    // A map that stores the preferred log dir for each partition
+<span class="nc" id="L120">    private final ConcurrentHashMap&lt;TopicPartition, String&gt; preferredLogDirs = new ConcurrentHashMap&lt;&gt;();</span>
+
+    // A map that stores hadCleanShutdown flag for each log dir.
+<span class="nc" id="L123">    private final ConcurrentHashMap&lt;String, Boolean&gt; hadCleanShutdownFlags = new ConcurrentHashMap&lt;&gt;();</span>
+
+    // A map that tells whether all logs in a log dir had been loaded or not at startup time.
+<span class="nc" id="L126">    private final ConcurrentHashMap&lt;String, Boolean&gt; loadLogsCompletedFlags = new ConcurrentHashMap&lt;&gt;();</span>
+
+    // This map contains all partitions whose logs are getting loaded and initialized. If log configuration
+    // of these partitions get updated at the same time, the corresponding entry in this map is set to &quot;true&quot;,
+    // which triggers a config reload after initialization is finished (to get the latest config value).
+    // See KAFKA-8813 for more detail on the race condition
+<span class="nc" id="L132">    private final ConcurrentHashMap&lt;TopicPartition, Boolean&gt; partitionsInitializing = new ConcurrentHashMap&lt;&gt;();</span>
+
+    private final ConcurrentLinkedQueue&lt;File&gt; liveLogDirs;
+    private final ConcurrentHashMap&lt;String, Uuid&gt; directoryIds;
+    private final List&lt;FileLock&gt; dirLocks;
+
+<span class="nc" id="L138">    private volatile Set&lt;String&gt; cordonedLogDirs = new HashSet&lt;&gt;();</span>
+    private volatile LogConfig currentDefaultConfig;
+    private volatile int numRecoveryThreadsPerDataDir;
+    private volatile Map&lt;File, OffsetCheckpointFile&gt; recoveryPointCheckpoints;
+    private volatile Map&lt;File, OffsetCheckpointFile&gt; logStartOffsetCheckpoints;
+    private volatile LogCleaner cleaner;
+
+    /**
+     * Interface to pass the values required to build a LogCleaner instance
+     */
+    public interface LogCleanerBuilder {
+
+        /**
+         * Build a LogCleaner
+         *
+         * @param config Initial configuration parameters for the cleaner. Actual config may be dynamically updated.
+         * @param logDirs The directories where offset checkpoints reside
+         * @param logs The map of logs
+         * @param logDirFailureChannel The channel used to add offline log dirs that may be encountered when cleaning the log
+         * @param time A way to control the passage of time
+         */
+        LogCleaner build(CleanerConfig config, List&lt;File&gt; logDirs, ConcurrentMap&lt;TopicPartition, UnifiedLog&gt; logs, LogDirFailureChannel logDirFailureChannel, Time time);
+    }
+
+    /**
+     * Interface to decouple LogManager and TopicsImage. TopicsImage is in the metadata module which depends on storage.
+     */
+    public interface DirectoryForBrokerPartition {
+
+        /**
+         * Retrieve the log dir Uuid hosting the specified topic-partition on the specified broker
+         * @param topicId The topic Uuid
+         * @param partition The partitionId
+         * @param brokerId The brokerId
+         * @return The log dir Uuid
+         */
+        Uuid get(Uuid topicId, int partition, int brokerId);
+    }
+
+    /**
+     * The entry point to the kafka log management subsystem. The log manager is responsible for log creation, retrieval, and cleaning.
+     * All read and write operations are delegated to the individual log instances.
+     *
+     * The log manager maintains logs in one or more directories. New logs are created in the data directory
+     * with the fewest logs. No attempt is made to move partitions after the fact or balance based on
+     * size or I/O rate.
+     *
+     * A background thread handles log retention by periodically truncating excess log segments.
+     *
+     * This class is thread-safe.
+     */
+    @SuppressWarnings(&quot;this-escape&quot;)
+    public LogManager(List&lt;File&gt; logDirs,
+                      List&lt;File&gt; initialOfflineDirs,
+                      ConfigRepository configRepository,
+                      LogConfig initialDefaultConfig,
+                      CleanerConfig cleanerConfig,
+                      int numRecoveryThreadsPerDataDir,
+                      long flushCheckMs,
+                      long flushRecoveryOffsetCheckpointMs,
+                      long flushStartOffsetCheckpointMs,
+                      long retentionCheckMs,
+                      int maxTransactionTimeoutMs,
+                      ProducerStateManagerConfig producerStateManagerConfig,
+                      int producerIdExpirationCheckIntervalMs,
+                      Scheduler scheduler,
+                      BrokerTopicStats brokerTopicStats,
+                      LogDirFailureChannel logDirFailureChannel,
+                      Time time,
+                      boolean remoteStorageSystemEnable,
+                      long initialTaskDelayMs,
+<span class="nc" id="L209">                      LogCleanerBuilder cleanerBuilder) throws IOException {</span>
+<span class="nc" id="L210">        this.logDirs = logDirs;</span>
+<span class="nc" id="L211">        this.configRepository = configRepository;</span>
+<span class="nc" id="L212">        this.initialDefaultConfig = initialDefaultConfig;</span>
+<span class="nc" id="L213">        this.cleanerConfig = cleanerConfig;</span>
+<span class="nc" id="L214">        this.numRecoveryThreadsPerDataDir = numRecoveryThreadsPerDataDir;</span>
+<span class="nc" id="L215">        this.flushCheckMs = flushCheckMs;</span>
+<span class="nc" id="L216">        this.flushRecoveryOffsetCheckpointMs = flushRecoveryOffsetCheckpointMs;</span>
+<span class="nc" id="L217">        this.flushStartOffsetCheckpointMs = flushStartOffsetCheckpointMs;</span>
+<span class="nc" id="L218">        this.retentionCheckMs = retentionCheckMs;</span>
+<span class="nc" id="L219">        this.maxTransactionTimeoutMs = maxTransactionTimeoutMs;</span>
+<span class="nc" id="L220">        this.producerStateManagerConfig = producerStateManagerConfig;</span>
+<span class="nc" id="L221">        this.producerIdExpirationCheckIntervalMs = producerIdExpirationCheckIntervalMs;</span>
+<span class="nc" id="L222">        this.scheduler = scheduler;</span>
+<span class="nc" id="L223">        this.brokerTopicStats = brokerTopicStats;</span>
+<span class="nc" id="L224">        this.logDirFailureChannel = logDirFailureChannel;</span>
+<span class="nc" id="L225">        this.time = time;</span>
+<span class="nc" id="L226">        this.remoteStorageSystemEnable = remoteStorageSystemEnable;</span>
+<span class="nc" id="L227">        this.initialTaskDelayMs = initialTaskDelayMs;</span>
+<span class="nc" id="L228">        this.cleanerFactory = cleanerBuilder;</span>
+<span class="nc" id="L229">        liveLogDirs = createAndValidateLogDirs(logDirs, initialOfflineDirs);</span>
+<span class="nc" id="L230">        currentDefaultConfig = initialDefaultConfig;</span>
+<span class="nc" id="L231">        dirLocks = lockLogDirs(liveLogDirs);</span>
+<span class="nc" id="L232">        directoryIds = loadDirectoryIds(liveLogDirs);</span>
+
+<span class="nc" id="L234">        recoveryPointCheckpoints = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L235">        logStartOffsetCheckpoints = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        for (File dir : liveLogDirs) {</span>
+<span class="nc" id="L237">            recoveryPointCheckpoints.put(dir, new OffsetCheckpointFile(new File(dir, RECOVERY_POINT_CHECKPOINT_FILE), logDirFailureChannel));</span>
+<span class="nc" id="L238">            logStartOffsetCheckpoints.put(dir, new OffsetCheckpointFile(new File(dir, LOG_START_OFFSET_CHECKPOINT_FILE), logDirFailureChannel));</span>
+<span class="nc" id="L239">        }</span>
+
+<span class="nc" id="L241">        metricsGroup.newGauge(&quot;OfflineLogDirectoryCount&quot;, () -&gt; offlineLogDirs().size());</span>
+<span class="nc" id="L242">        metricsGroup.newGauge(&quot;CordonedLogDirectoryCount&quot;, () -&gt; cordonedLogDirs().size());</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        for (File dir : logDirs) {</span>
+<span class="nc" id="L244">            metricsGroup.newGauge(&quot;LogDirectoryOffline&quot;,</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                    () -&gt; liveLogDirs.contains(dir) ? 0 : 1,</span>
+<span class="nc" id="L246">                    Map.of(&quot;logDirectory&quot;, dir.getAbsolutePath()));</span>
+<span class="nc" id="L247">            metricsGroup.newGauge(&quot;LogDirectoryCordoned&quot;,</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                    () -&gt; cordonedLogDirs.contains(dir.getAbsolutePath()) ? 1 : 0,</span>
+<span class="nc" id="L249">                    Map.of(&quot;logDirectory&quot;, dir.getAbsolutePath()));</span>
+<span class="nc" id="L250">        }</span>
+<span class="nc" id="L251">    }</span>
+
+    public boolean hasOfflineLogDirs() {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        return !offlineLogDirs().isEmpty();</span>
+    }
+
+    public boolean onlineLogDirId(Uuid uuid) {
+<span class="nc" id="L258">        return directoryIds.containsValue(uuid);</span>
+    }
+
+    public ProducerStateManagerConfig producerStateManagerConfig() {
+<span class="nc" id="L262">        return producerStateManagerConfig;</span>
+    }
+
+    public void updateCordonedLogDirs(Set&lt;String&gt; newCordonedLogDirs) {
+<span class="nc" id="L266">        cordonedLogDirs = newCordonedLogDirs;</span>
+<span class="nc" id="L267">    }</span>
+
+    public Set&lt;String&gt; cordonedLogDirs() {
+<span class="nc" id="L270">        return cordonedLogDirs;</span>
+    }
+
+    public void reconfigureDefaultLogConfig(LogConfig logConfig) {
+<span class="nc" id="L274">        this.currentDefaultConfig = logConfig;</span>
+<span class="nc" id="L275">    }</span>
+
+    public Collection&lt;File&gt; liveLogDirs() {
+<span class="nc bnc" id="L278" title="All 2 branches missed.">        return liveLogDirs.size() == logDirs.size() ? logDirs : liveLogDirs;</span>
+    }
+
+    public LogCleaner cleaner() {
+<span class="nc" id="L282">        return cleaner;</span>
+    }
+
+    public Map&lt;String, Uuid&gt; directoryIds() {
+<span class="nc" id="L286">        return Map.copyOf(directoryIds);</span>
+    }
+
+    private Set&lt;File&gt; offlineLogDirs() {
+<span class="nc" id="L290">        Set&lt;File&gt; result = new HashSet&lt;&gt;(logDirs);</span>
+<span class="nc" id="L291">        result.removeAll(liveLogDirs);</span>
+<span class="nc" id="L292">        return result;</span>
+    }
+
+    // Only for testing
+    public LogConfig initialDefaultConfig() {
+<span class="nc" id="L297">        return initialDefaultConfig;</span>
+    }
+
+    // Only for testing
+    public int maxTransactionTimeoutMs() {
+<span class="nc" id="L302">        return maxTransactionTimeoutMs;</span>
+    }
+
+    // Only for testing
+    public long initialTaskDelayMs() {
+<span class="nc" id="L307">        return initialTaskDelayMs;</span>
+    }
+
+    // Only for testing
+    public int producerIdExpirationCheckIntervalMs() {
+<span class="nc" id="L312">        return producerIdExpirationCheckIntervalMs;</span>
+    }
+
+    // Only for testing
+    public LogConfig currentDefaultConfig() {
+<span class="nc" id="L317">        return currentDefaultConfig;</span>
+    }
+
+    // Only for testing
+    public List&lt;FileLock&gt; dirLocks() {
+<span class="nc" id="L322">        return dirLocks;</span>
+    }
+
+    // Only for testing
+    public ConcurrentHashMap&lt;TopicPartition, Boolean&gt; partitionsInitializing() {
+<span class="nc" id="L327">        return partitionsInitializing;</span>
+    }
+
+    // Only for testing
+    public boolean hasLogsToBeDeleted() {
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        return !logsToBeDeleted.isEmpty();</span>
+    }
+
+    /**
+     * Create and check validity of the given directories that are not in the given offline directories, specifically:
+     * &lt;ol&gt;
+     * &lt;li&gt; Ensure that there are no duplicates in the directory list
+     * &lt;li&gt; Create each directory if it doesn't exist
+     * &lt;li&gt; Check that each path is a readable directory
+     * &lt;/ol&gt;
+     */
+    private ConcurrentLinkedQueue&lt;File&gt; createAndValidateLogDirs(List&lt;File&gt; dirs, List&lt;File&gt; initialOfflineDirs) {
+<span class="nc" id="L344">        ConcurrentLinkedQueue&lt;File&gt; liveLogDirs = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="nc" id="L345">        Set&lt;String&gt; canonicalPaths = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        for (File dir : dirs) {</span>
+            try {
+<span class="nc bnc" id="L349" title="All 2 branches missed.">                if (initialOfflineDirs.contains(dir)) {</span>
+<span class="nc" id="L350">                    throw new IOException(&quot;Failed to load &quot; + dir.getAbsolutePath() + &quot; during broker startup&quot;);</span>
+                }
+<span class="nc bnc" id="L352" title="All 2 branches missed.">                if (!dir.exists()) {</span>
+<span class="nc" id="L353">                    LOG.info(&quot;Log directory {} not found, creating it.&quot;, dir.getAbsolutePath());</span>
+<span class="nc" id="L354">                    boolean created = dir.mkdirs();</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">                    if (!created) {</span>
+<span class="nc" id="L356">                        throw new IOException(&quot;Failed to create data directory &quot; + dir.getAbsolutePath());</span>
+                    }
+<span class="nc" id="L358">                    Utils.flushDir(dir.toPath().toAbsolutePath().normalize().getParent());</span>
+                }
+<span class="nc bnc" id="L360" title="All 4 branches missed.">                if (!dir.isDirectory() || !dir.canRead()) {</span>
+<span class="nc" id="L361">                    throw new IOException(dir.getAbsolutePath() + &quot; is not a readable log directory.&quot;);</span>
+                }
+
+                // getCanonicalPath() throws IOException if a file system query fails or if the path is invalid (e.g. contains
+                // the Nul character). Since there's no easy way to distinguish between the two cases, we treat them the same
+                // and mark the log directory as offline.
+<span class="nc bnc" id="L367" title="All 2 branches missed.">                if (!canonicalPaths.add(dir.getCanonicalPath())) {</span>
+<span class="nc" id="L368">                    throw new KafkaException(&quot;Duplicate log directory found: &quot; + dirsToString(dirs));</span>
+                }
+
+<span class="nc" id="L371">                liveLogDirs.add(dir);</span>
+<span class="nc" id="L372">            } catch (IOException ioe) {</span>
+<span class="nc" id="L373">                logDirFailureChannel.maybeAddOfflineLogDir(dir.getAbsolutePath(), &quot;Failed to create or validate data directory &quot; + dir.getAbsolutePath(), ioe);</span>
+<span class="nc" id="L374">            }</span>
+<span class="nc" id="L375">        }</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        if (liveLogDirs.isEmpty()) {</span>
+<span class="nc" id="L377">            LOG.error(&quot;Shutdown broker because none of the specified log dirs from {} can be created or validated&quot;, dirsToString(dirs));</span>
+<span class="nc" id="L378">            Exit.halt(1);</span>
+        }
+
+<span class="nc" id="L381">        return liveLogDirs;</span>
+    }
+
+    public void resizeRecoveryThreadPool(int newSize) {
+<span class="nc" id="L385">        LOG.info(&quot;Resizing recovery thread pool size for each data dir from {} to {}&quot;, numRecoveryThreadsPerDataDir, newSize);</span>
+<span class="nc" id="L386">        numRecoveryThreadsPerDataDir = newSize;</span>
+<span class="nc" id="L387">    }</span>
+
+    private Set&lt;TopicPartition&gt; removeOfflineLogs(String dir, ConcurrentMap&lt;TopicPartition, UnifiedLog&gt; logs) {
+<span class="nc" id="L390">        Set&lt;TopicPartition&gt; offlineTopicPartitions = logs.entrySet().stream()</span>
+<span class="nc" id="L391">                .filter(entry -&gt; entry.getValue().parentDir().equals(dir))</span>
+<span class="nc" id="L392">                .map(Map.Entry::getKey)</span>
+<span class="nc" id="L393">                .collect(Collectors.toUnmodifiableSet());</span>
+<span class="nc" id="L394">        offlineTopicPartitions.forEach(topicPartition -&gt; {</span>
+<span class="nc" id="L395">            Optional&lt;UnifiedLog&gt; removedLog = removeLogAndMetrics(logs, topicPartition);</span>
+<span class="nc" id="L396">            removedLog.ifPresent(UnifiedLog::closeQuietly);</span>
+<span class="nc" id="L397">        });</span>
+
+<span class="nc" id="L399">        return offlineTopicPartitions;</span>
+    }
+
+    private String dirsToString(Collection&lt;File&gt; dirs) {
+<span class="nc" id="L403">        return dirs.stream().map(File::toString).collect(Collectors.joining(&quot;, &quot;));</span>
+    }
+
+    /**
+     * The log directory failure handler. It will stop log cleaning in that directory.
+     *
+     * @param dir the absolute path of the log directory
+     */
+    public void handleLogDirFailure(String dir) {
+<span class="nc" id="L412">        LOG.warn(&quot;Stopping serving logs in dir {}&quot;, dir);</span>
+<span class="nc" id="L413">        synchronized (logCreationOrDeletionLock)  {</span>
+<span class="nc" id="L414">            liveLogDirs.remove(new File(dir));</span>
+<span class="nc" id="L415">            directoryIds.remove(dir);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            if (liveLogDirs.isEmpty()) {</span>
+<span class="nc" id="L417">                LOG.error(&quot;Shutdown broker because all log dirs in {} have failed&quot;, dirsToString(logDirs));</span>
+<span class="nc" id="L418">                Exit.halt(1);</span>
+            }
+
+<span class="nc" id="L421">            recoveryPointCheckpoints = recoveryPointCheckpoints.entrySet().stream()</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">                    .filter(entry -&gt; !entry.getKey().getAbsolutePath().equals(dir))</span>
+<span class="nc" id="L423">                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+<span class="nc" id="L424">            logStartOffsetCheckpoints = logStartOffsetCheckpoints.entrySet().stream()</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                    .filter(entry -&gt; !entry.getKey().getAbsolutePath().equals(dir))</span>
+<span class="nc" id="L426">                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">            if (cleaner != null) {</span>
+<span class="nc" id="L428">                cleaner.handleLogDirFailure(dir);</span>
+            }
+
+<span class="nc" id="L431">            Set&lt;TopicPartition&gt; offlineCurrentTopicPartitions = removeOfflineLogs(dir, currentLogs);</span>
+<span class="nc" id="L432">            Set&lt;TopicPartition&gt; offlineFutureTopicPartitions = removeOfflineLogs(dir, futureLogs);</span>
+
+<span class="nc" id="L434">            LOG.warn(&quot;Logs for partitions {} are offline and logs for future partitions {} are offline due to failure on log directory {}&quot;,</span>
+<span class="nc" id="L435">                    offlineCurrentTopicPartitions.stream().map(Object::toString).collect(Collectors.joining(&quot;,&quot;)),</span>
+<span class="nc" id="L436">                    offlineFutureTopicPartitions.stream().map(Object::toString).collect(Collectors.joining(&quot;,&quot;)),</span>
+                    dir);
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            for (FileLock lock : dirLocks) {</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                if (lock.file().getParent().equals(dir)) {</span>
+<span class="nc" id="L440">                    Utils.swallow(LOG, lock::destroy);</span>
+                }
+<span class="nc" id="L442">            }</span>
+<span class="nc" id="L443">        }</span>
+<span class="nc" id="L444">    }</span>
+
+    /**
+     * Lock all the given directories
+     */
+    private List&lt;FileLock&gt; lockLogDirs(Collection&lt;File&gt; dirs) {
+<span class="nc" id="L450">        return dirs.stream().flatMap(dir -&gt; {</span>
+            try {
+<span class="nc" id="L452">                FileLock lock = new FileLock(new File(dir, LOCK_FILE_NAME));</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">                if (!lock.tryLock()) {</span>
+<span class="nc" id="L454">                    throw new KafkaException(&quot;Failed to acquire lock on file .lock in &quot; + lock.file().getParent() +</span>
+                            &quot;. A Kafka instance in another process or thread is using this directory.&quot;);
+                }
+<span class="nc" id="L457">                return Stream.of(lock);</span>
+<span class="nc" id="L458">            } catch (IOException ioe) {</span>
+<span class="nc" id="L459">                logDirFailureChannel.maybeAddOfflineLogDir(dir.getAbsolutePath(), &quot;Disk error while locking directory &quot; + dir, ioe);</span>
+<span class="nc" id="L460">                return Stream.empty();</span>
+            }
+<span class="nc" id="L462">        }).collect(Collectors.toList());</span>
+    }
+
+    /**
+     * Retrieves the Uuid for the directory, given its absolute path.
+     */
+    public Optional&lt;Uuid&gt; directoryId(String dir) {
+<span class="nc" id="L469">        return Optional.ofNullable(directoryIds.get(dir));</span>
+    }
+
+    /**
+     * Retrieves the absolute path for the directory, given its Uuid
+     */
+    public Optional&lt;String&gt; directoryPath(Uuid uuid) {
+<span class="nc bnc" id="L476" title="All 2 branches missed.">        for (Map.Entry&lt;String, Uuid&gt; entry : directoryIds.entrySet()) {</span>
+<span class="nc bnc" id="L477" title="All 2 branches missed.">            if (entry.getValue().equals(uuid)) {</span>
+<span class="nc" id="L478">                return Optional.of(entry.getKey());</span>
+            }
+<span class="nc" id="L480">        }</span>
+<span class="nc" id="L481">        return Optional.empty();</span>
+    }
+
+    /**
+     * Determine directory ID for each directory with a meta.properties.
+     * If meta.properties does not include a directory ID, one is generated and persisted back to meta.properties.
+     * Directories without a meta.properties don't get a directory ID assigned.
+     */
+    private ConcurrentHashMap&lt;String, Uuid&gt; loadDirectoryIds(Collection&lt;File&gt; logDirs) {
+<span class="nc" id="L490">        ConcurrentHashMap&lt;String, Uuid&gt; result = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L491">        logDirs.forEach(logDir -&gt; {</span>
+            try {
+<span class="nc" id="L493">                Properties props = PropertiesUtils.readPropertiesFile(</span>
+<span class="nc" id="L494">                        new File(logDir, MetaPropertiesEnsemble.META_PROPERTIES_NAME).getAbsolutePath());</span>
+<span class="nc" id="L495">                MetaProperties metaProps = new MetaProperties.Builder(props).build();</span>
+<span class="nc" id="L496">                metaProps.directoryId().ifPresent(directoryId -&gt; result.put(logDir.getAbsolutePath(), directoryId));</span>
+<span class="nc" id="L497">            } catch (NoSuchFileException nsfe) {</span>
+<span class="nc" id="L498">                LOG.info(&quot;No meta.properties file found in {}.&quot;, logDir);</span>
+<span class="nc" id="L499">            } catch (IOException ioe) {</span>
+<span class="nc" id="L500">                logDirFailureChannel.maybeAddOfflineLogDir(logDir.getAbsolutePath(), &quot;Disk error while loading ID &quot; + logDir, ioe);</span>
+<span class="nc" id="L501">            }</span>
+<span class="nc" id="L502">        });</span>
+<span class="nc" id="L503">        return result;</span>
+    }
+
+    private void addLogToBeDeleted(UnifiedLog log) {
+<span class="nc" id="L507">        this.logsToBeDeleted.add(Map.entry(log, time.milliseconds()));</span>
+<span class="nc" id="L508">    }</span>
+
+    // Visible for testing
+    public UnifiedLog loadLog(File logDir,
+                               boolean hadCleanShutdown,
+                               Map&lt;TopicPartition, Long&gt; recoveryPoints,
+                               Map&lt;TopicPartition, Long&gt; logStartOffsets,
+                               LogConfig defaultConfig,
+                               Map&lt;String, LogConfig&gt; topicConfigOverrides,
+                               ConcurrentMap&lt;String, Integer&gt; numRemainingSegments,
+                               Function&lt;UnifiedLog, Boolean&gt; isStray) throws IOException {
+<span class="nc" id="L519">        TopicPartition topicPartition = UnifiedLog.parseTopicPartitionName(logDir);</span>
+<span class="nc" id="L520">        LogConfig config = topicConfigOverrides.getOrDefault(topicPartition.topic(), defaultConfig);</span>
+<span class="nc" id="L521">        long logRecoveryPoint = recoveryPoints.getOrDefault(topicPartition, 0L);</span>
+<span class="nc" id="L522">        long logStartOffset = logStartOffsets.getOrDefault(topicPartition, 0L);</span>
+
+<span class="nc" id="L524">        UnifiedLog log = UnifiedLog.create(</span>
+            logDir,
+            config,
+            logStartOffset,
+            logRecoveryPoint,
+            scheduler,
+            brokerTopicStats,
+            time,
+            maxTransactionTimeoutMs,
+            producerStateManagerConfig,
+            producerIdExpirationCheckIntervalMs,
+            logDirFailureChannel,
+            hadCleanShutdown,
+<span class="nc" id="L537">            Optional.empty(),</span>
+            numRemainingSegments,
+            remoteStorageSystemEnable,
+            LogOffsetsListener.NO_OP_OFFSETS_LISTENER);
+
+<span class="nc bnc" id="L542" title="All 2 branches missed.">        if (logDir.getName().endsWith(UnifiedLog.DELETE_DIR_SUFFIX)) {</span>
+<span class="nc" id="L543">            addLogToBeDeleted(log);</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        } else if (logDir.getName().endsWith(UnifiedLog.STRAY_DIR_SUFFIX)) {</span>
+<span class="nc" id="L545">            LOG.warn(&quot;Loaded stray log: {}&quot;, logDir);</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">        } else if (isStray.apply(log)) {</span>
+            // We are unable to prevent a topic from being recreated before every replica has been deleted.
+            // Broker with an offline directory may be unable to detect it still holds a to-be-deleted replica,
+            // and can create a conflicting topic partition for a new incarnation of the topic in one of the remaining online directories.
+            // So upon a restart in which the offline directory is back online we need to clean up the old replica directory.
+<span class="nc" id="L551">            log.renameDir(UnifiedLog.logStrayDirName(log.topicPartition()), false);</span>
+<span class="nc" id="L552">            LOG.warn(&quot;Log in {} marked stray and renamed to {}&quot;, logDir.getAbsolutePath(), log.dir().getAbsolutePath());</span>
+        } else {
+<span class="nc bnc" id="L554" title="All 2 branches missed.">            UnifiedLog previous = log.isFuture()</span>
+<span class="nc" id="L555">                    ? this.futureLogs.put(topicPartition, log)</span>
+<span class="nc" id="L556">                    : this.currentLogs.put(topicPartition, log);</span>
+
+<span class="nc bnc" id="L558" title="All 2 branches missed.">            if (previous != null) {</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">                if (log.isFuture()) {</span>
+<span class="nc" id="L560">                    throw new IllegalStateException(&quot;Duplicate log directories found: &quot; + log.dir().getAbsolutePath() + &quot;, &quot; + previous.dir().getAbsolutePath());</span>
+                } else {
+<span class="nc" id="L562">                    throw new IllegalStateException(&quot;Duplicate log directories for &quot; + topicPartition + &quot; are found in both &quot; + log.dir().getAbsolutePath() +</span>
+<span class="nc" id="L563">                            &quot; and &quot; + previous.dir().getAbsolutePath() + &quot;. It is likely because log directory failure happened while broker was &quot; +</span>
+                            &quot;replacing current replica with future replica. Recover broker from this failure by manually deleting one of the two directories &quot; +
+                            &quot;for this partition. It is recommended to delete the partition in the log directory that is known to have failed recently.&quot;);
+                }
+            }
+        }
+
+<span class="nc" id="L570">        return log;</span>
+    }
+
+    // factory class for naming the log recovery threads used in metrics
+    private static class LogRecoveryThreadFactory implements ThreadFactory {
+
+        String dirPath;
+<span class="nc" id="L577">        AtomicInteger threadNum = new AtomicInteger(0);</span>
+
+<span class="nc" id="L579">        LogRecoveryThreadFactory(String dirPath) {</span>
+<span class="nc" id="L580">            this.dirPath = dirPath;</span>
+<span class="nc" id="L581">        }</span>
+
+        @Override
+        public Thread newThread(Runnable runnable) {
+<span class="nc" id="L585">            return KafkaThread.nonDaemon(logRecoveryThreadName(dirPath, threadNum.getAndIncrement()), runnable);</span>
+        }
+    }
+
+    // create a unique log recovery thread name for each log dir as the format: prefix-dirPath-threadNum, ex: &quot;log-recovery-/tmp/kafkaLogs-0&quot;
+    private static String logRecoveryThreadName(String dirPath, int threadNum) {
+<span class="nc" id="L591">        return &quot;log-recovery&quot; + &quot;-&quot; + dirPath + &quot;-&quot; + threadNum;</span>
+    }
+
+    // Visible for testing
+    public int decNumRemainingLogs(ConcurrentMap&lt;String, Integer&gt; numRemainingLogs, String path) {
+<span class="nc bnc" id="L596" title="All 2 branches missed.">        assert path != null : &quot;path cannot be null to update remaining logs metric.&quot;;</span>
+<span class="nc" id="L597">        return numRemainingLogs.compute(path, (k, oldVal) -&gt; oldVal - 1);</span>
+    }
+
+    private void handleIOException(Set&lt;Map.Entry&lt;String, IOException&gt;&gt; offlineDirs, String logDirAbsolutePath, IOException e) {
+<span class="nc" id="L601">        offlineDirs.add(Map.entry(logDirAbsolutePath, e));</span>
+<span class="nc" id="L602">        LOG.error(&quot;Error while loading log dir {}&quot;, logDirAbsolutePath, e);</span>
+<span class="nc" id="L603">    }</span>
+
+    /**
+     * Recover and load all logs in the given data directories
+     */
+    public void loadLogs(LogConfig defaultConfig, Map&lt;String, LogConfig&gt; topicConfigOverrides, Function&lt;UnifiedLog, Boolean&gt; isStray) throws Exception {
+<span class="nc" id="L609">        LOG.info(&quot;Loading logs from log dirs {}&quot;, liveLogDirs);</span>
+<span class="nc" id="L610">        long startMs = time.hiResClockMs();</span>
+<span class="nc" id="L611">        List&lt;ExecutorService&gt; threadPools = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L612">        Set&lt;Map.Entry&lt;String, IOException&gt;&gt; offlineDirs = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L613">        List&lt;List&lt;Future&lt;?&gt;&gt;&gt; jobs = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L614">        int numTotalLogs = 0;</span>
+        // log dir path -&gt; number of Remaining logs map for remainingLogsToRecover metric
+<span class="nc" id="L616">        ConcurrentMap&lt;String, Integer&gt; numRemainingLogs = new ConcurrentHashMap&lt;&gt;();</span>
+        // log recovery thread name -&gt; number of remaining segments map for remainingSegmentsToRecover metric
+<span class="nc" id="L618">        ConcurrentMap&lt;String, Integer&gt; numRemainingSegments = new ConcurrentHashMap&lt;&gt;();</span>
+
+<span class="nc" id="L620">        List&lt;String&gt; uncleanLogDirs = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">        for (File dir : liveLogDirs) {</span>
+<span class="nc" id="L622">            String logDirAbsolutePath = dir.getAbsolutePath();</span>
+<span class="nc" id="L623">            final AtomicBoolean hadCleanShutdown = new AtomicBoolean(false);</span>
+            try {
+<span class="nc" id="L625">                ExecutorService pool = Executors.newFixedThreadPool(numRecoveryThreadsPerDataDir,</span>
+                        new LogRecoveryThreadFactory(logDirAbsolutePath));
+<span class="nc" id="L627">                threadPools.add(pool);</span>
+
+<span class="nc" id="L629">                CleanShutdownFileHandler cleanShutdownFileHandler = new CleanShutdownFileHandler(dir.getPath());</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">                if (cleanShutdownFileHandler.exists()) {</span>
+                    // Cache the clean shutdown status and use that for rest of log loading workflow. Delete the CleanShutdownFile
+                    // so that if broker crashes while loading the log, it is considered hard shutdown during the next boot up. KAFKA-10471
+<span class="nc" id="L633">                    cleanShutdownFileHandler.delete();</span>
+<span class="nc" id="L634">                    hadCleanShutdown.set(true);</span>
+                }
+<span class="nc" id="L636">                hadCleanShutdownFlags.put(logDirAbsolutePath, hadCleanShutdown.get());</span>
+
+<span class="nc" id="L638">                final Map&lt;TopicPartition, Long&gt; recoveryPoints = new HashMap&lt;&gt;();</span>
+                try {
+<span class="nc" id="L640">                    recoveryPoints.putAll(recoveryPointCheckpoints.get(dir).read());</span>
+<span class="nc" id="L641">                } catch (Exception e) {</span>
+<span class="nc" id="L642">                    LOG.warn(&quot;Error occurred while reading recovery-point-offset-checkpoint file of directory &quot; +</span>
+                                    &quot;{}, resetting the recovery checkpoint to 0&quot;, logDirAbsolutePath, e);
+<span class="nc" id="L644">                }</span>
+
+<span class="nc" id="L646">                final Map&lt;TopicPartition, Long&gt; logStartOffsets = new HashMap&lt;&gt;();</span>
+                try {
+<span class="nc" id="L648">                    logStartOffsets.putAll(logStartOffsetCheckpoints.get(dir).read());</span>
+<span class="nc" id="L649">                } catch (Exception e) {</span>
+<span class="nc" id="L650">                    LOG.warn(&quot;Error occurred while reading log-start-offset-checkpoint file of directory &quot; +</span>
+                                    &quot;{}, resetting to the base offset of the first segment&quot;, logDirAbsolutePath, e);
+<span class="nc" id="L652">                }</span>
+<span class="nc" id="L653">                List&lt;File&gt; logsToLoad = Arrays.stream(Optional.ofNullable(dir.listFiles()).orElse(new File[]{}))</span>
+<span class="nc" id="L654">                        .filter(logDir -&gt; {</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">                            if (!logDir.isDirectory()) return false;</span>
+                            // Ignore remote-log-index-cache directory as that is index cache maintained by tiered storage subsystem
+                            // but not any topic-partition dir.
+<span class="nc bnc" id="L658" title="All 2 branches missed.">                            if (logDir.getName().equals(RemoteIndexCache.DIR_NAME)) return false;</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">                            return !UnifiedLog.parseTopicPartitionName(logDir).topic().equals(Topic.CLUSTER_METADATA_TOPIC_NAME);</span>
+                        })
+<span class="nc" id="L661">                        .toList();</span>
+<span class="nc" id="L662">                numTotalLogs += logsToLoad.size();</span>
+<span class="nc" id="L663">                numRemainingLogs.put(logDirAbsolutePath, logsToLoad.size());</span>
+<span class="nc" id="L664">                loadLogsCompletedFlags.put(logDirAbsolutePath, logsToLoad.isEmpty());</span>
+
+<span class="nc bnc" id="L666" title="All 2 branches missed.">                if (logsToLoad.isEmpty()) {</span>
+<span class="nc" id="L667">                    LOG.info(&quot;No logs found to be loaded in {}&quot;, logDirAbsolutePath);</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">                } else if (hadCleanShutdown.get()) {</span>
+<span class="nc" id="L669">                    LOG.info(&quot;Skipping recovery of {} logs from {} since clean shutdown file was found&quot;, logsToLoad.size(), logDirAbsolutePath);</span>
+                } else {
+<span class="nc" id="L671">                    LOG.info(&quot;Recovering {} logs from {} since no clean shutdown file was found&quot;, logsToLoad.size(), logDirAbsolutePath);</span>
+<span class="nc" id="L672">                    uncleanLogDirs.add(logDirAbsolutePath);</span>
+                }
+
+<span class="nc" id="L675">                List&lt;Runnable&gt; jobsForDir = logsToLoad.stream().map(logDir -&gt; (Runnable) () -&gt; {</span>
+<span class="nc" id="L676">                    LOG.debug(&quot;Loading log {}&quot;, logDir);</span>
+<span class="nc" id="L677">                    Optional&lt;UnifiedLog&gt; log = Optional.empty();</span>
+<span class="nc" id="L678">                    long logLoadStartMs = time.hiResClockMs();</span>
+                    try {
+<span class="nc" id="L680">                        log = Optional.of(loadLog(logDir, hadCleanShutdown.get(), recoveryPoints, logStartOffsets,</span>
+                                defaultConfig, topicConfigOverrides, numRemainingSegments, isStray));
+<span class="nc" id="L682">                    } catch (IOException ioe) {</span>
+<span class="nc" id="L683">                        handleIOException(offlineDirs, logDirAbsolutePath, ioe);</span>
+<span class="nc" id="L684">                    } catch (KafkaStorageException kse) {</span>
+                        // KafkaStorageException might be thrown, ex: during writing LeaderEpochFileCache
+                        // And while converting IOException to KafkaStorageException, we've already handled the exception.
+                        // So only throw if it's not the case here.
+<span class="nc bnc" id="L688" title="All 2 branches missed.">                        if (!(kse.getCause() instanceof IOException)) {</span>
+<span class="nc" id="L689">                            throw kse;</span>
+                        }
+                    } finally {
+<span class="nc" id="L692">                        long logLoadDurationMs = time.hiResClockMs() - logLoadStartMs;</span>
+<span class="nc" id="L693">                        int remainingLogs = decNumRemainingLogs(numRemainingLogs, logDirAbsolutePath);</span>
+<span class="nc" id="L694">                        int currentNumLoaded = logsToLoad.size() - remainingLogs;</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">                        if (log.isPresent()) {</span>
+<span class="nc" id="L696">                            UnifiedLog loadedLog = log.get();</span>
+<span class="nc" id="L697">                            LOG.info(&quot;Completed load of {} with {} segments, local-log-start-offset {} and log-end-offset {} in {}ms ({}/{} completed in {})&quot;,</span>
+<span class="nc" id="L698">                                    loadedLog, loadedLog.numberOfSegments(), loadedLog.localLogStartOffset(), loadedLog.logEndOffset(), logLoadDurationMs, currentNumLoaded, logsToLoad.size(), logDirAbsolutePath);</span>
+<span class="nc" id="L699">                        } else {</span>
+<span class="nc" id="L700">                            LOG.info(&quot;Error while loading logs in {} in {}ms ({}/{} completed in {})&quot;, logDir, logLoadDurationMs, currentNumLoaded, logsToLoad.size(), logDirAbsolutePath);</span>
+                        }
+
+<span class="nc bnc" id="L703" title="All 2 branches missed.">                        if (remainingLogs == 0) {</span>
+                            // loadLog is completed for all logs under the logDir, mark it.
+<span class="nc" id="L705">                            loadLogsCompletedFlags.put(logDirAbsolutePath, true);</span>
+                        }
+                    }
+<span class="nc" id="L708">                }).toList();</span>
+
+<span class="nc" id="L710">                jobs.add(jobsForDir.stream().map(pool::submit).collect(Collectors.toList()));</span>
+<span class="nc" id="L711">            } catch (IOException e) {</span>
+<span class="nc" id="L712">                handleIOException(offlineDirs, logDirAbsolutePath, e);</span>
+<span class="nc" id="L713">            }</span>
+<span class="nc" id="L714">        }</span>
+
+        try {
+<span class="nc" id="L717">            addLogRecoveryMetrics(numRemainingLogs, numRemainingSegments);</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">            for (List&lt;Future&lt;?&gt;&gt; dirJobs : jobs) {</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">                for (Future&lt;?&gt; job : dirJobs) {</span>
+<span class="nc" id="L720">                    job.get();</span>
+<span class="nc" id="L721">                }</span>
+<span class="nc" id="L722">            }</span>
+
+<span class="nc" id="L724">            offlineDirs.forEach(entry -&gt;</span>
+<span class="nc" id="L725">                logDirFailureChannel.maybeAddOfflineLogDir(entry.getKey(), &quot;Error while loading log dir &quot; + entry.getKey(), entry.getValue())</span>
+            );
+<span class="nc" id="L727">        } catch (ExecutionException e) {</span>
+<span class="nc" id="L728">            LOG.error(&quot;There was an error in one of the threads during logs loading&quot;, e.getCause());</span>
+<span class="nc" id="L729">            throw (Exception) e.getCause();</span>
+        } finally {
+<span class="nc" id="L731">            removeLogRecoveryMetrics();</span>
+<span class="nc" id="L732">            threadPools.forEach(ExecutorService::shutdown);</span>
+        }
+
+<span class="nc" id="L735">        long elapsedMs = time.hiResClockMs() - startMs;</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">        String printedUncleanLogDirs = uncleanLogDirs.isEmpty() ? &quot;&quot; : &quot; (unclean log dirs = &quot; + uncleanLogDirs + &quot;)&quot;;</span>
+<span class="nc" id="L737">        LOG.info(&quot;Loaded {} logs in {}ms{}&quot;, numTotalLogs, elapsedMs, printedUncleanLogDirs);</span>
+<span class="nc" id="L738">    }</span>
+
+    // Visible for testing
+    public void addLogRecoveryMetrics(ConcurrentMap&lt;String, Integer&gt; numRemainingLogs, ConcurrentMap&lt;String, Integer&gt; numRemainingSegments) {
+<span class="nc" id="L742">        LOG.debug(&quot;Adding log recovery metrics&quot;);</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">        for (File dir : logDirs) {</span>
+<span class="nc" id="L744">            metricsGroup.newGauge(&quot;remainingLogsToRecover&quot;, () -&gt; numRemainingLogs.get(dir.getAbsolutePath()),</span>
+<span class="nc" id="L745">                    Map.of(&quot;dir&quot;, dir.getAbsolutePath()));</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">            for (int i = 0; i &lt; numRecoveryThreadsPerDataDir; i++) {</span>
+<span class="nc" id="L747">                String threadName = logRecoveryThreadName(dir.getAbsolutePath(), i);</span>
+<span class="nc" id="L748">                LinkedHashMap&lt;String, String&gt; tags = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L749">                tags.put(&quot;dir&quot;, dir.getAbsolutePath());</span>
+<span class="nc" id="L750">                tags.put(&quot;threadNum&quot;, String.valueOf(i));</span>
+<span class="nc" id="L751">                metricsGroup.newGauge(&quot;remainingSegmentsToRecover&quot;, () -&gt; numRemainingSegments.get(threadName), tags);</span>
+            }
+<span class="nc" id="L753">        }</span>
+<span class="nc" id="L754">    }</span>
+
+    // Visible for testing
+    public void removeLogRecoveryMetrics() {
+<span class="nc" id="L758">        LOG.debug(&quot;Removing log recovery metrics&quot;);</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">        for (File dir : logDirs) {</span>
+<span class="nc" id="L760">            metricsGroup.removeMetric(&quot;remainingLogsToRecover&quot;, Map.of(&quot;dir&quot;, dir.getAbsolutePath()));</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">            for (int i = 0; i &lt; numRecoveryThreadsPerDataDir; i++) {</span>
+<span class="nc" id="L762">                LinkedHashMap&lt;String, String&gt; tags = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L763">                tags.put(&quot;dir&quot;, dir.getAbsolutePath());</span>
+<span class="nc" id="L764">                tags.put(&quot;threadNum&quot;, String.valueOf(i));</span>
+<span class="nc" id="L765">                metricsGroup.removeMetric(&quot;remainingSegmentsToRecover&quot;, tags);</span>
+            }
+<span class="nc" id="L767">        }</span>
+<span class="nc" id="L768">    }</span>
+
+    // Visible for testing
+    public void startup(Set&lt;String&gt; topicNames) throws Exception {
+<span class="nc" id="L772">        startup(topicNames, l -&gt; false);</span>
+<span class="nc" id="L773">    }</span>
+
+    /**
+     *  Start the background threads to flush logs and do log cleanup
+     */
+    public void startup(Set&lt;String&gt; topicNames, Function&lt;UnifiedLog, Boolean&gt; isStray) throws Exception {
+        // ensure consistency between default config and overrides
+<span class="nc" id="L780">        LogConfig defaultConfig = currentDefaultConfig;</span>
+<span class="nc" id="L781">        startupWithConfigOverrides(defaultConfig, fetchTopicConfigOverrides(defaultConfig, topicNames), isStray);</span>
+<span class="nc" id="L782">    }</span>
+
+    // Visible for testing
+    public Map&lt;String, LogConfig&gt; fetchTopicConfigOverrides(LogConfig defaultConfig, Set&lt;String&gt; topicNames) {
+<span class="nc" id="L786">        Map&lt;String, LogConfig&gt; topicConfigOverrides = new  HashMap&lt;&gt;();</span>
+<span class="nc" id="L787">        Map&lt;String, Object&gt; defaultProps = defaultConfig.originals();</span>
+<span class="nc" id="L788">        topicNames.forEach(topicName -&gt; {</span>
+<span class="nc" id="L789">            Properties overrides = configRepository.topicConfig(topicName);</span>
+            // save memory by only including configs for topics with overrides
+<span class="nc bnc" id="L791" title="All 2 branches missed.">            if (!overrides.isEmpty()) {</span>
+<span class="nc" id="L792">                LogConfig logConfig = LogConfig.fromProps(defaultProps, overrides);</span>
+<span class="nc" id="L793">                topicConfigOverrides.put(topicName, logConfig);</span>
+            }
+<span class="nc" id="L795">        });</span>
+<span class="nc" id="L796">        return topicConfigOverrides;</span>
+    }
+
+    private LogConfig fetchLogConfig(String topicName) {
+        // ensure consistency between default config and overrides
+<span class="nc" id="L801">        LogConfig defaultConfig = currentDefaultConfig;</span>
+<span class="nc" id="L802">        Iterator&lt;LogConfig&gt; config = fetchTopicConfigOverrides(defaultConfig, Set.of(topicName)).values().iterator();</span>
+<span class="nc bnc" id="L803" title="All 2 branches missed.">        return config.hasNext() ? config.next() : defaultConfig;</span>
+    }
+
+    private void startupWithConfigOverrides(LogConfig defaultConfig,
+                                            Map&lt;String, LogConfig&gt; topicConfigOverrides,
+                                            Function&lt;UnifiedLog, Boolean&gt; isStray) throws Exception {
+<span class="nc" id="L809">        loadLogs(defaultConfig, topicConfigOverrides, isStray); // this could take a while if shutdown was not clean</span>
+
+        // Schedule the cleanup task to delete old logs
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        if (scheduler != null) {</span>
+<span class="nc" id="L813">            LOG.info(&quot;Starting log cleanup with a period of {} ms.&quot;, retentionCheckMs);</span>
+<span class="nc" id="L814">            scheduler.schedule(&quot;kafka-log-retention&quot;,</span>
+                    this::cleanupLogs,
+                    initialTaskDelayMs,
+                    retentionCheckMs);
+<span class="nc" id="L818">            LOG.info(&quot;Starting log flusher with a default period of {} ms.&quot;, flushCheckMs);</span>
+<span class="nc" id="L819">            scheduler.schedule(&quot;kafka-log-flusher&quot;,</span>
+                    this::flushDirtyLogs,
+                    initialTaskDelayMs,
+                    flushCheckMs);
+<span class="nc" id="L823">            scheduler.schedule(&quot;kafka-recovery-point-checkpoint&quot;,</span>
+                    this::checkpointLogRecoveryOffsets,
+                    initialTaskDelayMs,
+                    flushRecoveryOffsetCheckpointMs);
+<span class="nc" id="L827">            scheduler.schedule(&quot;kafka-log-start-offset-checkpoint&quot;,</span>
+                    this::checkpointLogStartOffsets,
+                    initialTaskDelayMs,
+                    flushStartOffsetCheckpointMs);
+<span class="nc" id="L831">            scheduler.scheduleOnce(&quot;kafka-delete-logs&quot;, // will be rescheduled after each delete logs with a dynamic period</span>
+                    this::deleteLogs,
+                    initialTaskDelayMs);
+        }
+<span class="nc bnc" id="L835" title="All 2 branches missed.">        if (cleanerConfig.enableCleaner) {</span>
+<span class="nc" id="L836">            cleaner = cleanerFactory.build(cleanerConfig, liveLogDirs.stream().toList(), currentLogs, logDirFailureChannel, time);</span>
+<span class="nc" id="L837">            cleaner.startup();</span>
+        } else {
+<span class="nc" id="L839">            LOG.warn(&quot;The config `log.cleaner.enable` is deprecated and will be removed in Kafka 5.0. Starting from Kafka 5.0, the log cleaner will always be enabled, and this config will be ignored.&quot;);</span>
+
+        }
+<span class="nc" id="L842">    }</span>
+
+    // Only for testing
+    public void shutdown() throws IOException {
+<span class="nc" id="L846">        shutdown(-1L);</span>
+<span class="nc" id="L847">    }</span>
+
+    /**
+     * Close all the logs
+     */
+    public void shutdown(long brokerEpoch) throws IOException {
+<span class="nc" id="L853">        LOG.info(&quot;Shutting down.&quot;);</span>
+
+<span class="nc" id="L855">        metricsGroup.removeMetric(&quot;OfflineLogDirectoryCount&quot;);</span>
+<span class="nc bnc" id="L856" title="All 2 branches missed.">        for (File dir : logDirs) {</span>
+<span class="nc" id="L857">            metricsGroup.removeMetric(&quot;LogDirectoryOffline&quot;, Map.of(&quot;logDirectory&quot;, dir.getAbsolutePath()));</span>
+<span class="nc" id="L858">        }</span>
+
+<span class="nc" id="L860">        List&lt;ExecutorService&gt; threadPools = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L861">        Map&lt;File, List&lt;Future&lt;?&gt;&gt;&gt; jobs = new HashMap&lt;&gt;();</span>
+
+        // stop the cleaner first
+<span class="nc bnc" id="L864" title="All 2 branches missed.">        if (cleaner != null) {</span>
+<span class="nc" id="L865">            Utils.swallow(LOG, () -&gt; cleaner.shutdown());</span>
+        }
+
+<span class="nc" id="L868">        Map&lt;String, Map&lt;TopicPartition, UnifiedLog&gt;&gt; localLogsByDir = logsByDir();</span>
+
+        // close logs in each dir
+<span class="nc bnc" id="L871" title="All 2 branches missed.">        for (File dir : liveLogDirs) {</span>
+<span class="nc" id="L872">            LOG.debug(&quot;Flushing and closing logs at {}&quot;, dir);</span>
+
+<span class="nc" id="L874">            ExecutorService pool = Executors.newFixedThreadPool(numRecoveryThreadsPerDataDir,</span>
+<span class="nc" id="L875">                    runnable -&gt; KafkaThread.nonDaemon(&quot;log-closing-&quot; + dir.getAbsolutePath(), runnable));</span>
+<span class="nc" id="L876">            threadPools.add(pool);</span>
+
+<span class="nc" id="L878">            Collection&lt;UnifiedLog&gt; logs = logsInDir(localLogsByDir, dir).values();</span>
+
+<span class="nc" id="L880">            List&lt;Runnable&gt; jobsForDir = logs.stream().map(log -&gt; (Runnable) () -&gt; {</span>
+<span class="nc" id="L881">                log.prepareActiveSegmentForClose();</span>
+                // flush the log to ensure latest possible recovery point
+<span class="nc" id="L883">                log.flush(true);</span>
+<span class="nc" id="L884">                log.close();</span>
+<span class="nc" id="L885">            }).toList();</span>
+
+<span class="nc" id="L887">            jobs.put(dir, jobsForDir.stream().map(pool::submit).collect(Collectors.toList()));</span>
+<span class="nc" id="L888">        }</span>
+
+        try {
+<span class="nc" id="L891">            jobs.forEach((dir, dirJobs) -&gt; {</span>
+<span class="nc bnc" id="L892" title="All 2 branches missed.">                if (waitForAllToComplete(dirJobs,</span>
+<span class="nc" id="L893">                        e -&gt; LOG.warn(&quot;There was an error in one of the threads during LogManager shutdown&quot;, e.getCause()))) {</span>
+<span class="nc" id="L894">                    Map&lt;TopicPartition, UnifiedLog&gt; logs = logsInDir(localLogsByDir, dir);</span>
+
+                    // update the last flush point
+<span class="nc" id="L897">                    LOG.debug(&quot;Updating recovery points at {}&quot;, dir);</span>
+<span class="nc" id="L898">                    checkpointRecoveryOffsetsInDir(dir, logs);</span>
+
+<span class="nc" id="L900">                    LOG.debug(&quot;Updating log start offsets at {}&quot;, dir);</span>
+<span class="nc" id="L901">                    checkpointLogStartOffsetsInDir(dir, logs);</span>
+
+                    // mark that the shutdown was clean by creating marker file for log dirs that:
+                    //  1. had clean shutdown marker file; or
+                    //  2. had no clean shutdown marker file, but all logs under it have been recovered at startup time
+<span class="nc" id="L906">                    String logDirAbsolutePath = dir.getAbsolutePath();</span>
+<span class="nc bnc" id="L907" title="All 2 branches missed.">                    if (hadCleanShutdownFlags.getOrDefault(logDirAbsolutePath, false) ||</span>
+<span class="nc bnc" id="L908" title="All 2 branches missed.">                            loadLogsCompletedFlags.getOrDefault(logDirAbsolutePath, false)) {</span>
+<span class="nc" id="L909">                        CleanShutdownFileHandler cleanShutdownFileHandler = new CleanShutdownFileHandler(dir.getPath());</span>
+<span class="nc" id="L910">                        LOG.debug(&quot;Writing clean shutdown marker at {} with broker epoch={}&quot;, dir, brokerEpoch);</span>
+<span class="nc" id="L911">                        Utils.swallow(LOG, () -&gt; cleanShutdownFileHandler.write(brokerEpoch));</span>
+                    }
+                }
+<span class="nc" id="L914">            });</span>
+        } finally {
+<span class="nc" id="L916">            threadPools.forEach(ExecutorService::shutdown);</span>
+            // regardless of whether the close succeeded, we need to unlock the data directories
+<span class="nc bnc" id="L918" title="All 2 branches missed.">            for (FileLock lock : dirLocks) {</span>
+<span class="nc" id="L919">                lock.destroy();</span>
+<span class="nc" id="L920">            }</span>
+        }
+
+<span class="nc" id="L923">        LOG.info(&quot;Shutdown complete.&quot;);</span>
+<span class="nc" id="L924">    }</span>
+
+    /**
+     * Truncate the partition logs to the specified offsets and checkpoint the recovery point to this offset
+     *
+     * @param partitionOffsets Partition logs that need to be truncated
+     * @param isFuture True iff the truncation should be performed on the future log of the specified partitions
+     */
+    public void truncateTo(Map&lt;TopicPartition, Long&gt; partitionOffsets, boolean isFuture) {
+<span class="nc" id="L933">        List&lt;UnifiedLog&gt; affectedLogs = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L934" title="All 2 branches missed.">        for (Map.Entry&lt;TopicPartition, Long&gt; entry : partitionOffsets.entrySet()) {</span>
+<span class="nc" id="L935">            TopicPartition topicPartition = entry.getKey();</span>
+<span class="nc" id="L936">            long truncateOffset = entry.getValue();</span>
+<span class="nc bnc" id="L937" title="All 2 branches missed.">            UnifiedLog log = isFuture</span>
+<span class="nc" id="L938">                ? futureLogs.get(topicPartition)</span>
+<span class="nc" id="L939">                : currentLogs.get(topicPartition);</span>
+            // If the log does not exist, skip it
+<span class="nc bnc" id="L941" title="All 2 branches missed.">            if (log != null) {</span>
+                // May need to abort and pause the cleaning of the log, and resume after truncation is done.
+<span class="nc bnc" id="L943" title="All 2 branches missed.">                boolean needToStopCleaner = truncateOffset &lt; log.activeSegment().baseOffset();</span>
+<span class="nc bnc" id="L944" title="All 4 branches missed.">                if (needToStopCleaner &amp;&amp; !isFuture) {</span>
+<span class="nc" id="L945">                    abortAndPauseCleaning(topicPartition);</span>
+                }
+                try {
+<span class="nc bnc" id="L948" title="All 2 branches missed.">                    if (log.truncateTo(truncateOffset)) {</span>
+<span class="nc" id="L949">                        affectedLogs.add(log);</span>
+                    }
+<span class="nc bnc" id="L951" title="All 4 branches missed.">                    if (needToStopCleaner &amp;&amp; !isFuture) {</span>
+<span class="nc" id="L952">                        maybeTruncateCleanerCheckpointToActiveSegmentBaseOffset(log, topicPartition);</span>
+                    }
+                } finally {
+<span class="nc bnc" id="L955" title="All 4 branches missed.">                    if (needToStopCleaner &amp;&amp; !isFuture) {</span>
+<span class="nc" id="L956">                        resumeCleaning(topicPartition);</span>
+                    }
+                }
+            }
+<span class="nc" id="L960">        }</span>
+
+<span class="nc" id="L962">        affectedLogs.stream()</span>
+<span class="nc" id="L963">                .map(UnifiedLog::parentDirFile)</span>
+<span class="nc" id="L964">                .distinct()</span>
+<span class="nc" id="L965">                .forEach(this::checkpointRecoveryOffsetsInDir);</span>
+<span class="nc" id="L966">    }</span>
+
+    /**
+     * Delete all data in a partition and start the log at the new offset
+     *
+     * @param topicPartition The partition whose log needs to be truncated
+     * @param newOffset The new offset to start the log with
+     * @param isFuture True iff the truncation should be performed on the future log of the specified partition
+     * @param logStartOffsetOpt The log start offset to set for the log. If None, the new offset will be used.
+     */
+    public void truncateFullyAndStartAt(TopicPartition topicPartition,
+                                 long newOffset,
+                                 boolean isFuture,
+                                 Optional&lt;Long&gt; logStartOffsetOpt) {
+<span class="nc bnc" id="L980" title="All 2 branches missed.">        UnifiedLog log = isFuture</span>
+<span class="nc" id="L981">            ? futureLogs.get(topicPartition)</span>
+<span class="nc" id="L982">            : currentLogs.get(topicPartition);</span>
+        // If the log does not exist, skip it
+<span class="nc bnc" id="L984" title="All 2 branches missed.">        if (log != null) {</span>
+            // Abort and pause the cleaning of the log, and resume after truncation is done.
+<span class="nc bnc" id="L986" title="All 2 branches missed.">            if (!isFuture) {</span>
+<span class="nc" id="L987">                abortAndPauseCleaning(topicPartition);</span>
+            }
+            try {
+<span class="nc" id="L990">                log.truncateFullyAndStartAt(newOffset, logStartOffsetOpt);</span>
+<span class="nc bnc" id="L991" title="All 2 branches missed.">                if (!isFuture) {</span>
+<span class="nc" id="L992">                    maybeTruncateCleanerCheckpointToActiveSegmentBaseOffset(log, topicPartition);</span>
+                }
+            } finally {
+<span class="nc bnc" id="L995" title="All 2 branches missed.">                if (!isFuture) {</span>
+<span class="nc" id="L996">                    resumeCleaning(topicPartition);</span>
+                }
+            }
+<span class="nc" id="L999">            checkpointRecoveryOffsetsInDir(log.parentDirFile());</span>
+        }
+<span class="nc" id="L1001">    }</span>
+
+    /**
+     * Write out the current recovery point for all logs to a text file in the log directory
+     * to avoid recovering the whole log on startup.
+     */
+    // Visible for testing
+    public void checkpointLogRecoveryOffsets() {
+<span class="nc" id="L1009">        Map&lt;String, Map&lt;TopicPartition, UnifiedLog&gt;&gt; logsByDirCached = logsByDir();</span>
+<span class="nc" id="L1010">        liveLogDirs.forEach(logDir -&gt; {</span>
+<span class="nc" id="L1011">            Map&lt;TopicPartition, UnifiedLog&gt; logsToCheckpoint = logsInDir(logsByDirCached, logDir);</span>
+<span class="nc" id="L1012">            checkpointRecoveryOffsetsInDir(logDir, logsToCheckpoint);</span>
+<span class="nc" id="L1013">        });</span>
+<span class="nc" id="L1014">    }</span>
+
+    /**
+     * Write out the current log start offset for all logs to a text file in the log directory
+     * to avoid exposing data that have been deleted by DeleteRecordsRequest
+     */
+    public void checkpointLogStartOffsets() {
+<span class="nc" id="L1021">        Map&lt;String, Map&lt;TopicPartition, UnifiedLog&gt;&gt; logsByDirCached = logsByDir();</span>
+<span class="nc" id="L1022">        liveLogDirs.forEach(logDir -&gt;</span>
+<span class="nc" id="L1023">            checkpointLogStartOffsetsInDir(logDir, logsInDir(logsByDirCached, logDir))</span>
+        );
+<span class="nc" id="L1025">    }</span>
+
+    /**
+     * Checkpoint recovery offsets for all the logs in logDir.
+     *
+     * @param logDir the directory in which the logs to be checkpointed are
+     */
+    // Visible for testing
+    public void checkpointRecoveryOffsetsInDir(File logDir) {
+<span class="nc" id="L1034">        checkpointRecoveryOffsetsInDir(logDir, logsInDir(logDir));</span>
+<span class="nc" id="L1035">    }</span>
+
+    /**
+     * Checkpoint recovery offsets for all the provided logs.
+     *
+     * @param logDir the directory in which the logs are
+     * @param logsToCheckpoint the logs to be checkpointed
+     */
+    private void checkpointRecoveryOffsetsInDir(File logDir, Map&lt;TopicPartition, UnifiedLog&gt; logsToCheckpoint) {
+        try {
+<span class="nc" id="L1045">            OffsetCheckpointFile checkpoint = recoveryPointCheckpoints.get(logDir);</span>
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">            if (checkpoint != null) {</span>
+<span class="nc" id="L1047">                Map&lt;TopicPartition, Long&gt; recoveryOffsets = logsToCheckpoint.entrySet().stream()</span>
+<span class="nc" id="L1048">                        .collect(Collectors.toMap(</span>
+                                Map.Entry::getKey,
+<span class="nc" id="L1050">                                entry -&gt; entry.getValue().recoveryPoint()</span>
+                        ));
+                // checkpoint.write calls Utils.atomicMoveWithFallback, which flushes the parent
+                // directory and guarantees crash consistency.
+<span class="nc" id="L1054">                checkpoint.write(recoveryOffsets);</span>
+            }
+<span class="nc" id="L1056">        } catch (KafkaStorageException kse) {</span>
+<span class="nc" id="L1057">            LOG.error(&quot;Disk error while writing recovery offsets checkpoint in directory {}: {}&quot;, logDir, kse.getMessage());</span>
+<span class="nc" id="L1058">        }</span>
+<span class="nc" id="L1059">    }</span>
+
+    /**
+     * Checkpoint log start offsets for all the provided logs in the provided directory.
+     *
+     * @param logDir the directory in which logs are checkpointed
+     * @param logsToCheckpoint the logs to be checkpointed
+     */
+    private void checkpointLogStartOffsetsInDir(File logDir, Map&lt;TopicPartition, UnifiedLog&gt; logsToCheckpoint) {
+        try {
+<span class="nc" id="L1069">            OffsetCheckpointFile checkpoint = logStartOffsetCheckpoints.get(logDir);</span>
+<span class="nc bnc" id="L1070" title="All 2 branches missed.">            if (checkpoint != null) {</span>
+<span class="nc" id="L1071">                Map&lt;TopicPartition, Long&gt; logStartOffsets = logsToCheckpoint.entrySet().stream()</span>
+<span class="nc" id="L1072">                        .filter(entry -&gt; {</span>
+<span class="nc" id="L1073">                            UnifiedLog log = entry.getValue();</span>
+<span class="nc" id="L1074">                            List&lt;LogSegment&gt; segments = log.logSegments();</span>
+<span class="nc bnc" id="L1075" title="All 4 branches missed.">                            return log.remoteLogEnabled() || log.logStartOffset() &gt; segments.get(0).baseOffset();</span>
+                        })
+<span class="nc" id="L1077">                        .collect(Collectors.toMap(</span>
+                                Map.Entry::getKey,
+<span class="nc" id="L1079">                                entry -&gt; entry.getValue().logStartOffset()</span>
+                        ));
+<span class="nc" id="L1081">                checkpoint.write(logStartOffsets);</span>
+            }
+<span class="nc" id="L1083">        } catch (KafkaStorageException kse) {</span>
+<span class="nc" id="L1084">            LOG.error(&quot;Disk error while writing log start offsets checkpoint in directory {}: {}&quot;, logDir, kse.getMessage());</span>
+<span class="nc" id="L1085">        }</span>
+<span class="nc" id="L1086">    }</span>
+
+    /**
+     * Update the preferred log dir for the partition
+     *
+     * @param topicPartition The partition to update
+     * @param logDir The logDir should be an absolute path
+     */
+    public void maybeUpdatePreferredLogDir(TopicPartition topicPartition, String logDir) {
+        // Do not cache the preferred log directory if either the current log or the future log for this partition exists in the specified logDir
+<span class="nc" id="L1096">        boolean currentLogInDir = getLog(topicPartition)</span>
+<span class="nc" id="L1097">                .map(log -&gt; log.parentDir().equals(logDir))</span>
+<span class="nc" id="L1098">                .orElse(false);</span>
+<span class="nc" id="L1099">        boolean futureLogInDir = getLog(topicPartition, true)</span>
+<span class="nc" id="L1100">                .map(log -&gt; log.parentDir().equals(logDir))</span>
+<span class="nc" id="L1101">                .orElse(false);</span>
+<span class="nc bnc" id="L1102" title="All 4 branches missed.">        if (!currentLogInDir &amp;&amp; !futureLogInDir)</span>
+<span class="nc" id="L1103">            preferredLogDirs.put(topicPartition, logDir);</span>
+<span class="nc" id="L1104">    }</span>
+
+    /**
+     * Abort and pause cleaning of the provided partition and log a message about it.
+     */
+    public void abortAndPauseCleaning(TopicPartition topicPartition) {
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">        if (cleaner != null) {</span>
+<span class="nc" id="L1111">            cleaner.abortAndPauseCleaning(topicPartition);</span>
+<span class="nc" id="L1112">            LOG.info(&quot;The cleaning for partition {} is aborted and paused&quot;, topicPartition);</span>
+        }
+<span class="nc" id="L1114">    }</span>
+
+    /**
+     * Abort cleaning of the provided partition and log a message about it.
+     */
+    // Visible for testing
+    public void abortCleaning(TopicPartition topicPartition) {
+<span class="nc bnc" id="L1121" title="All 2 branches missed.">        if (cleaner != null) {</span>
+<span class="nc" id="L1122">            cleaner.abortCleaning(topicPartition);</span>
+<span class="nc" id="L1123">            LOG.info(&quot;The cleaning for partition {} is aborted&quot;, topicPartition);</span>
+        }
+<span class="nc" id="L1125">    }</span>
+
+    /**
+     * Resume cleaning of the provided partition and log a message about it.
+     */
+    public void resumeCleaning(TopicPartition topicPartition) {
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">        if (cleaner != null) {</span>
+<span class="nc" id="L1132">            cleaner.resumeCleaning(Set.of(topicPartition));</span>
+<span class="nc" id="L1133">            LOG.info(&quot;Cleaning for partition {} is resumed&quot;, topicPartition);</span>
+        }
+<span class="nc" id="L1135">    }</span>
+
+    /**
+     * Truncate the cleaner's checkpoint to the based offset of the active segment of
+     * the provided log.
+     */
+    private void maybeTruncateCleanerCheckpointToActiveSegmentBaseOffset(UnifiedLog log, TopicPartition topicPartition) {
+<span class="nc bnc" id="L1142" title="All 2 branches missed.">        if (cleaner != null) {</span>
+<span class="nc" id="L1143">            cleaner.maybeTruncateCheckpoint(log.parentDirFile(), topicPartition, log.activeSegment().baseOffset());</span>
+        }
+<span class="nc" id="L1145">    }</span>
+
+    /**
+     * Get the log if it exists, otherwise return None
+     *
+     * @param topicPartition the partition of the log
+     */
+    public Optional&lt;UnifiedLog&gt; getLog(TopicPartition topicPartition) {
+<span class="nc" id="L1153">        return getLog(topicPartition, false);</span>
+    }
+
+    /**
+     * Get the log if it exists, otherwise return None
+     *
+     * @param topicPartition the partition of the log
+     * @param isFuture True if the future log of the specified partition should be returned
+     */
+    public Optional&lt;UnifiedLog&gt; getLog(TopicPartition topicPartition, boolean isFuture) {
+<span class="nc bnc" id="L1163" title="All 2 branches missed.">        return isFuture</span>
+<span class="nc" id="L1164">            ? Optional.ofNullable(futureLogs.get(topicPartition))</span>
+<span class="nc" id="L1165">            : Optional.ofNullable(currentLogs.get(topicPartition));</span>
+    }
+
+    /**
+     * Method to indicate that logs are getting initialized for the partition passed in as argument.
+     * This method should always be followed by {@link #finishedInitializingLog} to indicate that log
+     * initialization is done.
+     */
+    public void initializingLog(TopicPartition topicPartition) {
+<span class="nc" id="L1174">        partitionsInitializing.put(topicPartition, false);</span>
+<span class="nc" id="L1175">    }</span>
+
+    /**
+     * Mark the partition configuration for all partitions that are getting initialized for topic
+     * as dirty. That will result in reloading of configuration once initialization is done.
+     */
+    // Visible for testing
+    public void topicConfigUpdated(String topic) {
+<span class="nc" id="L1183">        partitionsInitializing.keySet().stream()</span>
+<span class="nc" id="L1184">                .filter(tp -&gt; tp.topic().equals(topic))</span>
+<span class="nc" id="L1185">                .forEach(topicPartition -&gt;</span>
+<span class="nc" id="L1186">                    partitionsInitializing.replace(topicPartition, false, true));</span>
+<span class="nc" id="L1187">    }</span>
+
+    /**
+     * Update the configuration of the provided topic.
+     */
+    public void updateTopicConfig(String topic,
+                                  Properties newTopicConfig,
+                                  boolean isRemoteLogStorageSystemEnabled,
+                                  boolean wasRemoteLogEnabled) {
+<span class="nc" id="L1196">        topicConfigUpdated(topic);</span>
+<span class="nc" id="L1197">        List&lt;UnifiedLog&gt; logs = logsByTopic(topic);</span>
+<span class="nc" id="L1198">        LogConfig newLogConfig = LogConfig.fromProps(currentDefaultConfig.originals(), newTopicConfig);</span>
+<span class="nc" id="L1199">        boolean isRemoteLogStorageEnabled = newLogConfig.remoteStorageEnable();</span>
+        // We would like to validate the configuration no matter whether the logs have materialised on disk or not.
+        // Otherwise, we risk someone creating a tiered-topic, disabling Tiered Storage cluster-wide and the check
+        // failing since the logs for the topic are non-existent.
+<span class="nc" id="L1203">        LogConfig.validateRemoteStorageOnlyIfSystemEnabled(newLogConfig.values(), isRemoteLogStorageSystemEnabled, true);</span>
+<span class="nc" id="L1204">        LogConfig.validateTurningOffRemoteStorageWithDelete(newLogConfig.values(), wasRemoteLogEnabled, isRemoteLogStorageEnabled);</span>
+<span class="nc" id="L1205">        LogConfig.validateRetentionConfigsWhenRemoteCopyDisabled(newLogConfig.values(), isRemoteLogStorageEnabled);</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">        if (!logs.isEmpty()) {</span>
+<span class="nc" id="L1207">            logs.forEach(log -&gt; {</span>
+<span class="nc" id="L1208">                LogConfig oldLogConfig = log.updateConfig(newLogConfig);</span>
+<span class="nc bnc" id="L1209" title="All 4 branches missed.">                if (oldLogConfig.compact &amp;&amp; !newLogConfig.compact) {</span>
+<span class="nc" id="L1210">                    abortCleaning(log.topicPartition());</span>
+                }
+<span class="nc" id="L1212">            });</span>
+        }
+<span class="nc" id="L1214">    }</span>
+
+    /**
+     * Mark all in progress partitions having dirty configuration if broker configuration is updated.
+     */
+    public void brokerConfigUpdated() {
+<span class="nc" id="L1220">        partitionsInitializing.keySet().forEach(topicPartition -&gt;</span>
+<span class="nc" id="L1221">                partitionsInitializing.replace(topicPartition, false, true)</span>
+        );
+<span class="nc" id="L1223">    }</span>
+
+    /**
+     * Method to indicate that the log initialization for the partition passed in as argument is
+     * finished. This method should follow a call to {@link #initializingLog}.
+     *
+     * It will retrieve the topic configs a second time if they were updated while the
+     * relevant log was being loaded.
+     */
+    public void finishedInitializingLog(TopicPartition topicPartition, Optional&lt;UnifiedLog&gt; maybeLog) {
+<span class="nc" id="L1233">        Boolean removedValue = partitionsInitializing.remove(topicPartition);</span>
+<span class="nc bnc" id="L1234" title="All 4 branches missed.">        if (removedValue != null &amp;&amp; removedValue)</span>
+<span class="nc" id="L1235">            maybeLog.ifPresent(l -&gt; l.updateConfig(fetchLogConfig(topicPartition.topic())));</span>
+<span class="nc" id="L1236">    }</span>
+
+    // Only for testing
+    public UnifiedLog getOrCreateLog(TopicPartition topicPartition, Optional&lt;Uuid&gt; topicId) throws IOException {
+<span class="nc" id="L1240">        return getOrCreateLog(topicPartition, false, false, topicId, Optional.empty());</span>
+    }
+
+    // Only for testing
+    public UnifiedLog getOrCreateLog(TopicPartition topicPartition, boolean isNew, boolean isFuture, Optional&lt;Uuid&gt; topicId) throws IOException {
+<span class="nc" id="L1245">        return getOrCreateLog(topicPartition, isNew, isFuture, topicId, Optional.empty());</span>
+    }
+
+    /**
+     * If the log already exists, just return a copy of the existing log
+     * Otherwise if isNew=true or if there is no offline log directory, create a log for the given topic and the given partition
+     * Otherwise throw KafkaStorageException
+     *
+     * @param topicPartition The partition whose log needs to be returned or created
+     * @param isNew Whether the replica should have existed on the broker or not
+     * @param isFuture True if the future log of the specified partition should be returned or created
+     * @param topicId The topic ID of the partition's topic
+     * @param targetLogDirectoryId The directory Id that should host the partition's topic.
+     *                             The next selected directory will be picked up if it None or equal {@link DirectoryId#UNASSIGNED}.
+     *                             The method assumes provided Id belong to online directory.
+     * @throws KafkaStorageException if isNew=false, log is not found in the cache and there is offline log directory on the broker
+     * @throws InconsistentTopicIdException if the topic ID in the log does not match the topic ID provided
+     */
+    public UnifiedLog getOrCreateLog(TopicPartition topicPartition,
+                                     boolean isNew,
+                                     boolean isFuture,
+                                     Optional&lt;Uuid&gt; topicId,
+                                     Optional&lt;Uuid&gt; targetLogDirectoryId) throws IOException {
+<span class="nc" id="L1268">        synchronized (logCreationOrDeletionLock) {</span>
+<span class="nc" id="L1269">            Optional&lt;UnifiedLog&gt; logOpt = getLog(topicPartition, isFuture);</span>
+<span class="nc bnc" id="L1270" title="All 2 branches missed.">            UnifiedLog log = logOpt.isPresent()</span>
+<span class="nc" id="L1271">                    ? logOpt.get()</span>
+<span class="nc" id="L1272">                    : createLog(topicPartition, isNew, isFuture, topicId, targetLogDirectoryId);</span>
+
+            // Ensure topic IDs are consistent
+<span class="nc" id="L1275">            topicId.ifPresent(id -&gt;</span>
+<span class="nc" id="L1276">                log.topicId().ifPresent(logTopicId -&gt; {</span>
+<span class="nc bnc" id="L1277" title="All 2 branches missed.">                    if (!id.equals(logTopicId))</span>
+<span class="nc" id="L1278">                        throw new InconsistentTopicIdException(&quot;Tried to assign topic ID &quot; + id + &quot; to log for topic partition &quot; + topicPartition + &quot;,&quot; +</span>
+                                &quot;but log already contained topic ID &quot; + logTopicId);
+<span class="nc" id="L1280">                })</span>
+            );
+<span class="nc" id="L1282">            return log;</span>
+        }
+    }
+
+    private UnifiedLog createLog(TopicPartition topicPartition,
+                                 boolean isNew,
+                                 boolean isFuture,
+                                 Optional&lt;Uuid&gt; topicId,
+                                 Optional&lt;Uuid&gt; targetLogDirectoryId) throws IOException {
+        // create the log if it has not already been created in another thread
+<span class="nc bnc" id="L1292" title="All 4 branches missed.">        if (!isNew &amp;&amp; !offlineLogDirs().isEmpty())</span>
+<span class="nc" id="L1293">            throw new KafkaStorageException(&quot;Can not create log for &quot; + topicPartition + &quot; because log directories &quot; +</span>
+<span class="nc" id="L1294">                    dirsToString(offlineLogDirs()) + &quot; are offline&quot;);</span>
+
+        // Determine preferred log directory
+        String preferredLogDir;
+<span class="nc bnc" id="L1298" title="All 2 branches missed.">        if (targetLogDirectoryId.isPresent() &amp;&amp;</span>
+<span class="nc bnc" id="L1299" title="All 2 branches missed.">                !Set.of(DirectoryId.UNASSIGNED, DirectoryId.LOST).contains(targetLogDirectoryId.get()) &amp;&amp;</span>
+<span class="nc bnc" id="L1300" title="All 2 branches missed.">                !preferredLogDirs.containsKey(topicPartition)) {</span>
+            // If partition is configured with both targetLogDirectoryId and preferredLogDirs, then
+            // preferredLogDirs will be respected, otherwise targetLogDirectoryId will be respected
+<span class="nc" id="L1303">            preferredLogDir = directoryPath(targetLogDirectoryId.get()).orElse(null);</span>
+        } else {
+<span class="nc" id="L1305">            preferredLogDir = preferredLogDirs.get(topicPartition);</span>
+        }
+
+<span class="nc bnc" id="L1308" title="All 2 branches missed.">        if (isFuture) {</span>
+<span class="nc bnc" id="L1309" title="All 2 branches missed.">            if (preferredLogDir == null) {</span>
+<span class="nc" id="L1310">                throw new IllegalStateException(&quot;Can not create the future log for &quot; + topicPartition + &quot; without having a preferred log directory&quot;);</span>
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">            } else if (getLog(topicPartition).get().parentDir().equals(preferredLogDir)) {</span>
+<span class="nc" id="L1312">                throw new IllegalStateException(&quot;Can not create the future log for &quot; + topicPartition + &quot; in the current log directory of this partition&quot;);</span>
+            }
+        }
+
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">        List&lt;File&gt; logDirs = preferredLogDir != null</span>
+<span class="nc" id="L1317">                ? List.of(new File(preferredLogDir))</span>
+<span class="nc" id="L1318">                : nextLogDirs();</span>
+
+<span class="nc bnc" id="L1320" title="All 2 branches missed.">        String logDirName = isFuture</span>
+<span class="nc" id="L1321">                ? UnifiedLog.logFutureDirName(topicPartition)</span>
+<span class="nc" id="L1322">                : UnifiedLog.logDirName(topicPartition);</span>
+
+        // Try each directory until one succeeds
+<span class="nc" id="L1325">        File logDir = null;</span>
+<span class="nc" id="L1326">        KafkaStorageException lastException = null;</span>
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">        for (File dir : logDirs) {</span>
+            try {
+<span class="nc" id="L1329">                logDir = createLogDirectory(dir, logDirName);</span>
+<span class="nc" id="L1330">                break;</span>
+<span class="nc" id="L1331">            } catch (KafkaStorageException e) {</span>
+<span class="nc" id="L1332">                lastException = e;</span>
+            }
+<span class="nc" id="L1334">        }</span>
+<span class="nc bnc" id="L1335" title="All 2 branches missed.">        if (logDir == null) {</span>
+<span class="nc" id="L1336">            throw new KafkaStorageException(&quot;No log directories available. Tried &quot; + dirsToString(logDirs), lastException);</span>
+        }
+
+<span class="nc" id="L1339">        LogConfig config = fetchLogConfig(topicPartition.topic());</span>
+<span class="nc" id="L1340">        UnifiedLog newLog = UnifiedLog.create(</span>
+                logDir,
+                config,
+                0L,
+                0L,
+                scheduler,
+                brokerTopicStats,
+                time,
+                maxTransactionTimeoutMs,
+                producerStateManagerConfig,
+                producerIdExpirationCheckIntervalMs,
+                logDirFailureChannel,
+                true,
+                topicId,
+                new ConcurrentHashMap&lt;&gt;(),
+                remoteStorageSystemEnable,
+                LogOffsetsListener.NO_OP_OFFSETS_LISTENER);
+
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">        if (isFuture) {</span>
+<span class="nc" id="L1359">            futureLogs.put(topicPartition, newLog);</span>
+        } else {
+<span class="nc" id="L1361">            currentLogs.put(topicPartition, newLog);</span>
+        }
+
+<span class="nc" id="L1364">        LOG.info(&quot;Created log for partition {} in {} with properties {}&quot;, topicPartition, logDir, config.overriddenConfigsAsLoggableString());</span>
+        // Remove the preferred log dir since it has already been satisfied
+<span class="nc" id="L1366">        preferredLogDirs.remove(topicPartition);</span>
+
+<span class="nc" id="L1368">        return newLog;</span>
+    }
+
+    /**
+     * Create the log dir
+     * @param logDir The log dir path
+     * @param logDirName The log dir name
+     */
+    // Visible for testing
+    public File createLogDirectory(File logDir, String logDirName) {
+<span class="nc" id="L1378">        String logDirPath = logDir.getAbsolutePath();</span>
+<span class="nc bnc" id="L1379" title="All 2 branches missed.">        if (isLogDirOnline(logDirPath)) {</span>
+<span class="nc" id="L1380">            File dir = new File(logDirPath, logDirName);</span>
+            try {
+<span class="nc" id="L1382">                Files.createDirectories(dir.toPath());</span>
+<span class="nc" id="L1383">                return dir;</span>
+<span class="nc" id="L1384">            } catch (IOException ioe) {</span>
+<span class="nc" id="L1385">                String msg = &quot;Error while creating log for &quot; + logDirName + &quot; in dir &quot; + logDirPath;</span>
+<span class="nc" id="L1386">                logDirFailureChannel.maybeAddOfflineLogDir(logDirPath, msg, ioe);</span>
+<span class="nc" id="L1387">                LOG.warn(msg, ioe);</span>
+<span class="nc" id="L1388">                throw new KafkaStorageException(msg, ioe);</span>
+            }
+        } else {
+<span class="nc" id="L1391">            throw new KafkaStorageException(&quot;Can not create log &quot; + logDirName + &quot; because log directory &quot; + logDirPath + &quot; is offline&quot;);</span>
+        }
+    }
+
+    private long nextDeleteDelayMs(long fileDeleteDelayMs) {
+<span class="nc bnc" id="L1396" title="All 2 branches missed.">        if (!logsToBeDeleted.isEmpty()) {</span>
+<span class="nc" id="L1397">            Map.Entry&lt;UnifiedLog, Long&gt; entry = logsToBeDeleted.peek();</span>
+<span class="nc" id="L1398">            return entry.getValue() + fileDeleteDelayMs - time.milliseconds();</span>
+        } else {
+            // avoid the case: fileDeleteDelayMs is 0 with empty logsToBeDeleted
+            // in this case, logsToBeDeleted.take() will block forever
+<span class="nc" id="L1402">            return Math.max(fileDeleteDelayMs, 1);</span>
+        }
+    }
+
+    /**
+     *  Delete logs marked for deletion. Delete all logs for which `currentDefaultConfig.fileDeleteDelayMs`
+     *  has elapsed after the delete was scheduled. Logs for which this interval has not yet elapsed will be
+     *  considered for deletion in the next iteration of `deleteLogs`. The next iteration will be executed
+     *  after the remaining time for the first log that is not deleted. If there are no more `logsToBeDeleted`,
+     *  `deleteLogs` will be executed after `max(currentDefaultConfig.fileDeleteDelayMs, 1)`.
+     */
+    private void deleteLogs() {
+<span class="nc" id="L1414">        long fileDeleteDelayMs = currentDefaultConfig.fileDeleteDelayMs;</span>
+<span class="nc" id="L1415">        long nextDelayMs = nextDeleteDelayMs(fileDeleteDelayMs);</span>
+        try {
+<span class="nc bnc" id="L1417" title="All 2 branches missed.">            while (nextDelayMs &lt;= 0) {</span>
+<span class="nc" id="L1418">                Map.Entry&lt;UnifiedLog, Long&gt; entry = logsToBeDeleted.take();</span>
+<span class="nc" id="L1419">                UnifiedLog removedLog = entry.getKey();</span>
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">                if (removedLog != null) {</span>
+                    try {
+<span class="nc" id="L1422">                        removedLog.delete();</span>
+<span class="nc" id="L1423">                        LOG.info(&quot;Deleted log for partition {} in {}.&quot;, removedLog.topicPartition(), removedLog.dir().getAbsolutePath());</span>
+<span class="nc" id="L1424">                    } catch (KafkaStorageException kse) {</span>
+<span class="nc" id="L1425">                        LOG.error(&quot;Exception while deleting {} in dir {}.&quot;, removedLog, removedLog.parentDir(), kse);</span>
+<span class="nc" id="L1426">                    }</span>
+                }
+<span class="nc" id="L1428">                nextDelayMs = nextDeleteDelayMs(fileDeleteDelayMs);</span>
+<span class="nc" id="L1429">            }</span>
+<span class="nc" id="L1430">        } catch (Throwable e) {</span>
+<span class="nc" id="L1431">            LOG.error(&quot;Exception in kafka-delete-logs thread.&quot;, e);</span>
+        } finally {
+            try {
+<span class="nc" id="L1434">                scheduler.scheduleOnce(&quot;kafka-delete-logs&quot;, this::deleteLogs, nextDelayMs);</span>
+<span class="nc" id="L1435">            } catch (Throwable e) {</span>
+                // No errors should occur unless scheduler has been shutdown
+<span class="nc" id="L1437">                LOG.error(&quot;Failed to schedule next delete in kafka-delete-logs thread&quot;, e);</span>
+<span class="nc" id="L1438">            }</span>
+        }
+<span class="nc" id="L1440">    }</span>
+
+    /**
+     * Attempts to recover abandoned future logs if we can find a current matching log
+     */
+    public void recoverAbandonedFutureLogs(int brokerId, DirectoryForBrokerPartition tpToDirectoryUuid) throws IOException {
+<span class="nc" id="L1446">        Map&lt;UnifiedLog, Optional&lt;UnifiedLog&gt;&gt; abandonedFutureLogs = findAbandonedFutureLogs(brokerId, tpToDirectoryUuid);</span>
+<span class="nc bnc" id="L1447" title="All 2 branches missed.">        for (Map.Entry&lt;UnifiedLog, Optional&lt;UnifiedLog&gt;&gt; entry : abandonedFutureLogs.entrySet()) {</span>
+<span class="nc" id="L1448">            UnifiedLog futureLog = entry.getKey();</span>
+<span class="nc" id="L1449">            Optional&lt;UnifiedLog&gt; currentLog = entry.getValue();</span>
+<span class="nc" id="L1450">            TopicPartition tp = futureLog.topicPartition();</span>
+            // We invoke abortAndPauseCleaning here because log cleaner runs asynchronously and replaceCurrentWithFutureLog
+            // invokes resumeCleaning which requires log cleaner's internal state to have a key for the given topic partition.
+<span class="nc" id="L1453">            abortAndPauseCleaning(tp);</span>
+
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">            if (currentLog.isPresent()) {</span>
+<span class="nc" id="L1456">                LOG.info(&quot;Attempting to recover abandoned future log for {} at {} and removing {}&quot;, tp, futureLog, currentLog.get());</span>
+            } else {
+<span class="nc" id="L1458">                LOG.info(&quot;Attempting to recover abandoned future log for {} at {}&quot;, tp, futureLog);</span>
+            }
+<span class="nc" id="L1460">            replaceCurrentWithFutureLog(currentLog, futureLog, false);</span>
+<span class="nc" id="L1461">            LOG.info(&quot;Successfully recovered abandoned future log for {}&quot;, tp);</span>
+<span class="nc" id="L1462">        }</span>
+<span class="nc" id="L1463">    }</span>
+
+    private Map&lt;UnifiedLog, Optional&lt;UnifiedLog&gt;&gt; findAbandonedFutureLogs(int brokerId, DirectoryForBrokerPartition tpToDirectoryUuid) {
+<span class="nc" id="L1466">        return futureLogs.values().stream()</span>
+<span class="nc" id="L1467">                .flatMap(futureLog -&gt; {</span>
+<span class="nc" id="L1468">                    Uuid topicId = futureLog.topicId().orElseThrow(() -&gt;</span>
+<span class="nc" id="L1469">                            new RuntimeException(&quot;The log dir &quot; + futureLog + &quot; does not have a topic ID, &quot; +</span>
+                                    &quot;which is not allowed when running in KRaft mode.&quot;));
+<span class="nc" id="L1471">                    int partitionId = futureLog.topicPartition().partition();</span>
+
+                    // Get the directory assigned by the controller for this partition
+<span class="nc" id="L1474">                    Uuid assignedDirectory = tpToDirectoryUuid.get(topicId, partitionId, brokerId);</span>
+<span class="nc bnc" id="L1475" title="All 2 branches missed.">                    if (assignedDirectory == null) {</span>
+<span class="nc" id="L1476">                        return Stream.empty();</span>
+                    }
+
+                    // Check if the future log is in the assigned directory
+<span class="nc" id="L1480">                    Optional&lt;Uuid&gt; futureLogDirectoryId = directoryId(futureLog.parentDir());</span>
+<span class="nc bnc" id="L1481" title="All 4 branches missed.">                    if (futureLogDirectoryId.isEmpty() || !futureLogDirectoryId.get().equals(assignedDirectory)) {</span>
+<span class="nc" id="L1482">                        return Stream.empty();</span>
+                    }
+
+                    // Find the matching current log (if it exists)
+<span class="nc" id="L1486">                    Optional&lt;UnifiedLog&gt; currentLog = Optional.ofNullable(currentLogs.get(futureLog.topicPartition()))</span>
+<span class="nc" id="L1487">                            .filter(log -&gt; {</span>
+<span class="nc" id="L1488">                                Optional&lt;Uuid&gt; currentLogTopicId = log.topicId();</span>
+<span class="nc bnc" id="L1489" title="All 4 branches missed.">                                return currentLogTopicId.isPresent() &amp;&amp; currentLogTopicId.get().equals(topicId);</span>
+                            });
+
+<span class="nc" id="L1492">                    return Stream.of(Map.entry(futureLog, currentLog));</span>
+                })
+<span class="nc" id="L1494">                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+    }
+
+    /**
+     * Mark the partition directory in the source log directory for deletion and
+     * rename the future log of this partition in the destination log directory to be the current log
+     *
+     * @param topicPartition TopicPartition that needs to be swapped
+     */
+    public void replaceCurrentWithFutureLog(TopicPartition topicPartition) throws IOException {
+<span class="nc" id="L1504">        synchronized (logCreationOrDeletionLock)  {</span>
+<span class="nc" id="L1505">            UnifiedLog sourceLog = currentLogs.get(topicPartition);</span>
+<span class="nc" id="L1506">            UnifiedLog destLog = futureLogs.get(topicPartition);</span>
+
+<span class="nc bnc" id="L1508" title="All 2 branches missed.">            if (sourceLog == null) {</span>
+<span class="nc" id="L1509">                throw new KafkaStorageException(&quot;The current replica for &quot; + topicPartition + &quot; is offline&quot;);</span>
+            }
+<span class="nc bnc" id="L1511" title="All 2 branches missed.">            if (destLog == null) {</span>
+<span class="nc" id="L1512">                throw new KafkaStorageException(&quot;The future replica for &quot; + topicPartition + &quot; is offline&quot;);</span>
+            }
+
+<span class="nc" id="L1515">            LOG.info(&quot;Attempting to replace current log {} with {} for {}&quot;, sourceLog, destLog, topicPartition);</span>
+<span class="nc" id="L1516">            replaceCurrentWithFutureLog(Optional.of(sourceLog), destLog, true);</span>
+<span class="nc" id="L1517">            LOG.info(&quot;The current replica is successfully replaced with the future replica for {}&quot;, topicPartition);</span>
+<span class="nc" id="L1518">        }</span>
+<span class="nc" id="L1519">    }</span>
+
+    private void replaceCurrentWithFutureLog(Optional&lt;UnifiedLog&gt; sourceLog, UnifiedLog destLog, boolean updateHighWatermark) throws IOException {
+<span class="nc" id="L1522">        TopicPartition topicPartition = destLog.topicPartition();</span>
+
+<span class="nc" id="L1524">        destLog.renameDir(UnifiedLog.logDirName(topicPartition), true);</span>
+        // the metrics tags still contain &quot;future&quot;, so we have to remove it.
+        // we will add metrics back after sourceLog remove the metrics
+<span class="nc" id="L1527">        destLog.removeLogMetrics();</span>
+<span class="nc bnc" id="L1528" title="All 4 branches missed.">        if (updateHighWatermark &amp;&amp; sourceLog.isPresent()) {</span>
+<span class="nc" id="L1529">            destLog.updateHighWatermark(sourceLog.get().highWatermark());</span>
+        }
+
+        // Now that future replica has been successfully renamed to be the current replica
+        // Update the cached map and log cleaner as appropriate.
+<span class="nc" id="L1534">        futureLogs.remove(topicPartition);</span>
+<span class="nc" id="L1535">        currentLogs.put(topicPartition, destLog);</span>
+<span class="nc bnc" id="L1536" title="All 2 branches missed.">        if (cleaner != null) {</span>
+<span class="nc" id="L1537">            sourceLog.ifPresent(srcLog -&gt;</span>
+<span class="nc" id="L1538">                cleaner.alterCheckpointDir(topicPartition, srcLog.parentDirFile(), destLog.parentDirFile())</span>
+            );
+<span class="nc" id="L1540">            resumeCleaning(topicPartition);</span>
+        }
+
+        try {
+<span class="nc" id="L1544">            sourceLog.ifPresent(srcLog -&gt; {</span>
+<span class="nc" id="L1545">                srcLog.renameDir(UnifiedLog.logDeleteDirName(topicPartition), true);</span>
+                // Now that replica in source log directory has been successfully renamed for deletion,
+                // update checkpoint files and enqueue this log to be deleted.
+                // Note: We intentionally do NOT close the log here to avoid race conditions where concurrent
+                // operations (e.g., log flusher, fetch requests) might encounter ClosedChannelException.
+                // The log will be deleted asynchronously by the background delete-logs thread.
+                // File handles are intentionally left open; Unix semantics allow the renamed files
+                // to remain accessible until all handles are closed.
+<span class="nc" id="L1553">                File logDir = srcLog.parentDirFile();</span>
+<span class="nc" id="L1554">                Map&lt;TopicPartition, UnifiedLog&gt; logsToCheckpoint = logsInDir(logDir);</span>
+<span class="nc" id="L1555">                checkpointRecoveryOffsetsInDir(logDir, logsToCheckpoint);</span>
+<span class="nc" id="L1556">                checkpointLogStartOffsetsInDir(logDir, logsToCheckpoint);</span>
+<span class="nc" id="L1557">                srcLog.removeLogMetrics();</span>
+<span class="nc" id="L1558">                addLogToBeDeleted(srcLog);</span>
+<span class="nc" id="L1559">            });</span>
+<span class="nc" id="L1560">            destLog.newMetrics();</span>
+<span class="nc" id="L1561">        } catch (KafkaStorageException kse) {</span>
+            // If sourceLog's log directory is offline, we need to quietly close it here.
+            // handleLogDirFailure() will not close sourceLog because it has been removed from currentLogs map
+<span class="nc" id="L1564">            sourceLog.ifPresent(srcLog -&gt; {</span>
+<span class="nc" id="L1565">                srcLog.closeQuietly();</span>
+<span class="nc" id="L1566">                srcLog.removeLogMetrics();</span>
+<span class="nc" id="L1567">            });</span>
+<span class="nc" id="L1568">            throw kse;</span>
+<span class="nc" id="L1569">        }</span>
+<span class="nc" id="L1570">    }</span>
+
+    // Only for testing
+    public Optional&lt;UnifiedLog&gt; asyncDelete(TopicPartition topicPartition) {
+<span class="nc" id="L1574">        return asyncDelete(topicPartition, false, true, false);</span>
+    }
+
+    /**
+     * Rename the directory of the given topic-partition &quot;logdir&quot; as &quot;logdir.uuid.delete&quot; and
+     * add it in the queue for deletion.
+     *
+     * @param topicPartition TopicPartition that needs to be deleted
+     * @param isFuture True if the future log of the specified partition should be deleted
+     * @param checkpoint True if checkpoints must be written
+     * @param isStray True is the partition is stray
+     * @return the removed log
+     */
+    public Optional&lt;UnifiedLog&gt; asyncDelete(TopicPartition topicPartition, boolean isFuture, boolean checkpoint, boolean isStray) {
+        Optional&lt;UnifiedLog&gt; removedLogOpt;
+<span class="nc" id="L1589">        synchronized (logCreationOrDeletionLock)  {</span>
+<span class="nc bnc" id="L1590" title="All 2 branches missed.">            removedLogOpt = removeLogAndMetrics(isFuture ? futureLogs : currentLogs, topicPartition);</span>
+<span class="nc" id="L1591">        }</span>
+<span class="nc bnc" id="L1592" title="All 2 branches missed.">        if (removedLogOpt.isPresent()) {</span>
+<span class="nc" id="L1593">            UnifiedLog removedLog = removedLogOpt.get();</span>
+            // We need to wait until there is no more cleaning task on the log to be deleted before actually deleting it.
+<span class="nc bnc" id="L1595" title="All 4 branches missed.">            if (cleaner != null &amp;&amp; !isFuture) {</span>
+<span class="nc" id="L1596">                cleaner.abortCleaning(topicPartition);</span>
+<span class="nc bnc" id="L1597" title="All 2 branches missed.">                if (checkpoint) {</span>
+<span class="nc" id="L1598">                    cleaner.updateCheckpoints(removedLog.parentDirFile(), Optional.of(topicPartition));</span>
+                }
+            }
+<span class="nc bnc" id="L1601" title="All 2 branches missed.">            if (isStray) {</span>
+                // Move aside stray partitions, don't delete them
+<span class="nc" id="L1603">                removedLog.renameDir(UnifiedLog.logStrayDirName(topicPartition), false);</span>
+<span class="nc" id="L1604">                LOG.warn(&quot;Log for partition {} is marked as stray and renamed to {}&quot;, removedLog.topicPartition(), removedLog.dir().getAbsolutePath());</span>
+            } else {
+<span class="nc" id="L1606">                removedLog.renameDir(UnifiedLog.logDeleteDirName(topicPartition), false);</span>
+<span class="nc" id="L1607">                addLogToBeDeleted(removedLog);</span>
+<span class="nc" id="L1608">                LOG.info(&quot;Log for partition {} is renamed to {} and is scheduled for deletion&quot;, removedLog.topicPartition(), removedLog.dir().getAbsolutePath());</span>
+            }
+<span class="nc bnc" id="L1610" title="All 2 branches missed.">            if (checkpoint) {</span>
+<span class="nc" id="L1611">                File logDir = removedLog.parentDirFile();</span>
+<span class="nc" id="L1612">                Map&lt;TopicPartition, UnifiedLog&gt; logsToCheckpoint = logsInDir(logDir);</span>
+<span class="nc" id="L1613">                checkpointRecoveryOffsetsInDir(logDir, logsToCheckpoint);</span>
+<span class="nc" id="L1614">                checkpointLogStartOffsetsInDir(logDir, logsToCheckpoint);</span>
+            }
+<span class="nc" id="L1616">        } else {</span>
+<span class="nc bnc" id="L1617" title="All 2 branches missed.">            if (!offlineLogDirs().isEmpty()) {</span>
+<span class="nc bnc" id="L1618" title="All 2 branches missed.">                throw new KafkaStorageException(&quot;Failed to delete log for &quot; + (isFuture ? &quot;future &quot; : &quot; &quot;) + topicPartition + &quot; because it may be in one of the offline directories &quot; +</span>
+<span class="nc" id="L1619">                        dirsToString(offlineLogDirs()));</span>
+            }
+        }
+<span class="nc" id="L1622">        return removedLogOpt;</span>
+    }
+
+    /**
+     * Rename the directories of the given topic-partitions and add them in the queue for
+     * deletion. Checkpoints are updated once all the directories have been renamed.
+     *
+     * @param topicPartitions The set of topic-partitions to delete asynchronously
+     * @param isStray True if the topic-partitions are strays
+     * @param errorHandler The error handler that will be called when an exception for a particular
+     *                     topic-partition is raised
+     */
+    public void asyncDelete(Set&lt;TopicPartition&gt; topicPartitions,
+                            boolean isStray,
+                            BiConsumer&lt;TopicPartition, Throwable&gt; errorHandler) {
+<span class="nc" id="L1637">        Set&lt;File&gt; logDirs = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1638">        topicPartitions.forEach(topicPartition -&gt; {</span>
+            try {
+<span class="nc" id="L1640">                getLog(topicPartition).ifPresent(log -&gt; {</span>
+<span class="nc" id="L1641">                    logDirs.add(log.parentDirFile());</span>
+<span class="nc" id="L1642">                    asyncDelete(topicPartition, false, false, isStray);</span>
+<span class="nc" id="L1643">                });</span>
+<span class="nc" id="L1644">                getLog(topicPartition, true).ifPresent(log -&gt; {</span>
+<span class="nc" id="L1645">                    logDirs.add(log.parentDirFile());</span>
+<span class="nc" id="L1646">                    asyncDelete(topicPartition, true, false, isStray);</span>
+<span class="nc" id="L1647">                });</span>
+<span class="nc" id="L1648">            } catch (Throwable e) {</span>
+<span class="nc" id="L1649">                errorHandler.accept(topicPartition, e);</span>
+<span class="nc" id="L1650">            }</span>
+<span class="nc" id="L1651">        });</span>
+
+<span class="nc" id="L1653">        Map&lt;String, Map&lt;TopicPartition, UnifiedLog&gt;&gt; logsByDirCached = logsByDir();</span>
+<span class="nc" id="L1654">        logDirs.forEach(logDir -&gt; {</span>
+<span class="nc bnc" id="L1655" title="All 2 branches missed.">            if (cleaner != null) cleaner.updateCheckpoints(logDir, Optional.empty());</span>
+<span class="nc" id="L1656">            Map&lt;TopicPartition, UnifiedLog&gt; logsToCheckpoint = logsInDir(logsByDirCached, logDir);</span>
+<span class="nc" id="L1657">            checkpointRecoveryOffsetsInDir(logDir, logsToCheckpoint);</span>
+<span class="nc" id="L1658">            checkpointLogStartOffsetsInDir(logDir, logsToCheckpoint);</span>
+<span class="nc" id="L1659">        });</span>
+<span class="nc" id="L1660">    }</span>
+
+    /**
+     * Provides the full ordered list of suggested directories for the next partition.
+     * Currently, this is done by calculating the number of partitions in each directory and then sorting the
+     * data directories by fewest partitions.
+     *
+     * &lt;p&gt;It's possible replicas are assigned to this broker right before all its log directories are cordoned.
+     * In that case, pick the first available directory.
+     */
+    // Visible for testing
+    public List&lt;File&gt; nextLogDirs() {
+<span class="nc bnc" id="L1672" title="All 2 branches missed.">        if (liveLogDirs.size() == 1) {</span>
+<span class="nc" id="L1673">            return List.of(liveLogDirs.peek());</span>
+        } else {
+            // count the number of logs in each parent directory (including 0 for empty directories)
+<span class="nc" id="L1676">            Map&lt;String, Long&gt; logCounts = allLogs().stream()</span>
+<span class="nc" id="L1677">                    .collect(Collectors.groupingBy(UnifiedLog::parentDir, Collectors.counting()));</span>
+
+<span class="nc" id="L1679">            Map&lt;String, Long&gt; zeros = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L1680">            liveLogDirs.forEach(dir -&gt; zeros.put(dir.getPath(), 0L));</span>
+
+<span class="nc" id="L1682">            Map&lt;String, Long&gt; dirCounts = new LinkedHashMap&lt;&gt;(zeros);</span>
+<span class="nc" id="L1683">            dirCounts.putAll(logCounts);</span>
+<span class="nc" id="L1684">            dirCounts.entrySet().removeIf(entry -&gt; cordonedLogDirs.contains(entry.getKey()));</span>
+
+<span class="nc bnc" id="L1686" title="All 2 branches missed.">            if (dirCounts.isEmpty()) {</span>
+                // all log directories are cordoned, choose the first live directory
+<span class="nc" id="L1688">                return List.of(liveLogDirs.peek());</span>
+            } else {
+                // choose the directory with the least logs in it
+<span class="nc" id="L1691">                return dirCounts.entrySet().stream()</span>
+<span class="nc" id="L1692">                        .sorted(Map.Entry.comparingByValue())</span>
+<span class="nc" id="L1693">                        .map(entry -&gt; new File(entry.getKey()))</span>
+<span class="nc" id="L1694">                        .collect(Collectors.toList());</span>
+            }
+        }
+    }
+
+    /**
+     * Delete any eligible logs. Return the number of segments deleted.
+     * Only consider logs that are not compacted.
+     */
+    private void cleanupLogs() {
+<span class="nc" id="L1704">        LOG.debug(&quot;Beginning log cleanup...&quot;);</span>
+<span class="nc" id="L1705">        AtomicInteger total = new AtomicInteger(0);</span>
+<span class="nc" id="L1706">        long startMs = time.milliseconds();</span>
+
+        // clean current logs.
+        Map&lt;TopicPartition, UnifiedLog&gt; deletableLogs;
+<span class="nc bnc" id="L1710" title="All 2 branches missed.">        if (cleaner != null) {</span>
+            // prevent cleaner from working on same partitions when changing cleanup policy
+<span class="nc" id="L1712">            deletableLogs = cleaner.pauseCleaningForNonCompactedPartitions();</span>
+        } else {
+<span class="nc" id="L1714">            deletableLogs = currentLogs.entrySet().stream()</span>
+<span class="nc bnc" id="L1715" title="All 2 branches missed.">                    .filter(e -&gt; !e.getValue().config().compact)</span>
+<span class="nc" id="L1716">                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+        }
+
+        try {
+<span class="nc bnc" id="L1720" title="All 2 branches missed.">            for (Map.Entry&lt;TopicPartition, UnifiedLog&gt; entry : deletableLogs.entrySet()) {</span>
+<span class="nc" id="L1721">                TopicPartition topicPartition = entry.getKey();</span>
+<span class="nc" id="L1722">                UnifiedLog log = entry.getValue();</span>
+<span class="nc" id="L1723">                LOG.debug(&quot;Garbage collecting '{}'&quot;, log.name());</span>
+<span class="nc" id="L1724">                total.addAndGet(log.deleteOldSegments());</span>
+
+<span class="nc" id="L1726">                UnifiedLog futureLog = futureLogs.get(topicPartition);</span>
+<span class="nc bnc" id="L1727" title="All 2 branches missed.">                if (futureLog != null) {</span>
+                    // clean future logs
+<span class="nc" id="L1729">                    LOG.debug(&quot;Garbage collecting future log '{}'&quot;, futureLog.name());</span>
+<span class="nc" id="L1730">                    total.addAndGet(futureLog.deleteOldSegments());</span>
+                }
+<span class="nc" id="L1732">            }</span>
+<span class="nc" id="L1733">        } catch (IOException e) {</span>
+<span class="nc" id="L1734">            throw new UncheckedIOException(e);</span>
+        } finally {
+<span class="nc bnc" id="L1736" title="All 2 branches missed.">            if (cleaner != null) {</span>
+<span class="nc" id="L1737">                cleaner.resumeCleaning(deletableLogs.keySet());</span>
+            }
+        }
+
+<span class="nc" id="L1741">        LOG.debug(&quot;Log cleanup completed. {} files deleted in {} seconds&quot;, total, (time.milliseconds() - startMs) / 1000);</span>
+<span class="nc" id="L1742">    }</span>
+
+    /**
+     * Get all the partition logs
+     */
+    public Set&lt;UnifiedLog&gt; allLogs() {
+<span class="nc" id="L1748">        return Stream.of(currentLogs.values(), futureLogs.values())</span>
+<span class="nc" id="L1749">                .flatMap(Collection::stream)</span>
+<span class="nc" id="L1750">                .collect(Collectors.toSet());</span>
+    }
+
+    /**
+     * Get the UnifiedLogs for the specified topic
+     */
+    public List&lt;UnifiedLog&gt; logsByTopic(String topic) {
+<span class="nc" id="L1757">        return Stream.of(currentLogs.entrySet(), futureLogs.entrySet())</span>
+<span class="nc" id="L1758">                .flatMap(Collection::stream)</span>
+<span class="nc" id="L1759">                .filter(entry -&gt; entry.getKey().topic().equals(topic))</span>
+<span class="nc" id="L1760">                .map(Map.Entry::getValue)</span>
+<span class="nc" id="L1761">                .toList();</span>
+    }
+
+    /**
+     * Map of log dir to logs by topic and partitions in that dir
+     */
+    private Map&lt;String, Map&lt;TopicPartition, UnifiedLog&gt;&gt; logsByDir() {
+        // This code is called often by checkpoint processes and is written in a way that reduces
+        // allocations and CPU with many topic partitions.
+        // When changing this code please measure the changes with org.apache.kafka.jmh.server.CheckpointBench
+<span class="nc" id="L1771">        Map&lt;String, Map&lt;TopicPartition, UnifiedLog&gt;&gt; byDir = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1772">        currentLogs.forEach((tp, log) -&gt;</span>
+<span class="nc" id="L1773">            byDir.computeIfAbsent(log.parentDir(), k -&gt; new HashMap&lt;&gt;()).put(tp, log)</span>
+        );
+<span class="nc" id="L1775">        futureLogs.forEach((tp, log) -&gt;</span>
+<span class="nc" id="L1776">            byDir.computeIfAbsent(log.parentDir(), k -&gt; new HashMap&lt;&gt;()).put(tp, log)</span>
+        );
+<span class="nc" id="L1778">        return byDir;</span>
+    }
+
+    private Map&lt;TopicPartition, UnifiedLog&gt; logsInDir(File dir) {
+<span class="nc" id="L1782">        return logsByDir().getOrDefault(dir.getAbsolutePath(), Map.of());</span>
+    }
+
+    private Map&lt;TopicPartition, UnifiedLog&gt; logsInDir(Map&lt;String, Map&lt;TopicPartition, UnifiedLog&gt;&gt; cachedLogsByDir, File dir) {
+<span class="nc" id="L1786">        return cachedLogsByDir.getOrDefault(dir.getAbsolutePath(), Map.of());</span>
+    }
+
+    // logDir should be an absolute path
+    public boolean isLogDirOnline(String logDir) {
+        // The logDir should be an absolute path
+<span class="nc bnc" id="L1792" title="All 2 branches missed.">        if (logDirs.stream().noneMatch(f -&gt; f.getAbsolutePath().equals(logDir))) {</span>
+<span class="nc" id="L1793">            throw new LogDirNotFoundException(&quot;Log dir &quot; + logDir + &quot; is not found in the config.&quot;);</span>
+        }
+<span class="nc" id="L1795">        return liveLogDirs.contains(new File(logDir));</span>
+    }
+
+    /**
+     * Flush any log which has exceeded its flush interval and has unwritten messages.
+     */
+    private void flushDirtyLogs() {
+<span class="nc" id="L1802">        LOG.debug(&quot;Checking for dirty logs to flush...&quot;);</span>
+
+<span class="nc" id="L1804">        Stream.of(currentLogs.entrySet(), futureLogs.entrySet()).flatMap(Collection::stream).forEach(entry -&gt; {</span>
+<span class="nc" id="L1805">            TopicPartition topicPartition = entry.getKey();</span>
+<span class="nc" id="L1806">            UnifiedLog log = entry.getValue();</span>
+            try {
+<span class="nc" id="L1808">                long timeSinceLastFlush = time.milliseconds() - log.lastFlushTime();</span>
+<span class="nc" id="L1809">                LOG.debug(&quot;Checking if flush is needed on {} flush interval {} last flushed {} time since last flush: {}&quot;, topicPartition.topic(), log.config().flushMs, log.lastFlushTime(), timeSinceLastFlush);</span>
+<span class="nc bnc" id="L1810" title="All 2 branches missed.">                if (timeSinceLastFlush &gt;= log.config().flushMs) {</span>
+<span class="nc" id="L1811">                    log.flush(false);</span>
+                }
+<span class="nc" id="L1813">            } catch (Throwable e) {</span>
+<span class="nc" id="L1814">                LOG.error(&quot;Error flushing topic {}&quot;, topicPartition.topic(), e);</span>
+<span class="nc" id="L1815">            }</span>
+<span class="nc" id="L1816">        });</span>
+<span class="nc" id="L1817">    }</span>
+
+    private Optional&lt;UnifiedLog&gt; removeLogAndMetrics(ConcurrentMap&lt;TopicPartition, UnifiedLog&gt; logs, TopicPartition tp) {
+<span class="nc" id="L1820">        UnifiedLog removedLog = logs.remove(tp);</span>
+<span class="nc bnc" id="L1821" title="All 2 branches missed.">        if (removedLog != null) {</span>
+<span class="nc" id="L1822">            removedLog.removeLogMetrics();</span>
+<span class="nc" id="L1823">            return Optional.of(removedLog);</span>
+        } else {
+<span class="nc" id="L1825">            return Optional.empty();</span>
+        }
+    }
+
+    /**
+     * Retrieve the broker epoch from the shutdown file if it exists, return empty otherwise
+     */
+    public OptionalLong readBrokerEpochFromCleanShutdownFiles() {
+        // Verify whether all the log dirs have the same broker epoch in their clean shutdown files. If there is any dir not
+        // live, fail the broker epoch check.
+<span class="nc bnc" id="L1835" title="All 2 branches missed.">        if (liveLogDirs.size() &lt; logDirs.size()) {</span>
+<span class="nc" id="L1836">            return OptionalLong.empty();</span>
+        }
+<span class="nc" id="L1838">        long brokerEpoch = -1L;</span>
+<span class="nc bnc" id="L1839" title="All 2 branches missed.">        for (File dir : liveLogDirs) {</span>
+<span class="nc" id="L1840">            CleanShutdownFileHandler cleanShutdownFileHandler = new CleanShutdownFileHandler(dir.getPath());</span>
+<span class="nc" id="L1841">            OptionalLong currentBrokerEpoch = cleanShutdownFileHandler.read();</span>
+<span class="nc bnc" id="L1842" title="All 2 branches missed.">            if (currentBrokerEpoch.isEmpty()) {</span>
+<span class="nc" id="L1843">                LOG.info(&quot;Unable to read the broker epoch in {}.&quot;, dir);</span>
+<span class="nc" id="L1844">                return OptionalLong.empty();</span>
+            }
+<span class="nc bnc" id="L1846" title="All 4 branches missed.">            if (brokerEpoch != -1 &amp;&amp; currentBrokerEpoch.getAsLong() != brokerEpoch) {</span>
+<span class="nc" id="L1847">                LOG.info(&quot;Found different broker epochs in {}. Other={} vs current={}.&quot;, dir, brokerEpoch, currentBrokerEpoch);</span>
+<span class="nc" id="L1848">                return OptionalLong.empty();</span>
+            }
+<span class="nc" id="L1850">            brokerEpoch = currentBrokerEpoch.getAsLong();</span>
+<span class="nc" id="L1851">        }</span>
+<span class="nc" id="L1852">        return OptionalLong.of(brokerEpoch);</span>
+    }
+
+    /**
+     * Wait for all jobs to complete
+     * @param jobs The jobs
+     * @param callback This will be called to handle the exception caused by each Future#get
+     * @return true if all pass. Otherwise, false
+     */
+    public static boolean waitForAllToComplete(List&lt;Future&lt;?&gt;&gt; jobs, Consumer&lt;Throwable&gt; callback) {
+<span class="nc" id="L1862">        List&lt;Future&lt;?&gt;&gt; failed = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1863" title="All 2 branches missed.">        for (Future&lt;?&gt; job : jobs) {</span>
+            try {
+<span class="nc" id="L1865">                job.get();</span>
+<span class="nc" id="L1866">            } catch (Exception e) {</span>
+<span class="nc" id="L1867">                callback.accept(e);</span>
+<span class="nc" id="L1868">                failed.add(job);</span>
+<span class="nc" id="L1869">            }</span>
+<span class="nc" id="L1870">        }</span>
+<span class="nc" id="L1871">        return failed.isEmpty();</span>
+    }
+
+    /**
+     * Returns true if the given log should not be on the current broker according to the metadata.
+     *
+     * @param replicas       The replicas hosting the partition
+     * @param brokerId       The ID of the current broker.
+     * @param log            The log object to check
+     * @return true if the log should not exist on the broker, false otherwise.
+     */
+    public static boolean isStrayReplica(List&lt;Integer&gt; replicas, int brokerId, UnifiedLog log) {
+<span class="nc bnc" id="L1883" title="All 2 branches missed.">        if (replicas.isEmpty()) {</span>
+<span class="nc" id="L1884">            LOG.info(&quot;Found stray log dir {}: the topicId {} does not exist in the metadata image.&quot;, log, log.topicId().get());</span>
+<span class="nc" id="L1885">            return true;</span>
+        }
+<span class="nc bnc" id="L1887" title="All 2 branches missed.">        if (!replicas.contains(brokerId)) {</span>
+<span class="nc" id="L1888">            LOG.info(&quot;Found stray log dir {}: the current replica assignment {} does not contain the local brokerId {}.&quot;,</span>
+<span class="nc" id="L1889">                    log, replicas.stream().map(String::valueOf).collect(Collectors.joining(&quot;, &quot;, &quot;[&quot;, &quot;]&quot;)), brokerId);</span>
+<span class="nc" id="L1890">            return true;</span>
+        } else {
+<span class="nc" id="L1892">            return false;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

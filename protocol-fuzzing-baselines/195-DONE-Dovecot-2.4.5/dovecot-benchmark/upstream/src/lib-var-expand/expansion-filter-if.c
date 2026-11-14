@@ -1,0 +1,397 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "array.h"
+#include "var-expand-private.h"
+#include "expansion.h"
+#include "dregex.h"
+#include "wildcard-match.h"
+
+enum var_expand_if_op {
+	OP_UNKNOWN,
+	OP_NUM_EQ,
+	OP_NUM_LT,
+	OP_NUM_LE,
+	OP_NUM_GT,
+	OP_NUM_GE,
+	OP_NUM_NE,
+/* put all numeric comparisons before this line */
+	OP_STR_EQ,
+	OP_STR_LT,
+	OP_STR_LE,
+	OP_STR_GT,
+	OP_STR_GE,
+	OP_STR_NE,
+	OP_STR_LIKE,
+	OP_STR_NOT_LIKE,
+	OP_STR_REGEXP,
+	OP_STR_NOT_REGEXP,
+/* keep this as last */
+	OP_COUNT
+};
+
+static enum var_expand_if_op var_expand_if_str_to_comp(const char *op)
+{
+	const char *ops[] = {
+		NULL,
+		"==",
+		"<",
+		"<=",
+		">",
+		">=",
+		"!=",
+		"eq",
+		"lt",
+		"le",
+		"gt",
+		"ge",
+		"ne",
+		"*",
+		"!*",
+		"~",
+		"!~",
+	};
+	static_assert_array_size(ops, OP_COUNT);
+	for (enum var_expand_if_op i = 1; i < OP_COUNT; i++) {
+		i_assert(ops[i] != NULL);
+		if (strcmp(op, ops[i]) == 0)
+			return i;
+	}
+	return OP_UNKNOWN;
+}
+
+static int
+fn_if_cmp(struct var_expand_state *state, const struct var_expand_parameter *p_lhs,
+	  enum var_expand_if_op op, const struct var_expand_parameter *p_rhs,
+	  bool *result_r, const char **error_r)
+{
+	if (op < OP_STR_EQ) {
+		intmax_t a;
+		intmax_t b;
+		if (var_expand_parameter_number_or_var(state, p_lhs, &a, error_r) < 0) {
+			*error_r = t_strdup_printf("Left-hand side: %s", *error_r);
+			return -1;
+		} else if (var_expand_parameter_number_or_var(state, p_rhs, &b, error_r) < 0) {
+			*error_r = t_strdup_printf("Right-hand side: %s", *error_r);
+			return -1;
+		}
+		switch (op) {
+		case OP_NUM_EQ:
+			*result_r = a == b;
+			return 0;
+		case OP_NUM_LT:
+			*result_r = a < b;
+			return 0;
+		case OP_NUM_LE:
+			*result_r = a <= b;
+			return 0;
+		case OP_NUM_GT:
+			*result_r = a > b;
+			return 0;
+		case OP_NUM_GE:
+			*result_r = a >= b;
+			return 0;
+		case OP_NUM_NE:
+			*result_r = a != b;
+			return 0;
+		default:
+			i_panic("Missing numeric comparator %u", op);
+		}
+	}
+
+	const char *lhs, *rhs;
+	if (var_expand_parameter_string_or_var(state, p_lhs, &lhs, error_r) < 0) {
+		*error_r = t_strdup_printf("Left-hand side %s", *error_r);
+		return -1;
+	} else if (var_expand_parameter_string_or_var(state, p_rhs, &rhs, error_r) < 0) {
+		*error_r = t_strdup_printf("Right-hand side %s", *error_r);
+		return -1;
+	}
+
+	bool neg ATTR_UNUSED = FALSE;
+
+	switch (op) {
+	case OP_STR_EQ:
+		*result_r = strcmp(lhs,rhs) == 0;
+		return 0;
+	case OP_STR_LT:
+		*result_r = strcmp(lhs,rhs) < 0;
+		return 0;
+	case OP_STR_LE:
+		*result_r = strcmp(lhs,rhs) <= 0;
+		return 0;
+	case OP_STR_GT:
+		*result_r = strcmp(lhs,rhs) > 0;
+		return 0;
+	case OP_STR_GE:
+		*result_r = strcmp(lhs,rhs) >= 0;
+		return 0;
+	case OP_STR_NE:
+		*result_r = strcmp(lhs,rhs) != 0;
+		return 0;
+	case OP_STR_LIKE:
+		*result_r = wildcard_match(lhs, rhs);
+		return 0;
+	case OP_STR_NOT_LIKE:
+		*result_r = !wildcard_match(lhs, rhs);
+		return 0;
+	case OP_STR_NOT_REGEXP:
+		neg = TRUE;
+		/* fall through */
+	case OP_STR_REGEXP: {
+		int ec;
+		bool res;
+
+		ec = dregex_match(rhs, lhs, 0, error_r);
+
+		if (ec < 0)
+			return -1;
+
+		res = ec == 1;
+		*result_r = res != neg;
+
+		return 0;
+	}
+	default:
+		i_panic("Missing generic comparator %u", op);
+	}
+}
+
+int expansion_filter_if(const struct var_expand_statement *stmt,
+			struct var_expand_state *state,
+			const char **error_r)
+{
+	const char *_op;
+	bool use_first_as_lhs = !state->transfer_set;
+
+	const struct var_expand_parameter *p_lhs = NULL;
+	const struct var_expand_parameter *p_rhs = NULL;
+	const struct var_expand_parameter *p_true = NULL;
+	const struct var_expand_parameter *p_false = NULL;
+
+	enum {
+		STATE_LHS = 0,
+		STATE_OP,
+		STATE_RHS,
+		STATE_TRUE,
+		STATE_FALSE,
+		STATE_DONE,
+	} parse_state;
+
+	if (use_first_as_lhs)
+		parse_state = STATE_LHS;
+	else
+		parse_state = STATE_OP;
+
+	struct var_expand_parameter_iter_context *ctx =
+		var_expand_parameter_iter_init(stmt);
+	while (var_expand_parameter_iter_more(ctx)) {
+		const struct var_expand_parameter *par =
+			var_expand_parameter_iter_next(ctx);
+		const char *key = var_expand_parameter_key(par);
+		if (key != NULL) {
+			ERROR_UNSUPPORTED_KEY(key);
+		}
+		switch (parse_state) {
+		case STATE_LHS:	p_lhs = par; break;
+		case STATE_OP:
+			if (var_expand_parameter_string_or_var(state, par, &_op, error_r) < 0) {
+				*error_r = t_strdup_printf("Comparator: %s", *error_r);
+				return -1;
+			}
+			break;
+		case STATE_RHS: p_rhs = par; break;
+		case STATE_TRUE: p_true = par; break;
+		case STATE_FALSE: p_false = par; break;
+		case STATE_DONE: ERROR_TOO_MANY_UNNAMED_PARAMETERS;
+		}
+		parse_state++;
+	}
+
+	if (parse_state != STATE_DONE) {
+		*error_r = "Missing parameters";
+		return -1;
+	}
+
+	enum var_expand_if_op op = var_expand_if_str_to_comp(_op);
+
+	if (op == OP_UNKNOWN) {
+		*error_r = t_strdup_printf("Unsupported comparator '%s'", _op);
+		return -1;
+	}
+
+	if (!use_first_as_lhs) {
+		if (var_expand_parameter_from_state(state, op < OP_STR_EQ,
+						    &p_lhs) < 0) {
+			if (op < OP_STR_EQ) {
+				*error_r = "Input is not a number";
+			} else  {
+				*error_r = "No value to use as left-hand in if";
+			}
+			return -1;
+		}
+	}
+
+	i_assert(p_lhs != NULL);
+
+	bool result;
+	if (fn_if_cmp(state, p_lhs, op, p_rhs, &result, error_r) < 0)
+		return -1;
+	const struct var_expand_parameter *res = result ? p_true : p_false;
+	const char *value;
+
+	if (var_expand_parameter_any_or_var(state, res, &value, error_r) < 0) {
+		*error_r = t_strdup_printf("%s: %s",
+					   result ? "True branch" : "False branch",
+					   *error_r);
+		return -1;
+	}
+
+	var_expand_state_set_transfer(state, value);
+
+	return 0;
+}
+
+struct switch_cond {
+	const struct var_expand_parameter *cond;
+	const struct var_expand_parameter *value;
+};
+
+/* Accepts switch('lhs', 'op', 'cond', 'value, 'cond, 'value' ..., 'default')
+ *
+ * default is optional. lhs can be input. */
+int expansion_filter_switch(const struct var_expand_statement *stmt,
+			    struct var_expand_state *state,
+			    const char **error_r)
+{
+	ARRAY(struct switch_cond) conds;
+	const char *_op;
+	bool use_first_as_lhs = !state->transfer_set;
+
+	const struct var_expand_parameter *p_lhs = NULL;
+	const struct var_expand_parameter *p_cond = NULL;
+
+	enum {
+		STATE_LHS = 0,
+		STATE_OP,
+		STATE_COND,
+		STATE_VALUE,
+		STATE_DONE,
+	} parse_state;
+
+	if (use_first_as_lhs)
+		parse_state = STATE_LHS;
+	else
+		parse_state = STATE_OP;
+
+	t_array_init(&conds, 8);
+
+	struct var_expand_parameter_iter_context *ctx =
+		var_expand_parameter_iter_init(stmt);
+	while (var_expand_parameter_iter_more(ctx)) {
+		const struct var_expand_parameter *par =
+			var_expand_parameter_iter_next(ctx);
+		const char *key = var_expand_parameter_key(par);
+		struct switch_cond *cond;
+		if (key != NULL)
+			ERROR_UNSUPPORTED_KEY(key);
+		switch (parse_state) {
+		case STATE_LHS:
+			p_lhs = par;
+			parse_state = STATE_OP;
+			break;
+		case STATE_OP:
+			if (var_expand_parameter_string_or_var(state, par, &_op, error_r) < 0) {
+				*error_r = t_strdup_printf("Comparator: %s", *error_r);
+				return -1;
+			}
+			parse_state = STATE_COND;
+			break;
+		case STATE_COND:
+			p_cond = par;
+			parse_state = STATE_VALUE;
+			break;
+		case STATE_VALUE:
+			cond = array_append_space(&conds);
+			cond->cond = p_cond;
+			cond->value = par;
+			p_cond = NULL;
+			parse_state = STATE_COND;
+			break;
+		case STATE_DONE:
+			ERROR_TOO_MANY_UNNAMED_PARAMETERS;
+		}
+	}
+
+	if (parse_state > STATE_OP && array_is_empty(&conds)) {
+		*error_r = "At least one condition-value pair is required";
+		return -1;
+	} else if (parse_state == STATE_VALUE && p_cond != NULL) {
+		struct switch_cond *cond = array_append_space(&conds);
+		cond->value = p_cond;
+	} else if (parse_state == STATE_COND) {
+		/* no default, use empty */
+		array_append_zero(&conds);
+	} else if (parse_state != STATE_DONE) {
+		*error_r = "Missing parameters";
+		return -1;
+	}
+
+	enum var_expand_if_op op = var_expand_if_str_to_comp(_op);
+
+	if (op == OP_UNKNOWN) {
+		*error_r = t_strdup_printf("Unsupported comparator '%s'", _op);
+		return -1;
+	}
+
+	if (!use_first_as_lhs) {
+		if (var_expand_parameter_from_state(state, op < OP_STR_EQ,
+						    &p_lhs) < 0) {
+			if (op < OP_STR_EQ)
+				*error_r = "Input is not a number";
+			else
+				*error_r = "No value to use as left-hand in switch";
+			return -1;
+		}
+	}
+
+	i_assert(p_lhs != NULL);
+
+	/* then start matching */
+	struct switch_cond *cond;
+	const struct var_expand_parameter *res = NULL;
+	unsigned int cond_num = 0;
+	/* There has to be at least one cond */
+	array_foreach_modifiable(&conds, cond) {
+		bool match;
+		if (cond->cond == NULL) {
+			res = cond->value;
+			break;
+		}
+		int ret = fn_if_cmp(state, p_lhs, op, cond->cond, &match, error_r);
+		if (ret < 0)
+			return -1;
+		if (match) {
+			res = cond->value;
+			break;
+		}
+		cond_num++;
+	}
+
+	const char *value;
+
+	if (res == NULL) {
+		/* Since there was no default, leave it unset */
+		*error_r = "No default value provided";
+		var_expand_state_unset_transfer(state);
+		return -1;
+	} else if (var_expand_parameter_any_or_var(state, res, &value, error_r) < 0) {
+		*error_r = t_strdup_printf("in condition #%u: %s",
+					   cond_num, *error_r);
+		return -1;
+	} else {
+		var_expand_state_set_transfer(state, value);
+	}
+
+	return 0;
+}

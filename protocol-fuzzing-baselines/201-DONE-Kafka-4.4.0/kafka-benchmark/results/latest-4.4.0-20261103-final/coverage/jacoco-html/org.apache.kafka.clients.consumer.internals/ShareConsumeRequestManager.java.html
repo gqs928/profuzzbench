@@ -1,0 +1,1800 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShareConsumeRequestManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">ShareConsumeRequestManager.java</span></div><h1>ShareConsumeRequestManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.Metadata;
+import org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.PollResult;
+import org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.UnsentRequest;
+import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgementEvent;
+import org.apache.kafka.clients.consumer.internals.events.ShareAcknowledgementEventHandler;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.InvalidRecordStateException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.internals.IdempotentCloser;
+import org.apache.kafka.common.message.ShareAcknowledgeRequestData;
+import org.apache.kafka.common.message.ShareAcknowledgeResponseData;
+import org.apache.kafka.common.message.ShareFetchRequestData;
+import org.apache.kafka.common.message.ShareFetchResponseData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.ShareAcknowledgeRequest;
+import org.apache.kafka.common.requests.ShareAcknowledgeResponse;
+import org.apache.kafka.common.requests.ShareFetchRequest;
+import org.apache.kafka.common.requests.ShareFetchResponse;
+import org.apache.kafka.common.requests.ShareRequestMetadata;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.BufferSupplier;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.io.Closeable;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+
+/**
+ * {@code ShareConsumeRequestManager} is responsible for generating {@link ShareFetchRequest} and
+ * {@link ShareAcknowledgeRequest} to fetch and acknowledge records being delivered for a consumer
+ * in a share group.
+ *
+ * &lt;p&gt;The request manager keeps track of which share sessions contain which topic-partitions. This information will
+ * generally match the leaders in the metadata, but when the fetchable partitions or leadership change, there can be
+ * short-lived differences. This is intentional to ensure that topic-partitions which are no longer being
+ * fetched and topic-partitions which have changed leaders are cleanly removed from their former share sessions.
+ * It is all slightly complicated by the fact that the fetchable partitions are represented by TopicPartition
+ * (without topic ID) and, when a topic is recreated, its topic ID changes. All state in share sessions is tracked by
+ * topic ID so the current mapping from topic name to topic ID as represented in the share sessions is also maintained
+ * in the request manager, and again there can be short-lived differences between this and the cluster metadata.
+ */
+@SuppressWarnings({&quot;NPathComplexity&quot;, &quot;CyclomaticComplexity&quot;})
+public class ShareConsumeRequestManager implements RequestManager, MemberStateListener, Closeable {
+    private final Time time;
+    private final Logger log;
+    private final LogContext logContext;
+    private final String groupId;
+    private final ShareConsumerMetadata metadata;
+    private final SubscriptionState subscriptions;
+    private final ShareFetchConfig shareFetchConfig;
+    protected final ShareFetchBuffer shareFetchBuffer;
+    private final ShareAcknowledgementEventHandler acknowledgeEventHandler;
+    private final Map&lt;Integer, ShareSessionHandler&gt; sessionHandlers;
+    private final Set&lt;Integer&gt; nodesWithPendingRequests;
+    private final ShareFetchMetricsManager metricsManager;
+<span class="nc" id="L99">    private final IdempotentCloser idempotentCloser = new IdempotentCloser();</span>
+    private Uuid memberId;
+<span class="nc" id="L101">    private boolean fetchMoreRecords = false;</span>
+<span class="nc" id="L102">    private final AtomicInteger fetchRecordsNodeId = new AtomicInteger(-1);</span>
+    private final Map&lt;TopicPartition, TopicIdPartition&gt; shareSessionTopicIdMap;
+    private final Map&lt;TopicIdPartition, LeaderIdAndEpoch&gt; shareSessionLeaderMap;
+    private final Map&lt;Integer, Map&lt;TopicIdPartition, Acknowledgements&gt;&gt; fetchAcknowledgementsToSend;
+    private final Map&lt;Integer, Map&lt;TopicIdPartition, Acknowledgements&gt;&gt; fetchAcknowledgementsInFlight;
+    private final Map&lt;Integer, Tuple&lt;AcknowledgeRequestState&gt;&gt; acknowledgeRequestStates;
+    private final long retryBackoffMs;
+    private final long retryBackoffMaxMs;
+<span class="nc" id="L110">    private boolean closing = false;</span>
+    private final CompletableFuture&lt;Void&gt; closeFuture;
+<span class="nc" id="L112">    private boolean isAcknowledgementCommitCallbackRegistered = false;</span>
+<span class="nc" id="L113">    private final Map&lt;IdAndPartition, String&gt; topicNamesMap = new HashMap&lt;&gt;();</span>
+    private static final String INVALID_RESPONSE = &quot;Acknowledgement not successful due to invalid response from broker&quot;;
+
+    ShareConsumeRequestManager(final Time time,
+                               final LogContext logContext,
+                               final String groupId,
+                               final ShareConsumerMetadata metadata,
+                               final SubscriptionState subscriptions,
+                               final ShareFetchConfig shareFetchConfig,
+                               final ShareFetchBuffer shareFetchBuffer,
+                               final ShareAcknowledgementEventHandler acknowledgeEventHandler,
+                               final ShareFetchMetricsManager metricsManager,
+                               final long retryBackoffMs,
+<span class="nc" id="L126">                               final long retryBackoffMaxMs) {</span>
+<span class="nc" id="L127">        this.time = time;</span>
+<span class="nc" id="L128">        this.log = logContext.logger(ShareConsumeRequestManager.class);</span>
+<span class="nc" id="L129">        this.logContext = logContext;</span>
+<span class="nc" id="L130">        this.groupId = groupId;</span>
+<span class="nc" id="L131">        this.metadata = metadata;</span>
+<span class="nc" id="L132">        this.subscriptions = subscriptions;</span>
+<span class="nc" id="L133">        this.shareFetchConfig = shareFetchConfig;</span>
+<span class="nc" id="L134">        this.shareFetchBuffer = shareFetchBuffer;</span>
+<span class="nc" id="L135">        this.acknowledgeEventHandler = acknowledgeEventHandler;</span>
+<span class="nc" id="L136">        this.metricsManager = metricsManager;</span>
+<span class="nc" id="L137">        this.retryBackoffMs = retryBackoffMs;</span>
+<span class="nc" id="L138">        this.retryBackoffMaxMs = retryBackoffMaxMs;</span>
+<span class="nc" id="L139">        this.sessionHandlers = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L140">        this.nodesWithPendingRequests = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L141">        this.acknowledgeRequestStates = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L142">        this.shareSessionTopicIdMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L143">        this.shareSessionLeaderMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L144">        this.fetchAcknowledgementsToSend = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L145">        this.fetchAcknowledgementsInFlight = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L146">        this.closeFuture = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L147">    }</span>
+
+    @Override
+    public PollResult poll(long currentTimeMs) {
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        if (memberId == null) {</span>
+<span class="nc bnc" id="L152" title="All 4 branches missed.">            if (closing &amp;&amp; !closeFuture.isDone()) {</span>
+<span class="nc" id="L153">                closeFuture.complete(null);</span>
+            }
+<span class="nc" id="L155">            return PollResult.EMPTY;</span>
+        }
+
+        // Send any pending acknowledgements before fetching more records.
+<span class="nc" id="L159">        PollResult pollResult = processAcknowledgements(currentTimeMs);</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (pollResult != null) {</span>
+<span class="nc" id="L161">            return pollResult;</span>
+        }
+
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        if (!fetchMoreRecords) {</span>
+<span class="nc" id="L165">            return PollResult.EMPTY;</span>
+        }
+
+        // Iterate over the partitions to fetch, building a map from partition to leader node ID
+<span class="nc" id="L169">        Map&lt;Node, ShareSessionHandler&gt; handlerMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L170">        Cluster cluster = metadata.fetch();</span>
+<span class="nc" id="L171">        Map&lt;String, Uuid&gt; topicIds = metadata.topicIds();</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        for (TopicPartition partition : partitionsToFetch()) {</span>
+<span class="nc" id="L173">            TopicIdPartition tip = shareSessionTopicIdMap.get(partition);</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">            if (tip == null) {</span>
+<span class="nc" id="L175">                Uuid topicId = topicIds.get(partition.topic());</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                if (topicId == null) {</span>
+<span class="nc" id="L177">                    log.debug(&quot;Requesting metadata update for partition {} since topic ID is missing&quot;, partition);</span>
+<span class="nc" id="L178">                    metadata.requestUpdate(false);</span>
+<span class="nc" id="L179">                    continue;</span>
+                }
+
+<span class="nc" id="L182">                tip = new TopicIdPartition(topicId, partition);</span>
+<span class="nc" id="L183">                shareSessionTopicIdMap.put(partition, tip);</span>
+            }
+
+<span class="nc" id="L186">            LeaderIdAndEpoch leader = shareSessionLeaderMap.get(tip);</span>
+<span class="nc bnc" id="L187" title="All 4 branches missed.">            if (leader == null || cluster.nodeById(leader.leaderId) == null) {</span>
+<span class="nc" id="L188">                Metadata.LeaderAndEpoch leaderOpt = metadata.currentLeader(partition);</span>
+<span class="nc bnc" id="L189" title="All 4 branches missed.">                if (leaderOpt.leader.isEmpty() || cluster.nodeById(leaderOpt.leader.get().id()) == null) {</span>
+<span class="nc" id="L190">                    log.debug(&quot;Requesting metadata update for partition {} since current leader node is missing&quot;, partition);</span>
+<span class="nc" id="L191">                    metadata.requestUpdate(false);</span>
+<span class="nc" id="L192">                    shareSessionLeaderMap.remove(tip);</span>
+<span class="nc" id="L193">                    continue;</span>
+                }
+
+<span class="nc" id="L196">                shareSessionLeaderMap.put(tip, new LeaderIdAndEpoch(leaderOpt.leader.get().id(), leaderOpt.epoch.orElse(-1)));</span>
+            }
+<span class="nc" id="L198">        }</span>
+
+<span class="nc" id="L200">        Set&lt;Integer&gt; missingNodes = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        for (TopicPartition partition : partitionsToFetch()) {</span>
+<span class="nc" id="L202">            TopicIdPartition tip = shareSessionTopicIdMap.get(partition);</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">            if (tip == null) {</span>
+<span class="nc" id="L204">                continue;</span>
+            }
+<span class="nc" id="L206">            LeaderIdAndEpoch leader = shareSessionLeaderMap.get(tip);</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            if (leader == null) {</span>
+<span class="nc" id="L208">                continue;</span>
+            }
+<span class="nc" id="L210">            int nodeId = leader.leaderId;</span>
+<span class="nc" id="L211">            Node node = cluster.nodeById(nodeId);</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            if (node == null) {</span>
+<span class="nc" id="L213">                shareSessionLeaderMap.remove(tip);</span>
+<span class="nc" id="L214">                missingNodes.add(nodeId);</span>
+<span class="nc" id="L215">                continue;</span>
+            }
+<span class="nc bnc" id="L217" title="All 2 branches missed.">            if (nodesWithPendingRequests.contains(nodeId)) {</span>
+<span class="nc" id="L218">                log.trace(&quot;Skipping fetch for partition {} because previous request to {} has not been processed&quot;, partition, nodeId);</span>
+            } else {
+<span class="nc" id="L220">                ShareSessionHandler handler = handlerMap.computeIfAbsent(node,</span>
+<span class="nc" id="L221">                    k -&gt; sessionHandlers.computeIfAbsent(nodeId, n -&gt; new ShareSessionHandler(logContext, n, memberId)));</span>
+
+<span class="nc" id="L223">                Acknowledgements acknowledgementsToSend = null;</span>
+
+<span class="nc" id="L225">                Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcksFromFetchMap = fetchAcknowledgementsToSend.get(nodeId);</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">                if (nodeAcksFromFetchMap != null) {</span>
+<span class="nc" id="L227">                    acknowledgementsToSend = nodeAcksFromFetchMap.remove(tip);</span>
+
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                    if (acknowledgementsToSend != null) {</span>
+                        // Check if the share session epoch is valid for sending acknowledgements.
+<span class="nc bnc" id="L231" title="All 2 branches missed.">                        if (!maybeAddAcknowledgements(handler, node, tip, acknowledgementsToSend)) {</span>
+<span class="nc" id="L232">                            acknowledgementsToSend = null;</span>
+                        }
+                    }
+                }
+
+<span class="nc" id="L237">                handler.addPartitionToFetch(tip, acknowledgementsToSend);</span>
+<span class="nc" id="L238">                topicNamesMap.putIfAbsent(new IdAndPartition(tip.topicId(), tip.partition()), tip.topic());</span>
+
+                // If we have not chosen a node for fetching records yet, choose now, and rotate the assigned partitions
+                // so the next poll starts on a different partition. This is only applicable for record_limit mode.
+<span class="nc bnc" id="L242" title="All 4 branches missed.">                if (isShareAcquireModeRecordLimit() &amp;&amp; fetchRecordsNodeId.compareAndSet(-1, nodeId)) {</span>
+<span class="nc" id="L243">                    subscriptions.movePartitionToEnd(partition);</span>
+                }
+
+<span class="nc" id="L246">                log.debug(&quot;Added fetch request for partition {} to node {}&quot;, tip, nodeId);</span>
+            }
+<span class="nc" id="L248">        }</span>
+
+        // Calculate the set of nodes which have records buffered for the consumer to consume and acknowledge.
+        // Even when assignments change, we do not close the share sessions which have buffered records.
+        // This also does bookkeeping of the nodes which had pending acknowledgements in case they have become
+        // eligible for cleaning up.
+<span class="nc" id="L254">        Set&lt;Integer&gt; bufferedNodes = shareFetchBuffer.bufferedNodes();</span>
+
+        // Iterate over the session handlers to see if there are acknowledgements to be sent for partitions
+        // which are no longer part of the current subscription or which have disappeared from the metadata.
+        // Also include session handlers which have no fetchable partitions so the share sessions can be
+        // brought up to date. Finally, close share sessions for nodes which no longer have any share partitions
+        // and which do not have buffered data.
+<span class="nc" id="L261">        sessionHandlers.forEach((nodeId, sessionHandler) -&gt; {</span>
+<span class="nc" id="L262">            Node node = cluster.nodeById(nodeId);</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            if (node == null) {</span>
+<span class="nc" id="L264">                missingNodes.add(nodeId);</span>
+<span class="nc" id="L265">                return;</span>
+            }
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            if (nodesWithPendingRequests.contains(nodeId)) {</span>
+<span class="nc" id="L268">                log.trace(&quot;Skipping fetch because previous request to {} has not been processed&quot;, nodeId);</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            } else if (isSessionCloseCandidate(node, sessionHandler, handlerMap, bufferedNodes)) {</span>
+<span class="nc" id="L270">                log.debug(&quot;Closing share session for node {} which is now empty&quot;, nodeId);</span>
+<span class="nc" id="L271">                sessionHandler.notifyClose();</span>
+<span class="nc" id="L272">                handlerMap.put(node, sessionHandler);</span>
+            } else {
+<span class="nc" id="L274">                prepareRemainingSessionHandlerForRequest(node, sessionHandler, handlerMap);</span>
+            }
+<span class="nc" id="L276">        });</span>
+
+        // Iterate over the share session handlers and build a list of UnsentRequests.
+<span class="nc" id="L279">        List&lt;UnsentRequest&gt; requests = handlerMap.entrySet().stream().map(entry -&gt; {</span>
+<span class="nc" id="L280">            Node target = entry.getKey();</span>
+<span class="nc" id="L281">            ShareSessionHandler handler = entry.getValue();</span>
+
+            // For record_limit mode, we only send a full ShareFetch to a single node at a time. We prepare to build ShareFetch
+            // requests for all nodes with session handlers to permit piggybacking of acknowledgements, and also to adjust the
+            // topic-partitions in the share session, but if the request would contain neither of those, it can be skipped.
+<span class="nc bnc" id="L286" title="All 4 branches missed.">            boolean canSkipIfRequestEmpty = isShareAcquireModeRecordLimit() &amp;&amp; target.id() != fetchRecordsNodeId.get();</span>
+
+<span class="nc" id="L288">            ShareFetchRequest.Builder requestBuilder = handler.newShareFetchBuilder(groupId, shareFetchConfig, canSkipIfRequestEmpty);</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">            if (requestBuilder == null) {</span>
+<span class="nc" id="L290">                log.trace(&quot;Skipping ShareFetch request to send to node {}&quot;, target.id());</span>
+<span class="nc" id="L291">                return null;</span>
+            }
+
+<span class="nc" id="L294">            log.trace(&quot;Building ShareFetch request to send to node {}&quot;, target.id());</span>
+
+<span class="nc" id="L296">            nodesWithPendingRequests.add(target.id());</span>
+
+<span class="nc" id="L298">            BiConsumer&lt;ClientResponse, Throwable&gt; responseHandler = (clientResponse, error) -&gt; {</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L300">                    handleShareFetchFailure(target, requestBuilder.data(), error);</span>
+                } else {
+<span class="nc" id="L302">                    handleShareFetchSuccess(target, requestBuilder.data(), clientResponse);</span>
+                }
+<span class="nc" id="L304">            };</span>
+<span class="nc" id="L305">            return new UnsentRequest(requestBuilder, Optional.of(target)).whenComplete(responseHandler);</span>
+<span class="nc" id="L306">        }).filter(Objects::nonNull).collect(Collectors.toList());</span>
+
+        // Remove session handlers for nodes which are now missing from the cluster metadata.
+<span class="nc bnc" id="L309" title="All 2 branches missed.">        if (!missingNodes.isEmpty()) {</span>
+<span class="nc" id="L310">            removeSessionHandlersForMissingNodes(missingNodes);</span>
+        }
+
+<span class="nc" id="L313">        return new PollResult(requests);</span>
+    }
+
+    private boolean isShareAcquireModeRecordLimit() {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        return shareFetchConfig.shareAcquireMode == ShareAcquireMode.RECORD_LIMIT;</span>
+    }
+
+    /**
+     * Add acknowledgements for a topic-partition to the node's in-flight acknowledgements.
+     * If we cannot add acknowledgements, they are completed with {@link Errors#NETWORK_EXCEPTION} exception.
+     * This probably indicates the connection to the leader broker was lost, but then re-established without a
+     * leadership change, in which case the acknowledgements fail.
+     *
+     * @return True if we can add acknowledgements to the share session.
+     */
+    private boolean maybeAddAcknowledgements(ShareSessionHandler handler,
+                                             Node node,
+                                             TopicIdPartition tip,
+                                             Acknowledgements acknowledgements) {
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        if (handler.isNewSession()) {</span>
+            // Failing the acknowledgements as we cannot have piggybacked acknowledgements in the initial ShareFetchRequest.
+<span class="nc" id="L334">            log.debug(&quot;Cannot send acknowledgements on initial epoch for ShareSession for partition {}&quot;, tip);</span>
+<span class="nc" id="L335">            acknowledgements.complete(Errors.NETWORK_EXCEPTION.exception());</span>
+<span class="nc" id="L336">            maybeSendShareAcknowledgementEvent(Map.of(tip, acknowledgements), true, Optional.empty());</span>
+<span class="nc" id="L337">            return false;</span>
+        } else {
+<span class="nc" id="L339">            metricsManager.recordAcknowledgementSent(acknowledgements.size());</span>
+<span class="nc" id="L340">            fetchAcknowledgementsInFlight.computeIfAbsent(node.id(), k -&gt; new HashMap&lt;&gt;()).put(tip, acknowledgements);</span>
+<span class="nc" id="L341">            return true;</span>
+        }
+    }
+
+    /**
+     * Iterate over the session handlers to see if there are acknowledgements to be sent for partitions
+     * which are no longer part of the current subscription or which have disappeared from the metadata.
+     * Also include session handlers which have no fetchable partitions so the share sessions can be
+     * brought up to date.
+     */
+    private void prepareRemainingSessionHandlerForRequest(Node node, ShareSessionHandler sessionHandler, Map&lt;Node, ShareSessionHandler&gt; handlerMap) {
+<span class="nc" id="L352">        Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcksFromFetchMap = fetchAcknowledgementsToSend.get(node.id());</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">        if (nodeAcksFromFetchMap != null) {</span>
+<span class="nc" id="L354">            nodeAcksFromFetchMap.forEach((tip, acks) -&gt; {</span>
+<span class="nc" id="L355">                LeaderIdAndEpoch leader = shareSessionLeaderMap.get(tip);</span>
+<span class="nc bnc" id="L356" title="All 4 branches missed.">                if (leader != null &amp;&amp; leader.leaderId == node.id()) {</span>
+                    // Check if the share session epoch is valid for sending acknowledgements.
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                    if (!maybeAddAcknowledgements(sessionHandler, node, tip, acks)) {</span>
+<span class="nc" id="L359">                        return;</span>
+                    }
+
+<span class="nc" id="L362">                    sessionHandler.addPartitionToAcknowledgeOnly(tip, acks);</span>
+
+<span class="nc" id="L364">                    topicNamesMap.putIfAbsent(new IdAndPartition(tip.topicId(), tip.partition()), tip.topic());</span>
+<span class="nc" id="L365">                    log.debug(&quot;Added fetch request for previously subscribed partition {} to node {}&quot;, tip, node.id());</span>
+                } else {
+<span class="nc" id="L367">                    log.debug(&quot;Leader for the partition is down or has changed, failing acknowledgements for partition {}&quot;, tip);</span>
+<span class="nc" id="L368">                    acks.complete(acknowledgementsCannotBeSentError(node.id(), tip).exception());</span>
+<span class="nc" id="L369">                    maybeSendShareAcknowledgementEvent(Map.of(tip, acks), true, Optional.empty());</span>
+                }
+<span class="nc" id="L371">            });</span>
+
+<span class="nc" id="L373">            nodeAcksFromFetchMap.clear();</span>
+<span class="nc" id="L374">            handlerMap.put(node, sessionHandler);</span>
+        } else {
+<span class="nc" id="L376">            handlerMap.putIfAbsent(node, sessionHandler);</span>
+        }
+<span class="nc" id="L378">    }</span>
+
+    /**
+     * A share session can be closed if it's empty and has no buffered data.
+     *
+     * @return True if the node's share session can be closed.
+     */
+    private boolean isSessionCloseCandidate(Node node,
+                                            ShareSessionHandler sessionHandler,
+                                            Map&lt;Node, ShareSessionHandler&gt; handlerMap,
+                                            Set&lt;Integer&gt; bufferedNodes) {
+<span class="nc" id="L389">        final int nodeId = node.id();</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        return !closing                                 // the close path already managed closing share sessions</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">            &amp;&amp; sessionHandler.isSessionEmpty()          // no share partitions remain in the share session</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            &amp;&amp; !sessionHandler.isNewSession()           // the session is established on the broker</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">            &amp;&amp; !handlerMap.containsKey(node)            // the handler is already being used in this poll</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">            &amp;&amp; !bufferedNodes.contains(nodeId)          // no records for this node remain in the fetch buffer</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">            &amp;&amp; !nodeHasPendingAcknowledgements(nodeId); // the node has pending acknowledgements</span>
+    }
+
+    /**
+     * Returns whether there are acknowledgements still being delivered for the node, whether waiting to be sent,
+     * in flight, or being processed as part of an acknowledge request state.
+     */
+    private boolean nodeHasPendingAcknowledgements(int nodeId) {
+<span class="nc" id="L403">        Map&lt;TopicIdPartition, Acknowledgements&gt; acksToSend = fetchAcknowledgementsToSend.get(nodeId);</span>
+<span class="nc bnc" id="L404" title="All 4 branches missed.">        if (acksToSend != null &amp;&amp; !acksToSend.isEmpty()) {</span>
+<span class="nc" id="L405">            return true;</span>
+        }
+
+<span class="nc" id="L408">        Map&lt;TopicIdPartition, Acknowledgements&gt; acksInFlight = fetchAcknowledgementsInFlight.get(nodeId);</span>
+<span class="nc bnc" id="L409" title="All 4 branches missed.">        if (acksInFlight != null &amp;&amp; !acksInFlight.isEmpty()) {</span>
+<span class="nc" id="L410">            return true;</span>
+        }
+
+<span class="nc" id="L413">        Tuple&lt;AcknowledgeRequestState&gt; requestStates = acknowledgeRequestStates.get(nodeId);</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">        if (requestStates != null) {</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            return areRequestStatesInProgress(requestStates.getSyncRequestQueue())</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                || isRequestStateInProgress(requestStates.getAsyncRequest())</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">                || isRequestStateInProgress(requestStates.getCloseRequest());</span>
+        }
+
+<span class="nc" id="L420">        return false;</span>
+    }
+
+    /**
+     * Remove session handlers for nodes which are now missing from the cluster metadata. Only nodes with no
+     * in-flight requests are removed, since those requests will complete. Piggyback acknowledgements for the
+     * missing nodes are completed with {@link Errors#NETWORK_EXCEPTION}.
+     */
+    private void removeSessionHandlersForMissingNodes(Set&lt;Integer&gt; missingNodes) {
+<span class="nc" id="L429">        Cluster cluster = metadata.fetch();</span>
+<span class="nc" id="L430">        missingNodes.forEach(nodeId -&gt; {</span>
+<span class="nc" id="L431">            Node node = cluster.nodeById(nodeId);</span>
+<span class="nc bnc" id="L432" title="All 4 branches missed.">            if (node == null &amp;&amp; !nodesWithPendingRequests.contains(nodeId)) {</span>
+<span class="nc" id="L433">                Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcksFromFetchMap = fetchAcknowledgementsToSend.remove(nodeId);</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">                if (nodeAcksFromFetchMap != null) {</span>
+<span class="nc" id="L435">                    nodeAcksFromFetchMap.forEach((tip, acks) -&gt; {</span>
+<span class="nc" id="L436">                        log.debug(&quot;Node {} is no longer in the cluster metadata, failing acknowledgements for partition {}&quot;, nodeId, tip);</span>
+<span class="nc" id="L437">                        acks.complete(Errors.NETWORK_EXCEPTION.exception());</span>
+<span class="nc" id="L438">                        maybeSendShareAcknowledgementEvent(Map.of(tip, acks), true, Optional.empty());</span>
+<span class="nc" id="L439">                    });</span>
+                }
+
+<span class="nc" id="L442">                log.debug(&quot;Removing session handler for node {} which is no longer in the cluster metadata&quot;, nodeId);</span>
+<span class="nc" id="L443">                sessionHandlers.remove(nodeId);</span>
+            }
+<span class="nc" id="L445">        });</span>
+<span class="nc" id="L446">    }</span>
+
+    public void fetch(Map&lt;TopicIdPartition, NodeAcknowledgements&gt; acknowledgementsMap) {
+<span class="nc bnc" id="L449" title="All 2 branches missed.">        if (!fetchMoreRecords) {</span>
+<span class="nc" id="L450">            log.debug(&quot;Fetch more data&quot;);</span>
+<span class="nc" id="L451">            fetchMoreRecords = true;</span>
+        }
+
+        // Store the acknowledgements and send them in the next ShareFetch.
+<span class="nc" id="L455">        processAcknowledgementsMap(acknowledgementsMap);</span>
+<span class="nc" id="L456">    }</span>
+
+    private void processAcknowledgementsMap(Map&lt;TopicIdPartition, NodeAcknowledgements&gt; acknowledgementsMap) {
+<span class="nc" id="L459">        acknowledgementsMap.forEach((tip, nodeAcks) -&gt; {</span>
+<span class="nc" id="L460">            int nodeId = nodeAcks.nodeId();</span>
+<span class="nc" id="L461">            Map&lt;TopicIdPartition, Acknowledgements&gt; currentNodeAcknowledgementsMap = fetchAcknowledgementsToSend.get(nodeId);</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            if (currentNodeAcknowledgementsMap != null) {</span>
+<span class="nc" id="L463">                Acknowledgements currentAcknowledgementsForNode = currentNodeAcknowledgementsMap.get(tip);</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">                if (currentAcknowledgementsForNode != null) {</span>
+<span class="nc" id="L465">                    currentAcknowledgementsForNode.merge(nodeAcks.acknowledgements());</span>
+                } else {
+<span class="nc" id="L467">                    currentNodeAcknowledgementsMap.put(tip, nodeAcks.acknowledgements());</span>
+                }
+<span class="nc" id="L469">            } else {</span>
+<span class="nc" id="L470">                Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcknowledgementsMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L471">                nodeAcknowledgementsMap.put(tip, nodeAcks.acknowledgements());</span>
+<span class="nc" id="L472">                fetchAcknowledgementsToSend.put(nodeId, nodeAcknowledgementsMap);</span>
+            }
+<span class="nc" id="L474">        });</span>
+<span class="nc" id="L475">    }</span>
+
+    /**
+     * Process acknowledgeRequestStates and prepares a list of acknowledgements to be sent in the poll().
+     *
+     * @param currentTimeMs the current time in ms.
+     *
+     * @return the PollResult containing zero or more acknowledgements.
+     */
+    private PollResult processAcknowledgements(long currentTimeMs) {
+<span class="nc" id="L485">        List&lt;UnsentRequest&gt; unsentRequests = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L486">        AtomicBoolean isAsyncSent = new AtomicBoolean();</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        for (Map.Entry&lt;Integer, Tuple&lt;AcknowledgeRequestState&gt;&gt; requestStates : acknowledgeRequestStates.entrySet()) {</span>
+<span class="nc" id="L488">            int nodeId = requestStates.getKey();</span>
+
+<span class="nc bnc" id="L490" title="All 2 branches missed.">            if (!isNodeFree(nodeId)) {</span>
+<span class="nc" id="L491">                log.trace(&quot;Skipping acknowledge request because previous request to {} has not been processed, so acks are not sent&quot;, nodeId);</span>
+            } else {
+<span class="nc" id="L493">                isAsyncSent.set(false);</span>
+
+                // First, the acknowledgements from commitAsync are sent.
+<span class="nc" id="L496">                maybeBuildRequest(requestStates.getValue().getAsyncRequest(), currentTimeMs, true, isAsyncSent).ifPresent(unsentRequests::add);</span>
+
+                // Check to ensure we start processing commitSync/close only if there are no commitAsync requests left to process.
+<span class="nc bnc" id="L499" title="All 2 branches missed.">                if (isAsyncSent.get()) {</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">                    if (!isNodeFree(nodeId)) {</span>
+<span class="nc" id="L501">                        log.trace(&quot;Skipping acknowledge request because previous request to {} has not been processed, so acks are not sent&quot;, nodeId);</span>
+<span class="nc" id="L502">                        continue;</span>
+                    }
+
+                    // We try to process the close request only if we have processed the async and the sync requests for the node.
+<span class="nc bnc" id="L506" title="All 2 branches missed.">                    if (requestStates.getValue().getSyncRequestQueue() == null) {</span>
+<span class="nc" id="L507">                        AcknowledgeRequestState closeRequestState = requestStates.getValue().getCloseRequest();</span>
+
+<span class="nc" id="L509">                        maybeBuildRequest(closeRequestState, currentTimeMs, false, isAsyncSent).ifPresent(unsentRequests::add);</span>
+<span class="nc" id="L510">                    } else {</span>
+                        // Processing the acknowledgements from commitSync
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                        for (AcknowledgeRequestState acknowledgeRequestState : requestStates.getValue().getSyncRequestQueue()) {</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">                            if (!isNodeFree(nodeId)) {</span>
+<span class="nc" id="L514">                                log.trace(&quot;Skipping acknowledge request because previous request to {} has not been processed, so acks are not sent&quot;, nodeId);</span>
+<span class="nc" id="L515">                                break;</span>
+                            }
+<span class="nc" id="L517">                            maybeBuildRequest(acknowledgeRequestState, currentTimeMs, false, isAsyncSent).ifPresent(unsentRequests::add);</span>
+<span class="nc" id="L518">                        }</span>
+                    }
+                }
+            }
+<span class="nc" id="L522">        }</span>
+
+<span class="nc" id="L524">        PollResult pollResult = null;</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">        if (!unsentRequests.isEmpty()) {</span>
+<span class="nc" id="L526">            pollResult = new PollResult(unsentRequests);</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        } else if (checkAndRemoveCompletedAcknowledgements()) {</span>
+            // Return empty result until all the acknowledgement request states are processed
+<span class="nc" id="L529">            pollResult = PollResult.EMPTY;</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        } else if (closing) {</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">            if (!closeFuture.isDone()) {</span>
+<span class="nc" id="L532">                closeFuture.complete(null);</span>
+            }
+<span class="nc" id="L534">            pollResult = PollResult.EMPTY;</span>
+        }
+<span class="nc" id="L536">        return pollResult;</span>
+    }
+
+    private boolean isNodeFree(int nodeId) {
+<span class="nc bnc" id="L540" title="All 2 branches missed.">        return !nodesWithPendingRequests.contains(nodeId);</span>
+    }
+
+    public void setAcknowledgementCommitCallbackRegistered(boolean isAcknowledgementCommitCallbackRegistered) {
+<span class="nc" id="L544">        this.isAcknowledgementCommitCallbackRegistered = isAcknowledgementCommitCallbackRegistered;</span>
+<span class="nc" id="L545">    }</span>
+
+    private void maybeSendShareAcknowledgementEvent(Map&lt;TopicIdPartition, Acknowledgements&gt; acknowledgementsMap,
+                                                    boolean checkForRenewAcknowledgements,
+                                                    Optional&lt;Integer&gt; acquisitionLockTimeoutMs) {
+<span class="nc bnc" id="L550" title="All 4 branches missed.">        if (isAcknowledgementCommitCallbackRegistered || checkForRenewAcknowledgements) {</span>
+<span class="nc" id="L551">            ShareAcknowledgementEvent event = new ShareAcknowledgementEvent(acknowledgementsMap, checkForRenewAcknowledgements, acquisitionLockTimeoutMs);</span>
+<span class="nc" id="L552">            acknowledgeEventHandler.add(event);</span>
+        }
+<span class="nc" id="L554">    }</span>
+
+    /**
+     *
+     * @param acknowledgeRequestState Contains the acknowledgements to be sent.
+     * @param currentTimeMs The current time in ms.
+     * @param onCommitAsync Boolean to denote if the acknowledgements came from a commitAsync or not.
+     * @param isAsyncSent Boolean to indicate if the async request has been sent.
+     *
+     * @return Returns the request if it was built.
+     */
+    private Optional&lt;UnsentRequest&gt; maybeBuildRequest(AcknowledgeRequestState acknowledgeRequestState,
+                                                      long currentTimeMs,
+                                                      boolean onCommitAsync,
+                                                      AtomicBoolean isAsyncSent) {
+<span class="nc" id="L569">        boolean asyncSent = true;</span>
+        try {
+<span class="nc bnc" id="L571" title="All 2 branches missed.">            if (acknowledgeRequestState == null ||</span>
+<span class="nc bnc" id="L572" title="All 4 branches missed.">                    (!acknowledgeRequestState.isCloseRequest() &amp;&amp; acknowledgeRequestState.isEmpty()) ||</span>
+<span class="nc bnc" id="L573" title="All 4 branches missed.">                    (acknowledgeRequestState.isCloseRequest() &amp;&amp; acknowledgeRequestState.isProcessed)) {</span>
+<span class="nc" id="L574">                return Optional.empty();</span>
+            }
+
+<span class="nc bnc" id="L577" title="All 2 branches missed.">            if (acknowledgeRequestState.maybeExpire()) {</span>
+                // Fill in TimeoutException
+<span class="nc bnc" id="L579" title="All 2 branches missed.">                for (TopicIdPartition tip : acknowledgeRequestState.incompleteAcknowledgements.keySet()) {</span>
+<span class="nc" id="L580">                    metricsManager.recordFailedAcknowledgements(acknowledgeRequestState.getIncompleteAcknowledgementsCount(tip));</span>
+<span class="nc" id="L581">                    acknowledgeRequestState.handleAcknowledgeTimedOut(tip);</span>
+<span class="nc" id="L582">                }</span>
+<span class="nc" id="L583">                acknowledgeRequestState.incompleteAcknowledgements.clear();</span>
+                // Reset timer for any future processing on the same request state.
+<span class="nc" id="L585">                acknowledgeRequestState.maybeResetTimerAndRequestState();</span>
+<span class="nc" id="L586">                return Optional.empty();</span>
+            }
+
+<span class="nc bnc" id="L589" title="All 2 branches missed.">            if (!acknowledgeRequestState.canSendRequest(currentTimeMs)) {</span>
+                // We wait for the backoff before we can send this request.
+<span class="nc" id="L591">                asyncSent = false;</span>
+<span class="nc" id="L592">                return Optional.empty();</span>
+            }
+
+<span class="nc" id="L595">            UnsentRequest request = acknowledgeRequestState.buildRequest();</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">            if (request == null) {</span>
+<span class="nc" id="L597">                asyncSent = false;</span>
+<span class="nc" id="L598">                return Optional.empty();</span>
+            }
+
+<span class="nc" id="L601">            acknowledgeRequestState.onSendAttempt(currentTimeMs);</span>
+<span class="nc" id="L602">            return Optional.of(request);</span>
+        } finally {
+<span class="nc bnc" id="L604" title="All 2 branches missed.">            if (onCommitAsync) {</span>
+<span class="nc" id="L605">                isAsyncSent.set(asyncSent);</span>
+            }
+        }
+    }
+
+    /**
+     * Prunes the empty acknowledgementRequestStates in {@link #acknowledgeRequestStates}
+     *
+     * @return Returns true if there are still any acknowledgements left to be processed.
+     */
+    private boolean checkAndRemoveCompletedAcknowledgements() {
+<span class="nc" id="L616">        boolean areAnyAcksLeft = false;</span>
+<span class="nc" id="L617">        Iterator&lt;Map.Entry&lt;Integer, Tuple&lt;AcknowledgeRequestState&gt;&gt;&gt; iterator = acknowledgeRequestStates.entrySet().iterator();</span>
+
+<span class="nc bnc" id="L619" title="All 2 branches missed.">        while (iterator.hasNext()) {</span>
+<span class="nc" id="L620">            Map.Entry&lt;Integer, Tuple&lt;AcknowledgeRequestState&gt;&gt; acknowledgeRequestStatePair = iterator.next();</span>
+<span class="nc" id="L621">            boolean areAsyncAcksLeft = true, areSyncAcksLeft = true;</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">            if (!isRequestStateInProgress(acknowledgeRequestStatePair.getValue().getAsyncRequest())) {</span>
+<span class="nc" id="L623">                acknowledgeRequestStatePair.getValue().setAsyncRequest(null);</span>
+<span class="nc" id="L624">                areAsyncAcksLeft = false;</span>
+            }
+
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            if (!areRequestStatesInProgress(acknowledgeRequestStatePair.getValue().getSyncRequestQueue())) {</span>
+<span class="nc" id="L628">                acknowledgeRequestStatePair.getValue().nullifySyncRequestQueue();</span>
+<span class="nc" id="L629">                areSyncAcksLeft = false;</span>
+            }
+
+<span class="nc bnc" id="L632" title="All 2 branches missed.">            if (!isRequestStateInProgress(acknowledgeRequestStatePair.getValue().getCloseRequest())) {</span>
+<span class="nc" id="L633">                acknowledgeRequestStatePair.getValue().setCloseRequest(null);</span>
+            }
+
+<span class="nc bnc" id="L636" title="All 4 branches missed.">            if (areAsyncAcksLeft || areSyncAcksLeft) {</span>
+<span class="nc" id="L637">                areAnyAcksLeft = true;</span>
+<span class="nc bnc" id="L638" title="All 2 branches missed.">            } else if (acknowledgeRequestStatePair.getValue().getCloseRequest() == null) {</span>
+<span class="nc" id="L639">                iterator.remove();</span>
+            }
+<span class="nc" id="L641">        }</span>
+
+<span class="nc bnc" id="L643" title="All 2 branches missed.">        if (!acknowledgeRequestStates.isEmpty()) areAnyAcksLeft = true;</span>
+<span class="nc" id="L644">        return areAnyAcksLeft;</span>
+    }
+
+    private boolean isRequestStateInProgress(AcknowledgeRequestState acknowledgeRequestState) {
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        if (acknowledgeRequestState == null) {</span>
+<span class="nc" id="L649">            return false;</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">        } else if (acknowledgeRequestState.isCloseRequest()) {</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">            return !acknowledgeRequestState.isProcessed;</span>
+        } else {
+<span class="nc bnc" id="L653" title="All 2 branches missed.">            return !(acknowledgeRequestState.isEmpty());</span>
+        }
+    }
+
+    private boolean areRequestStatesInProgress(Queue&lt;AcknowledgeRequestState&gt; acknowledgeRequestStates) {
+<span class="nc bnc" id="L658" title="All 2 branches missed.">        if (acknowledgeRequestStates == null) return false;</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">        for (AcknowledgeRequestState acknowledgeRequestState : acknowledgeRequestStates) {</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">            if (isRequestStateInProgress(acknowledgeRequestState)) {</span>
+<span class="nc" id="L661">                return true;</span>
+            }
+<span class="nc" id="L663">        }</span>
+<span class="nc" id="L664">        return false;</span>
+    }
+
+    /**
+     * Enqueue an AcknowledgeRequestState to be picked up on the next poll
+     *
+     * @param acknowledgementsMap The acknowledgements to commit
+     * @param deadlineMs          Time until which the request will be retried if it fails with
+     *                            an expected retriable error.
+     *
+     * @return The future which completes when the acknowledgements finished
+     */
+    public CompletableFuture&lt;Map&lt;TopicIdPartition, Acknowledgements&gt;&gt; commitSync(
+            final Map&lt;TopicIdPartition, NodeAcknowledgements&gt; acknowledgementsMap,
+            final long deadlineMs) {
+<span class="nc" id="L679">        final AtomicInteger resultCount = new AtomicInteger();</span>
+<span class="nc" id="L680">        final CompletableFuture&lt;Map&lt;TopicIdPartition, Acknowledgements&gt;&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L681">        final ResultHandler resultHandler = new ResultHandler(resultCount, Optional.of(future));</span>
+
+<span class="nc" id="L683">        Map&lt;Integer, Map&lt;TopicIdPartition, Acknowledgements&gt;&gt; acknowledgementsMapAllNodes = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L684">        acknowledgementsMap.forEach((tip, nodeAcks) -&gt; {</span>
+<span class="nc" id="L685">            Map&lt;TopicIdPartition, Acknowledgements&gt; acksMap = acknowledgementsMapAllNodes.computeIfAbsent(nodeAcks.nodeId(), k -&gt; new HashMap&lt;&gt;());</span>
+<span class="nc" id="L686">            Acknowledgements prevAcks = acksMap.putIfAbsent(tip, nodeAcks.acknowledgements());</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            if (prevAcks != null) {</span>
+<span class="nc" id="L688">                prevAcks.merge(nodeAcks.acknowledgements());</span>
+            }
+<span class="nc" id="L690">        });</span>
+
+<span class="nc" id="L692">        sessionHandlers.forEach((nodeId, sessionHandler) -&gt; {</span>
+<span class="nc" id="L693">            Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcknowledgements = acknowledgementsMapAllNodes.remove(nodeId);</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">            if (nodeAcknowledgements == null)</span>
+<span class="nc" id="L695">                return;</span>
+
+<span class="nc" id="L697">            Map&lt;TopicIdPartition, Acknowledgements&gt; acknowledgementsMapToSend = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L699">            acknowledgeRequestStates.putIfAbsent(nodeId, new Tuple&lt;&gt;(null, null, null));</span>
+
+            // Add the incoming commitSync() request to the queue.
+<span class="nc" id="L702">            nodeAcknowledgements.forEach((tip, acks) -&gt; {</span>
+<span class="nc bnc" id="L703" title="All 2 branches missed.">                if (acks != null) {</span>
+<span class="nc" id="L704">                    acknowledgementsMapToSend.put(tip, acks);</span>
+<span class="nc" id="L705">                    resultCount.incrementAndGet();</span>
+
+<span class="nc" id="L707">                    metricsManager.recordAcknowledgementSent(acks.size());</span>
+<span class="nc" id="L708">                    log.debug(&quot;Added sync acknowledge request for partition {} to node {}&quot;, tip.topicPartition(), nodeId);</span>
+                }
+<span class="nc" id="L710">            });</span>
+
+<span class="nc bnc" id="L712" title="All 2 branches missed.">            if (!acknowledgementsMapToSend.isEmpty()) {</span>
+<span class="nc" id="L713">                acknowledgeRequestStates.get(nodeId).addSyncRequest(new AcknowledgeRequestState(logContext,</span>
+<span class="nc" id="L714">                    ShareConsumeRequestManager.class.getSimpleName() + &quot;:1&quot;,</span>
+                    deadlineMs,
+                    retryBackoffMs,
+                    retryBackoffMaxMs,
+                    sessionHandler,
+<span class="nc" id="L719">                    nodeId,</span>
+                    acknowledgementsMapToSend,
+                    resultHandler,
+                    AcknowledgeRequestType.COMMIT_SYNC
+                ));
+            }
+<span class="nc" id="L725">        });</span>
+
+<span class="nc bnc" id="L727" title="All 2 branches missed.">        if (!acknowledgementsMapAllNodes.isEmpty()) {</span>
+<span class="nc" id="L728">            acknowledgementsMapAllNodes.forEach((nodeId, nodeAcknowledgements) -&gt; resultCount.addAndGet(nodeAcknowledgements.size()));</span>
+
+<span class="nc" id="L730">            acknowledgementsMapAllNodes.forEach((nodeId, nodeAcknowledgements) -&gt;</span>
+<span class="nc" id="L731">                nodeAcknowledgements.forEach((tip, acks) -&gt; {</span>
+<span class="nc" id="L732">                    log.debug(&quot;No share session handler for node {}, failing acknowledgements for partition {}&quot;, nodeId, tip);</span>
+<span class="nc" id="L733">                    acks.complete(acknowledgementsCannotBeSentError(nodeId, tip).exception());</span>
+<span class="nc" id="L734">                    resultHandler.complete(tip, acks, AcknowledgeRequestType.COMMIT_SYNC, true, Optional.empty());</span>
+<span class="nc" id="L735">                })</span>
+            );
+        }
+
+<span class="nc" id="L739">        resultHandler.completeIfEmpty();</span>
+<span class="nc" id="L740">        return future;</span>
+    }
+
+    /**
+     * Enqueue an AcknowledgeRequestState to be picked up on the next poll.
+     *
+     * @param acknowledgementsMap The acknowledgements to commit
+     * @param deadlineMs          Time until which the request will be retried if it fails with
+     *                            an expected retriable error.
+     */
+    public void commitAsync(
+            final Map&lt;TopicIdPartition, NodeAcknowledgements&gt; acknowledgementsMap,
+            final long deadlineMs) {
+<span class="nc" id="L753">        final ResultHandler resultHandler = new ResultHandler(Optional.empty());</span>
+
+<span class="nc" id="L755">        Map&lt;Integer, Map&lt;TopicIdPartition, Acknowledgements&gt;&gt; acknowledgementsMapAllNodes = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L756">        acknowledgementsMap.forEach((tip, nodeAcks) -&gt; {</span>
+<span class="nc" id="L757">            Map&lt;TopicIdPartition, Acknowledgements&gt; acksMap = acknowledgementsMapAllNodes.computeIfAbsent(nodeAcks.nodeId(), k -&gt; new HashMap&lt;&gt;());</span>
+<span class="nc" id="L758">            Acknowledgements prevAcks = acksMap.putIfAbsent(tip, nodeAcks.acknowledgements());</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">            if (prevAcks != null) {</span>
+<span class="nc" id="L760">                prevAcks.merge(nodeAcks.acknowledgements());</span>
+            }
+<span class="nc" id="L762">        });</span>
+
+<span class="nc" id="L764">        sessionHandlers.forEach((nodeId, sessionHandler) -&gt; {</span>
+<span class="nc" id="L765">            Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcknowledgements = acknowledgementsMapAllNodes.remove(nodeId);</span>
+<span class="nc bnc" id="L766" title="All 2 branches missed.">            if (nodeAcknowledgements == null)</span>
+<span class="nc" id="L767">                return;</span>
+
+<span class="nc" id="L769">            Map&lt;TopicIdPartition, Acknowledgements&gt; acknowledgementsMapForNode = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L771">            acknowledgeRequestStates.putIfAbsent(nodeId, new Tuple&lt;&gt;(null, null, null));</span>
+
+<span class="nc" id="L773">            nodeAcknowledgements.forEach((tip, acks) -&gt; {</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">                if (acks != null) {</span>
+<span class="nc" id="L775">                    acknowledgementsMapForNode.put(tip, acks);</span>
+
+<span class="nc" id="L777">                    metricsManager.recordAcknowledgementSent(acks.size());</span>
+<span class="nc" id="L778">                    log.debug(&quot;Added async acknowledge request for partition {} to node {}&quot;, tip.topicPartition(), nodeId);</span>
+
+<span class="nc" id="L780">                    AcknowledgeRequestState asyncRequestState = acknowledgeRequestStates.get(nodeId).getAsyncRequest();</span>
+<span class="nc bnc" id="L781" title="All 2 branches missed.">                    if (asyncRequestState == null) {</span>
+<span class="nc" id="L782">                        acknowledgeRequestStates.get(nodeId).setAsyncRequest(new AcknowledgeRequestState(logContext,</span>
+<span class="nc" id="L783">                            ShareConsumeRequestManager.class.getSimpleName() + &quot;:2&quot;,</span>
+                            deadlineMs,
+                            retryBackoffMs,
+                            retryBackoffMaxMs,
+                            sessionHandler,
+<span class="nc" id="L788">                            nodeId,</span>
+                            acknowledgementsMapForNode,
+                            resultHandler,
+                            AcknowledgeRequestType.COMMIT_ASYNC
+                        ));
+                    } else {
+<span class="nc" id="L794">                        Acknowledgements prevAcks = asyncRequestState.acknowledgementsToSend.putIfAbsent(tip, acks);</span>
+<span class="nc bnc" id="L795" title="All 2 branches missed.">                        if (prevAcks != null) {</span>
+<span class="nc" id="L796">                            asyncRequestState.acknowledgementsToSend.get(tip).merge(acks);</span>
+                        }
+                    }
+                }
+<span class="nc" id="L800">            });</span>
+<span class="nc" id="L801">        });</span>
+
+<span class="nc" id="L803">        acknowledgementsMapAllNodes.forEach((nodeId, nodeAcknowledgements) -&gt;</span>
+<span class="nc" id="L804">            nodeAcknowledgements.forEach((tip, acks) -&gt; {</span>
+<span class="nc" id="L805">                log.debug(&quot;No share session handler for node {}, failing acknowledgements for partition {}&quot;, nodeId, tip);</span>
+<span class="nc" id="L806">                acks.complete(acknowledgementsCannotBeSentError(nodeId, tip).exception());</span>
+<span class="nc" id="L807">                maybeSendShareAcknowledgementEvent(Map.of(tip, acks), true, Optional.empty());</span>
+<span class="nc" id="L808">            })</span>
+        );
+
+<span class="nc" id="L811">        resultHandler.completeIfEmpty();</span>
+<span class="nc" id="L812">    }</span>
+
+    /**
+     * Enqueue the final AcknowledgeRequestState used to commit the final acknowledgements and
+     * close the share sessions.
+     *
+     * @param acknowledgementsMap The acknowledgements to commit
+     * @param deadlineMs          Time until which the request will be retried if it fails with
+     *                            an expected retriable error.
+     *
+     * @return The future which completes when the acknowledgements finished
+     */
+    public CompletableFuture&lt;Void&gt; acknowledgeOnClose(
+            final Map&lt;TopicIdPartition, NodeAcknowledgements&gt; acknowledgementsMap,
+            final long deadlineMs) {
+<span class="nc" id="L827">        final AtomicInteger resultCount = new AtomicInteger();</span>
+<span class="nc" id="L828">        final ResultHandler resultHandler = new ResultHandler(resultCount, Optional.empty());</span>
+
+<span class="nc" id="L830">        closing = true;</span>
+
+<span class="nc" id="L832">        Map&lt;Integer, Map&lt;TopicIdPartition, Acknowledgements&gt;&gt; acknowledgementsMapAllNodes = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L833">        acknowledgementsMap.forEach((tip, nodeAcks) -&gt; {</span>
+<span class="nc" id="L834">            Map&lt;TopicIdPartition, Acknowledgements&gt; acksMap = acknowledgementsMapAllNodes.computeIfAbsent(nodeAcks.nodeId(), k -&gt; new HashMap&lt;&gt;());</span>
+<span class="nc" id="L835">            Acknowledgements prevAcks = acksMap.putIfAbsent(tip, nodeAcks.acknowledgements());</span>
+<span class="nc bnc" id="L836" title="All 2 branches missed.">            if (prevAcks != null) {</span>
+<span class="nc" id="L837">                prevAcks.merge(nodeAcks.acknowledgements());</span>
+            }
+<span class="nc" id="L839">        });</span>
+
+        // Add any waiting piggyback acknowledgements.
+<span class="nc" id="L842">        fetchAcknowledgementsToSend.forEach((nodeId, nodeAcks) -&gt;</span>
+<span class="nc" id="L843">            nodeAcks.forEach((tip, acks) -&gt; {</span>
+<span class="nc" id="L844">                Map&lt;TopicIdPartition, Acknowledgements&gt; acksMap = acknowledgementsMapAllNodes.computeIfAbsent(nodeId, k -&gt; new HashMap&lt;&gt;());</span>
+<span class="nc" id="L845">                Acknowledgements prevAcks = acksMap.putIfAbsent(tip, acks);</span>
+<span class="nc bnc" id="L846" title="All 2 branches missed.">                if (prevAcks != null) {</span>
+<span class="nc" id="L847">                    prevAcks.merge(acks);</span>
+                }
+<span class="nc" id="L849">            })</span>
+        );
+
+<span class="nc" id="L852">        sessionHandlers.forEach((nodeId, sessionHandler) -&gt; {</span>
+<span class="nc" id="L853">            Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcknowledgements = acknowledgementsMapAllNodes.remove(nodeId);</span>
+<span class="nc bnc" id="L854" title="All 2 branches missed.">            if (nodeAcknowledgements != null) {</span>
+<span class="nc" id="L855">                nodeAcknowledgements.forEach((tip, acknowledgements) -&gt; {</span>
+<span class="nc" id="L856">                    resultCount.incrementAndGet();</span>
+
+<span class="nc" id="L858">                    metricsManager.recordAcknowledgementSent(acknowledgements.size());</span>
+<span class="nc" id="L859">                    log.debug(&quot;Added closing acknowledge request for partition {} to node {}&quot;, tip.topicPartition(), nodeId);</span>
+<span class="nc" id="L860">                });</span>
+            } else {
+<span class="nc" id="L862">                nodeAcknowledgements = new HashMap&lt;&gt;();</span>
+            }
+
+<span class="nc" id="L865">            acknowledgeRequestStates.putIfAbsent(nodeId, new Tuple&lt;&gt;(null, null, null));</span>
+
+            // Ensure there is no close() request already present as they are blocking calls
+            // and only one request can be active at a time.
+<span class="nc bnc" id="L869" title="All 4 branches missed.">            if (acknowledgeRequestStates.get(nodeId).getCloseRequest() != null &amp;&amp; isRequestStateInProgress(acknowledgeRequestStates.get(nodeId).getCloseRequest())) {</span>
+<span class="nc" id="L870">                log.error(&quot;Attempt to call close() when there is an existing close request for node {}-{}&quot;, nodeId, acknowledgeRequestStates.get(nodeId).getSyncRequestQueue());</span>
+<span class="nc" id="L871">                nodeAcknowledgements.forEach((tip, acks) -&gt; {</span>
+<span class="nc" id="L872">                    acks.complete(Errors.NOT_LEADER_OR_FOLLOWER.exception());</span>
+<span class="nc" id="L873">                    maybeSendShareAcknowledgementEvent(Map.of(tip, acks), true, Optional.empty());</span>
+<span class="nc" id="L874">                });</span>
+<span class="nc" id="L875">                closeFuture.completeExceptionally(new IllegalStateException(&quot;Attempt to call close() when there is an existing close request for node &quot; + nodeId));</span>
+            } else {
+                // There can only be one close() happening at a time. So per node, there will be one acknowledge request state.
+<span class="nc" id="L878">                acknowledgeRequestStates.get(nodeId).setCloseRequest(</span>
+                    new AcknowledgeRequestState(logContext,
+<span class="nc" id="L880">                        ShareConsumeRequestManager.class.getSimpleName() + &quot;:3&quot;,</span>
+                        deadlineMs,
+                        retryBackoffMs,
+                        retryBackoffMaxMs,
+                        sessionHandler,
+<span class="nc" id="L885">                        nodeId,</span>
+                        nodeAcknowledgements,
+                        resultHandler,
+                        AcknowledgeRequestType.CLOSE
+                ));
+            }
+<span class="nc" id="L891">        });</span>
+
+<span class="nc" id="L893">        acknowledgementsMapAllNodes.forEach((nodeId, nodeAcknowledgements) -&gt;</span>
+<span class="nc" id="L894">            nodeAcknowledgements.forEach((tip, acks) -&gt; {</span>
+<span class="nc" id="L895">                log.debug(&quot;No share session handler for node {}, failing acknowledgements for partition {}&quot;, nodeId, tip);</span>
+<span class="nc" id="L896">                acks.complete(acknowledgementsCannotBeSentError(nodeId, tip).exception());</span>
+<span class="nc" id="L897">                maybeSendShareAcknowledgementEvent(Map.of(tip, acks), true, Optional.empty());</span>
+<span class="nc" id="L898">            })</span>
+        );
+
+<span class="nc" id="L901">        resultHandler.completeIfEmpty();</span>
+<span class="nc" id="L902">        return closeFuture;</span>
+    }
+
+    private void handleShareFetchSuccess(Node fetchTarget,
+                                         ShareFetchRequestData requestData,
+                                         ClientResponse resp) {
+        try {
+<span class="nc" id="L909">            log.debug(&quot;Completed ShareFetch request from node {} successfully&quot;, fetchTarget.id());</span>
+<span class="nc" id="L910">            final ShareFetchResponse response = (ShareFetchResponse) resp.responseBody();</span>
+<span class="nc" id="L911">            final ShareSessionHandler handler = sessionHandler(fetchTarget.id());</span>
+
+<span class="nc" id="L913">            metricsManager.recordLatency(resp.destination(), resp.requestLatencyMs());</span>
+
+<span class="nc bnc" id="L915" title="All 2 branches missed.">            if (handler == null) {</span>
+<span class="nc" id="L916">                log.error(&quot;Unable to find ShareSessionHandler for node {}. Ignoring ShareFetch response.&quot;,</span>
+<span class="nc" id="L917">                        fetchTarget.id());</span>
+<span class="nc" id="L918">                return;</span>
+            }
+
+<span class="nc" id="L921">            final short requestVersion = resp.requestHeader().apiVersion();</span>
+
+<span class="nc bnc" id="L923" title="All 2 branches missed.">            if (!handler.handleResponse(response, requestVersion)) {</span>
+<span class="nc bnc" id="L924" title="All 2 branches missed.">                if (response.error() == Errors.UNKNOWN_TOPIC_ID) {</span>
+<span class="nc" id="L925">                    metadata.requestUpdate(false);</span>
+                }
+                // Complete any in-flight acknowledgements with the error code from the response, unless the share session was lost,
+                // in which case they are failed with NETWORK_EXCEPTION reflecting a loss of connectivity.
+                final Errors ackError;
+<span class="nc bnc" id="L930" title="All 4 branches missed.">                if (response.error() == Errors.SHARE_SESSION_NOT_FOUND || response.error() == Errors.INVALID_SHARE_SESSION_EPOCH) {</span>
+<span class="nc" id="L931">                    ackError = Errors.NETWORK_EXCEPTION;</span>
+                } else {
+<span class="nc" id="L933">                    ackError = response.error();</span>
+                }
+<span class="nc" id="L935">                Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcknowledgementsInFlight = fetchAcknowledgementsInFlight.remove(fetchTarget.id());</span>
+<span class="nc bnc" id="L936" title="All 4 branches missed.">                if (nodeAcknowledgementsInFlight != null &amp;&amp; !nodeAcknowledgementsInFlight.isEmpty()) {</span>
+<span class="nc" id="L937">                    nodeAcknowledgementsInFlight.forEach((tip, acks) -&gt; {</span>
+<span class="nc" id="L938">                        acks.complete(ackError.exception());</span>
+<span class="nc" id="L939">                        metricsManager.recordFailedAcknowledgements(acks.size());</span>
+<span class="nc" id="L940">                    });</span>
+<span class="nc" id="L941">                    maybeSendShareAcknowledgementEvent(nodeAcknowledgementsInFlight, requestData.isRenewAck(), Optional.empty());</span>
+                }
+<span class="nc" id="L943">                return;</span>
+            }
+
+<span class="nc" id="L946">            final Map&lt;TopicIdPartition, ShareFetchResponseData.PartitionData&gt; responseData = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L947" title="All 2 branches missed.">            final Optional&lt;Integer&gt; responseAcquisitionLockTimeoutMs = response.data().acquisitionLockTimeoutMs() &gt; 0</span>
+<span class="nc" id="L948">                ? Optional.of(response.data().acquisitionLockTimeoutMs()) : Optional.empty();</span>
+
+<span class="nc" id="L950">            response.data().responses().forEach(topicResponse -&gt;</span>
+<span class="nc" id="L951">                topicResponse.partitions().forEach(partition -&gt; {</span>
+<span class="nc" id="L952">                    TopicIdPartition tip = lookupTopicId(topicResponse.topicId(), partition.partitionIndex());</span>
+<span class="nc bnc" id="L953" title="All 2 branches missed.">                    if (tip != null) {</span>
+<span class="nc" id="L954">                        responseData.put(tip, partition);</span>
+                    }
+<span class="nc" id="L956">                })</span>
+            );
+
+<span class="nc" id="L959">            final Set&lt;TopicPartition&gt; partitions = responseData.keySet().stream().map(TopicIdPartition::topicPartition).collect(Collectors.toSet());</span>
+<span class="nc" id="L960">            final ShareFetchMetricsAggregator shareFetchMetricsAggregator = new ShareFetchMetricsAggregator(metricsManager, partitions);</span>
+
+<span class="nc" id="L962">            List&lt;ShareCompletedFetch&gt; completedFetches = new ArrayList&lt;&gt;(responseData.size());</span>
+<span class="nc" id="L963">            Map&lt;TopicPartition, Metadata.LeaderIdAndEpoch&gt; partitionsWithUpdatedLeaderInfo = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L964" title="All 2 branches missed.">            for (Map.Entry&lt;TopicIdPartition, ShareFetchResponseData.PartitionData&gt; entry : responseData.entrySet()) {</span>
+<span class="nc" id="L965">                TopicIdPartition tip = entry.getKey();</span>
+
+<span class="nc" id="L967">                ShareFetchResponseData.PartitionData partitionData = entry.getValue();</span>
+
+<span class="nc" id="L969">                log.debug(&quot;ShareFetch for partition {} returned fetch data {}&quot;, tip, partitionData);</span>
+
+<span class="nc" id="L971">                Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcknowledgementsInFlight = fetchAcknowledgementsInFlight.get(fetchTarget.id());</span>
+<span class="nc bnc" id="L972" title="All 2 branches missed.">                if (nodeAcknowledgementsInFlight != null) {</span>
+<span class="nc" id="L973">                    Acknowledgements acks = nodeAcknowledgementsInFlight.remove(tip);</span>
+<span class="nc bnc" id="L974" title="All 2 branches missed.">                    if (acks != null) {</span>
+<span class="nc bnc" id="L975" title="All 2 branches missed.">                        if (partitionData.acknowledgeErrorCode() != Errors.NONE.code()) {</span>
+<span class="nc" id="L976">                            metricsManager.recordFailedAcknowledgements(acks.size());</span>
+                        }
+<span class="nc" id="L978">                        acks.complete(Errors.forCode(partitionData.acknowledgeErrorCode())</span>
+<span class="nc" id="L979">                                .exception(partitionData.acknowledgeErrorMessage()));</span>
+<span class="nc" id="L980">                        Map&lt;TopicIdPartition, Acknowledgements&gt; acksMap = Map.of(tip, acks);</span>
+<span class="nc" id="L981">                        maybeSendShareAcknowledgementEvent(acksMap, requestData.isRenewAck(), responseAcquisitionLockTimeoutMs);</span>
+                    }
+                }
+
+<span class="nc" id="L985">                Errors partitionError = Errors.forCode(partitionData.errorCode());</span>
+<span class="nc bnc" id="L986" title="All 4 branches missed.">                if (partitionError == Errors.NOT_LEADER_OR_FOLLOWER || partitionError == Errors.FENCED_LEADER_EPOCH) {</span>
+<span class="nc" id="L987">                    log.debug(&quot;For {}, received error {}, with leaderIdAndEpoch {} in ShareFetch&quot;, tip, partitionError, partitionData.currentLeader());</span>
+<span class="nc bnc" id="L988" title="All 4 branches missed.">                    if (partitionData.currentLeader().leaderId() != -1 &amp;&amp; partitionData.currentLeader().leaderEpoch() != -1) {</span>
+<span class="nc" id="L989">                        partitionsWithUpdatedLeaderInfo.put(tip.topicPartition(), new Metadata.LeaderIdAndEpoch(</span>
+<span class="nc" id="L990">                            Optional.of(partitionData.currentLeader().leaderId()), Optional.of(partitionData.currentLeader().leaderEpoch())));</span>
+
+<span class="nc" id="L992">                        maybeUpdateLeaderCache(tip, partitionData.currentLeader().leaderId(), partitionData.currentLeader().leaderEpoch());</span>
+                    } else {
+<span class="nc" id="L994">                        shareSessionLeaderMap.remove(tip);</span>
+                    }
+<span class="nc bnc" id="L996" title="All 4 branches missed.">                } else if (partitionError == Errors.UNKNOWN_TOPIC_OR_PARTITION || partitionError == Errors.UNKNOWN_TOPIC_ID) {</span>
+<span class="nc" id="L997">                    shareSessionLeaderMap.remove(tip);</span>
+<span class="nc" id="L998">                    shareSessionTopicIdMap.remove(tip.topicPartition());</span>
+                }
+
+<span class="nc" id="L1001">                completedFetches.add(</span>
+                    new ShareCompletedFetch(
+                        logContext,
+<span class="nc" id="L1004">                        BufferSupplier.create(),</span>
+<span class="nc" id="L1005">                        fetchTarget.id(),</span>
+                        tip,
+                        partitionData,
+                        responseAcquisitionLockTimeoutMs,
+                        shareFetchMetricsAggregator,
+                        requestVersion)
+                );
+
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">                if (!partitionData.acquiredRecords().isEmpty()) {</span>
+<span class="nc" id="L1014">                    fetchMoreRecords = false;</span>
+                }
+<span class="nc" id="L1016">            }</span>
+
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">            if (!completedFetches.isEmpty()) {</span>
+<span class="nc" id="L1019">                shareFetchBuffer.add(completedFetches);</span>
+            }
+
+            // Handle any acknowledgements which were not received in the response for this node.
+<span class="nc bnc" id="L1023" title="All 2 branches missed.">            if (fetchAcknowledgementsInFlight.get(fetchTarget.id()) != null) {</span>
+<span class="nc" id="L1024">                fetchAcknowledgementsInFlight.remove(fetchTarget.id()).forEach((partition, acknowledgements) -&gt; {</span>
+<span class="nc" id="L1025">                    acknowledgements.complete(new InvalidRecordStateException(INVALID_RESPONSE));</span>
+<span class="nc" id="L1026">                    maybeSendShareAcknowledgementEvent(Map.of(partition, acknowledgements), true, Optional.empty());</span>
+<span class="nc" id="L1027">                });</span>
+            }
+
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">            if (!partitionsWithUpdatedLeaderInfo.isEmpty()) {</span>
+<span class="nc" id="L1031">                List&lt;Node&gt; leaderNodes = response.data().nodeEndpoints().stream()</span>
+<span class="nc" id="L1032">                    .map(e -&gt; new Node(e.nodeId(), e.host(), e.port(), e.rack()))</span>
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">                    .filter(e -&gt; !e.equals(Node.noNode()))</span>
+<span class="nc" id="L1034">                    .collect(Collectors.toList());</span>
+<span class="nc" id="L1035">                metadata.updatePartitionLeadership(partitionsWithUpdatedLeaderInfo, leaderNodes);</span>
+            }
+        } finally {
+<span class="nc" id="L1038">            log.debug(&quot;Removing pending request for node {} - success&quot;, fetchTarget.id());</span>
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">            if (isShareAcquireModeRecordLimit()) {</span>
+<span class="nc" id="L1040">                fetchRecordsNodeId.compareAndSet(fetchTarget.id(), -1);</span>
+            }
+<span class="nc" id="L1042">            nodesWithPendingRequests.remove(fetchTarget.id());</span>
+
+<span class="nc" id="L1044">            maybeRemoveSessionHandlerOnClose(fetchTarget.id(), requestData);</span>
+        }
+<span class="nc" id="L1046">    }</span>
+
+    private void handleShareFetchFailure(Node fetchTarget,
+                                         ShareFetchRequestData requestData,
+                                         Throwable error) {
+        try {
+<span class="nc" id="L1052">            log.debug(&quot;Completed ShareFetch request from node {} unsuccessfully {}&quot;, fetchTarget.id(), Errors.forException(error));</span>
+<span class="nc" id="L1053">            final ShareSessionHandler handler = sessionHandler(fetchTarget.id());</span>
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">            if (handler != null) {</span>
+<span class="nc" id="L1055">                handler.handleError(error);</span>
+            }
+
+<span class="nc" id="L1058">            requestData.topics().forEach(topic -&gt; topic.partitions().forEach(partition -&gt; {</span>
+<span class="nc" id="L1059">                TopicIdPartition tip = lookupTopicId(topic.topicId(), partition.partitionIndex());</span>
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">                if (tip == null) {</span>
+<span class="nc" id="L1061">                    return;</span>
+                }
+
+<span class="nc" id="L1064">                Map&lt;TopicIdPartition, Acknowledgements&gt; nodeAcknowledgementsInFlight = fetchAcknowledgementsInFlight.get(fetchTarget.id());</span>
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">                if (nodeAcknowledgementsInFlight != null) {</span>
+<span class="nc" id="L1066">                    Acknowledgements acks = nodeAcknowledgementsInFlight.remove(tip);</span>
+<span class="nc bnc" id="L1067" title="All 2 branches missed.">                    if (acks != null) {</span>
+<span class="nc" id="L1068">                        metricsManager.recordFailedAcknowledgements(acks.size());</span>
+<span class="nc bnc" id="L1069" title="All 2 branches missed.">                        if (error instanceof KafkaException) {</span>
+<span class="nc" id="L1070">                            acks.complete((KafkaException) error);</span>
+                        } else {
+<span class="nc" id="L1072">                            acks.complete(Errors.UNKNOWN_SERVER_ERROR.exception());</span>
+                        }
+<span class="nc" id="L1074">                        Map&lt;TopicIdPartition, Acknowledgements&gt; acksMap = Map.of(tip, acks);</span>
+<span class="nc" id="L1075">                        maybeSendShareAcknowledgementEvent(acksMap, requestData.isRenewAck(), Optional.empty());</span>
+                    }
+                }
+<span class="nc" id="L1078">            }));</span>
+        } finally {
+<span class="nc" id="L1080">            log.debug(&quot;Removing pending request for node {} - failed&quot;, fetchTarget.id());</span>
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">            if (isShareAcquireModeRecordLimit()) {</span>
+<span class="nc" id="L1082">                fetchRecordsNodeId.compareAndSet(fetchTarget.id(), -1);</span>
+            }
+<span class="nc" id="L1084">            nodesWithPendingRequests.remove(fetchTarget.id());</span>
+
+<span class="nc" id="L1086">            maybeRemoveSessionHandlerOnClose(fetchTarget.id(), requestData);</span>
+        }
+<span class="nc" id="L1088">    }</span>
+
+    /**
+     * If the completed ShareFetch was closing the share session with a final epoch, the session handler
+     * is no longer quired. A subsequent poll will establish a new session if partitions return to the node.
+     */
+    private void maybeRemoveSessionHandlerOnClose(int nodeId, ShareFetchRequestData requestData) {
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">        if (requestData.shareSessionEpoch() == ShareRequestMetadata.FINAL_EPOCH) {</span>
+<span class="nc" id="L1096">            log.debug(&quot;Removing session handler for node {} after closing empty share session&quot;, nodeId);</span>
+<span class="nc" id="L1097">            sessionHandlers.remove(nodeId);</span>
+        }
+<span class="nc" id="L1099">    }</span>
+
+    private void handleShareAcknowledgeSuccess(Node fetchTarget,
+                                               ShareAcknowledgeRequestData requestData,
+                                               AcknowledgeRequestState acknowledgeRequestState,
+                                               ClientResponse resp,
+                                               long responseCompletionTimeMs) {
+        try {
+<span class="nc" id="L1107">            log.debug(&quot;Completed ShareAcknowledge request from node {} successfully&quot;, fetchTarget.id());</span>
+<span class="nc" id="L1108">            ShareAcknowledgeResponse response = (ShareAcknowledgeResponse) resp.responseBody();</span>
+<span class="nc bnc" id="L1109" title="All 2 branches missed.">            final Optional&lt;Integer&gt; responseAcquisitionLockTimeoutMs = response.data().acquisitionLockTimeoutMs() &gt; 0</span>
+<span class="nc" id="L1110">                ? Optional.of(response.data().acquisitionLockTimeoutMs()) : Optional.empty();</span>
+
+<span class="nc" id="L1112">            Map&lt;TopicPartition, Metadata.LeaderIdAndEpoch&gt; partitionsWithUpdatedLeaderInfo = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1114" title="All 2 branches missed.">            if (acknowledgeRequestState.isCloseRequest()) {</span>
+<span class="nc" id="L1115">                response.data().responses().forEach(topicResponse -&gt; topicResponse.partitions().forEach(partitionData -&gt; {</span>
+<span class="nc" id="L1116">                    TopicIdPartition tip = lookupTopicId(topicResponse.topicId(), partitionData.partitionIndex());</span>
+<span class="nc bnc" id="L1117" title="All 2 branches missed.">                    if (tip == null) {</span>
+<span class="nc" id="L1118">                        return;</span>
+                    }
+
+<span class="nc bnc" id="L1121" title="All 2 branches missed.">                    if (partitionData.errorCode() != Errors.NONE.code()) {</span>
+<span class="nc" id="L1122">                        metricsManager.recordFailedAcknowledgements(acknowledgeRequestState.getInFlightAcknowledgementsCount(tip));</span>
+                    }
+
+<span class="nc" id="L1125">                    acknowledgeRequestState.handleAcknowledgeErrorCode(tip, Errors.forCode(partitionData.errorCode()), requestData.isRenewAck(), responseAcquisitionLockTimeoutMs);</span>
+<span class="nc" id="L1126">                }));</span>
+
+<span class="nc" id="L1128">                acknowledgeRequestState.onSuccessfulAttempt(responseCompletionTimeMs);</span>
+<span class="nc" id="L1129">                acknowledgeRequestState.processingComplete();</span>
+            } else {
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">                if (!acknowledgeRequestState.sessionHandler.handleResponse(response, resp.requestHeader().apiVersion())) {</span>
+                    // Received a response-level error code.
+<span class="nc" id="L1133">                    acknowledgeRequestState.onFailedAttempt(responseCompletionTimeMs);</span>
+
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">                    if (response.error().exception() instanceof RetriableException) {</span>
+                        // We retry the request until the timer expires, unless we are closing.
+<span class="nc" id="L1137">                        acknowledgeRequestState.moveAllToIncompleteAcks();</span>
+                    } else {
+<span class="nc" id="L1139">                        acknowledgeRequestState.processPendingInFlightAcknowledgements(response.error().exception());</span>
+<span class="nc" id="L1140">                        acknowledgeRequestState.processingComplete();</span>
+                    }
+                } else {
+<span class="nc" id="L1143">                    AtomicBoolean shouldRetry = new AtomicBoolean(false);</span>
+
+                    // Check all partition-level error codes.
+<span class="nc" id="L1146">                    response.data().responses().forEach(topicResponse -&gt; topicResponse.partitions().forEach(partitionData -&gt; {</span>
+<span class="nc" id="L1147">                        Errors partitionError = Errors.forCode(partitionData.errorCode());</span>
+<span class="nc" id="L1148">                        TopicIdPartition tip = lookupTopicId(topicResponse.topicId(), partitionData.partitionIndex());</span>
+<span class="nc bnc" id="L1149" title="All 2 branches missed.">                        if (tip == null) {</span>
+<span class="nc" id="L1150">                            return;</span>
+                        }
+
+<span class="nc" id="L1153">                        handlePartitionError(partitionData, partitionsWithUpdatedLeaderInfo, acknowledgeRequestState,</span>
+<span class="nc" id="L1154">                            partitionError, tip, shouldRetry, requestData.isRenewAck(), responseAcquisitionLockTimeoutMs);</span>
+<span class="nc" id="L1155">                    }));</span>
+
+<span class="nc" id="L1157">                    processRetryLogic(acknowledgeRequestState, shouldRetry, responseCompletionTimeMs);</span>
+                }
+            }
+
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">            if (!partitionsWithUpdatedLeaderInfo.isEmpty()) {</span>
+<span class="nc" id="L1162">                List&lt;Node&gt; leaderNodes = response.data().nodeEndpoints().stream()</span>
+<span class="nc" id="L1163">                    .map(e -&gt; new Node(e.nodeId(), e.host(), e.port(), e.rack()))</span>
+<span class="nc bnc" id="L1164" title="All 2 branches missed.">                    .filter(e -&gt; !e.equals(Node.noNode()))</span>
+<span class="nc" id="L1165">                    .collect(Collectors.toList());</span>
+<span class="nc" id="L1166">                metadata.updatePartitionLeadership(partitionsWithUpdatedLeaderInfo, leaderNodes);</span>
+            }
+
+        } finally {
+<span class="nc" id="L1170">            log.debug(&quot;Removing pending request for node {} - success&quot;, fetchTarget.id());</span>
+<span class="nc" id="L1171">            nodesWithPendingRequests.remove(fetchTarget.id());</span>
+
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">            if (acknowledgeRequestState.isCloseRequest()) {</span>
+<span class="nc" id="L1174">                log.debug(&quot;Removing node from ShareSession {}&quot;, fetchTarget.id());</span>
+<span class="nc" id="L1175">                sessionHandlers.remove(fetchTarget.id());</span>
+            }
+        }
+<span class="nc" id="L1178">    }</span>
+
+    private void handleShareAcknowledgeFailure(Node fetchTarget,
+                                               ShareAcknowledgeRequestData requestData,
+                                               AcknowledgeRequestState acknowledgeRequestState,
+                                               Throwable error,
+                                               long responseCompletionTimeMs) {
+        try {
+<span class="nc" id="L1186">            log.debug(&quot;Completed ShareAcknowledge request from node {} unsuccessfully {}&quot;, fetchTarget.id(), Errors.forException(error));</span>
+<span class="nc" id="L1187">            acknowledgeRequestState.sessionHandler().handleError(error);</span>
+<span class="nc" id="L1188">            acknowledgeRequestState.onFailedAttempt(responseCompletionTimeMs);</span>
+
+<span class="nc" id="L1190">            requestData.topics().forEach(topic -&gt; topic.partitions().forEach(partition -&gt; {</span>
+<span class="nc" id="L1191">                TopicIdPartition tip = lookupTopicId(topic.topicId(), partition.partitionIndex());</span>
+<span class="nc bnc" id="L1192" title="All 2 branches missed.">                if (tip == null) {</span>
+<span class="nc" id="L1193">                    return;</span>
+                }
+
+<span class="nc" id="L1196">                metricsManager.recordFailedAcknowledgements(acknowledgeRequestState.getInFlightAcknowledgementsCount(tip));</span>
+<span class="nc" id="L1197">                acknowledgeRequestState.handleAcknowledgeErrorCode(tip, Errors.forException(error), requestData.isRenewAck(), Optional.empty());</span>
+<span class="nc" id="L1198">            }));</span>
+
+<span class="nc" id="L1200">            acknowledgeRequestState.processingComplete();</span>
+        } finally {
+<span class="nc" id="L1202">            log.debug(&quot;Removing pending request for node {} - failed&quot;, fetchTarget.id());</span>
+<span class="nc" id="L1203">            nodesWithPendingRequests.remove(fetchTarget.id());</span>
+
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">            if (acknowledgeRequestState.isCloseRequest()) {</span>
+<span class="nc" id="L1206">                log.debug(&quot;Removing node from ShareSession {}&quot;, fetchTarget.id());</span>
+<span class="nc" id="L1207">                sessionHandlers.remove(fetchTarget.id());</span>
+            }
+        }
+<span class="nc" id="L1210">    }</span>
+
+    private void handlePartitionError(ShareAcknowledgeResponseData.PartitionData partitionData,
+                                      Map&lt;TopicPartition, Metadata.LeaderIdAndEpoch&gt; partitionsWithUpdatedLeaderInfo,
+                                      AcknowledgeRequestState acknowledgeRequestState,
+                                      Errors partitionError,
+                                      TopicIdPartition tip,
+                                      AtomicBoolean shouldRetry,
+                                      boolean isRenewAck,
+                                      Optional&lt;Integer&gt; acquisitionLockTimeoutMs) {
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">        if (partitionError.exception() != null) {</span>
+<span class="nc" id="L1221">            boolean retry = false;</span>
+<span class="nc bnc" id="L1222" title="All 4 branches missed.">            if (partitionError == Errors.NOT_LEADER_OR_FOLLOWER || partitionError == Errors.FENCED_LEADER_EPOCH) {</span>
+                // If the leader has changed, there's no point in retrying the operation because the acquisition locks
+                // will have been released. Instead, these records will be re-delivered once they get timed out on the broker.
+                // If the topic or partition has been deleted, we do not retry the failed acknowledgements.
+<span class="nc" id="L1226">                updateLeaderInfoMap(partitionData, partitionsWithUpdatedLeaderInfo, partitionError, tip);</span>
+<span class="nc bnc" id="L1227" title="All 4 branches missed.">            } else if (partitionError == Errors.UNKNOWN_TOPIC_OR_PARTITION || partitionError == Errors.UNKNOWN_TOPIC_ID) {</span>
+<span class="nc" id="L1228">                shareSessionLeaderMap.remove(tip);</span>
+<span class="nc" id="L1229">                shareSessionTopicIdMap.remove(tip.topicPartition());</span>
+<span class="nc bnc" id="L1230" title="All 2 branches missed.">            } else if (partitionError.exception() instanceof RetriableException) {</span>
+<span class="nc" id="L1231">                retry = true;</span>
+            }
+
+<span class="nc bnc" id="L1234" title="All 2 branches missed.">            if (retry) {</span>
+<span class="nc bnc" id="L1235" title="All 2 branches missed.">                if (acknowledgeRequestState.moveToIncompleteAcks(tip)) {</span>
+<span class="nc" id="L1236">                    shouldRetry.set(true);</span>
+                }
+            } else {
+<span class="nc" id="L1239">                metricsManager.recordFailedAcknowledgements(acknowledgeRequestState.getInFlightAcknowledgementsCount(tip));</span>
+<span class="nc" id="L1240">                acknowledgeRequestState.handleAcknowledgeErrorCode(tip, partitionError, isRenewAck, Optional.empty());</span>
+            }
+<span class="nc" id="L1242">        } else {</span>
+<span class="nc" id="L1243">            acknowledgeRequestState.handleAcknowledgeErrorCode(tip, partitionError, isRenewAck, acquisitionLockTimeoutMs);</span>
+        }
+<span class="nc" id="L1245">    }</span>
+
+    private void processRetryLogic(AcknowledgeRequestState acknowledgeRequestState,
+                                   AtomicBoolean shouldRetry,
+                                   long responseCompletionTimeMs) {
+<span class="nc bnc" id="L1250" title="All 2 branches missed.">        if (shouldRetry.get()) {</span>
+<span class="nc" id="L1251">            acknowledgeRequestState.onFailedAttempt(responseCompletionTimeMs);</span>
+
+            // Check for any acknowledgements that did not receive a response.
+            // These acknowledgements are failed with InvalidRecordStateException.
+<span class="nc" id="L1255">            acknowledgeRequestState.processPendingInFlightAcknowledgements(new InvalidRecordStateException(INVALID_RESPONSE));</span>
+        } else {
+<span class="nc" id="L1257">            acknowledgeRequestState.onSuccessfulAttempt(responseCompletionTimeMs);</span>
+<span class="nc" id="L1258">            acknowledgeRequestState.processingComplete();</span>
+        }
+<span class="nc" id="L1260">    }</span>
+
+    private void updateLeaderInfoMap(ShareAcknowledgeResponseData.PartitionData partitionData,
+                                  Map&lt;TopicPartition, Metadata.LeaderIdAndEpoch&gt; partitionsWithUpdatedLeaderInfo,
+                                  Errors partitionError,
+                                  TopicIdPartition tip) {
+
+<span class="nc" id="L1267">        log.debug(&quot;For {}, received error {}, with leaderIdAndEpoch {} in ShareAcknowledge&quot;, tip, partitionError, partitionData.currentLeader());</span>
+<span class="nc bnc" id="L1268" title="All 4 branches missed.">        if (partitionData.currentLeader().leaderId() != -1 &amp;&amp; partitionData.currentLeader().leaderEpoch() != -1) {</span>
+<span class="nc" id="L1269">            partitionsWithUpdatedLeaderInfo.put(tip.topicPartition(),</span>
+                new Metadata.LeaderIdAndEpoch(
+<span class="nc" id="L1271">                    Optional.of(partitionData.currentLeader().leaderId()),</span>
+<span class="nc" id="L1272">                    Optional.of(partitionData.currentLeader().leaderEpoch())</span>
+                ));
+
+<span class="nc" id="L1275">            maybeUpdateLeaderCache(tip, partitionData.currentLeader().leaderId(), partitionData.currentLeader().leaderEpoch());</span>
+        } else {
+<span class="nc" id="L1277">            shareSessionLeaderMap.remove(tip);</span>
+        }
+<span class="nc" id="L1279">    }</span>
+
+    /**
+     * Update the cache leader for a partition in a share session, only if the new leader epoch is newer than the
+     * currently cached epoch. This mirrors the rules applied by {@link Metadata#updateLastSeenEpochIfNewer(TopicPartition, int)}.
+     * A stale entry is never overwritten by an older epoch.
+     */
+    private void maybeUpdateLeaderCache(TopicIdPartition tip, int leaderId, int leaderEpoch) {
+<span class="nc" id="L1287">        LeaderIdAndEpoch oldLeader = shareSessionLeaderMap.get(tip);</span>
+<span class="nc bnc" id="L1288" title="All 4 branches missed.">        if ((oldLeader == null) || (leaderEpoch &gt; oldLeader.epoch)) {</span>
+<span class="nc" id="L1289">            shareSessionLeaderMap.put(tip, new LeaderIdAndEpoch(leaderId, leaderEpoch));</span>
+        }
+<span class="nc" id="L1291">    }</span>
+
+    /**
+     * Chooses the error used to fail acknowledgements which could not be sent to the node hosting the share session.
+     * If leadership has moved to a different live broker, the error is {@link Errors#NOT_LEADER_OR_FOLLOWER}.
+     * Otherwise, the error is {@link Errors#NETWORK_EXCEPTION}.
+     */
+    private Errors acknowledgementsCannotBeSentError(int nodeId, TopicIdPartition tip) {
+<span class="nc" id="L1299">        LeaderIdAndEpoch leaderAndEpoch = shareSessionLeaderMap.get(tip);</span>
+<span class="nc bnc" id="L1300" title="All 4 branches missed.">        if (leaderAndEpoch != null &amp;&amp; metadata.fetch().nodeById(leaderAndEpoch.leaderId) != null) {</span>
+<span class="nc bnc" id="L1301" title="All 2 branches missed.">            if (leaderAndEpoch.leaderId != nodeId) {</span>
+<span class="nc" id="L1302">                log.debug(&quot;Node {} is no longer the leader for partition {}, failing acknowledgements&quot;, nodeId, tip);</span>
+<span class="nc" id="L1303">                return Errors.NOT_LEADER_OR_FOLLOWER;</span>
+            }
+<span class="nc" id="L1305">            return Errors.NETWORK_EXCEPTION;</span>
+        }
+
+<span class="nc" id="L1308">        Optional&lt;Node&gt; leaderNode = metadata.currentLeader(tip.topicPartition()).leader;</span>
+<span class="nc bnc" id="L1309" title="All 2 branches missed.">        if (leaderNode.isPresent()) {</span>
+<span class="nc bnc" id="L1310" title="All 2 branches missed.">            if (leaderNode.get().id() != nodeId) {</span>
+<span class="nc" id="L1311">                log.debug(&quot;Node {} is no longer the leader for partition {}, failing acknowledgements&quot;, nodeId, tip);</span>
+<span class="nc" id="L1312">                return Errors.NOT_LEADER_OR_FOLLOWER;</span>
+            }
+        } else {
+<span class="nc" id="L1315">            log.debug(&quot;No leader found for partition {}&quot;, tip);</span>
+<span class="nc" id="L1316">            metadata.requestUpdate(false);</span>
+        }
+
+<span class="nc" id="L1319">        return Errors.NETWORK_EXCEPTION;</span>
+    }
+
+    private TopicIdPartition lookupTopicId(Uuid topicId, int partitionIndex) {
+<span class="nc" id="L1323">        String topicName = metadata.topicNames().get(topicId);</span>
+<span class="nc bnc" id="L1324" title="All 2 branches missed.">        if (topicName == null) {</span>
+<span class="nc" id="L1325">            topicName = topicNamesMap.remove(new IdAndPartition(topicId, partitionIndex));</span>
+        }
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">        if (topicName == null) {</span>
+<span class="nc" id="L1328">            log.error(&quot;Topic name not found in metadata for topicId {} and partitionIndex {}&quot;, topicId, partitionIndex);</span>
+<span class="nc" id="L1329">            return null;</span>
+        }
+<span class="nc" id="L1331">        return new TopicIdPartition(topicId, partitionIndex, topicName);</span>
+    }
+
+    private List&lt;TopicPartition&gt; partitionsToFetch() {
+<span class="nc" id="L1335">        return subscriptions.fetchablePartitions(tp -&gt; true);</span>
+    }
+
+    public ShareSessionHandler sessionHandler(int node) {
+<span class="nc" id="L1339">        return sessionHandlers.get(node);</span>
+    }
+
+    boolean hasCompletedFetches() {
+<span class="nc bnc" id="L1343" title="All 2 branches missed.">        return !shareFetchBuffer.isEmpty();</span>
+    }
+
+    protected void closeInternal() {
+<span class="nc" id="L1347">        Utils.closeQuietly(shareFetchBuffer, &quot;shareFetchBuffer&quot;);</span>
+<span class="nc" id="L1348">        Utils.closeQuietly(metricsManager, &quot;shareFetchMetricsManager&quot;);</span>
+<span class="nc" id="L1349">    }</span>
+
+    public void close() {
+<span class="nc" id="L1352">        idempotentCloser.close(this::closeInternal);</span>
+<span class="nc" id="L1353">    }</span>
+
+    @Override
+    public void onMemberEpochUpdated(Optional&lt;Integer&gt; memberEpochOpt, String memberId) {
+<span class="nc" id="L1357">        this.memberId = Uuid.fromString(memberId);</span>
+<span class="nc" id="L1358">    }</span>
+
+    /**
+     * Represents a request to acknowledge delivery that can be retried or aborted.
+     */
+    public class AcknowledgeRequestState extends TimedRequestState {
+
+        /**
+         * The share session handler.
+         */
+        private final ShareSessionHandler sessionHandler;
+
+        /**
+         * The node to send the request to.
+         */
+        private final int nodeId;
+
+        /**
+         * The map of acknowledgements to send
+         */
+        private final Map&lt;TopicIdPartition, Acknowledgements&gt; acknowledgementsToSend;
+
+        /**
+         * The map of acknowledgements to be retried in the next attempt.
+         */
+        private final Map&lt;TopicIdPartition, Acknowledgements&gt; incompleteAcknowledgements;
+
+        /**
+         * The in-flight acknowledgements
+         */
+        private final Map&lt;TopicIdPartition, Acknowledgements&gt; inFlightAcknowledgements;
+
+        /**
+         * This handles completing a future when all results are known.
+         */
+        private final ResultHandler resultHandler;
+
+        /**
+         * Indicates whether this was part of commitAsync, commitSync or close operation.
+         */
+        private final AcknowledgeRequestType requestType;
+
+        /**
+         * Boolean to indicate if the request has been processed.
+         * &lt;p&gt;
+         * Set to true once we process the response and do not retry the request.
+         * &lt;p&gt;
+         * Initialized to false every time we build a request.
+         */
+        private boolean isProcessed;
+
+        /**
+         * Timeout in milliseconds indicating how long the request would be retried if it fails with a retriable exception.
+         */
+        private final long timeoutMs;
+
+        AcknowledgeRequestState(LogContext logContext,
+                                String owner,
+                                long deadlineMs,
+                                long retryBackoffMs,
+                                long retryBackoffMaxMs,
+                                ShareSessionHandler sessionHandler,
+                                int nodeId,
+                                Map&lt;TopicIdPartition, Acknowledgements&gt; acknowledgementsMap,
+                                ResultHandler resultHandler,
+<span class="nc" id="L1423">                                AcknowledgeRequestType acknowledgeRequestType) {</span>
+<span class="nc" id="L1424">            super(logContext, owner, retryBackoffMs, retryBackoffMaxMs, deadlineTimer(time, deadlineMs));</span>
+<span class="nc" id="L1425">            this.sessionHandler = sessionHandler;</span>
+<span class="nc" id="L1426">            this.nodeId = nodeId;</span>
+<span class="nc" id="L1427">            this.acknowledgementsToSend = acknowledgementsMap;</span>
+<span class="nc" id="L1428">            this.resultHandler = resultHandler;</span>
+<span class="nc" id="L1429">            this.inFlightAcknowledgements = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1430">            this.incompleteAcknowledgements = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1431">            this.requestType = acknowledgeRequestType;</span>
+<span class="nc" id="L1432">            this.isProcessed = false;</span>
+<span class="nc" id="L1433">            this.timeoutMs = remainingMs();</span>
+<span class="nc" id="L1434">        }</span>
+
+        UnsentRequest buildRequest() {
+            // If the node is no longer in the cluster metadata, we can never send to it
+<span class="nc" id="L1438">            Node nodeToSend = metadata.fetch().nodeById(nodeId);</span>
+<span class="nc bnc" id="L1439" title="All 2 branches missed.">            if (nodeToSend == null) {</span>
+<span class="nc" id="L1440">                failPendingAcknowledgementsCannotBeSent();</span>
+<span class="nc" id="L1441">                return null;</span>
+            }
+
+            // If this is the closing request, close the share session by setting the final epoch
+<span class="nc bnc" id="L1445" title="All 2 branches missed.">            if (isCloseRequest()) {</span>
+<span class="nc" id="L1446">                sessionHandler.notifyClose();</span>
+            }
+
+<span class="nc" id="L1449">            Map&lt;TopicIdPartition, Acknowledgements&gt; finalAcknowledgementsToSend = new HashMap&lt;&gt;(</span>
+<span class="nc bnc" id="L1450" title="All 2 branches missed.">                incompleteAcknowledgements.isEmpty() ? acknowledgementsToSend : incompleteAcknowledgements);</span>
+
+<span class="nc bnc" id="L1452" title="All 2 branches missed.">            for (Map.Entry&lt;TopicIdPartition, Acknowledgements&gt; entry : finalAcknowledgementsToSend.entrySet()) {</span>
+<span class="nc" id="L1453">                sessionHandler.addPartitionToAcknowledgeOnly(entry.getKey(), entry.getValue());</span>
+<span class="nc" id="L1454">            }</span>
+
+<span class="nc" id="L1456">            ShareAcknowledgeRequest.Builder requestBuilder = sessionHandler.newShareAcknowledgeBuilder(groupId);</span>
+
+<span class="nc" id="L1458">            isProcessed = false;</span>
+
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">            if (requestBuilder == null) {</span>
+<span class="nc" id="L1461">                failPendingAcknowledgementsCannotBeSent();</span>
+<span class="nc" id="L1462">                return null;</span>
+            }
+
+<span class="nc" id="L1465">            nodesWithPendingRequests.add(nodeId);</span>
+
+<span class="nc" id="L1467">            log.trace(&quot;Building acknowledgements to send : {}&quot;, finalAcknowledgementsToSend);</span>
+
+<span class="nc" id="L1469">            inFlightAcknowledgements.putAll(finalAcknowledgementsToSend);</span>
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">            if (incompleteAcknowledgements.isEmpty()) {</span>
+<span class="nc" id="L1471">                acknowledgementsToSend.clear();</span>
+            } else {
+<span class="nc" id="L1473">                incompleteAcknowledgements.clear();</span>
+            }
+
+<span class="nc" id="L1476">            UnsentRequest unsentRequest = new UnsentRequest(requestBuilder, Optional.of(nodeToSend));</span>
+<span class="nc" id="L1477">            BiConsumer&lt;ClientResponse, Throwable&gt; responseHandler = (clientResponse, error) -&gt; {</span>
+<span class="nc bnc" id="L1478" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L1479">                    handleShareAcknowledgeFailure(nodeToSend, requestBuilder.data(), this, error, unsentRequest.handler().completionTimeMs());</span>
+                } else {
+<span class="nc" id="L1481">                    handleShareAcknowledgeSuccess(nodeToSend, requestBuilder.data(), this, clientResponse, unsentRequest.handler().completionTimeMs());</span>
+                }
+<span class="nc" id="L1483">            };</span>
+<span class="nc" id="L1484">            return unsentRequest.whenComplete(responseHandler);</span>
+        }
+
+        int getInFlightAcknowledgementsCount(TopicIdPartition tip) {
+<span class="nc" id="L1488">            Acknowledgements acks = inFlightAcknowledgements.get(tip);</span>
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">            if (acks == null) {</span>
+<span class="nc" id="L1490">                return 0;</span>
+            } else {
+<span class="nc" id="L1492">                return acks.size();</span>
+            }
+        }
+
+        int getIncompleteAcknowledgementsCount(TopicIdPartition tip) {
+<span class="nc" id="L1497">            Acknowledgements acks = incompleteAcknowledgements.get(tip);</span>
+<span class="nc bnc" id="L1498" title="All 2 branches missed.">            if (acks == null) {</span>
+<span class="nc" id="L1499">                return 0;</span>
+            } else {
+<span class="nc" id="L1501">                return acks.size();</span>
+            }
+        }
+
+        int getAcknowledgementsToSendCount(TopicIdPartition tip) {
+<span class="nc" id="L1506">            Acknowledgements acks = acknowledgementsToSend.get(tip);</span>
+<span class="nc bnc" id="L1507" title="All 2 branches missed.">            if (acks == null) {</span>
+<span class="nc" id="L1508">                return 0;</span>
+            } else {
+<span class="nc" id="L1510">                return acks.size();</span>
+            }
+        }
+
+        boolean isEmpty() {
+<span class="nc bnc" id="L1515" title="All 2 branches missed.">            return acknowledgementsToSend.isEmpty() &amp;&amp;</span>
+<span class="nc bnc" id="L1516" title="All 2 branches missed.">                incompleteAcknowledgements.isEmpty() &amp;&amp;</span>
+<span class="nc bnc" id="L1517" title="All 2 branches missed.">                inFlightAcknowledgements.isEmpty();</span>
+        }
+
+        /**
+         * Resets the timer with the configured timeout and resets the RequestState.
+         * This is only applicable for commitAsync() requests as these states could be re-used.
+         */
+        void maybeResetTimerAndRequestState() {
+<span class="nc bnc" id="L1525" title="All 2 branches missed.">            if (requestType == AcknowledgeRequestType.COMMIT_ASYNC) {</span>
+<span class="nc" id="L1526">                resetTimeout(timeoutMs);</span>
+<span class="nc" id="L1527">                reset();</span>
+            }
+<span class="nc" id="L1529">        }</span>
+
+        /**
+         * Sets the error code in the acknowledgements and sends the response
+         * through a background event.
+         */
+        void handleAcknowledgeErrorCode(TopicIdPartition tip, Errors acknowledgeErrorCode, boolean checkForRenewAcknowledgements, Optional&lt;Integer&gt; acquisitionLockTimeoutMs) {
+<span class="nc" id="L1536">            Acknowledgements acks = inFlightAcknowledgements.remove(tip);</span>
+<span class="nc bnc" id="L1537" title="All 2 branches missed.">            if (acks != null) {</span>
+<span class="nc" id="L1538">                acks.complete(acknowledgeErrorCode.exception());</span>
+<span class="nc" id="L1539">                resultHandler.complete(tip, acks, requestType, checkForRenewAcknowledgements, acquisitionLockTimeoutMs);</span>
+            } else {
+<span class="nc" id="L1541">                log.error(&quot;Invalid partition {} received in ShareAcknowledge response&quot;, tip);</span>
+            }
+<span class="nc" id="L1543">        }</span>
+
+        /**
+         * Sets the error code for the acknowledgements which were timed out
+         * after some retries.
+         */
+        void handleAcknowledgeTimedOut(TopicIdPartition tip) {
+<span class="nc" id="L1550">            Acknowledgements acks = incompleteAcknowledgements.get(tip);</span>
+<span class="nc bnc" id="L1551" title="All 2 branches missed.">            if (acks != null) {</span>
+<span class="nc" id="L1552">                acks.complete(Errors.REQUEST_TIMED_OUT.exception());</span>
+                // We do not know whether this is a renew ack, but handling the error as if it were, will ensure
+                // that we do not leave dangling acknowledgements
+<span class="nc" id="L1555">                resultHandler.complete(tip, acks, requestType, true, Optional.empty());</span>
+            }
+<span class="nc" id="L1557">        }</span>
+
+        /**
+         * Fail all remaining acknowledgements when they cannot be sent. This can happen when network connectivity
+         * is lost with the leader and the share session is lost, they are failed with {@link Errors#NETWORK_EXCEPTION}.
+         * If the leader has moved to a different live broker, they are failed with {@link Errors#NOT_LEADER_OR_FOLLOWER}.
+         */
+        void failPendingAcknowledgementsCannotBeSent() {
+            Map&lt;TopicIdPartition, Acknowledgements&gt; acknowledgementsMapToClear =
+<span class="nc bnc" id="L1566" title="All 2 branches missed.">                incompleteAcknowledgements.isEmpty() ? acknowledgementsToSend : incompleteAcknowledgements;</span>
+
+<span class="nc" id="L1568">            acknowledgementsMapToClear.forEach((tip, acks) -&gt; {</span>
+<span class="nc bnc" id="L1569" title="All 2 branches missed.">                if (acks != null) {</span>
+<span class="nc" id="L1570">                    acks.complete(acknowledgementsCannotBeSentError(nodeId, tip).exception());</span>
+                }
+                // We do not know whether this is a renew ack, but handling the error as if it were, will ensure
+                // that we do not leave dangling acknowledgements
+<span class="nc" id="L1574">                resultHandler.complete(tip, acks, requestType, true, Optional.empty());</span>
+<span class="nc" id="L1575">            });</span>
+<span class="nc" id="L1576">            acknowledgementsMapToClear.clear();</span>
+<span class="nc" id="L1577">            processingComplete();</span>
+<span class="nc" id="L1578">        }</span>
+
+        ShareSessionHandler sessionHandler() {
+<span class="nc" id="L1581">            return sessionHandler;</span>
+        }
+
+        void processingComplete() {
+            // If there are any pending inFlightAcknowledgements after processing the response, we fail them with an InvalidRecordStateException.
+<span class="nc" id="L1586">            processPendingInFlightAcknowledgements(new InvalidRecordStateException(INVALID_RESPONSE));</span>
+<span class="nc" id="L1587">            resultHandler.completeIfEmpty();</span>
+<span class="nc" id="L1588">            isProcessed = true;</span>
+<span class="nc" id="L1589">            maybeResetTimerAndRequestState();</span>
+<span class="nc" id="L1590">        }</span>
+
+        /**
+         * Fail any existing in-flight acknowledgements with the given exception and clear the map.
+         * We also send a background event to update {@link org.apache.kafka.clients.consumer.AcknowledgementCommitCallback }
+         */
+        private void processPendingInFlightAcknowledgements(KafkaException exception) {
+<span class="nc bnc" id="L1597" title="All 2 branches missed.">            if (!inFlightAcknowledgements.isEmpty()) {</span>
+<span class="nc" id="L1598">                inFlightAcknowledgements.forEach((partition, acknowledgements) -&gt; {</span>
+<span class="nc" id="L1599">                    acknowledgements.complete(exception);</span>
+                    // We do not know whether this is a renew ack, but handling the error as if it were, will ensure
+                    // that we do not leave dangling acknowledgements
+<span class="nc" id="L1602">                    resultHandler.complete(partition, acknowledgements, requestType, true, Optional.empty());</span>
+<span class="nc" id="L1603">                });</span>
+<span class="nc" id="L1604">                inFlightAcknowledgements.clear();</span>
+            }
+<span class="nc" id="L1606">        }</span>
+
+        /**
+         * Moves all the in-flight acknowledgements to incomplete acknowledgements to retry
+         * in the next request.
+         */
+        void moveAllToIncompleteAcks() {
+<span class="nc" id="L1613">            incompleteAcknowledgements.putAll(inFlightAcknowledgements);</span>
+<span class="nc" id="L1614">            inFlightAcknowledgements.clear();</span>
+<span class="nc" id="L1615">        }</span>
+
+        boolean maybeExpire() {
+<span class="nc bnc" id="L1618" title="All 4 branches missed.">            return numAttempts &gt; 0 &amp;&amp; isExpired();</span>
+        }
+
+        /**
+         * Moves the in-flight acknowledgements for a given partition to incomplete acknowledgements to retry
+         * in the next request.
+         *
+         * @param tip The TopicIdPartition for which we move the acknowledgements.
+         * @return True if the partition was sent in the request.
+         * &lt;p&gt; False if the partition was not part of the request, we log an error and ignore such partitions. &lt;/p&gt;
+         */
+        public boolean moveToIncompleteAcks(TopicIdPartition tip) {
+<span class="nc" id="L1630">            Acknowledgements acks = inFlightAcknowledgements.remove(tip);</span>
+<span class="nc bnc" id="L1631" title="All 2 branches missed.">            if (acks != null) {</span>
+<span class="nc" id="L1632">                incompleteAcknowledgements.put(tip, acks);</span>
+<span class="nc" id="L1633">                return true;</span>
+            } else {
+<span class="nc" id="L1635">                log.error(&quot;Invalid partition {} received in ShareAcknowledge response&quot;, tip);</span>
+<span class="nc" id="L1636">                return false;</span>
+            }
+        }
+
+        public boolean isCloseRequest() {
+<span class="nc bnc" id="L1641" title="All 2 branches missed.">            return requestType == AcknowledgeRequestType.CLOSE;</span>
+        }
+    }
+
+    /**
+     * Sends a ShareAcknowledgementEvent event to the application when it is done
+     * processing all the remaining acknowledgement request states.
+     * Also manages completing the future for synchronous acknowledgement commit by counting
+     * down the results as they are known and completing the future at the end.
+     */
+    class ResultHandler {
+        private final Map&lt;TopicIdPartition, Acknowledgements&gt; result;
+        private final AtomicInteger remainingResults;
+        private final Optional&lt;CompletableFuture&lt;Map&lt;TopicIdPartition, Acknowledgements&gt;&gt;&gt; future;
+
+        ResultHandler(final Optional&lt;CompletableFuture&lt;Map&lt;TopicIdPartition, Acknowledgements&gt;&gt;&gt; future) {
+<span class="nc" id="L1657">            this(null, future);</span>
+<span class="nc" id="L1658">        }</span>
+
+        ResultHandler(final AtomicInteger remainingResults,
+<span class="nc" id="L1661">                      final Optional&lt;CompletableFuture&lt;Map&lt;TopicIdPartition, Acknowledgements&gt;&gt;&gt; future) {</span>
+<span class="nc" id="L1662">            result = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1663">            this.remainingResults = remainingResults;</span>
+<span class="nc" id="L1664">            this.future = future;</span>
+<span class="nc" id="L1665">        }</span>
+
+        /**
+         * Handle the result of a ShareAcknowledge request sent to one or more nodes and
+         * signal the completion when all results are known.
+         */
+        public void complete(TopicIdPartition partition, Acknowledgements acknowledgements, AcknowledgeRequestType type, boolean checkForRenewAcknowledgements, Optional&lt;Integer&gt; acquisitionLockTimeoutMs) {
+<span class="nc bnc" id="L1672" title="All 2 branches missed.">            if (type.equals(AcknowledgeRequestType.COMMIT_ASYNC)) {</span>
+<span class="nc bnc" id="L1673" title="All 2 branches missed.">                if (acknowledgements != null) {</span>
+<span class="nc" id="L1674">                    maybeSendShareAcknowledgementEvent(Map.of(partition, acknowledgements), checkForRenewAcknowledgements, acquisitionLockTimeoutMs);</span>
+                }
+            } else {
+<span class="nc bnc" id="L1677" title="All 2 branches missed.">                if (acknowledgements != null) {</span>
+<span class="nc" id="L1678">                    result.put(partition, acknowledgements);</span>
+                }
+<span class="nc bnc" id="L1680" title="All 4 branches missed.">                if (remainingResults != null &amp;&amp; remainingResults.decrementAndGet() == 0) {</span>
+<span class="nc" id="L1681">                    maybeSendShareAcknowledgementEvent(result, checkForRenewAcknowledgements, acquisitionLockTimeoutMs);</span>
+<span class="nc" id="L1682">                    future.ifPresent(future -&gt; future.complete(result));</span>
+                }
+            }
+<span class="nc" id="L1685">        }</span>
+
+        /**
+         * Handles the case where there are no results pending after initialization.
+         */
+        public void completeIfEmpty() {
+<span class="nc bnc" id="L1691" title="All 4 branches missed.">            if (remainingResults != null &amp;&amp; remainingResults.get() == 0) {</span>
+<span class="nc" id="L1692">                future.ifPresent(future -&gt; future.complete(result));</span>
+            }
+<span class="nc" id="L1694">        }</span>
+    }
+
+    static class Tuple&lt;V&gt; {
+        private V asyncRequest;
+        private Queue&lt;V&gt; syncRequestQueue;
+        private V closeRequest;
+
+<span class="nc" id="L1702">        public Tuple(V asyncRequest, Queue&lt;V&gt; syncRequestQueue, V closeRequest) {</span>
+<span class="nc" id="L1703">            this.asyncRequest = asyncRequest;</span>
+<span class="nc" id="L1704">            this.syncRequestQueue = syncRequestQueue;</span>
+<span class="nc" id="L1705">            this.closeRequest = closeRequest;</span>
+<span class="nc" id="L1706">        }</span>
+
+        public void setAsyncRequest(V asyncRequest) {
+<span class="nc" id="L1709">            this.asyncRequest = asyncRequest;</span>
+<span class="nc" id="L1710">        }</span>
+
+        public void nullifySyncRequestQueue() {
+<span class="nc" id="L1713">            this.syncRequestQueue = null;</span>
+<span class="nc" id="L1714">        }</span>
+
+        public void addSyncRequest(V syncRequest) {
+<span class="nc bnc" id="L1717" title="All 2 branches missed.">            if (syncRequestQueue == null) {</span>
+<span class="nc" id="L1718">                syncRequestQueue = new LinkedList&lt;&gt;();</span>
+            }
+<span class="nc" id="L1720">            this.syncRequestQueue.add(syncRequest);</span>
+<span class="nc" id="L1721">        }</span>
+
+        public void setCloseRequest(V closeRequest) {
+<span class="nc" id="L1724">            this.closeRequest = closeRequest;</span>
+<span class="nc" id="L1725">        }</span>
+
+        public V getAsyncRequest() {
+<span class="nc" id="L1728">            return asyncRequest;</span>
+        }
+
+        public Queue&lt;V&gt; getSyncRequestQueue() {
+<span class="nc" id="L1732">            return syncRequestQueue;</span>
+        }
+
+        public V getCloseRequest() {
+<span class="nc" id="L1736">            return closeRequest;</span>
+        }
+    }
+
+    Tuple&lt;AcknowledgeRequestState&gt; requestStates(int nodeId) {
+<span class="nc" id="L1741">        return acknowledgeRequestStates.get(nodeId);</span>
+    }
+
+    int shareSessionNodeId(TopicIdPartition tip) {
+<span class="nc" id="L1745">        LeaderIdAndEpoch leader = shareSessionLeaderMap.get(tip);</span>
+<span class="nc bnc" id="L1746" title="All 2 branches missed.">        return leader == null ? -1 : leader.leaderId;</span>
+    }
+
+    static class IdAndPartition {
+        private final Uuid topicId;
+        private final int partitionIndex;
+
+<span class="nc" id="L1753">        IdAndPartition(Uuid topicId, int partitionIndex) {</span>
+<span class="nc" id="L1754">            this.topicId = topicId;</span>
+<span class="nc" id="L1755">            this.partitionIndex = partitionIndex;</span>
+<span class="nc" id="L1756">        }</span>
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L1760">            return Objects.hash(topicId, partitionIndex);</span>
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L1765" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L1766" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L1767">            IdAndPartition that = (IdAndPartition) o;</span>
+<span class="nc bnc" id="L1768" title="All 4 branches missed.">            return Objects.equals(topicId, that.topicId) &amp;&amp;</span>
+                partitionIndex == that.partitionIndex;
+        }
+    }
+
+    static class LeaderIdAndEpoch {
+        private final int leaderId;
+        private final int epoch;
+
+<span class="nc" id="L1777">        LeaderIdAndEpoch(int leaderId, int epoch) {</span>
+<span class="nc" id="L1778">            this.leaderId = leaderId;</span>
+<span class="nc" id="L1779">            this.epoch = epoch;</span>
+<span class="nc" id="L1780">        }</span>
+    }
+
+<span class="nc" id="L1783">    public enum AcknowledgeRequestType {</span>
+<span class="nc" id="L1784">        COMMIT_ASYNC((byte) 0),</span>
+<span class="nc" id="L1785">        COMMIT_SYNC((byte) 1),</span>
+<span class="nc" id="L1786">        CLOSE((byte) 2);</span>
+
+        public final byte id;
+
+<span class="nc" id="L1790">        AcknowledgeRequestType(byte id) {</span>
+<span class="nc" id="L1791">            this.id = id;</span>
+<span class="nc" id="L1792">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1796">            return super.toString().toLowerCase(Locale.ROOT);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

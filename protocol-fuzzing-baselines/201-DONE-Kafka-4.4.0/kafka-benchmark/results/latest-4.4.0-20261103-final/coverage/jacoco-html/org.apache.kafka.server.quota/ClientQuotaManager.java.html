@@ -1,0 +1,893 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClientQuotaManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.quota</a> &gt; <span class="el_source">ClientQuotaManager.java</span></div><h1>ClientQuotaManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server.quota;
+
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Quota;
+import org.apache.kafka.common.metrics.QuotaViolationException;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.CumulativeSum;
+import org.apache.kafka.common.metrics.stats.Rate;
+import org.apache.kafka.common.security.auth.KafkaPrincipal;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.Sanitizer;
+import org.apache.kafka.network.Session;
+import org.apache.kafka.server.config.ClientQuotaManagerConfig;
+import org.apache.kafka.server.util.ShutdownableThread;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.DelayQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Consumer;
+
+public class ClientQuotaManager {
+
+    public static final int NO_QUOTAS = 0;
+    public static final int CLIENT_ID_QUOTA_ENABLED = 1;
+    public static final int USER_QUOTA_ENABLED = 2;
+    public static final int USER_CLIENT_ID_QUOTA_ENABLED = 4;
+    public static final int CUSTOM_QUOTAS = 8; // No metric update optimizations are used with custom quotas
+
+<span class="nc" id="L58">    private static final Logger LOG = LoggerFactory.getLogger(ClientQuotaManager.class);</span>
+<span class="nc" id="L59">    private final ConcurrentHashMap&lt;Integer, Integer&gt; activeQuotaEntities = new ConcurrentHashMap&lt;&gt;();</span>
+
+    // Purge sensors after 1 hour of inactivity
+    private static final int INACTIVE_SENSOR_EXPIRATION_TIME_SECONDS = 3600;
+    private static final String DEFAULT_NAME = &quot;&lt;default&gt;&quot;;
+
+<span class="nc" id="L65">    public record UserEntity(String sanitizedUser) implements ClientQuotaEntity.ConfigEntity {</span>
+
+        @Override
+        public ClientQuotaEntity.ConfigEntityType entityType() {
+<span class="nc" id="L69">            return ClientQuotaEntity.ConfigEntityType.USER;</span>
+        }
+
+        @Override
+        public String name() {
+<span class="nc" id="L74">            return Sanitizer.desanitize(sanitizedUser);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L79">            return &quot;user &quot; + sanitizedUser;</span>
+        }
+    }
+<span class="nc" id="L82">    public record ClientIdEntity(String clientId) implements ClientQuotaEntity.ConfigEntity {</span>
+
+        @Override
+        public ClientQuotaEntity.ConfigEntityType entityType() {
+<span class="nc" id="L86">            return ClientQuotaEntity.ConfigEntityType.CLIENT_ID;</span>
+        }
+
+        @Override
+        public String name() {
+<span class="nc" id="L91">            return clientId;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L96">            return &quot;client-id &quot; + clientId;</span>
+        }
+    }
+
+<span class="nc" id="L100">    public static final ClientQuotaEntity.ConfigEntity DEFAULT_USER_ENTITY = new ClientQuotaEntity.ConfigEntity() {</span>
+        @Override
+        public ClientQuotaEntity.ConfigEntityType entityType() {
+<span class="nc" id="L103">            return ClientQuotaEntity.ConfigEntityType.DEFAULT_USER;</span>
+        }
+
+        @Override
+        public String name() {
+<span class="nc" id="L108">            return DEFAULT_NAME;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L113">            return &quot;default user&quot;;</span>
+        }
+    };
+
+<span class="nc" id="L117">    public static final ClientQuotaEntity.ConfigEntity DEFAULT_USER_CLIENT_ID = new ClientQuotaEntity.ConfigEntity() {</span>
+        @Override
+        public ClientQuotaEntity.ConfigEntityType entityType() {
+<span class="nc" id="L120">            return ClientQuotaEntity.ConfigEntityType.DEFAULT_CLIENT_ID;</span>
+        }
+        @Override
+        public String name() {
+<span class="nc" id="L124">            return DEFAULT_NAME;</span>
+        }
+        @Override
+        public String toString() {
+<span class="nc" id="L128">            return &quot;default client-id&quot;;</span>
+        }
+    };
+
+<span class="nc" id="L132">    private static final KafkaQuotaEntity DEFAULT_CLIENT_ID_QUOTA_ENTITY =</span>
+            new KafkaQuotaEntity(null, DEFAULT_USER_CLIENT_ID);
+<span class="nc" id="L134">    private static final KafkaQuotaEntity DEFAULT_USER_QUOTA_ENTITY =</span>
+            new KafkaQuotaEntity(DEFAULT_USER_ENTITY, null);
+<span class="nc" id="L136">    private static final KafkaQuotaEntity DEFAULT_USER_CLIENT_ID_QUOTA_ENTITY =</span>
+            new KafkaQuotaEntity(DEFAULT_USER_ENTITY, DEFAULT_USER_CLIENT_ID);
+
+<span class="nc" id="L139">    public record KafkaQuotaEntity(ClientQuotaEntity.ConfigEntity userEntity,</span>
+                                   ClientQuotaEntity.ConfigEntity clientIdEntity) implements ClientQuotaEntity {
+
+        @Override
+        public List&lt;ConfigEntity&gt; configEntities() {
+<span class="nc" id="L144">            List&lt;ClientQuotaEntity.ConfigEntity&gt; entities = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">            if (userEntity != null) {</span>
+<span class="nc" id="L146">                entities.add(userEntity);</span>
+            }
+<span class="nc bnc" id="L148" title="All 2 branches missed.">            if (clientIdEntity != null) {</span>
+<span class="nc" id="L149">                entities.add(clientIdEntity);</span>
+            }
+<span class="nc" id="L151">            return entities;</span>
+        }
+
+        public String sanitizedUser() {
+<span class="nc bnc" id="L155" title="All 2 branches missed.">            if (userEntity instanceof UserEntity userRecord) {</span>
+<span class="nc" id="L156">                return userRecord.sanitizedUser();</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">            } else if (userEntity == DEFAULT_USER_ENTITY) {</span>
+<span class="nc" id="L158">                return DEFAULT_NAME;</span>
+            }
+<span class="nc" id="L160">            return &quot;&quot;;</span>
+        }
+
+        public String clientId() {
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            return clientIdEntity != null ? clientIdEntity.name() : &quot;&quot;;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">            String user = userEntity != null ? userEntity.toString() : &quot;&quot;;</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            String clientId = clientIdEntity != null ? clientIdEntity.toString() : &quot;&quot;;</span>
+<span class="nc" id="L171">            return (user + &quot; &quot; + clientId).trim();</span>
+        }
+    }
+
+    public static final String USER_TAG = &quot;user&quot;;
+    public static final String CLIENT_ID_TAG = &quot;client-id&quot;;
+
+    private final ClientQuotaManagerConfig config;
+    protected final Metrics metrics;
+    private final QuotaType quotaType;
+    protected final Time time;
+
+<span class="nc" id="L183">    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();</span>
+    private final SensorAccess sensorAccessor;
+    private final ClientQuotaCallback quotaCallback;
+    private final ClientQuotaType clientQuotaType;
+
+    private volatile int quotaTypesEnabled;
+
+    public int quotaTypesEnabled() {
+<span class="nc" id="L191">        return quotaTypesEnabled;</span>
+    }
+
+    private final Sensor delayQueueSensor;
+<span class="nc" id="L195">    private final DelayQueue&lt;ThrottledChannel&gt; delayQueue = new DelayQueue&lt;&gt;();</span>
+    private final ThrottledChannelReaper throttledChannelReaper;
+
+    public void processThrottledChannelReaperDoWork() {
+<span class="nc" id="L199">        throttledChannelReaper.doWork();</span>
+<span class="nc" id="L200">    }</span>
+
+    /**
+     * Helper class that records per-client metrics. It is also responsible for maintaining Quota usage statistics
+     * for all clients.
+     * &lt;p&gt;
+     * Quotas can be set at {@code &lt;user, client-id&gt;}, user or client-id levels. For a given client connection,
+     * the most specific quota matching the connection will be applied. For example, if both a
+     * {@code &lt;user, client-id&gt;} and a user quota match a connection, the {@code &lt;user, client-id&gt;} quota will be
+     * used. Otherwise, user quota takes precedence over client-id quota. The order of precedence is:
+     * &lt;ul&gt;
+     *   &lt;li&gt;{@code /config/users/&lt;user&gt;/clients/&lt;client-id&gt;}&lt;/li&gt;
+     *   &lt;li&gt;{@code /config/users/&lt;user&gt;/clients/&lt;default&gt;}&lt;/li&gt;
+     *   &lt;li&gt;{@code /config/users/&lt;user&gt;}&lt;/li&gt;
+     *   &lt;li&gt;{@code /config/users/&lt;default&gt;/clients/&lt;client-id&gt;}&lt;/li&gt;
+     *   &lt;li&gt;{@code /config/users/&lt;default&gt;/clients/&lt;default&gt;}&lt;/li&gt;
+     *   &lt;li&gt;{@code /config/users/&lt;default&gt;}&lt;/li&gt;
+     *   &lt;li&gt;{@code /config/clients/&lt;client-id&gt;}&lt;/li&gt;
+     *   &lt;li&gt;{@code /config/clients/&lt;default&gt;}&lt;/li&gt;
+     * &lt;/ul&gt;
+     * Quota limits including defaults may be updated dynamically. The implementation is optimized for the case
+     * where a single level of quotas is configured.
+     * @param config the ClientQuotaManagerConfig containing quota configurations
+     * @param metrics the Metrics instance for recording quota-related metrics
+     * @param quotaType the quota type managed by this quota manager
+     * @param time the Time object used for time-based operations
+     * @param threadNamePrefix the thread name prefix used for internal threads
+     * @param clientQuotaCallbackPlugin optional Plugin containing a ClientQuotaCallback for custom quota logic
+     */
+    public ClientQuotaManager(ClientQuotaManagerConfig config,
+                              Metrics metrics,
+                              QuotaType quotaType,
+                              Time time,
+                              String threadNamePrefix,
+<span class="nc" id="L234">                              Optional&lt;Plugin&lt;ClientQuotaCallback&gt;&gt; clientQuotaCallbackPlugin) {</span>
+<span class="nc" id="L235">        this.config = config;</span>
+<span class="nc" id="L236">        this.metrics = metrics;</span>
+<span class="nc" id="L237">        this.quotaType = quotaType;</span>
+<span class="nc" id="L238">        this.time = time;</span>
+<span class="nc" id="L239">        this.sensorAccessor = new SensorAccess(lock, metrics);</span>
+<span class="nc" id="L240">        this.clientQuotaType = QuotaType.toClientQuotaType(quotaType);</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">        this.quotaTypesEnabled = clientQuotaCallbackPlugin.isPresent() ?</span>
+<span class="nc" id="L242">                CUSTOM_QUOTAS : NO_QUOTAS;</span>
+<span class="nc" id="L243">        this.delayQueueSensor = metrics.sensor(quotaType + &quot;-delayQueue&quot;);</span>
+<span class="nc" id="L244">        this.delayQueueSensor.add(metrics.metricName(&quot;queue-size&quot;, quotaType.toString(),</span>
+                &quot;Tracks the size of the delay queue&quot;), new CumulativeSum());
+<span class="nc" id="L246">        this.throttledChannelReaper = new ThrottledChannelReaper(delayQueue, threadNamePrefix);</span>
+<span class="nc" id="L247">        this.quotaCallback = clientQuotaCallbackPlugin</span>
+<span class="nc" id="L248">                .map(Plugin::get)</span>
+<span class="nc" id="L249">                .orElse(new DefaultQuotaCallback());</span>
+
+<span class="nc" id="L251">        start(); // Extract thread start to separate method to avoid SC_START_IN_CTOR warning</span>
+<span class="nc" id="L252">    }</span>
+
+    public ClientQuotaManager(ClientQuotaManagerConfig config,
+                              Metrics metrics,
+                              QuotaType quotaType,
+                              Time time,
+                              String threadNamePrefix) {
+<span class="nc" id="L259">        this(config, metrics, quotaType, time, threadNamePrefix, Optional.empty());</span>
+<span class="nc" id="L260">    }</span>
+
+    protected Metrics metrics() {
+<span class="nc" id="L263">        return metrics;</span>
+    }
+    protected Time time() {
+<span class="nc" id="L266">        return time;</span>
+    }
+
+    private void start() {
+<span class="nc" id="L270">        throttledChannelReaper.start();</span>
+<span class="nc" id="L271">    }</span>
+
+    /**
+     * Reaper thread that triggers channel unmute callbacks on all throttled channels
+     */
+    public class ThrottledChannelReaper extends ShutdownableThread {
+        private final DelayQueue&lt;ThrottledChannel&gt; delayQueue;
+
+<span class="nc" id="L279">        public ThrottledChannelReaper(DelayQueue&lt;ThrottledChannel&gt; delayQueue, String prefix) {</span>
+<span class="nc" id="L280">            super(prefix + &quot;ThrottledChannelReaper-&quot; + quotaType, false);</span>
+<span class="nc" id="L281">            this.delayQueue = delayQueue;</span>
+<span class="nc" id="L282">        }</span>
+
+        @Override
+        public void doWork() {
+            ThrottledChannel throttledChannel;
+            try {
+<span class="nc" id="L288">                throttledChannel = delayQueue.poll(1, TimeUnit.SECONDS);</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">                if (throttledChannel != null) {</span>
+                    // Decrement the size of the delay queue
+<span class="nc" id="L291">                    delayQueueSensor.record(-1);</span>
+                    // Notify the socket server that throttling is done for this channel
+<span class="nc" id="L293">                    throttledChannel.notifyThrottlingDone();</span>
+                }
+<span class="nc" id="L295">            } catch (InterruptedException e) {</span>
+                // Ignore and continue
+<span class="nc" id="L297">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L298">            }</span>
+<span class="nc" id="L299">        }</span>
+    }
+
+    /**
+     * Returns true if any quotas are enabled for this quota manager. This is used
+     * to determine if quota-related metrics should be created.
+     */
+    public boolean quotasEnabled() {
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        return quotaTypesEnabled != NO_QUOTAS;</span>
+    }
+
+    /**
+     * See recordAndGetThrottleTimeMs.
+     */
+    public int maybeRecordAndGetThrottleTimeMs(Session session, String clientId, double value, long timeMs) {
+        // Record metrics only if quotas are enabled.
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        if (quotasEnabled()) {</span>
+<span class="nc" id="L316">            return recordAndGetThrottleTimeMs(session, clientId, value, timeMs);</span>
+        } else {
+<span class="nc" id="L318">            return 0;</span>
+        }
+    }
+
+    /**
+     * Records that a user/clientId accumulated or would like to accumulate the provided amount at the
+     * specified time, returns throttle time in milliseconds.
+     *
+     * @param session The session from which the user is extracted
+     * @param clientId The client id
+     * @param value The value to accumulate
+     * @param timeMs The time at which to accumulate the value
+     * @return The throttle time in milliseconds defines as the time to wait until the average
+     *         rate gets back to the defined quota
+     */
+    public int recordAndGetThrottleTimeMs(Session session, String clientId, double value, long timeMs) {
+<span class="nc" id="L334">        var clientSensors = getOrCreateQuotaSensors(session, clientId);</span>
+        try {
+<span class="nc" id="L336">            clientSensors.quotaSensor().record(value, timeMs, true);</span>
+<span class="nc" id="L337">            return 0;</span>
+<span class="nc" id="L338">        } catch (QuotaViolationException e) {</span>
+<span class="nc" id="L339">            var throttleTimeMs = (int) Math.min(throttleTime(e, timeMs), Integer.MAX_VALUE);</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            if (LOG.isDebugEnabled()) {</span>
+<span class="nc" id="L341">                LOG.debug(&quot;Quota violated for sensor ({}). Delay time: ({})&quot;,</span>
+<span class="nc" id="L342">                        clientSensors.quotaSensor().name(), throttleTimeMs);</span>
+            }
+<span class="nc" id="L344">            return throttleTimeMs;</span>
+        }
+    }
+
+    /**
+     * Records that a user/clientId changed some metric being throttled without checking for
+     * quota violation. The aggregate value will subsequently be used for throttling when the
+     * next request is processed.
+     */
+    public void recordNoThrottle(Session session, String clientId, double value) {
+<span class="nc" id="L354">        var clientSensors = getOrCreateQuotaSensors(session, clientId);</span>
+<span class="nc" id="L355">        clientSensors.quotaSensor().record(value, time.milliseconds(), false);</span>
+<span class="nc" id="L356">    }</span>
+
+    /**
+     * &quot;Unrecord&quot; the given value that has already been recorded for the given user/client by recording a negative value
+     * of the same quantity.
+     * For a throttled fetch, the broker should return an empty response and thus should not record the value. Ideally,
+     * we would like to compute the throttle time before actually recording the value, but the current Sensor code
+     * couples value recording and quota checking very tightly. As a workaround, we will unrecord the value for the fetch
+     * in case of throttling. Rate keeps the sum of values that fall in each time window, so this should bring the
+     * overall sum back to the previous value.
+     */
+    public void unrecordQuotaSensor(Session session, String clientId, double value, long timeMs) {
+<span class="nc" id="L368">        var clientSensors = getOrCreateQuotaSensors(session, clientId);</span>
+<span class="nc" id="L369">        clientSensors.quotaSensor().record(value * -1, timeMs, false);</span>
+<span class="nc" id="L370">    }</span>
+
+    /**
+     * Returns the maximum value that could be recorded without guaranteed throttling.
+     * Recording any larger value will always be throttled, even if no other values were recorded in the quota window.
+     * This is used for deciding the maximum bytes that can be fetched at once
+     */
+    public double maxValueInQuotaWindow(Session session, String clientId) {
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        if (!quotasEnabled()) return Double.MAX_VALUE;</span>
+<span class="nc" id="L379">        var clientSensors = getOrCreateQuotaSensors(session, clientId);</span>
+<span class="nc" id="L380">        var limit = quotaCallback.quotaLimit(clientQuotaType, clientSensors.metricTags());</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (limit != null) return limit * (config.numQuotaSamples() - 1) * config.quotaWindowSizeSeconds();</span>
+<span class="nc" id="L382">        return Double.MAX_VALUE;</span>
+    }
+
+    /**
+     * Throttle a client by muting the associated channel for the given throttle time.
+     * @param clientId request client id
+     * @param session request session
+     * @param throttleTimeMs Duration in milliseconds for which the channel is to be muted.
+     * @param throttleCallback Callback for channel throttling
+     */
+    public void throttle(
+            String clientId,
+            Session session,
+            ThrottleCallback throttleCallback,
+            int throttleTimeMs
+    ) {
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (throttleTimeMs &gt; 0) {</span>
+<span class="nc" id="L399">            var clientSensors = getOrCreateQuotaSensors(session, clientId);</span>
+<span class="nc" id="L400">            clientSensors.throttleTimeSensor().record(throttleTimeMs);</span>
+<span class="nc" id="L401">            var throttledChannel = new ThrottledChannel(time, throttleTimeMs, throttleCallback);</span>
+<span class="nc" id="L402">            delayQueue.add(throttledChannel);</span>
+<span class="nc" id="L403">            delayQueueSensor.record();</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            if (LOG.isDebugEnabled()) {</span>
+<span class="nc" id="L405">                LOG.debug(&quot;Channel throttled for sensor ({}). Delay time: ({})&quot;,</span>
+<span class="nc" id="L406">                        clientSensors.quotaSensor().name(), throttleTimeMs);</span>
+            }
+        }
+<span class="nc" id="L409">    }</span>
+
+    /**
+     * Returns the quota for the client with the specified (non-encoded) user principal and client-id.
+     * Note: this method is expensive, it is meant to be used by tests only
+     */
+    public Quota quota(String user, String clientId) {
+<span class="nc" id="L416">        var userPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, user);</span>
+<span class="nc" id="L417">        return quota(userPrincipal, clientId);</span>
+    }
+
+    /**
+     * Returns the quota for the client with the specified user principal and client-id.
+     * Note: this method is expensive, it is meant to be used by tests only
+     */
+    public Quota quota(KafkaPrincipal userPrincipal, String clientId) {
+<span class="nc" id="L425">        var metricTags = quotaCallback.quotaMetricTags(clientQuotaType, userPrincipal, clientId);</span>
+<span class="nc" id="L426">        return Quota.upperBound(quotaLimit(metricTags));</span>
+    }
+
+    private double quotaLimit(Map&lt;String, String&gt; metricTags) {
+<span class="nc" id="L430">        var limit = quotaCallback.quotaLimit(clientQuotaType, metricTags);</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        return limit != null ? limit : Long.MAX_VALUE;</span>
+    }
+
+    /**
+     * This calculates the amount of time needed to bring the metric within quota
+     * assuming that no new metrics are recorded.
+     */
+    protected long throttleTime(QuotaViolationException e, long timeMs) {
+<span class="nc" id="L439">        return QuotaUtils.throttleTime(e, timeMs);</span>
+    }
+
+
+    /**
+     * This function either returns the sensors for a given client id or creates them if they don't exist
+     */
+    public ClientSensors getOrCreateQuotaSensors(Session session, String clientId) {
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        var metricTags = quotaCallback instanceof DefaultQuotaCallback defaultCallback</span>
+<span class="nc" id="L448">                ? defaultCallback.quotaMetricTags(session.sanitizedUser, clientId)</span>
+<span class="nc" id="L449">                : quotaCallback.quotaMetricTags(clientQuotaType, session.principal, clientId);</span>
+<span class="nc" id="L450">        var sensors = new ClientSensors(</span>
+                metricTags,
+<span class="nc" id="L452">                sensorAccessor.getOrCreate(</span>
+<span class="nc" id="L453">                        getQuotaSensorName(metricTags),</span>
+                        INACTIVE_SENSOR_EXPIRATION_TIME_SECONDS,
+<span class="nc" id="L455">                        sensor -&gt; registerQuotaMetrics(metricTags, sensor)  // quotaLimit() called here only for new sensors</span>
+                ),
+<span class="nc" id="L457">                sensorAccessor.getOrCreate(</span>
+<span class="nc" id="L458">                        getThrottleTimeSensorName(metricTags),</span>
+                        INACTIVE_SENSOR_EXPIRATION_TIME_SECONDS,
+<span class="nc" id="L460">                        sensor -&gt; sensor.add(throttleMetricName(metricTags), new Avg())</span>
+                )
+        );
+
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        if (quotaCallback.quotaResetRequired(clientQuotaType)) {</span>
+<span class="nc" id="L465">            updateQuotaMetricConfigs();</span>
+        }
+
+<span class="nc" id="L468">        return sensors;</span>
+    }
+
+    protected void registerQuotaMetrics(Map&lt;String, String&gt; metricTags, Sensor sensor) {
+<span class="nc" id="L472">        sensor.add(</span>
+<span class="nc" id="L473">                clientQuotaMetricName(metricTags),</span>
+                new Rate(),
+<span class="nc" id="L475">                getQuotaMetricConfig(metricTags)</span>
+        );
+<span class="nc" id="L477">    }</span>
+
+    private String metricTagsToSensorSuffix(Map&lt;String, String&gt; metricTags) {
+<span class="nc" id="L480">        return String.join(&quot;:&quot;, metricTags.values());</span>
+    }
+
+    private String getThrottleTimeSensorName(Map&lt;String, String&gt; metricTags) {
+<span class="nc" id="L484">        return quotaType.toString() + &quot;ThrottleTime-&quot; + metricTagsToSensorSuffix(metricTags);</span>
+    }
+
+    private String getQuotaSensorName(Map&lt;String, String&gt; metricTags) {
+<span class="nc" id="L488">        return quotaType.toString() + &quot;-&quot; + metricTagsToSensorSuffix(metricTags);</span>
+    }
+
+    protected MetricConfig getQuotaMetricConfig(Map&lt;String, String&gt; metricTags) {
+<span class="nc" id="L492">        return getQuotaMetricConfig(quotaLimit(metricTags));</span>
+    }
+
+    private MetricConfig getQuotaMetricConfig(double quotaLimit) {
+<span class="nc" id="L496">        return new MetricConfig()</span>
+<span class="nc" id="L497">                .timeWindow(config.quotaWindowSizeSeconds(), TimeUnit.SECONDS)</span>
+<span class="nc" id="L498">                .samples(config.numQuotaSamples())</span>
+<span class="nc" id="L499">                .quota(new Quota(quotaLimit, true));</span>
+    }
+
+    protected Sensor getOrCreateSensor(String sensorName, long expirationTimeSeconds, Consumer&lt;Sensor&gt; registerMetrics) {
+<span class="nc" id="L503">        return sensorAccessor.getOrCreate(</span>
+                sensorName,
+                expirationTimeSeconds,
+                registerMetrics);
+    }
+
+    /**
+     * Overrides quotas for {@code &lt;user&gt;}, {@code &lt;client-id&gt;} or {@code &lt;user, client-id&gt;} or the dynamic defaults
+     * for any of these levels.
+     *
+     * @param userEntity   user to override if quota applies to {@code &lt;user&gt;} or {@code &lt;user, client-id&gt;}
+     * @param clientEntity sanitized client entity to override if quota applies to {@code &lt;client-id&gt;} or
+     *                     {@code &lt;user, client-id&gt;}
+     * @param quota        custom quota to apply or None if quota override is being removed
+     */
+    public void updateQuota(
+            Optional&lt;ClientQuotaEntity.ConfigEntity&gt; userEntity,
+            Optional&lt;ClientQuotaEntity.ConfigEntity&gt; clientEntity,
+            Optional&lt;Quota&gt; quota
+    ) {
+        /*
+         * Acquire the write lock to apply changes in the quota objects.
+         * This method changes the quota in the overriddenQuota map and applies the update on the actual KafkaMetric object (if it exists).
+         * If the KafkaMetric hasn't been created, the most recent value will be used from the overriddenQuota map.
+         * The write lock prevents quota update and creation at the same time. It also guards against concurrent quota change
+         * notifications
+         */
+<span class="nc" id="L530">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L532">            var quotaEntity = new KafkaQuotaEntity(userEntity.orElse(null), clientEntity.orElse(null));</span>
+
+            // Apply quota changes with proper quota type tracking
+<span class="nc bnc" id="L535" title="All 2 branches missed.">            if (quota.isPresent()) {</span>
+<span class="nc" id="L536">                updateQuotaTypes(quotaEntity, true);</span>
+<span class="nc" id="L537">                quotaCallback.updateQuota(clientQuotaType, quotaEntity, quota.get().bound());</span>
+            } else {
+<span class="nc" id="L539">                updateQuotaTypes(quotaEntity, false);</span>
+<span class="nc" id="L540">                quotaCallback.removeQuota(clientQuotaType, quotaEntity);</span>
+            }
+
+            // Determine which entities need metric config updates
+            Optional&lt;KafkaQuotaEntity&gt; updatedEntity;
+<span class="nc bnc" id="L545" title="All 4 branches missed.">            if (userEntity.filter(entity -&gt; entity == DEFAULT_USER_ENTITY).isPresent() ||</span>
+<span class="nc bnc" id="L546" title="All 4 branches missed.">                    clientEntity.filter(entity -&gt; entity == DEFAULT_USER_CLIENT_ID).isPresent()) {</span>
+                // More than one entity may need updating, so updateQuotaMetricConfigs will go through all metrics
+<span class="nc" id="L548">                updatedEntity = Optional.empty();</span>
+            } else {
+<span class="nc" id="L550">                updatedEntity = Optional.of(quotaEntity);</span>
+            }
+
+<span class="nc" id="L553">            updateQuotaMetricConfigs(updatedEntity);</span>
+        } finally {
+<span class="nc" id="L555">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L557">    }</span>
+
+    /**
+     * Updates `quotaTypesEnabled` by performing a bitwise OR operation to combine the enabled quota types.
+     * This method ensures that the `quotaTypesEnabled` field reflects the active quota types based on the
+     * current state of `activeQuotaEntities`.
+     * For example:
+     *  - If UserQuotaEnabled = 2 and ClientIdQuotaEnabled = 1, then quotaTypesEnabled = 3 (2 | 1 = 3)
+     *  - If UserClientIdQuotaEnabled = 4 and UserQuotaEnabled = 1, then quotaTypesEnabled = 5 (4 | 1 = 5)
+     *  - If UserClientIdQuotaEnabled = 4 and ClientIdQuotaEnabled = 2, then quotaTypesEnabled = 6 (4 | 2 = 6)
+     *  - If all three are enabled (1 | 2 | 4), then quotaTypesEnabled = 7
+     *
+     * @param quotaEntity The entity for which the quota is being updated, which can be a combination of user and client-id.
+     * @param shouldAdd   A boolean indicating whether to add or remove the quota entity.
+     */
+    private void updateQuotaTypes(KafkaQuotaEntity quotaEntity, boolean shouldAdd) {
+<span class="nc bnc" id="L573" title="All 2 branches missed.">        if (quotaTypesEnabled == CUSTOM_QUOTAS) {</span>
+            // If custom quotas are enabled, we do not need to update quota types
+<span class="nc" id="L575">            return;</span>
+        }
+
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        boolean isActive = !(quotaCallback instanceof DefaultQuotaCallback defaultCallback) ||</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            defaultCallback.getActiveQuotasEntities().contains(quotaEntity);</span>
+
+        int activeQuotaType;
+<span class="nc bnc" id="L582" title="All 4 branches missed.">        if (quotaEntity.userEntity() != null &amp;&amp; quotaEntity.clientIdEntity() != null) {</span>
+<span class="nc" id="L583">            activeQuotaType = USER_CLIENT_ID_QUOTA_ENABLED;</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">        } else if (quotaEntity.userEntity() != null) {</span>
+<span class="nc" id="L585">            activeQuotaType = USER_QUOTA_ENABLED;</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        } else if (quotaEntity.clientIdEntity() != null) {</span>
+<span class="nc" id="L587">            activeQuotaType = CLIENT_ID_QUOTA_ENABLED;</span>
+        } else {
+<span class="nc" id="L589">            activeQuotaType = NO_QUOTAS;</span>
+        }
+
+<span class="nc bnc" id="L592" title="All 4 branches missed.">        if (shouldAdd &amp;&amp; !isActive) {</span>
+<span class="nc" id="L593">            activeQuotaEntities.compute(activeQuotaType, (key, currentValue) -&gt;</span>
+<span class="nc bnc" id="L594" title="All 4 branches missed.">                    (currentValue == null || currentValue == 0) ? 1 : currentValue + 1);</span>
+<span class="nc" id="L595">            quotaTypesEnabled |= activeQuotaType;</span>
+<span class="nc bnc" id="L596" title="All 4 branches missed.">        } else if (!shouldAdd &amp;&amp; isActive) {</span>
+<span class="nc" id="L597">            activeQuotaEntities.compute(activeQuotaType, (key, currentValue) -&gt;</span>
+<span class="nc bnc" id="L598" title="All 4 branches missed.">                    (currentValue == null || currentValue &lt;= 1) ? 0 : currentValue - 1);</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">            if (activeQuotaEntities.getOrDefault(activeQuotaType, 0) == 0) {</span>
+<span class="nc" id="L600">                quotaTypesEnabled &amp;= ~activeQuotaType;</span>
+            }
+        }
+
+        // Log the changes
+<span class="nc" id="L605">        var quotaTypeNames = Map.of(</span>
+<span class="nc" id="L606">                USER_CLIENT_ID_QUOTA_ENABLED, &quot;UserClientIdQuota&quot;,</span>
+<span class="nc" id="L607">                CLIENT_ID_QUOTA_ENABLED, &quot;ClientIdQuota&quot;,</span>
+<span class="nc" id="L608">                USER_QUOTA_ENABLED, &quot;UserQuota&quot;</span>
+        );
+
+<span class="nc" id="L611">        var activeEntities = quotaTypeNames.entrySet().stream()</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">                .filter(entry -&gt; activeQuotaEntities.getOrDefault(entry.getKey(), 0) &gt; 0)</span>
+<span class="nc" id="L613">                .map(Map.Entry::getValue)</span>
+<span class="nc" id="L614">                .collect(java.util.stream.Collectors.joining(&quot;, &quot;));</span>
+
+<span class="nc" id="L616">        LOG.info(&quot;Quota types enabled has been changed to {} with active quota entities: [{}]&quot;,</span>
+<span class="nc" id="L617">                quotaTypesEnabled, activeEntities);</span>
+<span class="nc" id="L618">    }</span>
+
+
+    /**
+     * Updates metrics configs. This is invoked when quota configs are updated when partition leaders change,
+     * and custom callbacks that implement partition-based quotas have updated quotas.
+     * Param updatedQuotaEntity If set to one entity and quotas have only been enabled at one
+     *    level, then an optimized update is performed with a single metric update. If None is provided,
+     *    or if custom callbacks are used or if multi-level quotas have been enabled, all metric configs
+     *    are checked and updated if required.
+     */
+    public void updateQuotaMetricConfigs() {
+<span class="nc" id="L630">        updateQuotaMetricConfigs(Optional.empty());</span>
+<span class="nc" id="L631">    }</span>
+
+    public void updateQuotaMetricConfigs(Optional&lt;KafkaQuotaEntity&gt; updatedQuotaEntity) {
+<span class="nc" id="L634">        var allMetrics = metrics.metrics();</span>
+
+        // If using custom quota callbacks or if multiple-levels of quotas are defined or
+        // if this is a default quota update, traverse metrics to find all affected values.
+        // Otherwise, update just the single matching one.
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        var singleUpdate = switch (quotaTypesEnabled) {</span>
+            case NO_QUOTAS,
+                 CLIENT_ID_QUOTA_ENABLED,
+                 USER_QUOTA_ENABLED,
+<span class="nc" id="L643">                 USER_CLIENT_ID_QUOTA_ENABLED -&gt; updatedQuotaEntity.isPresent();</span>
+<span class="nc" id="L644">            default -&gt; false;</span>
+<span class="nc" id="L645">        };</span>
+
+<span class="nc bnc" id="L647" title="All 2 branches missed.">        if (singleUpdate) {</span>
+<span class="nc" id="L648">            var quotaEntity = updatedQuotaEntity.orElseThrow(</span>
+<span class="nc" id="L649">                    () -&gt; new IllegalStateException(&quot;Quota entity not specified&quot;));</span>
+<span class="nc" id="L650">            var user = quotaEntity.sanitizedUser();</span>
+<span class="nc" id="L651">            var clientId = quotaEntity.clientId();</span>
+<span class="nc" id="L652">            var metricTags = Map.of(USER_TAG, user, CLIENT_ID_TAG, clientId);</span>
+
+<span class="nc" id="L654">            var quotaMetricName = clientQuotaMetricName(metricTags);</span>
+            // Change the underlying metric config if the sensor has been created
+<span class="nc" id="L656">            var metric = allMetrics.get(quotaMetricName);</span>
+<span class="nc bnc" id="L657" title="All 2 branches missed.">            if (metric != null) {</span>
+<span class="nc" id="L658">                var newQuota = quotaLimit(metricTags);</span>
+<span class="nc" id="L659">                LOG.info(&quot;Sensor for {} already exists. Changing quota to {} in MetricConfig&quot;,</span>
+<span class="nc" id="L660">                        quotaEntity, newQuota);</span>
+<span class="nc" id="L661">                metric.config(getQuotaMetricConfig(newQuota));</span>
+            }
+<span class="nc" id="L663">        } else {</span>
+<span class="nc" id="L664">            var quotaMetricName = clientQuotaMetricName(Map.of());</span>
+<span class="nc" id="L665">            allMetrics.forEach((metricName, metric) -&gt; {</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">                if (metricName.name().equals(quotaMetricName.name()) &amp;&amp;</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">                        metricName.group().equals(quotaMetricName.group())) {</span>
+<span class="nc" id="L668">                    var metricTags = metricName.tags();</span>
+<span class="nc" id="L669">                    var newQuota = quotaLimit(metricTags);</span>
+<span class="nc bnc" id="L670" title="All 2 branches missed.">                    if (Double.compare(newQuota, metric.config().quota().bound()) != 0) {</span>
+<span class="nc" id="L671">                        LOG.info(&quot;Sensor for quota-id {} already exists. Setting quota to {} in MetricConfig&quot;,</span>
+<span class="nc" id="L672">                                metricTags, newQuota);</span>
+<span class="nc" id="L673">                        metric.config(getQuotaMetricConfig(newQuota));</span>
+                    }
+                }
+<span class="nc" id="L676">            });</span>
+        }
+<span class="nc" id="L678">    }</span>
+
+    /**
+     * Returns the MetricName of the metric used for the quota. The name is used to create the
+     * metric but also to find the metric when the quota is changed.
+     */
+    protected MetricName clientQuotaMetricName(Map&lt;String, String&gt; quotaMetricTags) {
+<span class="nc" id="L685">        return metrics.metricName(&quot;byte-rate&quot;, quotaType.toString(),</span>
+                &quot;Tracking byte-rate per user/client-id&quot;,
+                quotaMetricTags);
+    }
+
+    private MetricName throttleMetricName(Map&lt;String, String&gt; quotaMetricTags) {
+<span class="nc" id="L691">        return metrics.metricName(&quot;throttle-time&quot;,</span>
+<span class="nc" id="L692">                quotaType.toString(),</span>
+                &quot;Tracking average throttle-time per user/client-id&quot;,
+                quotaMetricTags);
+    }
+
+    public void initiateShutdown() {
+<span class="nc" id="L698">        throttledChannelReaper.initiateShutdown();</span>
+        // improve shutdown time by waking up any ShutdownThread(s) blocked on poll by sending a no-op
+<span class="nc" id="L700">        delayQueue.add(new ThrottledChannel(time, 0, new ThrottleCallback() {</span>
+            @Override
+<span class="nc" id="L702">            public void startThrottling() {}</span>
+
+            @Override
+<span class="nc" id="L705">            public void endThrottling() {}</span>
+        }));
+<span class="nc" id="L707">    }</span>
+
+    public void shutdown() {
+<span class="nc" id="L710">        initiateShutdown();</span>
+        try {
+<span class="nc" id="L712">            throttledChannelReaper.awaitShutdown();</span>
+<span class="nc" id="L713">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L714">            LOG.warn(&quot;Shutdown was interrupted&quot;, e);</span>
+<span class="nc" id="L715">            Thread.currentThread().interrupt(); // Restore interrupt status</span>
+<span class="nc" id="L716">        }</span>
+<span class="nc" id="L717">    }</span>
+
+<span class="nc" id="L719">    private class DefaultQuotaCallback implements ClientQuotaCallback {</span>
+<span class="nc" id="L720">        private final ConcurrentHashMap&lt;ClientQuotaEntity, Quota&gt; overriddenQuotas = new ConcurrentHashMap&lt;&gt;();</span>
+
+        @Override
+        public void configure(Map&lt;String, ?&gt; configs) {
+<span class="nc" id="L724">        }</span>
+
+        @Override
+        public Map&lt;String, String&gt; quotaMetricTags(ClientQuotaType quotaType, KafkaPrincipal principal, String clientId) {
+<span class="nc" id="L728">            return quotaMetricTags(Sanitizer.sanitize(principal.getName()), clientId);</span>
+        }
+
+        @Override
+        public Double quotaLimit(ClientQuotaType quotaType, Map&lt;String, String&gt; metricTags) {
+<span class="nc" id="L733">            String sanitizedUser = metricTags.get(USER_TAG);</span>
+<span class="nc" id="L734">            String clientId = metricTags.get(CLIENT_ID_TAG);</span>
+
+<span class="nc bnc" id="L736" title="All 4 branches missed.">            if (sanitizedUser == null || clientId == null) {</span>
+<span class="nc" id="L737">                return null;</span>
+            }
+
+<span class="nc" id="L740">            var userEntity = new UserEntity(sanitizedUser);</span>
+<span class="nc" id="L741">            var clientIdEntity = new ClientIdEntity(clientId);</span>
+
+<span class="nc" id="L743">            Quota quota = findQuota(sanitizedUser, clientId, userEntity, clientIdEntity);</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">            return quota != null ? quota.bound() : null;</span>
+        }
+
+        private Quota findQuota(String sanitizedUser, String clientId, UserEntity userEntity, ClientIdEntity clientIdEntity) {
+<span class="nc bnc" id="L748" title="All 4 branches missed.">            if (!sanitizedUser.isEmpty() &amp;&amp; !clientId.isEmpty()) {</span>
+<span class="nc" id="L749">                return findUserClientQuota(userEntity, clientIdEntity);</span>
+            }
+
+<span class="nc bnc" id="L752" title="All 2 branches missed.">            if (!sanitizedUser.isEmpty()) {</span>
+<span class="nc" id="L753">                return findUserQuota(userEntity);</span>
+            }
+
+<span class="nc bnc" id="L756" title="All 2 branches missed.">            if (!clientId.isEmpty()) {</span>
+<span class="nc" id="L757">                return findClientQuota(clientIdEntity);</span>
+            }
+
+<span class="nc" id="L760">            return null;</span>
+        }
+
+        private Quota findUserClientQuota(UserEntity userEntity, ClientIdEntity clientIdEntity) {
+            // /config/users/&lt;user&gt;/clients/&lt;client-id&gt;
+<span class="nc" id="L765">            var quota = overriddenQuotas.get(new KafkaQuotaEntity(userEntity, clientIdEntity));</span>
+<span class="nc bnc" id="L766" title="All 2 branches missed.">            if (quota != null) return quota;</span>
+
+            // /config/users/&lt;user&gt;/clients/&lt;default&gt;
+<span class="nc" id="L769">            quota = overriddenQuotas.get(new KafkaQuotaEntity(userEntity, DEFAULT_USER_CLIENT_ID));</span>
+<span class="nc bnc" id="L770" title="All 2 branches missed.">            if (quota != null) return quota;</span>
+
+            // /config/users/&lt;default&gt;/clients/&lt;client-id&gt;
+<span class="nc" id="L773">            quota = overriddenQuotas.get(new KafkaQuotaEntity(DEFAULT_USER_ENTITY, clientIdEntity));</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">            if (quota != null) return quota;</span>
+
+            // /config/users/&lt;default&gt;/clients/&lt;default&gt;
+<span class="nc" id="L777">            return overriddenQuotas.get(DEFAULT_USER_CLIENT_ID_QUOTA_ENTITY);</span>
+        }
+
+        private Quota findUserQuota(UserEntity userEntity) {
+            // /config/users/&lt;user&gt;
+<span class="nc" id="L782">            var quota = overriddenQuotas.get(new KafkaQuotaEntity(userEntity, null));</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">            if (quota != null) return quota;</span>
+
+            // /config/users/&lt;default&gt;
+<span class="nc" id="L786">            return overriddenQuotas.get(DEFAULT_USER_QUOTA_ENTITY);</span>
+        }
+
+        private Quota findClientQuota(ClientIdEntity clientIdEntity) {
+            // /config/clients/&lt;client-id&gt;
+<span class="nc" id="L791">            var quota = overriddenQuotas.get(new KafkaQuotaEntity(null, clientIdEntity));</span>
+<span class="nc bnc" id="L792" title="All 2 branches missed.">            if (quota != null) return quota;</span>
+
+            // /config/clients/&lt;default&gt;
+<span class="nc" id="L795">            return overriddenQuotas.get(DEFAULT_CLIENT_ID_QUOTA_ENTITY);</span>
+        }
+
+        @Override
+        public void updateQuota(ClientQuotaType quotaType, ClientQuotaEntity entity, double newValue) {
+<span class="nc" id="L800">            KafkaQuotaEntity quotaEntity = (KafkaQuotaEntity) entity;</span>
+<span class="nc" id="L801">            LOG.info(&quot;Changing {} quota for {} to {}&quot;, quotaType, quotaEntity, newValue);</span>
+<span class="nc" id="L802">            overriddenQuotas.put(quotaEntity, new Quota(newValue, true));</span>
+<span class="nc" id="L803">        }</span>
+
+        @Override
+        public void removeQuota(ClientQuotaType quotaType, ClientQuotaEntity entity) {
+<span class="nc" id="L807">            KafkaQuotaEntity quotaEntity = (KafkaQuotaEntity) entity;</span>
+<span class="nc" id="L808">            LOG.info(&quot;Removing {} quota for {}&quot;, quotaType, quotaEntity);</span>
+<span class="nc" id="L809">            overriddenQuotas.remove(quotaEntity);</span>
+<span class="nc" id="L810">        }</span>
+
+        @Override
+        public boolean quotaResetRequired(ClientQuotaType quotaType) {
+<span class="nc" id="L814">            return false;</span>
+        }
+
+        public java.util.Set&lt;ClientQuotaEntity&gt; getActiveQuotasEntities() {
+<span class="nc" id="L818">            return overriddenQuotas.keySet();</span>
+        }
+
+        public Map&lt;String, String&gt; quotaMetricTags(String sanitizedUser, String clientId) {
+            String userTag;
+            String clientIdTag;
+
+            // Access the outer class's quotaTypesEnabled field
+<span class="nc bnc" id="L826" title="All 4 branches missed.">            switch (quotaTypesEnabled) {</span>
+                case NO_QUOTAS:
+                case CLIENT_ID_QUOTA_ENABLED:
+<span class="nc" id="L829">                    userTag = &quot;&quot;;</span>
+<span class="nc" id="L830">                    clientIdTag = clientId;</span>
+<span class="nc" id="L831">                    break;</span>
+                case USER_QUOTA_ENABLED:
+<span class="nc" id="L833">                    userTag = sanitizedUser;</span>
+<span class="nc" id="L834">                    clientIdTag = &quot;&quot;;</span>
+<span class="nc" id="L835">                    break;</span>
+                case USER_CLIENT_ID_QUOTA_ENABLED:
+<span class="nc" id="L837">                    userTag = sanitizedUser;</span>
+<span class="nc" id="L838">                    clientIdTag = clientId;</span>
+<span class="nc" id="L839">                    break;</span>
+                default:
+                    // Complex lookup logic for optimizing quota lookups when multiple types of quotas are defined
+<span class="nc" id="L842">                    var userEntity = new UserEntity(sanitizedUser);</span>
+<span class="nc" id="L843">                    var clientIdEntity = new ClientIdEntity(clientId);</span>
+
+                    // Start with full tags (sanitizedUser, clientId)
+                    // 1) /config/users/&lt;user&gt;/clients/&lt;client-id&gt;
+<span class="nc" id="L847">                    userTag = sanitizedUser;</span>
+<span class="nc" id="L848">                    clientIdTag = clientId;</span>
+
+                    // 2) /config/users/&lt;user&gt;/clients/&lt;default&gt;
+<span class="nc bnc" id="L851" title="All 2 branches missed.">                    if (overriddenQuotas.containsKey(new KafkaQuotaEntity(userEntity, clientIdEntity))) break;</span>
+<span class="nc" id="L852">                    userTag = sanitizedUser;</span>
+<span class="nc" id="L853">                    clientIdTag = clientId;</span>
+
+                    // 3) /config/users/&lt;user&gt;
+<span class="nc bnc" id="L856" title="All 2 branches missed.">                    if (overriddenQuotas.containsKey(new KafkaQuotaEntity(userEntity, DEFAULT_USER_CLIENT_ID))) break;</span>
+<span class="nc" id="L857">                    userTag = sanitizedUser;</span>
+<span class="nc" id="L858">                    clientIdTag = &quot;&quot;;</span>
+
+                    // 4) /config/users/&lt;default&gt;/clients/&lt;client-id&gt;
+<span class="nc bnc" id="L861" title="All 2 branches missed.">                    if (overriddenQuotas.containsKey(new KafkaQuotaEntity(userEntity, null))) break;</span>
+<span class="nc" id="L862">                    userTag = sanitizedUser;</span>
+<span class="nc" id="L863">                    clientIdTag = clientId;</span>
+
+                    // 5) /config/users/&lt;default&gt;/clients/&lt;default&gt;
+<span class="nc bnc" id="L866" title="All 2 branches missed.">                    if (overriddenQuotas.containsKey(new KafkaQuotaEntity(DEFAULT_USER_ENTITY, clientIdEntity))) break;</span>
+<span class="nc" id="L867">                    userTag = sanitizedUser;</span>
+<span class="nc" id="L868">                    clientIdTag = clientId;</span>
+
+                    // 6) /config/users/&lt;default&gt;
+<span class="nc bnc" id="L871" title="All 2 branches missed.">                    if (overriddenQuotas.containsKey(DEFAULT_USER_CLIENT_ID_QUOTA_ENTITY)) break;</span>
+<span class="nc" id="L872">                    userTag = sanitizedUser;</span>
+<span class="nc" id="L873">                    clientIdTag = &quot;&quot;;</span>
+
+                    // 7) /config/clients/&lt;client-id&gt;
+                    // 8) /config/clients/&lt;default&gt;
+<span class="nc bnc" id="L877" title="All 2 branches missed.">                    if (overriddenQuotas.containsKey(DEFAULT_USER_QUOTA_ENTITY)) break;</span>
+<span class="nc" id="L878">                    userTag = &quot;&quot;;</span>
+<span class="nc" id="L879">                    clientIdTag = clientId;</span>
+                    break;
+            }
+
+<span class="nc" id="L883">            var result = new LinkedHashMap&lt;String, String&gt;();</span>
+<span class="nc" id="L884">            result.put(USER_TAG, userTag);</span>
+<span class="nc" id="L885">            result.put(CLIENT_ID_TAG, clientIdTag);</span>
+<span class="nc" id="L886">            return result;</span>
+        }
+
+        @Override
+<span class="nc" id="L890">        public void close() {}</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

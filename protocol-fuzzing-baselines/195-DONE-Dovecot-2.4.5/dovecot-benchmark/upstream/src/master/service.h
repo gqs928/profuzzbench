@@ -1,0 +1,281 @@
+#ifndef SERVICE_H
+#define SERVICE_H
+
+#include "net.h"
+#include "master-settings.h"
+
+/* If a service process doesn't send its first status notification in
+   this many seconds, kill the process */
+#define SERVICE_FIRST_STATUS_TIMEOUT_SECS 30
+
+#define SERVICE_STARTUP_FAILURE_THROTTLE_MIN_MSECS (2*1000)
+#define SERVICE_STARTUP_FAILURE_THROTTLE_MAX_MSECS (60*1000)
+
+/* stats service's name */
+#define SERVICE_NAME_STATS "stats"
+
+enum service_listener_type {
+	SERVICE_LISTENER_UNIX,
+	SERVICE_LISTENER_FIFO,
+	SERVICE_LISTENER_INET
+};
+
+struct service_listener {
+	struct service *service;
+
+	enum service_listener_type type;
+	int fd; /* may be -1 */
+	struct io *io;
+
+	const char *name;
+	const char *inet_address;
+
+	union {
+		struct {
+			const struct file_listener_settings *set;
+			uid_t uid;
+			gid_t gid;
+			bool pid_listener;
+		} fileset;
+		struct {
+			const struct inet_listener_settings *set;
+			struct ip_addr ip;
+		} inetset;
+	} set;
+
+	/* This listener is used only by the process with this index number.
+	   Each process gets their own reuse_port listener. This index number
+	   is between 0..(process_limit-1) and valid only for that process
+	   index. The index is assigned while at the process creation order.
+	   If a process exits or retires, it is replaced by a new process with
+	   the same index number. */
+	unsigned int reuse_port_process_index;
+};
+
+struct service {
+	struct service_list *list;
+	struct event *event;
+
+	enum service_type type;
+
+	const struct service_settings *set;
+	const char *config_file_path;
+
+	const char *executable;
+	uid_t uid;
+	gid_t gid;
+	gid_t privileged_gid;
+	const char *extra_gids; /* comma-separated list */
+
+	/* all listeners, even those that aren't currently listening */
+	ARRAY(struct service_listener *) listeners;
+	/* per-process unix_listeners */
+	ARRAY(struct service_listener *) unix_pid_listeners;
+	/* linked list of processes belonging to this service, which have
+	   idle_start == 0. */
+	struct service_process *busy_processes;
+	/* linked list of processes belonging to this service, which have
+	   idle_start != 0. */
+	struct service_process *idle_processes_head, *idle_processes_tail;
+
+	/* number of processes currently created for this service */
+	unsigned int process_count;
+	/* number of processes that have retired=TRUE.
+	   Always <= process_count. */
+	unsigned int retired_process_count;
+	/* number of processes currently accepting new clients */
+	unsigned int process_avail;
+	/* number of processes currently idling (idle_start != 0) */
+	unsigned int process_idling;
+	/* Lowest number of processes that have been idling at the same time.
+	   This is reset to process_idling every idle_kill_interval seconds. */
+	unsigned int process_idling_lowwater_since_kills;
+	/* max number of processes allowed */
+	unsigned int process_limit;
+	/* Total number of processes ever created */
+	uint64_t process_count_total;
+
+	/* Maximum number of client connections a process can handle. */
+	unsigned int client_limit;
+	/* Kill idling processes after this many seconds. */
+	unsigned int idle_kill_interval;
+	/* How long this service's processes may keep serving their existing
+	   clients after a configuration reload replaced them. Overridden by
+	   services_destroy(). */
+	unsigned int shutdown_clients_timeout;
+	/* set->vsz_limit or set->master_set->default_client_limit */
+	uoff_t vsz_limit;
+
+	/* log process pipe file descriptors. */
+	int log_fd[2];
+	/* fd that log process sees log_fd[0] as. can be used to identify
+	   service name when sending commands via master_log_fd. */
+	int log_process_internal_fd;
+
+	/* status report pipe file descriptors */
+	int status_fd[2];
+	struct io *io_status;
+
+	/* Pipe that is closed when the master no longer wants this service's
+	   processes to accept new connections. */
+	int stop_pipe_fd[2];
+
+	unsigned int throttle_msecs;
+	time_t exit_failure_last;
+	unsigned int exit_failures_in_sec;
+
+	/* Login process's notify fd. We change its seek position to
+	   communicate state to login processes. */
+	int login_notify_fd;
+	time_t last_login_notify_time;
+	struct timeout *to_login_notify;
+
+	/* if a process fails before servicing its first request, assume it's
+	   broken and start throttling new process creations */
+	struct timeout *to_throttle;
+	/* when process_limit is reached, wait for a while until we actually
+	   start dropping pending connections */
+	struct timeout *to_drop;
+	/* delayed process_limit reached warning for non-login services */
+	struct timeout *to_drop_warning;
+	/* next time to try to kill idling processes */
+	struct timeout *to_idle;
+	/* Disconnects the clients of this service's preserved processes once
+	   shutdown_clients_timeout has passed since the reload. */
+	struct timeout *to_kick;
+	/* Time when to_kick fires next, or 0 if it isn't armed. */
+	time_t kick_time;
+
+	/* prefork processes up to process_min_avail if there's time */
+	struct timeout *to_prefork;
+	unsigned int prefork_counter;
+
+	/* Last time a "dropping client connections" warning was logged */
+	time_t last_drop_warning;
+
+	/* all processes are in use and new connections are coming */
+	bool listen_pending:1;
+	/* service is currently listening for new connections */
+	bool listening:1;
+	/* TRUE if service has at least one inet_listener */
+	bool have_inet_listeners:1;
+	/* service_login_notify()'s last notification state */
+	bool last_login_full_notify:1;
+	/* service has exited at least once with exit code 0 */
+	bool have_successful_exits:1;
+	/* service_monitor_stop() was called for this service. No new processes
+	   are created for it anymore. The status fd is still kept open as long
+	   as there are processes running, so their status notifications are
+	   still received. */
+	bool monitor_stopped:1;
+	/* service was stopped via doveadm */
+	bool doveadm_stop:1;
+	/* the old generation's processes were already sent a SIGTERM, so the
+	   next kill escalates to SIGKILL */
+	bool kill_sigterm_sent:1;
+};
+
+ARRAY_DEFINE_TYPE(service_list, struct service_list *);
+
+struct service_list {
+	pool_t pool;
+	int refcount;
+	/* Increases by one for each configuration reload. */
+	unsigned int generation;
+	/* Kills the old generation's processes that a reload doesn't
+	   preserve. */
+	struct timeout *to_kill;
+	/* Time when to_kill fires next, or 0 if it isn't armed. */
+	time_t kill_time;
+	unsigned int fork_counter;
+	struct event *event;
+
+	const struct master_settings *set;
+
+	struct service *config;
+	struct service *log;
+	struct service *anvil;
+	struct service *stats;
+
+	struct file_listener_settings master_listener_set;
+	struct io *io_master;
+	int master_fd;
+
+	/* nonblocking log fds used by master */
+	int master_log_fd[2];
+	struct service_process_notify *log_byes;
+
+	ARRAY(struct service *) services;
+
+	bool destroying:1;
+	bool destroyed:1;
+	bool sigterm_sent_to_log:1;
+};
+
+HASH_TABLE_DEFINE_TYPE(pid_process, void *, struct service_process *);
+extern HASH_TABLE_TYPE(pid_process) service_pids;
+/* All the service lists that still have processes, newest generation first.
+   The first one is the current generation, the rest are waiting for their
+   preserved processes to stop. */
+extern ARRAY_TYPE(service_list) service_lists;
+
+/* Create all services from settings */
+int services_create(const struct master_settings *set,
+		    struct service_list **services_r, const char **error_r);
+
+/* Destroy services. If replace_timeout is TRUE, kick_timeout_secs overrides
+   the services' shutdown_clients_timeout setting: it's how long the old
+   generations' client-facing processes may keep their clients, where 0
+   disconnects them immediately and SET_TIME_INFINITE never disconnects
+   them. The override covers also the generations that earlier reloads left
+   behind, except for the processes whose clients were already
+   disconnected. */
+void services_destroy(struct service_list *service_list, bool wait,
+		      bool replace_timeout, unsigned int kick_timeout_secs);
+
+/* Returns the time when the master will next signal this service's old
+   generation processes, or 0 if it isn't going to. */
+time_t service_get_kill_time(const struct service *service);
+
+void service_list_ref(struct service_list *service_list);
+void service_list_unref(struct service_list *service_list);
+
+/* Return path to configuration process socket. */
+const char *services_get_config_socket_path(struct service_list *service_list);
+
+/* Send a signal to all processes in a given service. However, if we're sending
+   a SIGTERM and a process hasn't yet sent the initial status notification,
+   that process is skipped. The number of such skipped processes are stored in
+   uninitialized_count_r. Returns the number of processes that a signal was
+   successfully sent to. If expected is TRUE, the signal is logged at debug
+   level instead of warning level. */
+unsigned int service_signal(struct service *service, int signo, bool expected,
+			    unsigned int *uninitialized_count_r);
+/* Notify all processes (if necessary) that no more connections can be handled
+   by the service without killing existing connections (TRUE) or that they
+   can be (FALSE). */
+void service_login_notify(struct service *service, bool all_processes_full);
+
+/* Prevent service from launching new processes for a while. */
+void service_throttle(struct service *service, unsigned int msecs);
+/* Time moved backwards. Throttle services that care about time. */
+void services_throttle_time_sensitives(struct service_list *list,
+				       unsigned int msecs);
+
+/* Find service by name. */
+struct service *
+service_lookup(struct service_list *service_list, const char *name);
+/* Find service by type */
+struct service *
+service_lookup_type(struct service_list *service_list, enum service_type type);
+
+/* Return the number of active (non-retired) processes the service has. */
+unsigned int service_active_process_count(struct service *service);
+
+void service_pids_init(void);
+void service_pids_deinit(void);
+
+void service_lists_init(void);
+void service_lists_deinit(void);
+
+#endif

@@ -1,0 +1,444 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StripedReplicaPlacer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.metadata.placement</a> &gt; <span class="el_source">StripedReplicaPlacer.java</span></div><h1>StripedReplicaPlacer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.metadata.placement;
+
+import org.apache.kafka.common.errors.InvalidReplicationFactorException;
+import org.apache.kafka.metadata.OptionalStringComparator;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Random;
+
+
+/**
+ * The striped replica placer.
+ * &lt;p&gt;
+ * &lt;h3&gt;Goals&lt;/h3&gt;
+ * &lt;p&gt;The design of this placer attempts to satisfy a few competing goals. Firstly, we want
+ * to spread the replicas as evenly as we can across racks. In the simple case where
+ * broker racks have not been configured, this goal is a no-op, of course. But it is the
+ * highest priority goal in multi-rack clusters.
+ *
+ * &lt;p&gt;Our second goal is to spread the replicas evenly across brokers. Since we are placing
+ * multiple partitions, we try to avoid putting each partition on the same set of
+ * replicas, even if it does satisfy the rack placement goal. If any specific broker is
+ * fenced, we would like the new leaders to distributed evenly across the remaining
+ * brokers.
+ *
+ * &lt;p&gt;However, we treat the rack placement goal as higher priority than this goal-- if you
+ * configure 10 brokers in rack A and B, and 1 broker in rack C, you will end up with a
+ * lot of partitions on that one broker in rack C.  If you were to place a lot of
+ * partitions with replication factor 3, each partition would try to get a replica there.
+ * In general racks are supposed to be about the same size -- if they aren't, this is a
+ * user error.
+ *
+ * &lt;p&gt;Finally, we would prefer to place replicas on unfenced brokers, rather than on fenced
+ * brokers.
+ * &lt;p&gt;
+ * &lt;h3&gt;Constraints&lt;/h3&gt;
+ * In addition to these goals, we have two constraints. Unlike the goals, these are not
+ * optional -- they are mandatory. Placement will fail if a constraint cannot be
+ * satisfied. The first constraint is that we can't place more than one replica on the
+ * same broker. This imposes an upper limit on replication factor-- for example, a 3-node
+ * cluster can't have any topics with replication factor 4. This constraint comes from
+ * Kafka's internal design.
+ *
+ * &lt;p&gt;The second constraint is that the leader of each partition must be an unfenced broker.
+ * This constraint is a bit arbitrary. In theory, we could allow people to create
+ * new topics even if every broker were fenced. However, this would be confusing for
+ * users.
+ * &lt;p&gt;
+ * &lt;h3&gt;Algorithm&lt;/h3&gt;
+ * &lt;p&gt;The StripedReplicaPlacer constructor loads the broker data into rack objects. Each
+ * rack object contains a sorted list of fenced brokers, and a separate sorted list of
+ * unfenced brokers. The racks themselves are organized into a sorted list, stored inside
+ * the top-level RackList object.
+ *
+ * &lt;p&gt;The general idea is that we place replicas on to racks in a round-robin fashion. So if
+ * we had racks A, B, C, and D, and we were creating a new partition with replication
+ * factor 3, our first replica might come from A, our second from B, and our third from C.
+ * Of course our placement would not be very fair if we always started with rack A.
+ * Therefore, we generate a random starting offset when the RackList is created. So one
+ * time we might go B, C, D. Another time we might go C, D, A. And so forth.
+ *
+ * &lt;p&gt;Note that each partition we generate advances the starting offset by one.
+ * So in our 4-rack cluster, with 3 partitions, we might choose these racks:
+ * &lt;pre&gt;
+ * partition 1: A, B, C
+ * partition 2: B, C, A
+ * partition 3: C, A, B
+ * &lt;/pre&gt;
+ * This is what generates the characteristic &quot;striped&quot; pattern of this placer.
+ *
+ * &lt;p&gt;So far I haven't said anything about how we choose a replica from within a rack.  In
+ * fact, this is also done in a round-robin fashion. So if rack A had replica A0, A1, A2,
+ * and A3, we might return A0 the first time, A1, the second, A2 the third, and so on.
+ * Just like with the racks, we add a random starting offset to mix things up a bit.
+ *
+ * &lt;p&gt;So let's say you had a cluster with racks A, B, and C, and each rack had 3 replicas,
+ * for 9 nodes in total.
+ * If all the offsets were 0, you'd get placements like this:
+ * &lt;pre&gt;
+ * partition 1: A0, B0, C0
+ * partition 2: B1, C1, A1
+ * partition 3: C2, A2, B2
+ * &lt;/pre&gt;
+ * &lt;p&gt;One additional complication with choosing a replica within a rack is that we want to
+ * choose the unfenced replicas first. In a big cluster with lots of nodes available,
+ * we'd prefer not to place a new partition on a node that is fenced. Therefore, we
+ * actually maintain two lists, rather than the single list I described above.
+ * We only start using the fenced node list when the unfenced node list is totally
+ * exhausted.
+ *
+ * &lt;p&gt;Furthermore, we cannot place the first replica (the leader) of a new partition on a
+ * fenced replica. Therefore, we have some special logic to ensure that this doesn't
+ * happen.
+ */
+public class StripedReplicaPlacer implements ReplicaPlacer {
+    /**
+     * A list of brokers that we can iterate through.
+     */
+<span class="nc" id="L121">    static class BrokerList {</span>
+<span class="nc" id="L122">        static final BrokerList EMPTY = new BrokerList();</span>
+<span class="nc" id="L123">        private final List&lt;Integer&gt; brokers = new ArrayList&lt;&gt;(0);</span>
+
+        /**
+         * How many brokers we have retrieved from the list during the current iteration epoch.
+         */
+<span class="nc" id="L128">        private int index = 0;</span>
+
+        /**
+         * The offset to add to the index in order to calculate the list entry to fetch.  The
+         * addition is done modulo the list size.
+         */
+<span class="nc" id="L134">        private int offset = 0;</span>
+
+        /**
+         * The last known iteration epoch. If we call next with a different epoch than this, the
+         * index and offset will be reset.
+         */
+<span class="nc" id="L140">        private int epoch = 0;</span>
+
+        BrokerList add(int broker) {
+<span class="nc" id="L143">            this.brokers.add(broker);</span>
+<span class="nc" id="L144">            return this;</span>
+        }
+
+        /**
+         * Initialize this broker list by sorting it and randomizing the start offset.
+         *
+         * @param random    The random number generator.
+         */
+        void initialize(Random random) {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if (!brokers.isEmpty()) {</span>
+<span class="nc" id="L154">                brokers.sort(Integer::compareTo);</span>
+<span class="nc" id="L155">                this.offset = random.nextInt(brokers.size());</span>
+            }
+<span class="nc" id="L157">        }</span>
+
+        /**
+         * Randomly shuffle the brokers in this list.
+         */
+        void shuffle(Random random) {
+<span class="nc" id="L163">            Collections.shuffle(brokers, random);</span>
+<span class="nc" id="L164">        }</span>
+
+        /**
+         * @return          The number of brokers in this list.
+         */
+        int size() {
+<span class="nc" id="L170">            return brokers.size();</span>
+        }
+
+        /**
+         * Get the next broker in this list, or -1 if there are no more elements to be
+         * returned.
+         *
+         * @param epoch     The current iteration epoch.
+         *
+         * @return          The broker ID, or -1 if there are no more brokers to be
+         *                  returned in this epoch.
+         */
+        int next(int epoch) {
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            if (brokers.isEmpty()) return -1;</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if (this.epoch != epoch) {</span>
+<span class="nc" id="L185">                this.epoch = epoch;</span>
+<span class="nc" id="L186">                this.index = 0;</span>
+<span class="nc" id="L187">                this.offset = (offset + 1) % brokers.size();</span>
+            }
+<span class="nc bnc" id="L189" title="All 2 branches missed.">            if (index &gt;= brokers.size()) return -1;</span>
+<span class="nc" id="L190">            int broker = brokers.get((index + offset) % brokers.size());</span>
+<span class="nc" id="L191">            index++;</span>
+<span class="nc" id="L192">            return broker;</span>
+        }
+    }
+
+    /**
+     * A rack in the cluster, which contains brokers.
+     */
+<span class="nc" id="L199">    static class Rack {</span>
+<span class="nc" id="L200">        private final BrokerList fenced = new BrokerList();</span>
+<span class="nc" id="L201">        private final BrokerList unfenced = new BrokerList();</span>
+
+        /**
+         * Initialize this rack.
+         *
+         * @param random    The random number generator.
+         */
+        void initialize(Random random) {
+<span class="nc" id="L209">            fenced.initialize(random);</span>
+<span class="nc" id="L210">            unfenced.initialize(random);</span>
+<span class="nc" id="L211">        }</span>
+
+        void shuffle(Random random) {
+<span class="nc" id="L214">            fenced.shuffle(random);</span>
+<span class="nc" id="L215">            unfenced.shuffle(random);</span>
+<span class="nc" id="L216">        }</span>
+
+        BrokerList fenced() {
+<span class="nc" id="L219">            return fenced;</span>
+        }
+
+        BrokerList unfenced() {
+<span class="nc" id="L223">            return unfenced;</span>
+        }
+
+        /**
+         * Get the next unfenced broker in this rack, or -1 if there are no more brokers
+         * to be returned.
+         *
+         * @param epoch     The current iteration epoch.
+         *
+         * @return          The broker ID, or -1 if there are no more brokers to be
+         *                  returned in this epoch.
+         */
+        int nextUnfenced(int epoch) {
+<span class="nc" id="L236">            return unfenced.next(epoch);</span>
+        }
+
+        /**
+         * Get the next broker in this rack, or -1 if there are no more brokers to be
+         * returned.
+         *
+         * @param epoch     The current iteration epoch.
+         *
+         * @return          The broker ID, or -1 if there are no more brokers to be
+         *                  returned in this epoch.
+         */
+        int next(int epoch) {
+<span class="nc" id="L249">            int result = unfenced.next(epoch);</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">            if (result &gt;= 0) return result;</span>
+<span class="nc" id="L251">            return fenced.next(epoch);</span>
+        }
+    }
+
+    /**
+     * A list of racks that we can iterate through.
+     */
+    static class RackList {
+        /**
+         * The random number generator.
+         */
+        private final Random random;
+
+        /**
+         * A map from rack names to the brokers contained within them.
+         */
+<span class="nc" id="L267">        private final Map&lt;Optional&lt;String&gt;, Rack&gt; racks = new HashMap&lt;&gt;();</span>
+
+        /**
+         * The names of all the racks in the cluster.
+         * Racks which have at least one unfenced broker come first (in sorted order),
+         * followed by racks which have only fenced brokers (also in sorted order).
+         */
+<span class="nc" id="L274">        private final List&lt;Optional&lt;String&gt;&gt; rackNames = new ArrayList&lt;&gt;();</span>
+
+        /**
+         * The total number of brokers in the cluster, both fenced and unfenced.
+         */
+        private final int numTotalBrokers;
+
+        /**
+         * The total number of unfenced brokers in the cluster.
+         */
+        private final int numUnfencedBrokers;
+
+        /**
+         * The iteration epoch.
+         */
+<span class="nc" id="L289">        private int epoch = 0;</span>
+
+        /**
+         * The offset we use to determine which rack is returned first.
+         */
+        private int offset;
+
+<span class="nc" id="L296">        RackList(Random random, Iterator&lt;UsableBroker&gt; iterator) {</span>
+<span class="nc" id="L297">            this.random = random;</span>
+<span class="nc" id="L298">            int numTotalBrokersCount = 0, numUnfencedBrokersCount = 0;</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            while (iterator.hasNext()) {</span>
+<span class="nc" id="L300">                UsableBroker broker = iterator.next();</span>
+<span class="nc" id="L301">                Rack rack = racks.get(broker.rack());</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                if (rack == null) {</span>
+<span class="nc" id="L303">                    rackNames.add(broker.rack());</span>
+<span class="nc" id="L304">                    rack = new Rack();</span>
+<span class="nc" id="L305">                    racks.put(broker.rack(), rack);</span>
+                }
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                if (broker.fenced()) {</span>
+<span class="nc" id="L308">                    rack.fenced().add(broker.id());</span>
+                } else {
+<span class="nc" id="L310">                    numUnfencedBrokersCount++;</span>
+<span class="nc" id="L311">                    rack.unfenced().add(broker.id());</span>
+                }
+<span class="nc" id="L313">                numTotalBrokersCount++;</span>
+<span class="nc" id="L314">            }</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            for (Rack rack : racks.values()) {</span>
+<span class="nc" id="L316">                rack.initialize(random);</span>
+<span class="nc" id="L317">            }</span>
+<span class="nc" id="L318">            this.rackNames.sort(OptionalStringComparator.INSTANCE);</span>
+<span class="nc" id="L319">            this.numTotalBrokers = numTotalBrokersCount;</span>
+<span class="nc" id="L320">            this.numUnfencedBrokers = numUnfencedBrokersCount;</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            this.offset = rackNames.isEmpty() ? 0 : random.nextInt(rackNames.size());</span>
+<span class="nc" id="L322">        }</span>
+
+        int numTotalBrokers() {
+<span class="nc" id="L325">            return numTotalBrokers;</span>
+        }
+
+        int numUnfencedBrokers() {
+<span class="nc" id="L329">            return numUnfencedBrokers;</span>
+        }
+
+        // VisibleForTesting
+        List&lt;Optional&lt;String&gt;&gt; rackNames() {
+<span class="nc" id="L334">            return rackNames;</span>
+        }
+
+        List&lt;Integer&gt; place(int replicationFactor) {
+<span class="nc" id="L338">            throwInvalidReplicationFactorIfNonPositive(replicationFactor);</span>
+<span class="nc" id="L339">            throwInvalidReplicationFactorIfTooFewBrokers(replicationFactor, numTotalBrokers());</span>
+<span class="nc" id="L340">            throwInvalidReplicationFactorIfZero(numUnfencedBrokers());</span>
+            // If we have returned as many assignments as there are unfenced brokers in
+            // the cluster, shuffle the rack list and broker lists to try to avoid
+            // repeating the same assignments again.
+            // But don't reset the iteration epoch for a single unfenced broker -- otherwise we would loop forever
+<span class="nc bnc" id="L345" title="All 4 branches missed.">            if (epoch == numUnfencedBrokers &amp;&amp; numUnfencedBrokers &gt; 1) {</span>
+<span class="nc" id="L346">                shuffle();</span>
+<span class="nc" id="L347">                epoch = 0;</span>
+            }
+<span class="nc bnc" id="L349" title="All 2 branches missed.">            if (offset == rackNames.size()) {</span>
+<span class="nc" id="L350">                offset = 0;</span>
+            }
+<span class="nc" id="L352">            List&lt;Integer&gt; brokers = new ArrayList&lt;&gt;(replicationFactor);</span>
+<span class="nc" id="L353">            int firstRackIndex = offset;</span>
+            while (true) {
+<span class="nc" id="L355">                Optional&lt;String&gt; name = rackNames.get(firstRackIndex);</span>
+<span class="nc" id="L356">                Rack rack = racks.get(name);</span>
+<span class="nc" id="L357">                int result = rack.nextUnfenced(epoch);</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                if (result &gt;= 0) {</span>
+<span class="nc" id="L359">                    brokers.add(result);</span>
+<span class="nc" id="L360">                    break;</span>
+                }
+<span class="nc" id="L362">                firstRackIndex++;</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                if (firstRackIndex == rackNames.size()) {</span>
+<span class="nc" id="L364">                    firstRackIndex = 0;</span>
+                }
+<span class="nc" id="L366">            }</span>
+<span class="nc" id="L367">            int rackIndex = offset;</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            for (int replica = 1; replica &lt; replicationFactor; replica++) {</span>
+<span class="nc" id="L369">                int result = -1;</span>
+                do {
+<span class="nc bnc" id="L371" title="All 2 branches missed.">                    if (rackIndex == firstRackIndex) {</span>
+<span class="nc" id="L372">                        firstRackIndex = -1;</span>
+                    } else {
+<span class="nc" id="L374">                        Optional&lt;String&gt; rackName = rackNames.get(rackIndex);</span>
+<span class="nc" id="L375">                        Rack rack = racks.get(rackName);</span>
+<span class="nc" id="L376">                        result = rack.next(epoch);</span>
+                    }
+<span class="nc" id="L378">                    rackIndex++;</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">                    if (rackIndex == rackNames.size()) {</span>
+<span class="nc" id="L380">                        rackIndex = 0;</span>
+                    }
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                } while (result &lt; 0);</span>
+<span class="nc" id="L383">                brokers.add(result);</span>
+            }
+<span class="nc" id="L385">            epoch++;</span>
+<span class="nc" id="L386">            offset++;</span>
+<span class="nc" id="L387">            return brokers;</span>
+        }
+
+        void shuffle() {
+<span class="nc" id="L391">            Collections.shuffle(rackNames, random);</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            for (Rack rack : racks.values()) {</span>
+<span class="nc" id="L393">                rack.shuffle(random);</span>
+<span class="nc" id="L394">            }</span>
+<span class="nc" id="L395">        }</span>
+    }
+
+    private static void throwInvalidReplicationFactorIfNonPositive(int replicationFactor) {
+<span class="nc bnc" id="L399" title="All 2 branches missed.">        if (replicationFactor &lt;= 0) {</span>
+<span class="nc" id="L400">            throw new InvalidReplicationFactorException(&quot;Invalid replication factor &quot; +</span>
+                    replicationFactor + &quot;: the replication factor must be positive.&quot;);
+        }
+<span class="nc" id="L403">    }</span>
+
+    private static void throwInvalidReplicationFactorIfZero(int numUnfenced) {
+<span class="nc bnc" id="L406" title="All 2 branches missed.">        if (numUnfenced == 0) {</span>
+<span class="nc" id="L407">            throw new InvalidReplicationFactorException(&quot;All brokers are currently fenced, or have all their log directories cordoned.&quot;);</span>
+        }
+<span class="nc" id="L409">    }</span>
+
+    private static void throwInvalidReplicationFactorIfTooFewBrokers(int replicationFactor, int numTotalBrokers) {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">        if (replicationFactor &gt; numTotalBrokers) {</span>
+<span class="nc" id="L413">            throw new InvalidReplicationFactorException(&quot;The target replication factor &quot; +</span>
+                    &quot;of &quot; + replicationFactor + &quot; cannot be reached because only &quot; +
+                    numTotalBrokers + &quot; broker(s) are registered or some brokers have all their log directories cordoned.&quot;);
+        }
+<span class="nc" id="L417">    }</span>
+
+    private final Random random;
+
+<span class="nc" id="L421">    public StripedReplicaPlacer(Random random) {</span>
+<span class="nc" id="L422">        this.random = random;</span>
+<span class="nc" id="L423">    }</span>
+
+    @Override
+    public TopicAssignment place(
+        PlacementSpec placement,
+        ClusterDescriber cluster
+    ) throws InvalidReplicationFactorException {
+<span class="nc" id="L430">        RackList rackList = new RackList(random, cluster.usableBrokers());</span>
+<span class="nc" id="L431">        throwInvalidReplicationFactorIfNonPositive(placement.numReplicas());</span>
+<span class="nc" id="L432">        throwInvalidReplicationFactorIfZero(rackList.numUnfencedBrokers());</span>
+<span class="nc" id="L433">        throwInvalidReplicationFactorIfTooFewBrokers(placement.numReplicas(),</span>
+<span class="nc" id="L434">            rackList.numTotalBrokers());</span>
+<span class="nc" id="L435">        List&lt;List&lt;Integer&gt;&gt; placements = new ArrayList&lt;&gt;(placement.numPartitions());</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">        for (int partition = 0; partition &lt; placement.numPartitions(); partition++) {</span>
+<span class="nc" id="L437">            placements.add(rackList.place(placement.numReplicas()));</span>
+        }
+<span class="nc" id="L439">        return new TopicAssignment(</span>
+<span class="nc" id="L440">            placements.stream().map(replicas -&gt; new PartitionAssignment(replicas, cluster)).toList()</span>
+        );
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

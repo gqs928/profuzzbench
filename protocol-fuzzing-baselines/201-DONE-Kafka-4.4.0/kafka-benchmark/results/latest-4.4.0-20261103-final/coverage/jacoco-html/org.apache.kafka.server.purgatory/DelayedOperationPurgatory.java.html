@@ -1,0 +1,424 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DelayedOperationPurgatory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.purgatory</a> &gt; <span class="el_source">DelayedOperationPurgatory.java</span></div><h1>DelayedOperationPurgatory.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server.purgatory;
+
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+import org.apache.kafka.server.util.ShutdownableThread;
+import org.apache.kafka.server.util.timer.SystemTimer;
+import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.server.util.timer.TimerTask;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class DelayedOperationPurgatory&lt;T extends DelayedOperation&gt; {
+
+<span class="nc" id="L40">    private static final Logger LOG = LoggerFactory.getLogger(DelayedOperationPurgatory.class);</span>
+    private static final int SHARDS = 512; // Shard the watcher list to reduce lock contention
+
+<span class="nc" id="L43">    private final KafkaMetricsGroup metricsGroup = new KafkaMetricsGroup(&quot;kafka.server&quot;, &quot;DelayedOperationPurgatory&quot;);</span>
+    private final Map&lt;String, String&gt; metricsTags;
+    private final List&lt;WatcherList&gt; watcherLists;
+    // the number of estimated total operations in the purgatory
+<span class="nc" id="L47">    private final AtomicInteger estimatedTotalOperations = new AtomicInteger(0);</span>
+    /* background thread expiring operations that have timed out */
+    private final ExpiredOperationReaper expirationReaper;
+    private final String purgatoryName;
+    private final Timer timeoutTimer;
+    private final int brokerId;
+    private final int purgeInterval;
+    private final boolean reaperEnabled;
+    private final boolean timerEnabled;
+
+    public DelayedOperationPurgatory(String purgatoryName, Timer timer, int brokerId, boolean reaperEnabled) {
+<span class="nc" id="L58">        this(purgatoryName, timer, brokerId, 1000, reaperEnabled, true);</span>
+<span class="nc" id="L59">    }</span>
+
+    public DelayedOperationPurgatory(String purgatoryName, Timer timer, int brokerId, int purgeInterval) {
+<span class="nc" id="L62">        this(purgatoryName, timer, brokerId, purgeInterval, true, true);</span>
+<span class="nc" id="L63">    }</span>
+
+    public DelayedOperationPurgatory(String purgatoryName, int brokerId) {
+<span class="nc" id="L66">        this(purgatoryName, brokerId, 1000);</span>
+<span class="nc" id="L67">    }</span>
+
+    public DelayedOperationPurgatory(String purgatoryName, int brokerId, int purgeInterval) {
+<span class="nc" id="L70">        this(purgatoryName, new SystemTimer(purgatoryName), brokerId, purgeInterval, true, true);</span>
+<span class="nc" id="L71">    }</span>
+
+    /**
+     * A helper purgatory class for bookkeeping delayed operations with a timeout, and expiring timed out operations.
+     */
+    @SuppressWarnings(&quot;this-escape&quot;)
+    public DelayedOperationPurgatory(String purgatoryName,
+                                     Timer timeoutTimer,
+                                     int brokerId,
+                                     int purgeInterval,
+                                     boolean reaperEnabled,
+<span class="nc" id="L82">                                     boolean timerEnabled) {</span>
+<span class="nc" id="L83">        this.purgatoryName = purgatoryName;</span>
+<span class="nc" id="L84">        this.timeoutTimer = timeoutTimer;</span>
+<span class="nc" id="L85">        this.brokerId = brokerId;</span>
+<span class="nc" id="L86">        this.purgeInterval = purgeInterval;</span>
+<span class="nc" id="L87">        this.reaperEnabled = reaperEnabled;</span>
+<span class="nc" id="L88">        this.timerEnabled = timerEnabled;</span>
+        // The initialization of the expiration reaper thread is done after the brokerId and purgatoryName
+        // are set, so that the thread name can include these values.
+<span class="nc" id="L91">        this.expirationReaper = new ExpiredOperationReaper();</span>
+
+<span class="nc" id="L93">        watcherLists = new ArrayList&lt;&gt;(SHARDS);</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        for (int i = 0; i &lt; SHARDS; i++) {</span>
+<span class="nc" id="L95">            watcherLists.add(new WatcherList());</span>
+        }
+<span class="nc" id="L97">        metricsTags = Map.of(&quot;delayedOperation&quot;, purgatoryName);</span>
+<span class="nc" id="L98">        metricsGroup.newGauge(&quot;PurgatorySize&quot;, this::watched, metricsTags);</span>
+<span class="nc" id="L99">        metricsGroup.newGauge(&quot;NumDelayedOperations&quot;, this::numDelayed, metricsTags);</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">        if (reaperEnabled) {</span>
+<span class="nc" id="L101">            expirationReaper.start();</span>
+        }
+<span class="nc" id="L103">    }</span>
+
+    private WatcherList watcherList(DelayedOperationKey key) {
+<span class="nc" id="L106">        return watcherLists.get(Math.abs(key.hashCode() % watcherLists.size()));</span>
+    }
+
+    /**
+     * Check if the operation can be completed, if not watch it based on the given watch keys
+     * &lt;br/&gt;
+     * Note that a delayed operation can be watched on multiple keys. It is possible that
+     * an operation is completed after it has been added to the watch list for some, but
+     * not all the keys. In this case, the operation is considered completed and won't
+     * be added to the watch list of the remaining keys. The expiration reaper thread will
+     * remove this operation from any watcher list in which the operation exists.
+     *
+     * @param operation the delayed operation to be checked
+     * @param watchKeys keys for bookkeeping the operation
+     * @return true iff the delayed operations can be completed by the caller
+     */
+    public &lt;K extends DelayedOperationKey&gt; boolean tryCompleteElseWatch(T operation, List&lt;K&gt; watchKeys) {
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        if (watchKeys.isEmpty()) {</span>
+<span class="nc" id="L124">            throw new IllegalArgumentException(&quot;The watch key list can't be empty&quot;);</span>
+        }
+
+        // The cost of tryComplete() is typically proportional to the number of keys. Calling tryComplete() for each key is
+        // going to be expensive if there are many keys. Instead, we do the check in the following way through safeTryCompleteOrElse().
+        // If the operation is not completed, we just add the operation to all keys. Then we call tryComplete() again. At
+        // this time, if the operation is still not completed, we are guaranteed that it won't miss any future triggering
+        // event since the operation is already on the watcher list for all keys.
+        //
+        // ==============[story about lock]==============
+        // Through safeTryCompleteOrElse(), we hold the operation's lock while adding the operation to watch list and doing
+        // the tryComplete() check. This is to avoid a potential deadlock between the callers to tryCompleteElseWatch() and
+        // checkAndComplete(). For example, the following deadlock can happen if the lock is only held for the final tryComplete()
+        // 1) thread_a holds readlock of stateLock from TransactionStateManager
+        // 2) thread_a is executing tryCompleteElseWatch()
+        // 3) thread_a adds op to watch list
+        // 4) thread_b requires writelock of stateLock from TransactionStateManager (blocked by thread_a)
+        // 5) thread_c calls checkAndComplete() and holds lock of op
+        // 6) thread_c is waiting readlock of stateLock to complete op (blocked by thread_b)
+        // 7) thread_a is waiting lock of op to call the final tryComplete() (blocked by thread_c)
+        //
+        // Note that even with the current approach, deadlocks could still be introduced. For example,
+        // 1) thread_a calls tryCompleteElseWatch() and gets lock of op
+        // 2) thread_a adds op to watch list
+        // 3) thread_a calls op#tryComplete and tries to require lock_b
+        // 4) thread_b holds lock_b and calls checkAndComplete()
+        // 5) thread_b sees op from watch list
+        // 6) thread_b needs lock of op
+        // To avoid the above scenario, we recommend DelayedOperationPurgatory.checkAndComplete() be called without holding
+        // any exclusive lock. Since DelayedOperationPurgatory.checkAndComplete() completes delayed operations asynchronously,
+        // holding an exclusive lock to make the call is often unnecessary.
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        if (operation.safeTryCompleteOrElse(() -&gt; {</span>
+<span class="nc" id="L156">            watchKeys.forEach(key -&gt; {</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">                if (!operation.isCompleted())</span>
+<span class="nc" id="L158">                    watchForOperation(key, operation);</span>
+<span class="nc" id="L159">            });</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            if (!watchKeys.isEmpty())</span>
+<span class="nc" id="L161">                estimatedTotalOperations.incrementAndGet();</span>
+<span class="nc" id="L162">        })) {</span>
+<span class="nc" id="L163">            return true;</span>
+        }
+
+        // if it cannot be completed by now and hence is watched, add to the timeout queue also
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if (!operation.isCompleted()) {</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">            if (timerEnabled)</span>
+<span class="nc" id="L169">                timeoutTimer.add(operation);</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            if (operation.isCompleted()) {</span>
+                // cancel the timer task
+<span class="nc" id="L172">                operation.cancel();</span>
+            }
+        }
+<span class="nc" id="L175">        return false;</span>
+    }
+
+    /**
+     * Check if some delayed operations can be completed with the given watch key,
+     * and if yes complete them.
+     *
+     * @return the number of completed operations during this process
+     */
+    public &lt;K extends DelayedOperationKey&gt; int checkAndComplete(K key) {
+<span class="nc" id="L185">        WatcherList wl = watcherList(key);</span>
+        Watchers watchers;
+<span class="nc" id="L187">        wl.watchersLock.lock();</span>
+        try {
+<span class="nc" id="L189">            watchers = wl.watchersByKey.get(key);</span>
+        } finally {
+<span class="nc" id="L191">            wl.watchersLock.unlock();</span>
+        }
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        int numCompleted = watchers == null ? 0 : watchers.tryCompleteWatched();</span>
+
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (numCompleted &gt; 0) {</span>
+<span class="nc" id="L196">            LOG.debug(&quot;Request key {} unblocked {} {} operations&quot;, key, numCompleted, purgatoryName);</span>
+        }
+<span class="nc" id="L198">        return numCompleted;</span>
+    }
+
+    /**
+     * Return the total size of watch lists in the purgatory. Since an operation may be watched
+     * on multiple lists, and some of its watched entries may still be in the watch lists
+     * even when it has been completed, this number may be larger than the number of real operations watched
+     */
+    public int watched() {
+<span class="nc" id="L207">        int sum = 0;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        for (WatcherList watcherList : watcherLists) {</span>
+<span class="nc" id="L209">            sum += watcherList.allWatchers().stream().mapToInt(Watchers::countWatched).sum();</span>
+<span class="nc" id="L210">        }</span>
+<span class="nc" id="L211">        return sum;</span>
+    }
+
+    /**
+     * Return the number of delayed operations in the expiry queue
+     */
+    public int numDelayed() {
+<span class="nc" id="L218">        return timeoutTimer.size();</span>
+    }
+
+    /**
+     * Cancel watching on any delayed operations for the given key. Note the operation will not be completed
+     */
+    public List&lt;T&gt; cancelForKey(DelayedOperationKey key) {
+<span class="nc" id="L225">        WatcherList wl = watcherList(key);</span>
+<span class="nc" id="L226">        wl.watchersLock.lock();</span>
+        try {
+<span class="nc" id="L228">            Watchers watchers = wl.watchersByKey.remove(key);</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">            if (watchers != null)</span>
+<span class="nc" id="L230">                return watchers.cancel();</span>
+            else
+<span class="nc" id="L232">                return List.of();</span>
+        } finally {
+<span class="nc" id="L234">            wl.watchersLock.unlock();</span>
+        }
+    }
+
+    /*
+     * Watch the operation
+     */
+    private void watchForOperation(DelayedOperationKey key, T operation) {
+<span class="nc" id="L242">        WatcherList wl = watcherList(key);</span>
+<span class="nc" id="L243">        wl.watchersLock.lock();</span>
+        try {
+<span class="nc" id="L245">            Watchers watcher = wl.watchersByKey.computeIfAbsent(key, Watchers::new);</span>
+<span class="nc" id="L246">            watcher.watch(operation);</span>
+        } finally {
+<span class="nc" id="L248">            wl.watchersLock.unlock();</span>
+        }
+<span class="nc" id="L250">    }</span>
+
+    /*
+     * Remove the key from watcher lists if its list is empty
+     */
+    private void removeKeyIfEmpty(DelayedOperationKey key, Watchers watchers) {
+<span class="nc" id="L256">        WatcherList wl = watcherList(key);</span>
+<span class="nc" id="L257">        wl.watchersLock.lock();</span>
+        try {
+            // if the current key is no longer correlated to the watchers to remove, skip
+<span class="nc bnc" id="L260" title="All 2 branches missed.">            if (wl.watchersByKey.get(key) != watchers)</span>
+<span class="nc" id="L261">                return;</span>
+
+<span class="nc bnc" id="L263" title="All 4 branches missed.">            if (watchers != null &amp;&amp; watchers.isEmpty()) {</span>
+<span class="nc" id="L264">                wl.watchersByKey.remove(key);</span>
+            }
+        } finally {
+<span class="nc" id="L267">            wl.watchersLock.unlock();</span>
+        }
+<span class="nc" id="L269">    }</span>
+
+    /**
+     * Shutdown the expiration reaper thread
+     */
+    public void shutdown() throws Exception {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        if (reaperEnabled) {</span>
+<span class="nc" id="L276">            expirationReaper.initiateShutdown();</span>
+            // improve shutdown time by waking up any ShutdownableThread blocked on poll by sending a no-op
+<span class="nc" id="L278">            timeoutTimer.add(new TimerTask(0) {</span>
+                @Override
+<span class="nc" id="L280">                public void run() {}</span>
+            });
+<span class="nc" id="L282">            expirationReaper.awaitShutdown();</span>
+        }
+<span class="nc" id="L284">        timeoutTimer.close();</span>
+<span class="nc" id="L285">        metricsGroup.removeMetric(&quot;PurgatorySize&quot;, metricsTags);</span>
+<span class="nc" id="L286">        metricsGroup.removeMetric(&quot;NumDelayedOperations&quot;, metricsTags);</span>
+<span class="nc" id="L287">    }</span>
+
+    /**
+     * A list of operation watching keys
+     */
+<span class="nc" id="L292">    private class WatcherList {</span>
+<span class="nc" id="L293">        private final ConcurrentHashMap&lt;DelayedOperationKey, Watchers&gt; watchersByKey = new ConcurrentHashMap&lt;&gt;();</span>
+
+<span class="nc" id="L295">        private final ReentrantLock watchersLock = new ReentrantLock();</span>
+
+        /*
+         * Return all the current watcher lists,
+         * note that the returned watchers may be removed from the list by other threads
+         */
+        Collection&lt;Watchers&gt; allWatchers() {
+<span class="nc" id="L302">            return watchersByKey.values();</span>
+        }
+    }
+
+    /**
+     * A linked list of watched delayed operations based on some key
+     */
+    private class Watchers {
+
+<span class="nc" id="L311">        private final ConcurrentLinkedQueue&lt;T&gt; operations = new ConcurrentLinkedQueue&lt;&gt;();</span>
+
+        private final DelayedOperationKey key;
+<span class="nc" id="L314">        Watchers(DelayedOperationKey key) {</span>
+<span class="nc" id="L315">            this.key = key;</span>
+<span class="nc" id="L316">        }</span>
+
+        // count the current number of watched operations. This is O(n), so use isEmpty() if possible
+        int countWatched() {
+<span class="nc" id="L320">            return operations.size();</span>
+        }
+
+        boolean isEmpty() {
+<span class="nc" id="L324">            return operations.isEmpty();</span>
+        }
+
+        // add the element to watch
+        void watch(T t) {
+<span class="nc" id="L329">            operations.add(t);</span>
+<span class="nc" id="L330">        }</span>
+
+        // traverse the list and try to complete some watched elements
+        int tryCompleteWatched() {
+<span class="nc" id="L334">            int completed = 0;</span>
+
+<span class="nc" id="L336">            Iterator&lt;T&gt; iter = operations.iterator();</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L338">                T curr = iter.next();</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                if (curr.isCompleted()) {</span>
+                    // another thread has completed this operation, just remove it
+<span class="nc" id="L341">                    iter.remove();</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">                } else if (curr.safeTryComplete()) {</span>
+<span class="nc" id="L343">                    iter.remove();</span>
+<span class="nc" id="L344">                    completed += 1;</span>
+                }
+<span class="nc" id="L346">            }</span>
+
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            if (operations.isEmpty())</span>
+<span class="nc" id="L349">                removeKeyIfEmpty(key, this);</span>
+
+<span class="nc" id="L351">            return completed;</span>
+        }
+
+        List&lt;T&gt; cancel() {
+<span class="nc" id="L355">            Iterator&lt;T&gt; iter = operations.iterator();</span>
+<span class="nc" id="L356">            List&lt;T&gt; cancelled = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L358">                T curr = iter.next();</span>
+<span class="nc" id="L359">                curr.cancel();</span>
+<span class="nc" id="L360">                iter.remove();</span>
+<span class="nc" id="L361">                cancelled.add(curr);</span>
+<span class="nc" id="L362">            }</span>
+<span class="nc" id="L363">            return cancelled;</span>
+        }
+
+        // traverse the list and purge elements that are already completed by others
+        int purgeCompleted() {
+<span class="nc" id="L368">            int purged = 0;</span>
+
+<span class="nc" id="L370">            Iterator&lt;T&gt; iter = operations.iterator();</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L372">                T curr = iter.next();</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">                if (curr.isCompleted()) {</span>
+<span class="nc" id="L374">                    iter.remove();</span>
+<span class="nc" id="L375">                    purged += 1;</span>
+                }
+<span class="nc" id="L377">            }</span>
+
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            if (operations.isEmpty())</span>
+<span class="nc" id="L380">                removeKeyIfEmpty(key, this);</span>
+
+<span class="nc" id="L382">            return purged;</span>
+        }
+    }
+
+    private void advanceClock(long timeoutMs) throws InterruptedException {
+<span class="nc" id="L387">        timeoutTimer.advanceClock(timeoutMs);</span>
+
+        // Trigger a purge if the number of completed but still being watched operations is larger than
+        // the purge threshold. That number is computed by the difference btw the estimated total number of
+        // operations and the number of pending delayed operations.
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        if (estimatedTotalOperations.get() - numDelayed() &gt; purgeInterval) {</span>
+            // now set estimatedTotalOperations to delayed (the number of pending operations) since we are going to
+            // clean up watchers. Note that, if more operations are completed during the cleanup, we may end up with
+            // a little overestimated total number of operations.
+<span class="nc" id="L396">            estimatedTotalOperations.getAndSet(numDelayed());</span>
+<span class="nc" id="L397">            LOG.debug(&quot;Begin purging watch lists&quot;);</span>
+<span class="nc" id="L398">            int purged = 0;</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">            for (WatcherList watcherList : watcherLists) {</span>
+<span class="nc" id="L400">                purged += watcherList.allWatchers().stream().mapToInt(Watchers::purgeCompleted).sum();</span>
+<span class="nc" id="L401">            }</span>
+<span class="nc" id="L402">            LOG.debug(&quot;Purged {} elements from watch lists.&quot;, purged);</span>
+        }
+<span class="nc" id="L404">    }</span>
+
+    /**
+     * A background reaper to expire delayed operations that have timed out
+     */
+    private class ExpiredOperationReaper extends ShutdownableThread {
+<span class="nc" id="L410">        ExpiredOperationReaper() {</span>
+<span class="nc" id="L411">            super(&quot;ExpirationReaper-&quot; + brokerId + &quot;-&quot; + purgatoryName, false);</span>
+<span class="nc" id="L412">        }</span>
+
+        @Override
+        public void doWork() {
+            try {
+<span class="nc" id="L417">                advanceClock(200L);</span>
+<span class="nc" id="L418">            } catch (InterruptedException ie) {</span>
+<span class="nc" id="L419">                throw new RuntimeException(ie);</span>
+<span class="nc" id="L420">            }</span>
+<span class="nc" id="L421">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

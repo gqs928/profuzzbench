@@ -1,0 +1,202 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "str.h"
+#include "eacces-error.h"
+#include "safe-mkstemp.h"
+#include "mkdir-parents.h"
+#include "file-lock.h"
+#include "file-create-locked.h"
+
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+/* Try mkdir() + lock creation multiple times. This allows the lock file
+   creation to work even while the directory is simultaneously being
+   rmdir()ed. */
+#define MAX_MKDIR_COUNT 10
+#define MAX_RETRY_COUNT 1000
+
+static int
+try_lock_existing(int fd, const char *path,
+		  const struct file_create_settings *set,
+		  struct file_lock **lock_r, const char **error_r)
+{
+	struct file_lock_settings lock_set = set->lock_settings;
+	struct stat st1, st2;
+	int ret;
+
+	lock_set.unlink_on_free = FALSE;
+	lock_set.close_on_free = FALSE;
+
+	if (fstat(fd, &st1) < 0) {
+		*error_r = t_strdup_printf("fstat(%s) failed: %m", path);
+		return -1;
+	}
+	if (file_wait_lock(fd, path, F_WRLCK, &lock_set, set->lock_timeout_secs,
+			   lock_r, error_r) <= 0)
+		return -1;
+	if (stat(path, &st2) == 0) {
+		ret = st1.st_ino == st2.st_ino &&
+			CMP_DEV_T(st1.st_dev, st2.st_dev) ? 1 : 0;
+	} else if (errno == ENOENT) {
+		ret = 0;
+	} else {
+		*error_r = t_strdup_printf("stat(%s) failed: %m", path);
+		ret = -1;
+	}
+	if (ret <= 0) {
+		/* the fd is closed next - no need to unlock */
+		file_lock_free(lock_r);
+	} else {
+		file_lock_set_unlink_on_free(
+			*lock_r, set->lock_settings.unlink_on_free);
+		file_lock_set_close_on_free(
+			*lock_r, set->lock_settings.close_on_free);
+	}
+	return ret;
+}
+
+static int
+try_mkdir(const char *path, const struct file_create_settings *set,
+	  const char **error_r)
+{
+	uid_t uid = set->mkdir_uid != 0 ? set->mkdir_uid : (uid_t)-1;
+	gid_t gid = set->mkdir_gid != 0 ? set->mkdir_gid : (gid_t)-1;
+	const char *p = strrchr(path, '/');
+	if (p == NULL)
+		return 0;
+
+	const char *dir = t_strdup_until(path, p);
+	int ret;
+	if (uid != (uid_t)-1)
+		ret = mkdir_parents_chown(dir, set->mkdir_mode, uid, gid);
+	else {
+		ret = mkdir_parents_chgrp(dir, set->mkdir_mode,
+					  gid, set->gid_origin);
+	}
+	if (ret < 0 && errno != EEXIST) {
+		*error_r = t_strdup_printf("mkdir_parents(%s) failed: %m", dir);
+		return -1;
+	}
+	return 1;
+}
+
+static int
+try_create_new(const char *path, const struct file_create_settings *set,
+	       int *fd_r, struct file_lock **lock_r,  const char **error_r)
+{
+	string_t *temp_path = t_str_new(128);
+	int fd, orig_errno, ret = 1;
+	int mode = set->mode != 0 ? set->mode : 0600;
+	uid_t uid = set->uid != 0 ? set->uid : (uid_t)-1;
+	uid_t gid = set->gid != 0 ? set->gid : (gid_t)-1;
+
+	str_append(temp_path, path);
+	for (unsigned int i = 0; ret > 0; i++) {
+		if (uid != (uid_t)-1)
+			fd = safe_mkstemp(temp_path, mode, uid, gid);
+		else
+			fd = safe_mkstemp_group(temp_path, mode, gid, set->gid_origin);
+		if (fd != -1 || errno != ENOENT || set->mkdir_mode == 0 ||
+		    i >= MAX_MKDIR_COUNT)
+			break;
+
+		int orig_errno = errno;
+		if ((ret = try_mkdir(path, set, error_r)) < 0)
+			return -1;
+		errno = orig_errno;
+	}
+	if (fd == -1) {
+		if (errno == EACCES)
+			*error_r = eacces_error_get("safe_mkstemp", path);
+		else {
+			*error_r = t_strdup_printf(
+				"safe_mkstemp(%s) failed: %m", path);
+		}
+		return -1;
+	}
+
+	struct file_lock_settings lock_set = set->lock_settings;
+	lock_set.unlink_on_free = FALSE;
+	lock_set.close_on_free = FALSE;
+
+	ret = -1;
+	if (file_try_lock(fd, str_c(temp_path), F_WRLCK, &lock_set,
+			  lock_r, error_r) <= 0) {
+	} else if (link(str_c(temp_path), path) < 0) {
+		if (errno == EEXIST) {
+			/* just created by somebody else */
+			ret = 0;
+		} else if (errno == ENOENT) {
+			/* nobody should be deleting the temp file unless the
+			   entire directory is deleted. */
+			*error_r = t_strdup_printf(
+				"Temporary file %s was unexpectedly deleted",
+				str_c(temp_path));
+		} else {
+			*error_r = t_strdup_printf("link(%s, %s) failed: %m",
+						   str_c(temp_path), path);
+		}
+		file_lock_free(lock_r);
+	} else {
+		file_lock_set_path(*lock_r, path);
+		file_lock_set_unlink_on_free(
+			*lock_r, set->lock_settings.unlink_on_free);
+		file_lock_set_close_on_free(
+			*lock_r, set->lock_settings.close_on_free);
+		i_unlink_if_exists(str_c(temp_path));
+		*fd_r = fd;
+		return 1;
+	}
+	orig_errno = errno;
+	i_close_fd(&fd);
+	i_unlink_if_exists(str_c(temp_path));
+	errno = orig_errno;
+	return ret;
+}
+
+int file_create_locked(const char *path, const struct file_create_settings *set,
+		       struct file_lock **lock_r, bool *created_r,
+		       const char **error_r)
+{
+	unsigned int i;
+	int fd, ret;
+
+	for (i = 0; i < MAX_RETRY_COUNT; i++) {
+		fd = open(path, O_RDWR | O_NOFOLLOW);
+		if (fd != -1) {
+			ret = try_lock_existing(fd, path, set, lock_r, error_r);
+			if (ret > 0) {
+				/* successfully locked an existing file */
+				*created_r = FALSE;
+				return fd;
+			}
+			i_close_fd(&fd);
+			if (ret < 0)
+				return -1;
+		} else if (errno == EACCES) {
+			*error_r = eacces_error_get("open", path);
+			return -1;
+		} else if (errno != ENOENT) {
+			*error_r = t_strdup_printf("open(%s) failed: %m", path);
+			return -1;
+		} else {
+			/* try to create the file */
+			ret = try_create_new(path, set, &fd, lock_r, error_r);
+			if (ret < 0)
+				return -1;
+			if (ret > 0) {
+				/* successfully created a new locked file */
+				*created_r = TRUE;
+				return fd;
+			}
+			/* the file was just created - try again opening and
+			   locking it */
+		}
+	}
+	*error_r = t_strdup_printf("Creating a locked file %s keeps failing", path);
+	errno = EINVAL;
+	return -1;
+}

@@ -1,0 +1,816 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ProcessorStateManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">ProcessorStateManager.java</span></div><h1>ProcessorStateManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.FixedOrderMap;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.errors.TaskCorruptedException;
+import org.apache.kafka.streams.errors.TaskMigratedException;
+import org.apache.kafka.streams.errors.internals.FailedProcessingException;
+import org.apache.kafka.streams.internals.UpgradeFromValues;
+import org.apache.kafka.streams.processor.CommitCallback;
+import org.apache.kafka.streams.processor.StateRestoreCallback;
+import org.apache.kafka.streams.processor.StateRestoreListener;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.Task.TaskType;
+import org.apache.kafka.streams.state.internals.CachedStateStore;
+import org.apache.kafka.streams.state.internals.LegacyCheckpointingStateStore;
+import org.apache.kafka.streams.state.internals.RecordConverter;
+import org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBuffer;
+import org.apache.kafka.streams.state.internals.WithRetentionPeriod;
+
+import org.slf4j.Logger;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import static java.lang.String.format;
+import static org.apache.kafka.streams.processor.internals.StateManagerUtil.converterForStore;
+import static org.apache.kafka.streams.processor.internals.StateRestoreCallbackAdapter.adapt;
+import static org.apache.kafka.streams.state.internals.OffsetCheckpoint.OFFSET_UNKNOWN;
+
+/**
+ * ProcessorStateManager is the source of truth for the current offset for each state store,
+ * which is either the read offset during restoring, or the written offset during normal processing.
+ *
+ * &lt;p&gt;The offset is initialized as null when the state store is registered, and then it can be updated by
+ * loading checkpoint file, restore state stores, or passing from the record collector's written offsets.
+ *
+ * &lt;p&gt;When checkpointing, if the offset is not null it would be written to the file.
+ *
+ * &lt;p&gt;The manager is also responsible for restoring state stores via their registered restore callback,
+ * which is used for both updating standby tasks as well as restoring active tasks.
+ */
+public class ProcessorStateManager implements StateManager {
+
+    public static class StateStoreMetadata {
+        private final StateStore stateStore;
+
+        // corresponding changelog partition of the store, this and the following two fields
+        // will only be not-null if the state store is logged (i.e. changelog partition and restorer provided)
+        private final TopicPartition changelogPartition;
+
+        // could be used for both active restoration and standby
+        private final StateRestoreCallback restoreCallback;
+
+        private final CommitCallback commitCallback;
+
+        // record converters used for restoration and standby
+        private final RecordConverter recordConverter;
+
+        // indicating the current snapshot of the store as the offset of last changelog record that has been
+        // applied to the store used for both restoration (active and standby tasks restored offset) and
+        // normal processing that update stores (written offset); could be null (when initialized)
+        //
+        // the offset is updated in three ways:
+        //   1. when loading from the checkpoint file, when the corresponding task has acquired the state
+        //      directory lock and have registered all the state store; it is only one-time
+        //   2. when updating with restore records (by both restoring active and standby),
+        //      update to the last restore record's offset
+        //   3. when checkpointing with the given written offsets from record collector,
+        //      update blindly with the given offset
+        private Long offset;
+
+        // Will be updated on batch restored
+        private Long endOffset;
+        // corrupted state store should not be included in checkpointing
+        private boolean corrupted;
+
+        private final long retentionPeriod;
+
+
+        private StateStoreMetadata(final StateStore stateStore,
+<span class="nc" id="L113">                                   final CommitCallback commitCallback) {</span>
+<span class="nc" id="L114">            this.stateStore = stateStore;</span>
+<span class="nc" id="L115">            this.commitCallback = commitCallback;</span>
+<span class="nc" id="L116">            this.restoreCallback = null;</span>
+<span class="nc" id="L117">            this.recordConverter = null;</span>
+<span class="nc" id="L118">            this.changelogPartition = null;</span>
+<span class="nc" id="L119">            this.corrupted = false;</span>
+<span class="nc" id="L120">            this.offset = null;</span>
+<span class="nc" id="L121">            this.retentionPeriod = -1L;</span>
+<span class="nc" id="L122">        }</span>
+
+        private StateStoreMetadata(final StateStore stateStore,
+                                   final TopicPartition changelogPartition,
+                                   final StateRestoreCallback restoreCallback,
+                                   final CommitCallback commitCallback,
+<span class="nc" id="L128">                                   final RecordConverter recordConverter) {</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            if (restoreCallback == null) {</span>
+<span class="nc" id="L130">                throw new IllegalStateException(&quot;Log enabled store should always provide a restore callback upon registration&quot;);</span>
+            }
+
+<span class="nc" id="L133">            this.stateStore = stateStore;</span>
+<span class="nc" id="L134">            this.changelogPartition = changelogPartition;</span>
+<span class="nc" id="L135">            this.restoreCallback = restoreCallback;</span>
+<span class="nc" id="L136">            this.commitCallback = commitCallback;</span>
+<span class="nc" id="L137">            this.recordConverter = recordConverter;</span>
+<span class="nc" id="L138">            this.offset = null;</span>
+<span class="nc" id="L139">            this.retentionPeriod = WithRetentionPeriod.resolveRetentionPeriod(stateStore);</span>
+<span class="nc" id="L140">        }</span>
+
+        private void setOffset(final Long offset) {
+<span class="nc" id="L143">            this.offset = offset;</span>
+<span class="nc" id="L144">        }</span>
+
+        // the offset is exposed to the changelog reader to determine if restoration is completed
+        Long offset() {
+<span class="nc" id="L148">            return this.offset;</span>
+        }
+
+        Long endOffset() {
+<span class="nc" id="L152">            return this.endOffset;</span>
+        }
+
+        // the retentionPeriod is exposed to the changelog reader for window restoration
+        long retentionPeriod() {
+<span class="nc" id="L157">            return retentionPeriod;</span>
+        }
+
+        public void setEndOffset(final Long endOffset) {
+<span class="nc" id="L161">            this.endOffset = endOffset;</span>
+<span class="nc" id="L162">        }</span>
+
+        TopicPartition changelogPartition() {
+<span class="nc" id="L165">            return this.changelogPartition;</span>
+        }
+
+        StateStore store() {
+<span class="nc" id="L169">            return LegacyCheckpointingStateStore.maybeUnwrapStore(this.stateStore);</span>
+        }
+
+        void markCorrupted() {
+<span class="nc" id="L173">            this.corrupted = true;</span>
+<span class="nc" id="L174">            LegacyCheckpointingStateStore.maybeMarkCorrupted(this.stateStore);</span>
+<span class="nc" id="L175">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L179">            return &quot;StateStoreMetadata (&quot; + stateStore.name() + &quot; : &quot; + changelogPartition + &quot; @ &quot; + offset;</span>
+        }
+    }
+
+    private static final String STATE_CHANGELOG_TOPIC_SUFFIX = &quot;-changelog&quot;;
+
+    private String logPrefix;
+
+    private final TaskId taskId;
+    private final boolean eosEnabled;
+    private final boolean transactionalStateStoresEnabled;
+    private final Collection&lt;TopicPartition&gt; sourcePartitions;
+    private final Map&lt;String, String&gt; storeToChangelogTopic;
+
+    // must be maintained in topological order
+<span class="nc" id="L194">    private final FixedOrderMap&lt;String, StateStoreMetadata&gt; stores = new FixedOrderMap&lt;&gt;();</span>
+<span class="nc" id="L195">    private final FixedOrderMap&lt;String, StateStore&gt; globalStores = new FixedOrderMap&lt;&gt;();</span>
+
+    private final StateDirectory stateDirectory;
+    private final File baseDir;
+    private final UpgradeFromValues upgradeFrom;
+    private final Time time;
+
+<span class="nc" id="L202">    private boolean startupTask = false;</span>
+
+    private TaskType taskType;
+    private Logger log;
+    private Task.State taskState;
+
+    public static String storeChangelogTopic(final String prefix, final String storeName, final String namedTopology) {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (namedTopology == null) {</span>
+<span class="nc" id="L210">            return prefix + &quot;-&quot; + storeName + STATE_CHANGELOG_TOPIC_SUFFIX;</span>
+        } else {
+<span class="nc" id="L212">            return prefix + &quot;-&quot; + namedTopology + &quot;-&quot; + storeName + STATE_CHANGELOG_TOPIC_SUFFIX;</span>
+        }
+    }
+
+    /**
+     * @throws ProcessorStateException if the task directory does not exist and could not be created
+     */
+    public ProcessorStateManager(final TaskId taskId,
+                                 final TaskType taskType,
+                                 final boolean eosEnabled,
+                                 final boolean transactionalStateStoresEnabled,
+                                 final LogContext logContext,
+                                 final StateDirectory stateDirectory,
+                                 final Time time,
+                                 final Map&lt;String, String&gt; storeToChangelogTopic,
+                                 final Collection&lt;TopicPartition&gt; sourcePartitions,
+<span class="nc" id="L228">                                 final UpgradeFromValues upgradeFrom) throws ProcessorStateException {</span>
+<span class="nc" id="L229">        this.storeToChangelogTopic = storeToChangelogTopic;</span>
+<span class="nc" id="L230">        this.log = logContext.logger(ProcessorStateManager.class);</span>
+<span class="nc" id="L231">        this.logPrefix = logContext.logPrefix();</span>
+<span class="nc" id="L232">        this.taskId = taskId;</span>
+<span class="nc" id="L233">        this.taskType = taskType;</span>
+<span class="nc" id="L234">        this.eosEnabled = eosEnabled;</span>
+<span class="nc" id="L235">        this.transactionalStateStoresEnabled = transactionalStateStoresEnabled;</span>
+<span class="nc" id="L236">        this.sourcePartitions = sourcePartitions;</span>
+<span class="nc" id="L237">        this.upgradeFrom = upgradeFrom;</span>
+<span class="nc" id="L238">        this.time = time;</span>
+
+<span class="nc" id="L240">        this.baseDir = stateDirectory.getOrCreateDirectoryForTask(taskId);</span>
+<span class="nc" id="L241">        this.stateDirectory = stateDirectory;</span>
+
+<span class="nc" id="L243">        log.debug(&quot;Created state store manager for task {}&quot;, taskId);</span>
+<span class="nc" id="L244">    }</span>
+
+    /**
+     * Convenience constructor that defaults {@code upgradeFrom} to {@code null}.
+     *
+     * @throws ProcessorStateException if the task directory does not exist and could not be created
+     */
+    public ProcessorStateManager(final TaskId taskId,
+                                 final TaskType taskType,
+                                 final boolean eosEnabled,
+                                 final boolean transactionalStateStoresEnabled,
+                                 final LogContext logContext,
+                                 final StateDirectory stateDirectory,
+                                 final Time time,
+                                 final Map&lt;String, String&gt; storeToChangelogTopic,
+                                 final Collection&lt;TopicPartition&gt; sourcePartitions) throws ProcessorStateException {
+<span class="nc" id="L260">        this(taskId, taskType, eosEnabled, transactionalStateStoresEnabled, logContext, stateDirectory, time, storeToChangelogTopic, sourcePartitions, null);</span>
+<span class="nc" id="L261">    }</span>
+
+    /**
+     * Special constructor used by {@link StateDirectory} to partially initialize startup tasks for local state, before
+     * they're assigned to a thread. When the task is assigned to a thread, the initialization of this StateManager is
+     * completed in {@link #assignToStreamThread(LogContext, Collection)}.
+     */
+    static ProcessorStateManager createStartupTaskStateManager(final TaskId taskId,
+                                                               final boolean eosEnabled,
+                                                               final LogContext logContext,
+                                                               final StateDirectory stateDirectory,
+                                                               final Time time,
+                                                               final Map&lt;String, String&gt; storeToChangelogTopic,
+                                                               final Set&lt;TopicPartition&gt; sourcePartitions) {
+<span class="nc" id="L275">        final ProcessorStateManager stateManager =</span>
+            new ProcessorStateManager(taskId, TaskType.STANDBY, eosEnabled, false, logContext, stateDirectory, time, storeToChangelogTopic, sourcePartitions);
+<span class="nc" id="L277">        stateManager.startupTask = true;</span>
+<span class="nc" id="L278">        return stateManager;</span>
+    }
+
+    void registerStateStores(final List&lt;StateStore&gt; allStores, final InternalProcessorContext&lt;?, ?&gt; processorContext) {
+<span class="nc" id="L282">        processorContext.uninitialize();</span>
+<span class="nc" id="L283">        final Map&lt;TopicPartition, StateStore&gt; storesToMigrate = new HashMap&lt;&gt;(stores.size());</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">        for (final StateStore store : allStores) {</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            if (!stores.containsKey(store.name())) {</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">                if (isLoggingEnabled(store.name())) {</span>
+<span class="nc" id="L287">                    final TopicPartition changelogPartition = getStorePartition(store.name());</span>
+<span class="nc" id="L288">                    final StateStore maybeWrappedStore = LegacyCheckpointingStateStore.maybeWrapStore(</span>
+<span class="nc" id="L289">                            store, eosEnabled, Set.of(changelogPartition), stateDirectory, taskId, logPrefix);</span>
+<span class="nc" id="L290">                    maybeWrappedStore.init(processorContext, maybeWrappedStore);</span>
+<span class="nc" id="L291">                    storesToMigrate.put(changelogPartition, maybeWrappedStore);</span>
+<span class="nc" id="L292">                } else {</span>
+<span class="nc" id="L293">                    final StateStore maybeWrappedStore = LegacyCheckpointingStateStore.maybeWrapStore(</span>
+<span class="nc" id="L294">                            store, eosEnabled, Set.of(), stateDirectory, taskId, logPrefix);</span>
+<span class="nc" id="L295">                    maybeWrappedStore.init(processorContext, maybeWrappedStore);</span>
+                }
+            }
+<span class="nc" id="L298">            log.trace(&quot;Registered state store {}&quot;, store.name());</span>
+<span class="nc" id="L299">        }</span>
+
+        // migrate offsets from the legacy checkpoint file into the stores
+<span class="nc" id="L302">        LegacyCheckpointingStateStore.migrateLegacyOffsets(logPrefix, stateDirectory, taskId, storesToMigrate);</span>
+<span class="nc" id="L303">    }</span>
+
+    void registerGlobalStateStores(final List&lt;StateStore&gt; stateStores) {
+<span class="nc" id="L306">        log.debug(&quot;Register global stores {}&quot;, stateStores);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        for (final StateStore stateStore : stateStores) {</span>
+<span class="nc" id="L308">            globalStores.put(stateStore.name(), stateStore);</span>
+<span class="nc" id="L309">        }</span>
+<span class="nc" id="L310">    }</span>
+
+    @Override
+    public StateStore globalStore(final String name) {
+<span class="nc" id="L314">        return globalStores.get(name);</span>
+    }
+
+    // package-private for test only
+    void initializeStoreOffsets(final boolean storeDirIsEmpty) {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        for (final StateStoreMetadata store : stores.values()) {</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">            if (store.corrupted) {</span>
+<span class="nc" id="L321">                log.error(&quot;Tried to initialize store offsets for corrupted store {}&quot;, store);</span>
+<span class="nc" id="L322">                throw new ProcessorStateException(</span>
+                        &quot;Error initializing offsets for store '&quot; + store + &quot;'&quot;,
+                        new IllegalStateException(&quot;Should not initialize offsets for a corrupted task&quot;)
+                );
+            }
+
+<span class="nc bnc" id="L328" title="All 2 branches missed.">            if (store.changelogPartition == null) {</span>
+<span class="nc" id="L329">                log.info(&quot;State store {} is not logged and hence would not be restored&quot;, store.stateStore.name());</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            } else if (!store.stateStore.persistent()) {</span>
+<span class="nc" id="L331">                log.info(&quot;Initializing to the starting offset for changelog {} of in-memory state store {}&quot;,</span>
+<span class="nc" id="L332">                        store.changelogPartition, store.stateStore.name());</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">            } else if (store.offset() == null) {</span>
+<span class="nc" id="L334">                final Long offset = store.stateStore.committedOffset(store.changelogPartition);</span>
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">                if (offset != null) {</span>
+<span class="nc" id="L337">                    store.setOffset(changelogOffsetFromCommittedOffset(offset));</span>
+<span class="nc" id="L338">                    log.info(&quot;State store {} initialized from checkpoint with offset {} at changelog {}&quot;,</span>
+<span class="nc" id="L339">                            store.stateStore.name(), store.offset, store.changelogPartition);</span>
+                } else {
+                    // with EOS, if the previous run did not shutdown gracefully, we may lost the checkpoint file
+                    // and hence we are uncertain that the current local state only contains committed data;
+                    // in that case we need to treat it as a task-corrupted exception
+<span class="nc bnc" id="L344" title="All 6 branches missed.">                    if (eosEnabled &amp;&amp; !storeDirIsEmpty &amp;&amp; !transactionalStateStoresEnabled) {</span>
+<span class="nc" id="L345">                        log.warn(&quot;State store {} did not find checkpoint offsets while stores are not empty, &quot; +</span>
+                                &quot;since under EOS it has the risk of getting uncommitted data in stores we have to &quot; +
+                                &quot;treat it as a task corruption error and wipe out the local state of task {} &quot; +
+<span class="nc" id="L348">                                &quot;before re-bootstrapping&quot;, store.stateStore.name(), taskId);</span>
+
+<span class="nc" id="L350">                        throw new TaskCorruptedException(Collections.singleton(taskId));</span>
+                    } else {
+<span class="nc" id="L352">                        log.info(&quot;State store {} did not find checkpoint offset, hence would &quot; +</span>
+                                        &quot;default to the starting offset at changelog {}&quot;,
+<span class="nc" id="L354">                                store.stateStore.name(), store.changelogPartition);</span>
+                    }
+                }
+            }
+<span class="nc" id="L358">        }</span>
+
+        try {
+<span class="nc" id="L361">            stateDirectory.updateTaskOffsets(taskId, persistentChangelogOffsets());</span>
+<span class="nc" id="L362">        } catch (final RuntimeException e) {</span>
+<span class="nc" id="L363">            throw new ProcessorStateException(format(&quot;%sError updating state directory offsets when creating the state manager&quot;,</span>
+                logPrefix), e);
+<span class="nc" id="L365">        }</span>
+<span class="nc" id="L366">    }</span>
+
+    @Override
+    public File baseDir() {
+<span class="nc" id="L370">        return baseDir;</span>
+    }
+
+    @Override
+    public void registerStore(final StateStore store,
+                              final StateRestoreCallback stateRestoreCallback,
+                              final CommitCallback commitCallback) {
+<span class="nc" id="L377">        final String storeName = store.name();</span>
+
+        // TODO (KAFKA-12887): we should not trigger user's exception handler for illegal-argument but always
+        // fail-crash; in this case we would not need to immediately close the state store before throwing
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (LegacyCheckpointingStateStore.CHECKPOINT_FILE_NAME.startsWith(storeName)) {</span>
+<span class="nc" id="L382">            store.close();</span>
+<span class="nc" id="L383">            throw new IllegalArgumentException(format(&quot;%sIllegal store name: %s, which collides with the pre-defined &quot; +</span>
+                &quot;checkpoint file name&quot;, logPrefix, storeName));
+        }
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        if (stores.containsKey(storeName)) {</span>
+<span class="nc" id="L388">            store.close();</span>
+<span class="nc" id="L389">            throw new IllegalArgumentException(format(&quot;%sStore %s has already been registered.&quot;, logPrefix, storeName));</span>
+        }
+
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        if (stateRestoreCallback instanceof StateRestoreListener) {</span>
+<span class="nc" id="L393">            log.warn(&quot;The registered state restore callback is also implementing the state restore listener interface, &quot; +</span>
+                    &quot;which is not expected and would be ignored&quot;);
+        }
+
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        final StateStoreMetadata storeMetadata = isLoggingEnabled(storeName) ?</span>
+<span class="nc" id="L398">            new StateStoreMetadata(</span>
+                store,
+<span class="nc" id="L400">                getStorePartition(storeName),</span>
+                stateRestoreCallback,
+                commitCallback,
+<span class="nc" id="L403">                converterForStore(store)) :</span>
+<span class="nc" id="L404">            new StateStoreMetadata(store, commitCallback);</span>
+
+        // register the store first, so that if later an exception is thrown then eventually while we call `close`
+        // on the state manager this state store would be closed as well
+<span class="nc" id="L408">        stores.put(storeName, storeMetadata);</span>
+
+<span class="nc" id="L410">        log.debug(&quot;Registered state store {} to its state manager&quot;, storeName);</span>
+<span class="nc" id="L411">    }</span>
+
+    @Override
+    public StateStore store(final String name) {
+<span class="nc bnc" id="L415" title="All 2 branches missed.">        if (stores.containsKey(name)) {</span>
+<span class="nc" id="L416">            return stores.get(name).store();</span>
+        } else {
+<span class="nc" id="L418">            return null;</span>
+        }
+    }
+
+    Set&lt;TopicPartition&gt; changelogPartitions() {
+<span class="nc" id="L423">        return Collections.unmodifiableSet(changelogOffsets().keySet());</span>
+    }
+
+    boolean hasCorruptedStores() {
+<span class="nc" id="L427">        return stores.values().stream().anyMatch(m -&gt; m.corrupted);</span>
+    }
+
+    void markChangelogAsCorrupted(final Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L431">        final Collection&lt;TopicPartition&gt; partitionsToMarkAsCorrupted = new LinkedList&lt;&gt;(partitions);</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">        for (final StateStoreMetadata storeMetadata : stores.values()) {</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">            if (partitionsToMarkAsCorrupted.contains(storeMetadata.changelogPartition)) {</span>
+<span class="nc" id="L434">                storeMetadata.markCorrupted();</span>
+<span class="nc" id="L435">                partitionsToMarkAsCorrupted.remove(storeMetadata.changelogPartition);</span>
+            }
+<span class="nc" id="L437">        }</span>
+
+<span class="nc bnc" id="L439" title="All 2 branches missed.">        if (!partitionsToMarkAsCorrupted.isEmpty()) {</span>
+<span class="nc" id="L440">            throw new IllegalStateException(&quot;Some partitions &quot; + partitionsToMarkAsCorrupted + &quot; are not contained in &quot; +</span>
+                &quot;the store list of task &quot; + taskId + &quot; marking as corrupted, this is not expected&quot;);
+        }
+<span class="nc" id="L443">    }</span>
+
+    @Override
+    public Map&lt;TopicPartition, Long&gt; changelogOffsets() {
+<span class="nc" id="L447">        return changelogOffsets(storeMetadata -&gt; true);</span>
+    }
+
+    private Map&lt;TopicPartition, Long&gt; persistentChangelogOffsets() {
+<span class="nc" id="L451">        return changelogOffsets(storeMetadata -&gt; storeMetadata.stateStore.persistent());</span>
+    }
+
+    private Map&lt;TopicPartition, Long&gt; changelogOffsets(final Predicate&lt;StateStoreMetadata&gt; storeFilter) {
+        // return the current offsets for those logged stores
+<span class="nc" id="L456">        final Map&lt;TopicPartition, Long&gt; changelogOffsets = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        for (final StateStoreMetadata storeMetadata : stores.values()) {</span>
+<span class="nc bnc" id="L458" title="All 4 branches missed.">            if (storeMetadata.changelogPartition != null &amp;&amp; storeFilter.test(storeMetadata)) {</span>
+                // for changelog whose offset is unknown, use 0L indicating earliest offset
+                // otherwise return the current offset + 1 as the next offset to fetch
+<span class="nc" id="L461">                changelogOffsets.put(</span>
+                    storeMetadata.changelogPartition,
+<span class="nc bnc" id="L463" title="All 2 branches missed.">                    storeMetadata.offset == null ? 0L : storeMetadata.offset + 1L);</span>
+            }
+<span class="nc" id="L465">        }</span>
+<span class="nc" id="L466">        return changelogOffsets;</span>
+    }
+
+    TaskId taskId() {
+<span class="nc" id="L470">        return taskId;</span>
+    }
+
+    void transitionTaskState(final Task.State taskState) {
+<span class="nc" id="L474">        this.taskState = taskState;</span>
+<span class="nc" id="L475">    }</span>
+
+    Task.State taskState() {
+<span class="nc" id="L478">        return taskState;</span>
+    }
+
+    // used by the changelog reader only
+    boolean changelogAsSource(final TopicPartition partition) {
+<span class="nc" id="L483">        return sourcePartitions.contains(partition);</span>
+    }
+
+    @Override
+    public TaskType taskType() {
+<span class="nc" id="L488">        return taskType;</span>
+    }
+
+    // used by the changelog reader only
+    StateStoreMetadata storeMetadata(final TopicPartition partition) {
+<span class="nc bnc" id="L493" title="All 2 branches missed.">        for (final StateStoreMetadata storeMetadata : stores.values()) {</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">            if (partition.equals(storeMetadata.changelogPartition)) {</span>
+<span class="nc" id="L495">                return storeMetadata;</span>
+            }
+<span class="nc" id="L497">        }</span>
+<span class="nc" id="L498">        return null;</span>
+    }
+
+    // used by the changelog reader only
+    void restore(final StateStoreMetadata storeMetadata, final List&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; restoreRecords, final OptionalLong optionalLag) {
+<span class="nc bnc" id="L503" title="All 2 branches missed.">        if (!stores.containsValue(storeMetadata)) {</span>
+<span class="nc" id="L504">            throw new IllegalStateException(&quot;Restoring &quot; + storeMetadata + &quot; which is not registered in this state manager, &quot; +</span>
+                &quot;this should not happen.&quot;);
+        }
+
+<span class="nc bnc" id="L508" title="All 2 branches missed.">        if (!restoreRecords.isEmpty()) {</span>
+            // restore states from changelog records and update the snapshot offset as the batch end record's offset
+<span class="nc" id="L510">            final Long batchEndOffset = restoreRecords.get(restoreRecords.size() - 1).offset();</span>
+<span class="nc" id="L511">            final RecordBatchingStateRestoreCallback restoreCallback = adapt(storeMetadata.restoreCallback);</span>
+<span class="nc" id="L512">            final List&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; convertedRecords = restoreRecords.stream()</span>
+<span class="nc" id="L513">                .map(storeMetadata.recordConverter::convert)</span>
+<span class="nc" id="L514">                .collect(Collectors.toList());</span>
+
+            try {
+<span class="nc" id="L517">                restoreCallback.restoreBatch(convertedRecords);</span>
+<span class="nc" id="L518">            } catch (final RuntimeException e) {</span>
+<span class="nc" id="L519">                throw new ProcessorStateException(</span>
+<span class="nc" id="L520">                    format(&quot;%sException caught while trying to restore state from %s&quot;, logPrefix, storeMetadata.changelogPartition),</span>
+                    e
+                );
+<span class="nc" id="L523">            }</span>
+
+<span class="nc" id="L525">            storeMetadata.setOffset(batchEndOffset);</span>
+
+            // If null means the lag for this partition is not known yet
+<span class="nc bnc" id="L528" title="All 2 branches missed.">            if (optionalLag.isPresent()) {</span>
+<span class="nc" id="L529">                storeMetadata.setEndOffset(optionalLag.getAsLong() + batchEndOffset);</span>
+            }
+
+<span class="nc" id="L532">            stateDirectory.updateTaskOffsets(taskId, persistentChangelogOffsets());</span>
+        }
+<span class="nc" id="L534">    }</span>
+
+    /**
+     * @throws TaskMigratedException recoverable error sending changelog records that would cause the task to be removed
+     * @throws StreamsException fatal error when committing the state store, for example sending changelog records failed
+     *                          or committing state store get IO errors; such error should cause the thread to die
+     */
+    @Override
+    public void commit() {
+<span class="nc" id="L543">        RuntimeException firstException = null;</span>
+        // attempting to commit the stores
+<span class="nc bnc" id="L545" title="All 2 branches missed.">        if (!stores.isEmpty()) {</span>
+<span class="nc" id="L546">            log.debug(&quot;Committing all stores registered in the state manager: {}&quot;, stores);</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">            for (final StateStoreMetadata metadata : stores.values()) {</span>
+<span class="nc" id="L548">                final StateStore store = metadata.stateStore;</span>
+<span class="nc" id="L549">                log.trace(&quot;Committing store {}&quot;, store.name());</span>
+                try {
+<span class="nc bnc" id="L551" title="All 6 branches missed.">                    if (metadata.changelogPartition == null || metadata.corrupted || !store.persistent()) {</span>
+<span class="nc" id="L552">                        store.commit(Map.of());</span>
+                    } else {
+                        // logged store, persistent and valid end offset
+<span class="nc" id="L555">                        store.commit(Map.of(metadata.changelogPartition, committableOffsetFromChangelogOffset(metadata.offset)));</span>
+                    }
+
+<span class="nc bnc" id="L558" title="All 4 branches missed.">                    if (!metadata.corrupted &amp;&amp; metadata.commitCallback != null) {</span>
+                        try {
+<span class="nc" id="L560">                            metadata.commitCallback.onCommit();</span>
+<span class="nc" id="L561">                        } catch (final IOException e) {</span>
+<span class="nc" id="L562">                            throw new ProcessorStateException(</span>
+<span class="nc" id="L563">                                    format(&quot;%sException caught while trying to checkpoint store, &quot; +</span>
+                                            &quot;changelog partition %s&quot;, logPrefix, metadata.changelogPartition),
+                                    e
+                            );
+<span class="nc" id="L567">                        }</span>
+                    }
+<span class="nc" id="L569">                } catch (final RuntimeException exception) {</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">                    if (firstException == null) {</span>
+                        // do NOT wrap the error if it is actually caused by Streams itself
+                        // In case of FailedProcessingException Do not keep the failed processing exception in the stack trace
+<span class="nc bnc" id="L573" title="All 2 branches missed.">                        if (exception instanceof FailedProcessingException)</span>
+<span class="nc" id="L574">                            firstException = new ProcessorStateException(</span>
+<span class="nc" id="L575">                                    format(&quot;%sFailed to commit state store %s&quot;, logPrefix, store.name()),</span>
+<span class="nc" id="L576">                                    exception.getCause());</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                        else if (exception instanceof StreamsException)</span>
+<span class="nc" id="L578">                            firstException = exception;</span>
+                        else
+<span class="nc" id="L580">                            firstException = new ProcessorStateException(</span>
+<span class="nc" id="L581">                                    format(&quot;%sFailed to commit state store %s&quot;, logPrefix, store.name()), exception);</span>
+<span class="nc" id="L582">                        log.error(&quot;Failed to commit state store {}: &quot;, store.name(), firstException);</span>
+                    } else {
+<span class="nc" id="L584">                        log.error(&quot;Failed to commit state store {}: &quot;, store.name(), exception);</span>
+                    }
+<span class="nc" id="L586">                }</span>
+<span class="nc" id="L587">            }</span>
+        }
+
+<span class="nc bnc" id="L590" title="All 2 branches missed.">        if (firstException != null) {</span>
+<span class="nc" id="L591">            throw firstException;</span>
+        }
+<span class="nc" id="L593">    }</span>
+
+    public void flushCache() {
+<span class="nc" id="L596">        RuntimeException firstException = null;</span>
+        // attempting to flush the stores
+<span class="nc bnc" id="L598" title="All 2 branches missed.">        if (!stores.isEmpty()) {</span>
+<span class="nc" id="L599">            log.debug(&quot;Flushing all store caches registered in the state manager: {}&quot;, stores);</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">            for (final StateStoreMetadata metadata : stores.values()) {</span>
+<span class="nc" id="L601">                final StateStore store = metadata.stateStore;</span>
+
+                try {
+                    // buffer should be committed to send all records to changelog
+<span class="nc bnc" id="L605" title="All 2 branches missed.">                    if (store instanceof TimeOrderedKeyValueBuffer) {</span>
+<span class="nc" id="L606">                        store.commit(Map.of());</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">                    } else if (store instanceof CachedStateStore) {</span>
+<span class="nc" id="L608">                        ((CachedStateStore&lt;?, ?&gt;) store).flushCache();</span>
+                    }
+<span class="nc" id="L610">                    log.trace(&quot;Flushed cache or buffer {}&quot;, store.name());</span>
+<span class="nc" id="L611">                } catch (final RuntimeException exception) {</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">                    if (firstException == null) {</span>
+                        // do NOT wrap the error if it is actually caused by Streams itself
+                        // In case of FailedProcessingException Do not keep the failed processing exception in the stack trace
+<span class="nc bnc" id="L615" title="All 2 branches missed.">                        if (exception instanceof FailedProcessingException) {</span>
+<span class="nc" id="L616">                            firstException = new ProcessorStateException(</span>
+<span class="nc" id="L617">                                format(&quot;%sFailed to flush cache of store %s&quot;, logPrefix, store.name()),</span>
+<span class="nc" id="L618">                                exception.getCause());</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">                        } else if (exception instanceof StreamsException) {</span>
+<span class="nc" id="L620">                            firstException = exception;</span>
+                        } else {
+<span class="nc" id="L622">                            firstException = new ProcessorStateException(</span>
+<span class="nc" id="L623">                                format(&quot;%sFailed to flush cache of store %s&quot;, logPrefix, store.name()),</span>
+                                exception
+                            );
+                        }
+<span class="nc" id="L627">                        log.error(&quot;Failed to flush cache of store {}: &quot;, store.name(), firstException);</span>
+                    } else {
+<span class="nc" id="L629">                        log.error(&quot;Failed to flush cache of store {}: &quot;, store.name(), exception);</span>
+                    }
+<span class="nc" id="L631">                }</span>
+<span class="nc" id="L632">            }</span>
+        }
+
+<span class="nc bnc" id="L635" title="All 2 branches missed.">        if (firstException != null) {</span>
+<span class="nc" id="L636">            throw firstException;</span>
+        }
+<span class="nc" id="L638">    }</span>
+
+    long approximateNumUncommittedBytes() {
+<span class="nc" id="L641">        long total = 0;</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        for (final StateStoreMetadata metadata : stores.values()) {</span>
+<span class="nc" id="L643">            total += metadata.stateStore.approximateNumUncommittedBytes();</span>
+<span class="nc" id="L644">        }</span>
+<span class="nc" id="L645">        return total;</span>
+    }
+
+    /**
+     * {@link StateStore#close() Close} all stores (even in case of failure).
+     * Log all exceptions and re-throw the first exception that occurred at the end.
+     *
+     * @throws ProcessorStateException if any error happens when closing the state stores
+     */
+    @Override
+    public void close() throws ProcessorStateException {
+<span class="nc" id="L656">        log.debug(&quot;Closing its state manager and all the registered state stores: {}&quot;, stores);</span>
+
+<span class="nc" id="L658">        final Map&lt;TopicPartition, Long&gt; allOffsets = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L659">        RuntimeException firstException = null;</span>
+        // attempting to close the stores, just in case they
+        // are not closed by a ProcessorNode yet
+<span class="nc bnc" id="L662" title="All 2 branches missed.">        if (!stores.isEmpty()) {</span>
+<span class="nc bnc" id="L663" title="All 2 branches missed.">            for (final Map.Entry&lt;String, StateStoreMetadata&gt; entry : stores.entrySet()) {</span>
+<span class="nc" id="L664">                final StateStoreMetadata metadata = entry.getValue();</span>
+<span class="nc" id="L665">                final StateStore store = metadata.stateStore;</span>
+<span class="nc" id="L666">                log.trace(&quot;Closing store {}&quot;, store.name());</span>
+                try {
+<span class="nc" id="L668">                    store.close();</span>
+<span class="nc" id="L669">                } catch (final RuntimeException exception) {</span>
+<span class="nc bnc" id="L670" title="All 2 branches missed.">                    if (firstException == null) {</span>
+                        // do NOT wrap the error if it is actually caused by Streams itself
+                        // In case of FailedProcessingException Do not keep the failed processing exception in the stack trace
+<span class="nc bnc" id="L673" title="All 2 branches missed.">                        if (exception instanceof FailedProcessingException)</span>
+<span class="nc" id="L674">                            firstException = new ProcessorStateException(</span>
+<span class="nc" id="L675">                                format(&quot;%sFailed to close state store %s&quot;, logPrefix, store.name()),</span>
+<span class="nc" id="L676">                                exception.getCause());</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">                        else if (exception instanceof StreamsException)</span>
+<span class="nc" id="L678">                            firstException = exception;</span>
+                        else
+<span class="nc" id="L680">                            firstException = new ProcessorStateException(</span>
+<span class="nc" id="L681">                                format(&quot;%sFailed to close state store %s&quot;, logPrefix, store.name()), exception);</span>
+<span class="nc" id="L682">                        log.error(&quot;Failed to close state store {}: &quot;, store.name(), firstException);</span>
+                    } else {
+<span class="nc" id="L684">                        log.error(&quot;Failed to close state store {}: &quot;, store.name(), exception);</span>
+                    }
+<span class="nc" id="L686">                }</span>
+
+                // collect offsets for potential downgrade checkpoint
+<span class="nc bnc" id="L689" title="All 4 branches missed.">                if (metadata.changelogPartition != null &amp;&amp; !metadata.corrupted) {</span>
+<span class="nc" id="L690">                    allOffsets.put(metadata.changelogPartition, metadata.offset);</span>
+                }
+<span class="nc" id="L692">            }</span>
+
+<span class="nc" id="L694">            stores.clear();</span>
+
+            // Refresh the task directory's modification time so the state directory cleaner does
+            // not treat the just-released directory as obsolete before it can be reassigned.
+<span class="nc bnc" id="L698" title="All 6 branches missed.">            if (!startupTask &amp;&amp; baseDir.exists() &amp;&amp; !baseDir.setLastModified(time.milliseconds())) {</span>
+<span class="nc" id="L699">                log.warn(&quot;{}Failed to update modification time of state directory {} for task {}&quot;,</span>
+                    logPrefix, baseDir, taskId);
+            }
+        }
+
+<span class="nc" id="L704">        LegacyCheckpointingStateStore.maybeDowngradeOffsets(logPrefix, upgradeFrom, stateDirectory, taskId, allOffsets);</span>
+
+<span class="nc bnc" id="L706" title="All 2 branches missed.">        if (firstException != null) {</span>
+<span class="nc" id="L707">            throw firstException;</span>
+        }
+<span class="nc" id="L709">    }</span>
+
+    /**
+     * Alternative to {@link #close()} that just resets the changelogs without closing any of the underlying state
+     * or unregistering the stores themselves
+     */
+    void recycle() {
+<span class="nc" id="L716">        log.debug(&quot;Recycling state for {} task {}.&quot;, taskType, taskId);</span>
+
+        // when the state manager is recycled to be used, future writes may bypass its store's caching
+        // layer if they are from restoration, hence we need to clear the state store's caches just in case
+        // See KAFKA-14172 for details
+<span class="nc bnc" id="L721" title="All 2 branches missed.">        if (!stores.isEmpty()) {</span>
+<span class="nc" id="L722">            log.debug(&quot;Clearing all store caches registered in the state manager: {}&quot;, stores);</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">            for (final StateStoreMetadata metadata : stores.values()) {</span>
+<span class="nc" id="L724">                final StateStore store = metadata.stateStore;</span>
+
+<span class="nc bnc" id="L726" title="All 2 branches missed.">                if (store instanceof CachedStateStore) {</span>
+<span class="nc" id="L727">                    ((CachedStateStore&lt;?, ?&gt;) store).clearCache();</span>
+                }
+<span class="nc" id="L729">                log.trace(&quot;Cleared cache {}&quot;, store.name());</span>
+<span class="nc" id="L730">            }</span>
+        }
+<span class="nc" id="L732">    }</span>
+
+    void transitionTaskType(final TaskType newType, final LogContext logContext) {
+<span class="nc bnc" id="L735" title="All 2 branches missed.">        if (taskType.equals(newType)) {</span>
+<span class="nc" id="L736">            throw new IllegalStateException(&quot;Tried to recycle state for task type conversion but new type was the same.&quot;);</span>
+        }
+
+<span class="nc" id="L739">        taskType = newType;</span>
+<span class="nc" id="L740">        log = logContext.logger(ProcessorStateManager.class);</span>
+<span class="nc" id="L741">    }</span>
+
+    @Override
+    public void updateChangelogOffsets(final Map&lt;TopicPartition, Long&gt; writtenOffsets) {
+<span class="nc bnc" id="L745" title="All 2 branches missed.">        for (final Map.Entry&lt;TopicPartition, Long&gt; entry : writtenOffsets.entrySet()) {</span>
+<span class="nc" id="L746">            final StateStoreMetadata store = findStore(entry.getKey());</span>
+
+<span class="nc bnc" id="L748" title="All 2 branches missed.">            if (store != null) {</span>
+<span class="nc" id="L749">                store.setOffset(entry.getValue());</span>
+
+<span class="nc" id="L751">                log.debug(&quot;State store {} updated to written offset {} at changelog {}&quot;,</span>
+<span class="nc" id="L752">                        store.stateStore.name(), store.offset, store.changelogPartition);</span>
+            }
+<span class="nc" id="L754">        }</span>
+
+<span class="nc" id="L756">        stateDirectory.updateTaskOffsets(taskId, persistentChangelogOffsets());</span>
+<span class="nc" id="L757">    }</span>
+
+    // Commit a sentinel value when the changelog offset is not yet initialized/known
+    private long committableOffsetFromChangelogOffset(final Long offset) {
+<span class="nc bnc" id="L761" title="All 2 branches missed.">        return offset != null ? offset : OFFSET_UNKNOWN;</span>
+    }
+
+    // Convert the written offsets in the checkpoint file back to the changelog offset
+    private Long changelogOffsetFromCommittedOffset(final long offset) {
+<span class="nc bnc" id="L766" title="All 2 branches missed.">        return offset != OFFSET_UNKNOWN ? offset : null;</span>
+    }
+
+    private  TopicPartition getStorePartition(final String storeName) {
+        // NOTE we assume the partition of the topic can always be inferred from the task id;
+        // if user ever use a custom partition grouper (deprecated in KIP-528) this would break and
+        // it is not a regression (it would always break anyways)
+<span class="nc" id="L773">        return new TopicPartition(changelogFor(storeName), taskId.partition());</span>
+    }
+
+    private boolean isLoggingEnabled(final String storeName) {
+        // if the store name does not exist in the changelog map, it means the underlying store
+        // is not log enabled (including global stores)
+<span class="nc bnc" id="L779" title="All 2 branches missed.">        return changelogFor(storeName) != null;</span>
+    }
+
+    private StateStoreMetadata findStore(final TopicPartition changelogPartition) {
+<span class="nc" id="L783">        final List&lt;StateStoreMetadata&gt; found = stores.values().stream()</span>
+<span class="nc" id="L784">            .filter(metadata -&gt; changelogPartition.equals(metadata.changelogPartition))</span>
+<span class="nc" id="L785">            .collect(Collectors.toList());</span>
+
+<span class="nc bnc" id="L787" title="All 2 branches missed.">        if (found.size() &gt; 1) {</span>
+<span class="nc" id="L788">            throw new IllegalStateException(&quot;Multiple state stores are found for changelog partition &quot; + changelogPartition +</span>
+                &quot;, this should never happen: &quot; + found);
+        }
+
+<span class="nc bnc" id="L792" title="All 2 branches missed.">        return found.isEmpty() ? null : found.get(0);</span>
+    }
+
+    public TopicPartition registeredChangelogPartitionFor(final String storeName) {
+<span class="nc" id="L796">        final StateStoreMetadata storeMetadata = stores.get(storeName);</span>
+<span class="nc bnc" id="L797" title="All 2 branches missed.">        if (storeMetadata == null) {</span>
+<span class="nc" id="L798">            throw new IllegalStateException(&quot;State store &quot; + storeName</span>
+                + &quot; for which the registered changelog partition should be&quot;
+                + &quot; retrieved has not been registered&quot;
+            );
+        }
+<span class="nc bnc" id="L803" title="All 2 branches missed.">        if (storeMetadata.changelogPartition == null) {</span>
+<span class="nc" id="L804">            throw new IllegalStateException(&quot;Registered state store &quot; + storeName</span>
+                + &quot; does not have a registered changelog partition.&quot;
+                + &quot; This may happen if logging is disabled for the state store.&quot;
+            );
+        }
+<span class="nc" id="L809">        return storeMetadata.changelogPartition;</span>
+    }
+
+    public String changelogFor(final String storeName) {
+<span class="nc" id="L813">        return storeToChangelogTopic.get(storeName);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

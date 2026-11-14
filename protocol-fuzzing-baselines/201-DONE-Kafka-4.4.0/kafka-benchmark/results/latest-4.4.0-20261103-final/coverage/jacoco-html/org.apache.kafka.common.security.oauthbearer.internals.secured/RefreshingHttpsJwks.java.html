@@ -1,0 +1,377 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RefreshingHttpsJwks.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.security.oauthbearer.internals.secured</a> &gt; <span class="el_source">RefreshingHttpsJwks.java</span></div><h1>RefreshingHttpsJwks.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.common.security.oauthbearer.internals.secured;
+
+import org.apache.kafka.common.security.oauthbearer.BrokerJwtValidator;
+import org.apache.kafka.common.utils.Time;
+
+import org.jose4j.jwk.HttpsJwks;
+import org.jose4j.jwk.JsonWebKey;
+import org.jose4j.lang.JoseException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+/**
+ * Implementation of {@link HttpsJwks} that will periodically refresh the JWKS cache to reduce or
+ * even prevent HTTP/HTTPS traffic in the hot path of validation. It is assumed that it's
+ * possible to receive a JWT that contains a &lt;code&gt;kid&lt;/code&gt; that points to yet-unknown JWK,
+ * thus requiring a connection to the OAuth/OIDC provider to be made. Hopefully, in practice,
+ * keys are made available for some amount of time before they're used within JWTs.
+ * &lt;p&gt;
+ * This instance is created and provided to the
+ * {@link org.jose4j.keys.resolvers.HttpsJwksVerificationKeyResolver} that is used when using
+ * an HTTP-/HTTPS-based {@link org.jose4j.keys.resolvers.VerificationKeyResolver}, which is then
+ * provided to the {@link BrokerJwtValidator} to use in validating the signature of
+ * a JWT.
+ *
+ * @see org.jose4j.keys.resolvers.HttpsJwksVerificationKeyResolver
+ * @see org.jose4j.keys.resolvers.VerificationKeyResolver
+ * @see BrokerJwtValidator
+ */
+public final class RefreshingHttpsJwks implements OAuthBearerConfigurable {
+
+<span class="nc" id="L61">    private static final Logger log = LoggerFactory.getLogger(RefreshingHttpsJwks.class);</span>
+
+    private static final int MISSING_KEY_ID_CACHE_MAX_ENTRIES = 16;
+
+    static final long MISSING_KEY_ID_CACHE_IN_FLIGHT_MS = 60000;
+
+    static final int MISSING_KEY_ID_MAX_KEY_LENGTH = 1000;
+
+    private static final int SHUTDOWN_TIMEOUT = 10;
+
+<span class="nc" id="L71">    private static final TimeUnit SHUTDOWN_TIME_UNIT = TimeUnit.SECONDS;</span>
+
+    /**
+     * {@link HttpsJwks} does the actual work of contacting the OAuth/OIDC endpoint to get the
+     * JWKS. In some cases, the call to {@link HttpsJwks#getJsonWebKeys()} will trigger a call
+     * to {@link HttpsJwks#refresh()} which will block the current thread in network I/O. We cache
+     * the JWKS ourselves (see {@link #jsonWebKeys}) to avoid the network I/O.
+     * &lt;p&gt;
+     * We want to be very careful where we use the {@link HttpsJwks} instance so that we don't
+     * perform any operation (directly or indirectly) that could cause blocking. This is because
+     * the JWKS logic is part of the larger authentication logic which operates on Kafka's network
+     * thread. It's OK to execute {@link HttpsJwks#getJsonWebKeys()} (which calls
+     * {@link HttpsJwks#refresh()}) from within {@link #init()} as that method is called only at
+     * startup, and we can afford the blocking hit there.
+     */
+
+    private final HttpsJwks httpsJwks;
+
+    private final ScheduledExecutorService executorService;
+
+    private final Time time;
+
+    private final long refreshMs;
+
+    private final long refreshRetryBackoffMs;
+
+    private final long refreshRetryBackoffMaxMs;
+
+    /**
+     * Protects {@link #missingKeyIds} and {@link #jsonWebKeys}.
+     */
+
+<span class="nc" id="L103">    private final ReadWriteLock refreshLock = new ReentrantReadWriteLock();</span>
+
+    private final Map&lt;String, Long&gt; missingKeyIds;
+
+    /**
+     * Flag to prevent concurrent refresh invocations.
+     */
+
+<span class="nc" id="L111">    private final AtomicBoolean refreshInProgressFlag = new AtomicBoolean(false);</span>
+
+    /**
+     * As mentioned in the comments for {@link #httpsJwks}, we cache the JWKS ourselves so that
+     * we can return the list immediately without any network I/O. They are only cached within
+     * calls to {@link #refresh()}.
+     */
+
+    private List&lt;JsonWebKey&gt; jsonWebKeys;
+
+    private boolean isInitialized;
+
+    /**
+     * Creates a &lt;code&gt;RefreshingHttpsJwks&lt;/code&gt;. It should only be used for testing to pass in a mock executor
+     * service. Otherwise the constructor below should be used.
+     */
+
+    // VisibleForTesting
+    RefreshingHttpsJwks(Time time,
+                        HttpsJwks httpsJwks,
+                        long refreshMs,
+                        long refreshRetryBackoffMs,
+                        long refreshRetryBackoffMaxMs,
+<span class="nc" id="L134">                        ScheduledExecutorService executorService) {</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        if (refreshMs &lt;= 0)</span>
+<span class="nc" id="L136">            throw new IllegalArgumentException(&quot;JWKS validation key refresh configuration value retryWaitMs value must be positive&quot;);</span>
+
+<span class="nc" id="L138">        this.httpsJwks = httpsJwks;</span>
+<span class="nc" id="L139">        this.time = time;</span>
+<span class="nc" id="L140">        this.refreshMs = refreshMs;</span>
+<span class="nc" id="L141">        this.refreshRetryBackoffMs = refreshRetryBackoffMs;</span>
+<span class="nc" id="L142">        this.refreshRetryBackoffMaxMs = refreshRetryBackoffMaxMs;</span>
+<span class="nc" id="L143">        this.executorService = executorService;</span>
+<span class="nc" id="L144">        this.missingKeyIds = new LinkedHashMap&lt;&gt;(MISSING_KEY_ID_CACHE_MAX_ENTRIES, .75f, true) {</span>
+            @Override
+            protected boolean removeEldestEntry(Map.Entry&lt;String, Long&gt; eldest) {
+<span class="nc bnc" id="L147" title="All 2 branches missed.">                return this.size() &gt; MISSING_KEY_ID_CACHE_MAX_ENTRIES;</span>
+            }
+        };
+<span class="nc" id="L150">    }</span>
+
+    /**
+     * Creates a &lt;code&gt;RefreshingHttpsJwks&lt;/code&gt; that will be used by the
+     * {@link RefreshingHttpsJwksVerificationKeyResolver} to resolve new key IDs in JWTs.
+     *
+     * @param time                     {@link Time} instance
+     * @param httpsJwks                {@link HttpsJwks} instance from which to retrieve the JWKS
+     *                                 based on the OAuth/OIDC standard
+     * @param refreshMs                The number of milliseconds between refresh passes to connect
+     *                                 to the OAuth/OIDC JWKS endpoint to retrieve the latest set
+     * @param refreshRetryBackoffMs    Time for delay after initial failed attempt to retrieve JWKS
+     * @param refreshRetryBackoffMaxMs Maximum time to retrieve JWKS
+     */
+
+    public RefreshingHttpsJwks(Time time,
+                               HttpsJwks httpsJwks,
+                               long refreshMs,
+                               long refreshRetryBackoffMs,
+                               long refreshRetryBackoffMaxMs) {
+<span class="nc" id="L170">        this(time, httpsJwks, refreshMs, refreshRetryBackoffMs, refreshRetryBackoffMaxMs, Executors.newSingleThreadScheduledExecutor());</span>
+<span class="nc" id="L171">    }</span>
+
+    public void init() throws IOException {
+        try {
+<span class="nc" id="L175">            log.debug(&quot;init started&quot;);</span>
+
+            List&lt;JsonWebKey&gt; localJWKs;
+
+            try {
+<span class="nc" id="L180">                localJWKs = httpsJwks.getJsonWebKeys();</span>
+<span class="nc" id="L181">            } catch (JoseException e) {</span>
+<span class="nc" id="L182">                throw new IOException(&quot;Could not refresh JWKS&quot;, e);</span>
+<span class="nc" id="L183">            }</span>
+
+            try {
+<span class="nc" id="L186">                refreshLock.writeLock().lock();</span>
+<span class="nc" id="L187">                jsonWebKeys = Collections.unmodifiableList(localJWKs);</span>
+            } finally {
+<span class="nc" id="L189">                refreshLock.writeLock().unlock();</span>
+            }
+
+            // Since we just grabbed the keys (which will have invoked a HttpsJwks.refresh()
+            // internally), we can delay our first invocation by refreshMs.
+            //
+            // Note: we refer to this as a _scheduled_ refresh.
+<span class="nc" id="L196">            executorService.scheduleAtFixedRate(this::refresh,</span>
+                    refreshMs,
+                    refreshMs,
+                    TimeUnit.MILLISECONDS);
+
+<span class="nc" id="L201">            log.info(&quot;JWKS validation key refresh thread started with a refresh interval of {} ms&quot;, refreshMs);</span>
+        } finally {
+<span class="nc" id="L203">            isInitialized = true;</span>
+
+<span class="nc" id="L205">            log.debug(&quot;init completed&quot;);</span>
+        }
+<span class="nc" id="L207">    }</span>
+
+    @Override
+    public void close() {
+        try {
+<span class="nc" id="L212">            log.debug(&quot;close started&quot;);</span>
+
+            try {
+<span class="nc" id="L215">                log.debug(&quot;JWKS validation key refresh thread shutting down&quot;);</span>
+<span class="nc" id="L216">                executorService.shutdown();</span>
+
+<span class="nc bnc" id="L218" title="All 2 branches missed.">                if (!executorService.awaitTermination(SHUTDOWN_TIMEOUT, SHUTDOWN_TIME_UNIT)) {</span>
+<span class="nc" id="L219">                    log.warn(&quot;JWKS validation key refresh thread termination did not end after {} {}&quot;,</span>
+<span class="nc" id="L220">                            SHUTDOWN_TIMEOUT, SHUTDOWN_TIME_UNIT);</span>
+                }
+<span class="nc" id="L222">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L223">                log.warn(&quot;JWKS validation key refresh thread error during close&quot;, e);</span>
+<span class="nc" id="L224">            }</span>
+        } finally {
+<span class="nc" id="L226">            log.debug(&quot;close completed&quot;);</span>
+        }
+<span class="nc" id="L228">    }</span>
+
+    /**
+     * Our implementation avoids the blocking call within {@link HttpsJwks#refresh()} that is
+     * sometimes called internal to {@link HttpsJwks#getJsonWebKeys()}. We want to avoid any
+     * blocking I/O as this code is running in the authentication path on the Kafka network thread.
+     * &lt;p&gt;
+     * The list may be stale up to {@link #refreshMs}.
+     *
+     * @return {@link List} of {@link JsonWebKey} instances
+     * @throws JoseException Thrown if a problem is encountered parsing the JSON content into JWKs
+     * @throws IOException   Thrown f a problem is encountered making the HTTP request
+     */
+
+    public List&lt;JsonWebKey&gt; getJsonWebKeys() throws JoseException, IOException {
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        if (!isInitialized)</span>
+<span class="nc" id="L244">            throw new IllegalStateException(&quot;Please call init() first&quot;);</span>
+
+        try {
+<span class="nc" id="L247">            refreshLock.readLock().lock();</span>
+<span class="nc" id="L248">            return jsonWebKeys;</span>
+        } finally {
+<span class="nc" id="L250">            refreshLock.readLock().unlock();</span>
+        }
+    }
+
+    public String getLocation() {
+<span class="nc" id="L255">        return httpsJwks.getLocation();</span>
+    }
+
+    /**
+     * &lt;p&gt;
+     * &lt;code&gt;refresh&lt;/code&gt; is an internal method that will refresh the JWKS cache and is
+     * invoked in one of two ways:
+     *
+     * &lt;ol&gt;
+     *     &lt;li&gt;Scheduled&lt;/li&gt;
+     *     &lt;li&gt;Expedited&lt;/li&gt;
+     * &lt;/ol&gt;
+     * &lt;/p&gt;
+     *
+     * &lt;p&gt;
+     * The &lt;i&gt;scheduled&lt;/i&gt; refresh is scheduled in {@link #init()} and runs every
+     * {@link #refreshMs} milliseconds. An &lt;i&gt;expedited&lt;/i&gt; refresh is performed when an
+     * incoming JWT refers to a key ID that isn't in our JWKS cache ({@link #jsonWebKeys})
+     * and we try to perform a refresh sooner than the next scheduled refresh.
+     * &lt;/p&gt;
+     */
+
+    private void refresh() {
+<span class="nc bnc" id="L278" title="All 2 branches missed.">        if (!refreshInProgressFlag.compareAndSet(false, true)) {</span>
+<span class="nc" id="L279">            log.debug(&quot;OAuth JWKS refresh is already in progress; ignoring concurrent refresh&quot;);</span>
+<span class="nc" id="L280">            return;</span>
+        }
+
+        try {
+<span class="nc" id="L284">            log.info(&quot;OAuth JWKS refresh of {} starting&quot;, httpsJwks.getLocation());</span>
+<span class="nc" id="L285">            Retry&lt;List&lt;JsonWebKey&gt;&gt; retry = new Retry&lt;&gt;(refreshRetryBackoffMs, refreshRetryBackoffMaxMs);</span>
+<span class="nc" id="L286">            List&lt;JsonWebKey&gt; localJWKs = retry.execute(() -&gt; {</span>
+                try {
+<span class="nc" id="L288">                    log.debug(&quot;JWKS validation key calling refresh of {} starting&quot;, httpsJwks.getLocation());</span>
+                    // Call the *actual* refresh implementation that will more than likely issue
+                    // HTTP(S) calls over the network.
+<span class="nc" id="L291">                    httpsJwks.refresh();</span>
+<span class="nc" id="L292">                    List&lt;JsonWebKey&gt; jwks = httpsJwks.getJsonWebKeys();</span>
+<span class="nc" id="L293">                    log.debug(&quot;JWKS validation key refresh of {} complete&quot;, httpsJwks.getLocation());</span>
+<span class="nc" id="L294">                    return jwks;</span>
+<span class="nc" id="L295">                } catch (Exception e) {</span>
+<span class="nc" id="L296">                    throw new ExecutionException(e);</span>
+                }
+            });
+
+            try {
+<span class="nc" id="L301">                refreshLock.writeLock().lock();</span>
+
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                for (JsonWebKey jwk : localJWKs)</span>
+<span class="nc" id="L304">                    missingKeyIds.remove(jwk.getKeyId());</span>
+
+<span class="nc" id="L306">                jsonWebKeys = Collections.unmodifiableList(localJWKs);</span>
+            } finally {
+<span class="nc" id="L308">                refreshLock.writeLock().unlock();</span>
+            }
+
+<span class="nc" id="L311">            log.info(&quot;OAuth JWKS refresh of {} complete&quot;, httpsJwks.getLocation());</span>
+<span class="nc" id="L312">        } catch (ExecutionException e) {</span>
+<span class="nc" id="L313">            log.warn(&quot;OAuth JWKS refresh of {} encountered an error; not updating local JWKS cache&quot;, httpsJwks.getLocation(), e);</span>
+        } finally {
+<span class="nc" id="L315">            refreshInProgressFlag.set(false);</span>
+        }
+<span class="nc" id="L317">    }</span>
+
+    /**
+     * &lt;p&gt;
+     * &lt;code&gt;maybeExpediteRefresh&lt;/code&gt; is a public method that will trigger a refresh of
+     * the JWKS cache if all of the following conditions are met:
+     *
+     * &lt;ul&gt;
+     *     &lt;li&gt;The given &lt;code&gt;keyId&lt;/code&gt; parameter is &amp;lte; the
+     *     {@link #MISSING_KEY_ID_MAX_KEY_LENGTH}&lt;/li&gt;
+     *     &lt;li&gt;The key isn't in the process of being expedited already&lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * &lt;p&gt;
+     * This &lt;i&gt;expedited&lt;/i&gt; refresh is scheduled immediately.
+     * &lt;/p&gt;
+     *
+     * @param keyId JWT key ID
+     * @return &lt;code&gt;true&lt;/code&gt; if an expedited refresh was scheduled, &lt;code&gt;false&lt;/code&gt; otherwise
+     */
+
+    public boolean maybeExpediteRefresh(String keyId) {
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (keyId.length() &gt; MISSING_KEY_ID_MAX_KEY_LENGTH) {</span>
+            // Although there's no limit on the length of the key ID, they're generally
+            // &quot;reasonably&quot; short. If we have a very long key ID length, we're going to assume
+            // the JWT is malformed, and we will not actually try to resolve the key.
+            //
+            // In this case, let's prevent blowing out our memory in two ways:
+            //
+            //     1. Don't try to resolve the key as the large ID will sit in our cache
+            //     2. Report the issue in the logs but include only the first N characters
+<span class="nc" id="L348">            int actualLength = keyId.length();</span>
+<span class="nc" id="L349">            String trimmedKeyId = keyId.substring(0, MISSING_KEY_ID_MAX_KEY_LENGTH);</span>
+<span class="nc" id="L350">            String snippet = String.format(&quot;%s (trimmed to first %d characters out of %d total)&quot;, trimmedKeyId, MISSING_KEY_ID_MAX_KEY_LENGTH, actualLength);</span>
+<span class="nc" id="L351">            log.warn(&quot;Key ID {} was too long to cache&quot;, snippet);</span>
+<span class="nc" id="L352">            return false;</span>
+        } else {
+            try {
+<span class="nc" id="L355">                refreshLock.writeLock().lock();</span>
+
+<span class="nc" id="L357">                Long nextCheckTime = missingKeyIds.get(keyId);</span>
+<span class="nc" id="L358">                long currTime = time.milliseconds();</span>
+<span class="nc" id="L359">                log.debug(&quot;For key ID {}, nextCheckTime: {}, currTime: {}&quot;, keyId, nextCheckTime, currTime);</span>
+
+<span class="nc bnc" id="L361" title="All 4 branches missed.">                if (nextCheckTime == null || nextCheckTime &lt;= currTime) {</span>
+                    // If there's no entry in the missing key ID cache for the incoming key ID,
+                    // or it has expired, schedule a refresh ASAP.
+<span class="nc" id="L364">                    nextCheckTime = currTime + MISSING_KEY_ID_CACHE_IN_FLIGHT_MS;</span>
+<span class="nc" id="L365">                    missingKeyIds.put(keyId, nextCheckTime);</span>
+<span class="nc" id="L366">                    executorService.schedule(this::refresh, 0, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L367">                    return true;</span>
+                } else {
+<span class="nc" id="L369">                    return false;</span>
+                }
+            } finally {
+<span class="nc" id="L372">                refreshLock.writeLock().unlock();</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

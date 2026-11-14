@@ -1,0 +1,609 @@
+include $(top_srcdir)/Makefile.test.include
+
+AM_CPPFLAGS = \
+	-I$(top_srcdir)/src/lib-test \
+	$(LIBUNWIND_CFLAGS)
+
+noinst_LTLIBRARIES = liblib.la
+
+BUILT_SOURCES = $(srcdir)/unicode-data-tables.c \
+		$(srcdir)/unicode-data-tables.h \
+		$(srcdir)/unicode-data-types.c \
+		$(srcdir)/unicode-data-types.h \
+		event-filter-lexer.c \
+		event-filter-parser.c \
+		event-filter-parser.h
+
+UCD_VERSION = 18.0.0
+UCD_URL = https://dovecot.org/res
+UCD_DIR = $(srcdir)/ucd
+UCD_ABS_DIR = $(abs_srcdir)/ucd
+UCD_FILES = \
+	$(UCD_DIR)/CaseFolding.txt \
+	$(UCD_DIR)/CompositionExclusions.txt \
+	$(UCD_DIR)/DerivedBidiClass.txt \
+	$(UCD_DIR)/DerivedCoreProperties.txt \
+	$(UCD_DIR)/DerivedJoiningType.txt \
+	$(UCD_DIR)/DerivedNormalizationProps.txt \
+	$(UCD_DIR)/emoji-data.txt \
+	$(UCD_DIR)/GraphemeBreakProperty.txt \
+	$(UCD_DIR)/GraphemeBreakTest.txt \
+	$(UCD_DIR)/NormalizationTest.txt \
+	$(UCD_DIR)/PropertyValueAliases.txt \
+	$(UCD_DIR)/PropList.txt \
+	$(UCD_DIR)/Scripts.txt \
+	$(UCD_DIR)/SpecialCasing.txt \
+	$(UCD_DIR)/UnicodeData.txt \
+	$(UCD_DIR)/WordBreakProperty.txt \
+	$(UCD_DIR)/IdnaMappingTable.txt \
+	$(UCD_DIR)/IdnaTestV2.txt
+
+EXTRA_DIST = \
+	unicode-data-tables.c \
+	unicode-data-tables.h \
+	unicode-data-types.c \
+	unicode-data-types.h \
+	unicode-ucd-compile.py \
+	$(UCD_FILES)
+EXTRA_CLEAN = unicode-data-tables.c
+
+UCD_STAMP = ucd-$(UCD_VERSION).stamp
+CLEANFILES = $(UCD_STAMP)
+
+# Squelch autoconf error about using .[ly] sources but not defining $(LEX)
+# and $(YACC).  Using false here avoids accidental use.
+LEX=/bin/false
+YACC=/bin/false
+
+# We use custom rules here because we want to use flex and bison instead
+# of lex and yacc (or bison in yacc-compatibility mode).  Both flex and
+# bison can handle properly naming the generated files, and it is simpler
+# and cleaner to make this rule ourselves instead of working around ylwrap
+# and yywrap's antiquated notion of what is happening.
+.l.c:
+	$(AM_V_GEN)$(FLEX) -o $@ $<
+
+.y.c:
+	$(AM_V_GEN)$(BISON) -o $@ $<
+
+# Bison generates both a header and a .c file.  Without the following
+# dependency, anything including the header will race the bison process.
+event-filter-parser.h: event-filter-parser.c
+
+# Remove cached UCD files that are not for UCD_VERSION, so they get downloaded
+# again. UnicodeData.txt has no version header, so it's removed along with the
+# others.
+$(UCD_STAMP):
+	$(AM_V_at)stale=no; \
+	for f in $(UCD_FILES); do \
+		case $$f in */UnicodeData.txt) continue;; esac; \
+		if test -f $$f && ! head -n 10 $$f | \
+		   grep -q -e '-$(UCD_VERSION)\.txt' -e 'Version: $(UCD_VERSION)'; then \
+			stale=yes; \
+		fi; \
+	done; \
+	if test $$stale = yes; then \
+		echo "Removing UCD files not matching version $(UCD_VERSION)"; \
+		rm -f $(UCD_FILES); \
+	fi
+	$(AM_V_at)rm -f ucd-*.stamp && touch $@
+
+$(UCD_FILES): $(UCD_STAMP)
+
+$(UCD_DIR)/CaseFolding.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/CaseFolding.txt
+$(UCD_DIR)/CompositionExclusions.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/CompositionExclusions.txt
+$(UCD_DIR)/DerivedBidiClass.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/DerivedBidiClass.txt
+$(UCD_DIR)/DerivedCoreProperties.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/DerivedCoreProperties.txt
+$(UCD_DIR)/DerivedJoiningType.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/DerivedJoiningType.txt
+$(UCD_DIR)/DerivedNormalizationProps.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/DerivedNormalizationProps.txt
+$(UCD_DIR)/emoji-data.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/emoji-data.txt
+$(UCD_DIR)/GraphemeBreakProperty.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/GraphemeBreakProperty.txt
+$(UCD_DIR)/GraphemeBreakTest.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/GraphemeBreakTest.txt
+$(UCD_DIR)/NormalizationTest.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/NormalizationTest.txt
+$(UCD_DIR)/PropertyValueAliases.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/PropertyValueAliases.txt
+$(UCD_DIR)/PropList.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/PropList.txt
+$(UCD_DIR)/Scripts.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/Scripts.txt
+$(UCD_DIR)/SpecialCasing.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/SpecialCasing.txt
+$(UCD_DIR)/UnicodeData.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/UnicodeData.txt
+$(UCD_DIR)/WordBreakProperty.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/WordBreakProperty.txt
+$(UCD_DIR)/IdnaMappingTable.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/IdnaMappingTable.txt
+$(UCD_DIR)/IdnaTestV2.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv --no-use-server-timestamps -O $@ $(UCD_URL)/IdnaTestV2.txt
+
+$(srcdir)/unicode-data-tables.c $(srcdir)/unicode-data-tables.h \
+	$(srcdir)/unicode-data-types.c $(srcdir)/unicode-data-types.h &: \
+	$(srcdir)/unicode-ucd-compile.py $(UCD_FILES)
+	$(AM_V_GEN)$(PYTHON) $(srcdir)/unicode-ucd-compile.py $(UCD_DIR) $(srcdir)
+
+liblib_la_LIBADD = $(LIBUNWIND_LIBS) $(ZLIB_LIBS_STATIC) $(ZLIB_LIBS)
+liblib_la_SOURCES = \
+	array.c \
+	aqueue.c \
+	askpass.c \
+	backtrace-string.c \
+	base32.c \
+	base64.c \
+	bits.c \
+	bitmap.c \
+	bsearch-insert-pos.c \
+	buffer.c \
+	buffer-istream.c \
+	child-wait.c \
+	connection.c \
+	cpu-count.c \
+	cpu-limit.c \
+	crc32.c \
+	data-stack.c \
+	eacces-error.c \
+	env-util.c \
+	event-filter.c \
+	event-filter-lexer.l \
+	event-filter-parser.y \
+	event-log.c \
+	execv-const.c \
+	failures.c \
+	fd-util.c \
+	fdatasync-path.c \
+	fdpass.c \
+	file-cache.c \
+	file-create-locked.c \
+	file-copy.c \
+	file-dotlock.c \
+	file-lock.c \
+	file-lock-proc.c \
+	file-set-size.c \
+	guid.c \
+	hash.c \
+	hash-format.c \
+	hash-method.c \
+	hash2.c \
+	hex-binary.c \
+	hex-dec.c \
+	hmac.c \
+	hmac-cram-md5.c \
+	home-expand.c \
+	hook-build.c \
+	hostpid.c \
+	idna.c \
+	idna-punycode.c \
+	imem.c \
+	ipwd.c \
+	iostream.c \
+	iostream-pump.c \
+	iostream-proxy.c \
+	iostream-rawlog.c \
+	iostream-temp.c \
+	iso8601-date.c \
+	istream.c \
+	istream-base64-decoder.c \
+	istream-base64-encoder.c \
+	istream-callback.c \
+	istream-chain.c \
+	istream-concat.c \
+	istream-crlf.c \
+	istream-data.c \
+	istream-failure-at.c \
+	istream-file.c \
+	istream-hash.c \
+	istream-limit.c \
+	istream-multiplex.c \
+	istream-nonuls.c \
+	istream-noop.c \
+	istream-rawlog.c \
+	istream-seekable.c \
+	istream-sized.c \
+	istream-tee.c \
+	istream-try.c \
+	istream-timeout.c \
+	istream-unix.c \
+	ioloop.c \
+	ioloop-iolist.c \
+	ioloop-notify-none.c \
+	ioloop-notify-fd.c \
+	ioloop-notify-inotify.c \
+	ioloop-notify-kqueue.c \
+	ioloop-poll.c \
+	ioloop-epoll.c \
+	ioloop-kqueue.c \
+	lib.c \
+	lib-event.c \
+	lib-signals.c \
+	log-throttle.c \
+	md4.c \
+	md5.c \
+	memarea.c \
+	mempool.c \
+	mempool-allocfree.c \
+	mempool-alloconly.c \
+	mempool-datastack.c \
+	mempool-null.c \
+	mempool-system.c \
+	mempool-unsafe-datastack.c \
+	mkdir-parents.c \
+	mmap-anon.c \
+	mmap-util.c \
+	module-dir.c \
+	mountpoint.c \
+	net.c \
+	nfs-workarounds.c \
+	numpack.c \
+	ostream.c \
+	ostream-buffer.c \
+	ostream-failure-at.c \
+	ostream-file.c \
+	ostream-hash.c \
+	ostream-multiplex.c \
+	ostream-null.c \
+	ostream-rawlog.c \
+	ostream-unix.c \
+	ostream-wrapper.c \
+	path-util.c \
+	pkcs5.c \
+	primes.c \
+	printf-format-fix.c \
+	process-stat.c \
+	process-title.c \
+	priorityq.c \
+	randgen.c \
+	rand.c \
+	rate-limit.c \
+	read-full.c \
+	restrict-access.c \
+	restrict-process-size.c \
+	safe-memset.c \
+	safe-mkdir.c \
+	safe-mkstemp.c \
+	sendfile-util.c \
+	seq-range-array.c \
+	seq-set-builder.c \
+	sha1.c \
+	sha2.c \
+	sha3.c \
+	xxh64.c \
+	sleep.c \
+	sort.c \
+	stats-dist.c \
+	str.c \
+	str-find.c \
+	str-sanitize.c \
+	str-parse.c \
+	str-table.c \
+	strescape.c \
+	strfuncs.c \
+	strnum.c \
+	time-util.c \
+	unix-socket-create.c \
+	unlink-directory.c \
+	unlink-old-files.c \
+	unichar.c \
+	unicode-break.c \
+	unicode-data-types.c \
+	unicode-data-tables.c \
+	unicode-data.c \
+	unicode-transform.c \
+	uri-util.c \
+	utc-offset.c \
+	utc-mktime.c \
+	version.c \
+	wildcard-match.c \
+	write-full.c
+
+headers = \
+	abnf.h \
+	aqueue.h \
+	array.h \
+	array-decl.h \
+	askpass.h \
+	backtrace-string.h \
+	base32.h \
+	base64.h \
+	bits.h \
+	bitmap.h \
+	bsearch-insert-pos.h \
+	buffer.h \
+	byteorder.h \
+	child-wait.h \
+	compat.h \
+	connection.h \
+	cpu-count.h \
+	cpu-limit.h \
+	crc32.h \
+	data-stack.h \
+	doc.h \
+	eacces-error.h \
+	env-util.h \
+	event-filter.h \
+	event-filter-parser.h \
+	event-filter-private.h \
+	event-log.h \
+	execv-const.h \
+	failures.h \
+	failures-private.h \
+	fd-util.h \
+	fdatasync-path.h \
+	fdpass.h \
+	file-cache.h \
+	file-create-locked.h \
+	file-copy.h \
+	file-dotlock.h \
+	file-lock.h \
+	file-lock-proc.h \
+	file-set-size.h \
+	fsync-mode.h \
+	guid.h \
+	hash.h \
+	hash-decl.h \
+	hash-format.h \
+	hash-method.h \
+	hash2.h \
+	hex-binary.h \
+	hex-dec.h \
+	hmac.h \
+	hmac-cram-md5.h \
+	home-expand.h \
+	hook-build.h \
+	hostpid.h \
+	idna.h \
+	idna-punycode.h \
+	imem.h \
+	ipwd.h \
+	iostream.h \
+	iostream-multiplex-private.h \
+	iostream-private.h \
+	iostream-pump.h \
+	iostream-proxy.h \
+	iostream-rawlog.h \
+	iostream-rawlog-private.h \
+	iostream-temp.h \
+	iso8601-date.h \
+	istream.h \
+	istream-base64.h \
+	istream-callback.h \
+	istream-chain.h \
+	istream-concat.h \
+	istream-crlf.h \
+	istream-failure-at.h \
+	istream-file-private.h \
+	istream-hash.h \
+	istream-multiplex.h \
+	istream-nonuls.h \
+	istream-private.h \
+	istream-rawlog.h \
+	istream-seekable.h \
+	istream-sized.h \
+	istream-tee.h \
+	istream-try.h \
+	istream-timeout.h \
+	istream-unix.h \
+	ioloop.h \
+	ioloop-iolist.h \
+	ioloop-private.h \
+	ioloop-notify-fd.h \
+	lib.h \
+	lib-event.h \
+	lib-event-private.h \
+	lib-signals.h \
+	llist.h \
+	log-throttle.h \
+	macros.h \
+	md4.h \
+	md5.h \
+	malloc-overflow.h \
+	memarea.h \
+	mempool.h \
+	mkdir-parents.h \
+	mmap-util.h \
+	module-context.h \
+	module-dir.h \
+	mountpoint.h \
+	net.h \
+	nfs-workarounds.h \
+	numpack.h \
+	ostream.h \
+	ostream-failure-at.h \
+	ostream-file-private.h \
+	ostream-hash.h \
+	ostream-multiplex.h \
+	ostream-private.h \
+	ostream-null.h \
+	ostream-rawlog.h \
+	ostream-unix.h \
+	ostream-wrapper.h \
+	path-util.h \
+	pkcs5.h \
+	primes.h \
+	printf-format-fix.h \
+	process-stat.h \
+	process-title.h \
+	priorityq.h \
+	randgen.h \
+	rate-limit.h \
+	read-full.h \
+	restrict-access.h \
+	restrict-process-size.h \
+	safe-memset.h \
+	safe-mkdir.h \
+	safe-mkstemp.h \
+	sendfile-util.h \
+	seq-range-array.h \
+	seq-set-builder.h \
+	sha-common.h \
+	sha1.h \
+	sha2.h \
+	sha3.h \
+	xxh64.h \
+	sleep.h \
+	sort.h \
+	stats-dist.h \
+	str.h \
+	str-find.h \
+	str-sanitize.h \
+	str-parse.h \
+	str-table.h \
+	strescape.h \
+	strfuncs.h \
+	strnum.h \
+	time-util.h \
+	unix-socket-create.h \
+	unlink-directory.h \
+	unlink-old-files.h \
+	unichar.h \
+	unicode-break.h \
+	unicode-data-static.h \
+	unicode-data-types.h \
+	unicode-data-tables.h \
+	unicode-data.h \
+	unicode-transform.h \
+	uri-util.h \
+	utc-offset.h \
+	utc-mktime.h \
+	version.h \
+	wildcard-match.h \
+	write-full.h
+
+test_programs = test-lib test-cpu-limit
+
+test_lib_CPPFLAGS = \
+	-I$(top_srcdir)/src/lib-test \
+	-DUCD_DIR=\"$(UCD_ABS_DIR)\"
+
+test_libs = \
+	../lib-test/libtest.la \
+	liblib.la
+
+test_lib_SOURCES = \
+	test-lib.c \
+	test-array.c \
+	test-aqueue.c \
+	test-backtrace.c \
+	test-base32.c \
+	test-base64.c \
+	test-bits.c \
+	test-bitmap.c \
+	test-bsearch-insert-pos.c \
+	test-buffer.c \
+	test-buffer-istream.c \
+	test-byteorder.c \
+	test-connection.c \
+	test-crc32.c \
+	test-data-stack.c \
+	test-env-util.c \
+	test-event-category-register.c \
+	test-event-filter.c \
+	test-event-filter-expr.c \
+	test-event-filter-merge.c \
+	test-event-filter-parser.c \
+	test-event-flatten.c \
+	test-event-log.c \
+	test-failures.c \
+	test-fd-util.c \
+	test-file-cache.c \
+	test-file-create-locked.c \
+	test-file-lock.c \
+	test-file-lock-proc.c \
+	test-guid.c \
+	test-hash.c \
+	test-hash-format.c \
+	test-hash-method.c \
+	test-hmac.c \
+	test-hex-binary.c \
+	test-idna.c \
+	test-idna-punycode.c \
+	test-imem.c \
+	test-ioloop.c \
+	test-iso8601-date.c \
+	test-iostream-pump.c \
+	test-iostream-proxy.c \
+	test-iostream-temp.c \
+	test-istream.c \
+	test-istream-base64-decoder.c \
+	test-istream-base64-encoder.c \
+	test-istream-chain.c \
+	test-istream-concat.c \
+	test-istream-crlf.c \
+	test-istream-failure-at.c \
+	test-istream-multiplex.c \
+	test-istream-noop.c \
+	test-istream-seekable.c \
+	test-istream-sized.c \
+	test-istream-tee.c \
+	test-istream-try.c \
+	test-istream-unix.c \
+	test-lib-event.c \
+	test-lib-signals.c \
+	test-llist.c \
+	test-log-throttle.c \
+	test-macros.c \
+	test-malloc-overflow.c \
+	test-memarea.c \
+	test-mempool.c \
+	test-mempool-allocfree.c \
+	test-mempool-alloconly.c \
+	test-pkcs5.c \
+	test-net.c \
+	test-numpack.c \
+	test-ostream-buffer.c \
+	test-ostream-failure-at.c \
+	test-ostream-file.c \
+	test-ostream-multiplex.c \
+	test-multiplex.c \
+	test-path-util.c \
+	test-primes.c \
+	test-printf-format-fix.c \
+	test-priorityq.c \
+	test-random.c \
+	test-rate-limit.c \
+	test-seq-range-array.c \
+	test-seq-set-builder.c \
+	test-stats-dist.c \
+	test-str.c \
+	test-strescape.c \
+	test-strfuncs.c \
+	test-strnum.c \
+	test-str-find.c \
+	test-str-sanitize.c \
+	test-str-parse.c \
+	test-str-table.c \
+	test-time-util.c \
+	test-unichar.c \
+	test-unicode-break.c \
+	test-unicode-data.c \
+	test-unicode-nf.c \
+	test-unicode-casemap.c \
+	test-utc-mktime.c \
+	test-uri.c \
+	test-version.c \
+	test-wildcard-match.c
+
+test_headers = \
+	test-lib.h \
+	test-lib.inc
+
+test_lib_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+test_lib_DEPENDENCIES = $(test_libs)
+
+test_cpu_limit_SOURCES = \
+	test-cpu-limit.c
+test_cpu_limit_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+test_cpu_limit_DEPENDENCIES = $(test_libs)
+
+pkginc_libdir=$(pkgincludedir)
+pkginc_lib_HEADERS = $(headers)
+noinst_HEADERS = $(test_headers)

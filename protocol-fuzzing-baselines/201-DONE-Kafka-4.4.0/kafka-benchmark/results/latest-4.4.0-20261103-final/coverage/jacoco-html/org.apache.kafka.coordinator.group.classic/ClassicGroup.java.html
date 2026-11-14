@@ -1,0 +1,1492 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClassicGroup.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.group.classic</a> &gt; <span class="el_source">ClassicGroup.java</span></div><h1>ClassicGroup.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.coordinator.group.classic;
+
+import org.apache.kafka.clients.consumer.internals.ConsumerProtocol;
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.errors.CoordinatorNotAvailableException;
+import org.apache.kafka.common.errors.FencedInstanceIdException;
+import org.apache.kafka.common.errors.GroupIdNotFoundException;
+import org.apache.kafka.common.errors.IllegalGenerationException;
+import org.apache.kafka.common.errors.UnknownMemberIdException;
+import org.apache.kafka.common.message.JoinGroupRequestData.JoinGroupRequestProtocolCollection;
+import org.apache.kafka.common.message.JoinGroupResponseData;
+import org.apache.kafka.common.message.JoinGroupResponseData.JoinGroupResponseMember;
+import org.apache.kafka.common.message.ListGroupsResponseData;
+import org.apache.kafka.common.message.SyncGroupResponseData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.protocol.types.SchemaException;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataImage;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+import org.apache.kafka.coordinator.group.CommitPartitionValidator;
+import org.apache.kafka.coordinator.group.Group;
+import org.apache.kafka.coordinator.group.GroupCoordinatorRecordHelpers;
+import org.apache.kafka.coordinator.group.OffsetExpirationCondition;
+import org.apache.kafka.coordinator.group.OffsetExpirationConditionImpl;
+import org.apache.kafka.coordinator.group.modern.consumer.ConsumerGroup;
+import org.apache.kafka.coordinator.group.modern.consumer.ConsumerGroupMember;
+
+import org.slf4j.Logger;
+
+import java.nio.ByteBuffer;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.coordinator.group.Utils.toConsumerProtocolAssignment;
+import static org.apache.kafka.coordinator.group.classic.ClassicGroupState.COMPLETING_REBALANCE;
+import static org.apache.kafka.coordinator.group.classic.ClassicGroupState.DEAD;
+import static org.apache.kafka.coordinator.group.classic.ClassicGroupState.EMPTY;
+import static org.apache.kafka.coordinator.group.classic.ClassicGroupState.PREPARING_REBALANCE;
+import static org.apache.kafka.coordinator.group.classic.ClassicGroupState.STABLE;
+
+/**
+ * This class holds metadata for a classic group where the
+ * member assignment is driven solely from the client side.
+ *
+ * The APIs members use to make changes to the group membership
+ * consist of JoinGroup, SyncGroup, and LeaveGroup.
+ */
+public class ClassicGroup implements Group {
+
+    /**
+     * No leader.
+     */
+    public static final String NO_LEADER = &quot;&quot;;
+
+    /**
+     * Delimiter used to join a randomly generated UUID
+     * with a client id or a group instance id.
+     */
+    private static final String MEMBER_ID_DELIMITER = &quot;-&quot;;
+
+    /**
+     * The slf4j logger.
+     */
+    private final Logger log;
+
+    /**
+     * The group id.
+     */
+    private final String groupId;
+
+    /**
+     * The time.
+     */
+    private final Time time;
+
+    /**
+     * The current group state.
+     */
+    private ClassicGroupState state;
+
+    /**
+     * The previous group state.
+     */
+    private ClassicGroupState previousState;
+
+    /**
+     * The timestamp of when the group transitioned
+     * to its current state.
+     */
+    private Optional&lt;Long&gt; currentStateTimestamp;
+
+    /**
+     * The protocol type used for rebalance.
+     */
+    private Optional&lt;String&gt; protocolType;
+
+    /**
+     * The protocol name used for rebalance.
+     */
+    private Optional&lt;String&gt; protocolName;
+
+    /**
+     * The generation id.
+     */
+    private int generationId;
+
+    /**
+     * The id of the group's leader.
+     */
+    private Optional&lt;String&gt; leaderId;
+
+    /**
+     * The members of the group.
+     */
+<span class="nc" id="L144">    private final Map&lt;String, ClassicGroupMember&gt; members = new HashMap&lt;&gt;();</span>
+
+    /**
+     * The static members of the group.
+     */
+<span class="nc" id="L149">    private final Map&lt;String, String&gt; staticMembers = new HashMap&lt;&gt;();</span>
+
+    /**
+     * Members who have yet to (re)join the group
+     * during the join group phase.
+     */
+<span class="nc" id="L155">    private final Set&lt;String&gt; pendingJoinMembers = new HashSet&lt;&gt;();</span>
+
+    /**
+     * The number of members awaiting a join response.
+     */
+<span class="nc" id="L160">    private int numMembersAwaitingJoinResponse = 0;</span>
+
+    /**
+     * Map of protocol names to the number of members that support them.
+     */
+<span class="nc" id="L165">    private final Map&lt;String, Integer&gt; supportedProtocols = new HashMap&lt;&gt;();</span>
+
+    /**
+     * Members who have yet to sync with the group
+     * during the sync group phase.
+     */
+<span class="nc" id="L171">    private final Set&lt;String&gt; pendingSyncMembers = new HashSet&lt;&gt;();</span>
+
+    /**
+     * The list of topics to which the group members are subscribed.
+     */
+<span class="nc" id="L176">    private Optional&lt;Set&lt;String&gt;&gt; subscribedTopics = Optional.empty();</span>
+
+    /**
+     * A flag to indicate whether a new member was added. Used
+     * to further delay initial joins (new group).
+     */
+<span class="nc" id="L182">    private boolean newMemberAdded = false;</span>
+
+    public ClassicGroup(
+        LogContext logContext,
+        String groupId,
+        ClassicGroupState initialState,
+        Time time
+    ) {
+<span class="nc" id="L190">        this(</span>
+            logContext,
+            groupId,
+            initialState,
+            time,
+            0,
+<span class="nc" id="L196">            Optional.empty(),</span>
+<span class="nc" id="L197">            Optional.empty(),</span>
+<span class="nc" id="L198">            Optional.empty(),</span>
+<span class="nc" id="L199">            Optional.of(time.milliseconds())</span>
+        );
+<span class="nc" id="L201">    }</span>
+
+    public ClassicGroup(
+        LogContext logContext,
+        String groupId,
+        ClassicGroupState initialState,
+        Time time,
+        int generationId,
+        Optional&lt;String&gt; protocolType,
+        Optional&lt;String&gt; protocolName,
+        Optional&lt;String&gt; leaderId,
+        Optional&lt;Long&gt; currentStateTimestamp
+<span class="nc" id="L213">    ) {</span>
+<span class="nc" id="L214">        Objects.requireNonNull(logContext);</span>
+<span class="nc" id="L215">        this.log = logContext.logger(ClassicGroup.class);</span>
+<span class="nc" id="L216">        this.groupId = Objects.requireNonNull(groupId);</span>
+<span class="nc" id="L217">        this.state = Objects.requireNonNull(initialState);</span>
+<span class="nc" id="L218">        this.previousState = DEAD;</span>
+<span class="nc" id="L219">        this.time = Objects.requireNonNull(time);</span>
+<span class="nc" id="L220">        this.generationId = generationId;</span>
+<span class="nc" id="L221">        this.protocolType = protocolType;</span>
+<span class="nc" id="L222">        this.protocolName = protocolName;</span>
+<span class="nc" id="L223">        this.leaderId = leaderId;</span>
+<span class="nc" id="L224">        this.currentStateTimestamp = currentStateTimestamp;</span>
+<span class="nc" id="L225">    }</span>
+
+    /**
+     * The type of this group.
+     *
+     * @return The group type (Classic).
+     */
+    @Override
+    public GroupType type() {
+<span class="nc" id="L234">        return GroupType.CLASSIC;</span>
+    }
+
+    /**
+     * The state of this group.
+     *
+     * @return The current state as a String.
+     */
+    @Override
+    public String stateAsString() {
+<span class="nc" id="L244">        return this.state.toString();</span>
+    }
+
+    /**
+     * The state of this group based on the committed offset.
+     *
+     * @return The current state as a String.
+     */
+    @Override
+    public String stateAsString(long committedOffset) {
+<span class="nc" id="L254">        return this.state.toString();</span>
+    }
+
+    /**
+     * @return the group id.
+     */
+    public String groupId() {
+<span class="nc" id="L261">        return this.groupId;</span>
+    }
+
+    /**
+     * @return the generation id.
+     */
+    public int generationId() {
+<span class="nc" id="L268">        return this.generationId;</span>
+    }
+
+    /**
+     * @return the protocol name.
+     */
+    public Optional&lt;String&gt; protocolName() {
+<span class="nc" id="L275">        return this.protocolName;</span>
+    }
+
+    /**
+     * @return the protocol type.
+     */
+    public Optional&lt;String&gt; protocolType() {
+<span class="nc" id="L282">        return this.protocolType;</span>
+    }
+
+    /**
+     * @return True if the group is a simple group.
+     */
+    public boolean isSimpleGroup() {
+<span class="nc bnc" id="L289" title="All 6 branches missed.">        return protocolType.isEmpty() &amp;&amp; isEmpty() &amp;&amp; pendingJoinMembers.isEmpty();</span>
+    }
+
+    /**
+     * @return the current group state.
+     */
+    public ClassicGroupState currentState() {
+<span class="nc" id="L296">        return this.state;</span>
+    }
+
+    public ClassicGroupState previousState() {
+<span class="nc" id="L300">        return this.previousState;</span>
+    }
+
+    /**
+     * @return true if a new member was added.
+     */
+    public boolean newMemberAdded() {
+<span class="nc" id="L307">        return this.newMemberAdded;</span>
+    }
+
+    /**
+     * Compares the group's current state with the given state.
+     *
+     * @param groupState the state to match against.
+     * @return true if the state matches, false otherwise.
+     */
+    public boolean isInState(ClassicGroupState groupState) {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        return this.state == groupState;</span>
+    }
+
+    /**
+     * @return true if the member is part of this group, false otherwise.
+     */
+    @Override
+    public boolean hasMember(String memberId) {
+<span class="nc" id="L325">        return members.containsKey(memberId);</span>
+    }
+
+    /**
+     * Get the member metadata associated with the provided member id.
+     *
+     * @param memberId the member id.
+     * @return the member metadata if it exists, null otherwise.
+     */
+    public ClassicGroupMember member(String memberId) {
+<span class="nc" id="L335">        return members.get(memberId);</span>
+    }
+
+    /**
+     * @return the total number of members in this group.
+     */
+    @Override
+    public int numMembers() {
+<span class="nc" id="L343">        return members.size();</span>
+    }
+
+    /**
+     * Requests a metadata refresh.
+     */
+    @Override
+    public void requestMetadataRefresh() {
+        // This does not apply to classic groups.
+<span class="nc" id="L352">    }</span>
+
+    /**
+     * Used to identify whether the given member is the leader of this group.
+     *
+     * @param memberId the member id.
+     * @return true if the member is the leader, false otherwise.
+     */
+    public boolean isLeader(String memberId) {
+<span class="nc" id="L361">        return leaderId.map(id -&gt; id.equals(memberId)).orElse(false);</span>
+    }
+
+    /**
+     * @return the leader id or null if a leader does not exist.
+     */
+    public String leaderOrNull() {
+<span class="nc" id="L368">        return leaderId.orElse(null);</span>
+    }
+
+    /**
+     * @return the current state timestamp.
+     */
+    public long currentStateTimestampOrDefault() {
+<span class="nc" id="L375">        return currentStateTimestamp.orElse(-1L);</span>
+    }
+
+    /**
+     * @return the current supportedProtocols.
+     */
+    public Map&lt;String, Integer&gt; supportedProtocols() {
+<span class="nc" id="L382">        return supportedProtocols;</span>
+    }
+
+    /**
+     * Sets newMemberAdded.
+     *
+     * @param value the value to set.
+     */
+    public void setNewMemberAdded(boolean value) {
+<span class="nc" id="L391">        this.newMemberAdded = value;</span>
+<span class="nc" id="L392">    }</span>
+
+    /**
+     * Sets subscribedTopics.
+     *
+     * @param subscribedTopics the value to set.
+     */
+    public void setSubscribedTopics(Optional&lt;Set&lt;String&gt;&gt; subscribedTopics) {
+<span class="nc" id="L400">        this.subscribedTopics = subscribedTopics;</span>
+<span class="nc" id="L401">    }</span>
+
+    /**
+     * Sets protocolName.
+     *
+     * @param protocolName the value to set.
+     */
+    public void setProtocolName(Optional&lt;String&gt; protocolName) {
+<span class="nc" id="L409">        this.protocolName = protocolName;</span>
+<span class="nc" id="L410">    }</span>
+
+    /**
+     * @return whether the group is using the consumer protocol.
+     */
+    public boolean usesConsumerGroupProtocol() {
+<span class="nc" id="L416">        return protocolType.map(type -&gt;</span>
+<span class="nc" id="L417">            type.equals(ConsumerProtocol.PROTOCOL_TYPE)</span>
+<span class="nc" id="L418">        ).orElse(false);</span>
+    }
+
+    /**
+     * Add a member to this group.
+     *
+     * @param member  the member to add.
+     */
+    public void add(ClassicGroupMember member) {
+<span class="nc" id="L427">        add(member, null);</span>
+<span class="nc" id="L428">    }</span>
+
+    /**
+     * Add a member to this group.
+     *
+     * @param member  the member to add.
+     * @param future  the future to complete once the join group phase completes.
+     */
+    public void add(ClassicGroupMember member, CompletableFuture&lt;JoinGroupResponseData&gt; future) {
+<span class="nc" id="L437">        member.groupInstanceId().ifPresent(instanceId -&gt; {</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            if (staticMembers.containsKey(instanceId)) {</span>
+<span class="nc" id="L439">                throw new IllegalStateException(&quot;Static member with groupInstanceId=&quot; +</span>
+                    instanceId + &quot; cannot be added to group &quot; + groupId + &quot; since&quot; +
+                    &quot; it is already a member.&quot;);
+            }
+<span class="nc" id="L443">            staticMembers.put(instanceId, member.memberId());</span>
+<span class="nc" id="L444">        });</span>
+
+<span class="nc bnc" id="L446" title="All 2 branches missed.">        if (members.isEmpty()) {</span>
+<span class="nc" id="L447">            this.protocolType = Optional.of(member.protocolType());</span>
+        }
+
+<span class="nc bnc" id="L450" title="All 2 branches missed.">        if (!Objects.equals(this.protocolType.orElse(null), member.protocolType())) {</span>
+<span class="nc" id="L451">            throw new IllegalStateException(&quot;The group and member's protocol type must be the same.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L454" title="All 2 branches missed.">        if (!supportsProtocols(member)) {</span>
+<span class="nc" id="L455">            throw new IllegalStateException(&quot;None of the member's protocols can be supported.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L458" title="All 2 branches missed.">        if (leaderId.isEmpty()) {</span>
+<span class="nc" id="L459">            leaderId = Optional.of(member.memberId());</span>
+        }
+
+<span class="nc" id="L462">        members.put(member.memberId(), member);</span>
+<span class="nc" id="L463">        incrementSupportedProtocols(member);</span>
+<span class="nc" id="L464">        member.setAwaitingJoinFuture(future);</span>
+
+<span class="nc bnc" id="L466" title="All 2 branches missed.">        if (member.isAwaitingJoin()) {</span>
+<span class="nc" id="L467">            numMembersAwaitingJoinResponse++;</span>
+        }
+
+<span class="nc" id="L470">        pendingJoinMembers.remove(member.memberId());</span>
+<span class="nc" id="L471">    }</span>
+
+    /**
+     * Remove a member from the group.
+     *
+     * @param memberId the member id to remove.
+     */
+    public void remove(String memberId) {
+<span class="nc" id="L479">        ClassicGroupMember removedMember = members.remove(memberId);</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        if (removedMember != null) {</span>
+<span class="nc" id="L481">            decrementSupportedProtocols(removedMember);</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">            if (removedMember.isAwaitingJoin()) {</span>
+<span class="nc" id="L483">                numMembersAwaitingJoinResponse--;</span>
+            }
+
+<span class="nc" id="L486">            removedMember.groupInstanceId().ifPresent(staticMembers::remove);</span>
+        }
+
+<span class="nc bnc" id="L489" title="All 2 branches missed.">        if (isLeader(memberId)) {</span>
+<span class="nc" id="L490">            Iterator&lt;String&gt; iter = members.keySet().iterator();</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">            String newLeader = iter.hasNext() ? iter.next() : null;</span>
+<span class="nc" id="L492">            leaderId = Optional.ofNullable(newLeader);</span>
+        }
+
+<span class="nc" id="L495">        pendingJoinMembers.remove(memberId);</span>
+<span class="nc" id="L496">        pendingSyncMembers.remove(memberId);</span>
+<span class="nc" id="L497">    }</span>
+
+    /**
+     * Check whether current leader has rejoined. If not, choose a
+     * new leader from one of the joined members.
+     *
+     * Return false if
+     *   1. the group is currently empty (has no designated leader)
+     *   2. no member rejoined
+     *
+     * @return true if a new leader was elected or the existing
+     *         leader rejoined, false otherwise.
+     */
+    public boolean maybeElectNewJoinedLeader() {
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if (leaderId.isPresent()) {</span>
+<span class="nc" id="L512">            ClassicGroupMember currentLeader = member(leaderId.get());</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">            if (!currentLeader.isAwaitingJoin()) {</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">                for (ClassicGroupMember member : members.values()) {</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">                    if (member.isAwaitingJoin()) {</span>
+<span class="nc" id="L516">                        leaderId = Optional.of(member.memberId());</span>
+<span class="nc" id="L517">                        log.info(&quot;Group leader [memberId: {}, groupInstanceId: {}] &quot; +</span>
+                                &quot;failed to join before the rebalance timeout. Member {} &quot; +
+                                &quot;was elected as the new leader.&quot;,
+<span class="nc" id="L520">                            currentLeader.memberId(),</span>
+<span class="nc" id="L521">                            currentLeader.groupInstanceId().orElse(&quot;None&quot;),</span>
+                            member
+                        );
+<span class="nc" id="L524">                        return true;</span>
+                    }
+<span class="nc" id="L526">                }</span>
+<span class="nc" id="L527">                log.info(&quot;Group leader [memberId: {}, groupInstanceId: {}] &quot; +</span>
+                        &quot;failed to join before the rebalance timeout and the &quot; +
+                        &quot;group couldn't proceed to the next generation because &quot; +
+                        &quot;no member joined.&quot;,
+<span class="nc" id="L531">                    currentLeader.memberId(),</span>
+<span class="nc" id="L532">                    currentLeader.groupInstanceId().orElse(&quot;None&quot;)</span>
+                );
+<span class="nc" id="L534">                return false;</span>
+            }
+<span class="nc" id="L536">            return true;</span>
+        }
+<span class="nc" id="L538">        return false;</span>
+    }
+
+    /**
+     * [For static members only]: Replace the old member id with the new one,
+     * keep everything else unchanged and return the updated member.
+     *
+     * @param groupInstanceId  the group instance id.
+     * @param oldMemberId      the old member id.
+     * @param newMemberId      the new member id that will replace the old member id.
+     * @return the member with the new id.
+     */
+    public ClassicGroupMember replaceStaticMember(
+        String groupInstanceId,
+        String oldMemberId,
+        String newMemberId
+    ) {
+<span class="nc" id="L555">        ClassicGroupMember removedMember = members.remove(oldMemberId);</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">        if (removedMember == null) {</span>
+<span class="nc" id="L557">            throw new IllegalArgumentException(&quot;Cannot replace non-existing member id &quot; + oldMemberId);</span>
+        }
+
+        // Fence potential duplicate member immediately if someone awaits join/sync future.
+<span class="nc" id="L561">        JoinGroupResponseData joinGroupResponse = new JoinGroupResponseData()</span>
+<span class="nc" id="L562">            .setMembers(List.of())</span>
+<span class="nc" id="L563">            .setMemberId(oldMemberId)</span>
+<span class="nc" id="L564">            .setProtocolName(null)</span>
+<span class="nc" id="L565">            .setProtocolType(null)</span>
+<span class="nc" id="L566">            .setLeader(NO_LEADER)</span>
+<span class="nc" id="L567">            .setSkipAssignment(false)</span>
+<span class="nc" id="L568">            .setErrorCode(Errors.FENCED_INSTANCE_ID.code());</span>
+<span class="nc" id="L569">        completeJoinFuture(removedMember, joinGroupResponse);</span>
+
+<span class="nc" id="L571">        SyncGroupResponseData syncGroupResponse = new SyncGroupResponseData()</span>
+<span class="nc" id="L572">            .setAssignment(new byte[0])</span>
+<span class="nc" id="L573">            .setProtocolName(null)</span>
+<span class="nc" id="L574">            .setProtocolType(null)</span>
+<span class="nc" id="L575">            .setErrorCode(Errors.FENCED_INSTANCE_ID.code());</span>
+<span class="nc" id="L576">        completeSyncFuture(removedMember, syncGroupResponse);</span>
+
+<span class="nc" id="L578">        ClassicGroupMember newMember = new ClassicGroupMember(</span>
+            newMemberId,
+<span class="nc" id="L580">            removedMember.groupInstanceId(),</span>
+<span class="nc" id="L581">            removedMember.clientId(),</span>
+<span class="nc" id="L582">            removedMember.clientHost(),</span>
+<span class="nc" id="L583">            removedMember.rebalanceTimeoutMs(),</span>
+<span class="nc" id="L584">            removedMember.sessionTimeoutMs(),</span>
+<span class="nc" id="L585">            removedMember.protocolType(),</span>
+<span class="nc" id="L586">            removedMember.supportedProtocols(),</span>
+<span class="nc" id="L587">            removedMember.assignment()</span>
+        );
+
+<span class="nc" id="L590">        members.put(newMemberId, newMember);</span>
+
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        if (isLeader(oldMemberId)) {</span>
+<span class="nc" id="L593">            leaderId = Optional.of(newMemberId);</span>
+        }
+
+<span class="nc" id="L596">        staticMembers.put(groupInstanceId, newMemberId);</span>
+<span class="nc" id="L597">        return newMember;</span>
+    }
+
+    /**
+     * Check whether a member has joined the group.
+     *
+     * @param memberId the member id.
+     * @return true if the member has yet to join, false otherwise.
+     */
+    public boolean isPendingMember(String memberId) {
+<span class="nc" id="L607">        return pendingJoinMembers.contains(memberId);</span>
+    }
+
+    /**
+     * Add a pending member.
+     *
+     * @param memberId the member id.
+     * @return true if the group did not already have the pending member,
+     *         false otherwise.
+     */
+    public boolean addPendingMember(String memberId) {
+<span class="nc bnc" id="L618" title="All 2 branches missed.">        if (hasMember(memberId)) {</span>
+<span class="nc" id="L619">            throw new IllegalStateException(&quot;Attempt to add pending member &quot; + memberId +</span>
+                &quot; which is already a stable member of the group.&quot;);
+        }
+<span class="nc" id="L622">        return pendingJoinMembers.add(memberId);</span>
+    }
+
+    /**
+     * @return number of members that are pending join.
+     */
+    public int numPendingJoinMembers() {
+<span class="nc" id="L629">        return pendingJoinMembers.size();</span>
+    }
+
+    /**
+     * Add a pending sync member.
+     *
+     * @param memberId the member id.
+     * @return true if the group did not already have the pending sync member,
+     *         false otherwise.
+     */
+    public boolean addPendingSyncMember(String memberId) {
+<span class="nc bnc" id="L640" title="All 2 branches missed.">        if (!hasMember(memberId)) {</span>
+<span class="nc" id="L641">            throw new IllegalStateException(&quot;Attempt to add pending sync member &quot; + memberId +</span>
+                &quot; which is already a stable member of the group.&quot;);
+        }
+
+<span class="nc" id="L645">        return pendingSyncMembers.add(memberId);</span>
+    }
+
+    /**
+     * Remove a member that has not yet synced.
+     *
+     * @param memberId the member id.
+     * @return true if the group did store this member, false otherwise.
+     */
+    public boolean removePendingSyncMember(String memberId) {
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        if (!hasMember(memberId)) {</span>
+<span class="nc" id="L656">            throw new IllegalStateException(&quot;Attempt to add pending member &quot; + memberId +</span>
+                &quot; which is already a stable member of the group.&quot;);
+        }
+<span class="nc" id="L659">        return pendingSyncMembers.remove(memberId);</span>
+    }
+
+    /**
+     * @return true if all members have sent sync group requests,
+     *         false otherwise.
+     */
+    public boolean hasReceivedSyncFromAllMembers() {
+<span class="nc" id="L667">        return pendingSyncMembers.isEmpty();</span>
+    }
+
+    /**
+     * @return members that have yet to sync.
+     */
+    public Set&lt;String&gt; allPendingSyncMembers() {
+<span class="nc" id="L674">        return pendingSyncMembers;</span>
+    }
+
+    /**
+     * Clear members pending sync.
+     */
+    public void clearPendingSyncMembers() {
+<span class="nc" id="L681">        pendingSyncMembers.clear();</span>
+<span class="nc" id="L682">    }</span>
+
+    /**
+     * Checks whether the given group instance id exists as
+     * a static member.
+     *
+     * @param groupInstanceId the group instance id.
+     * @return true if a static member with the group instance id exists,
+     *         false otherwise.
+     */
+    public boolean hasStaticMember(String groupInstanceId) {
+<span class="nc" id="L693">        return staticMembers.containsKey(groupInstanceId);</span>
+    }
+
+    /**
+     * Get member id of a static member that matches the given group
+     * instance id.
+     *
+     * @param groupInstanceId the group instance id.
+     * @return the static member if it exists.
+     */
+    public String staticMemberId(String groupInstanceId) {
+<span class="nc" id="L704">        return staticMembers.get(groupInstanceId);</span>
+    }
+
+    /**
+     * @return members who have yet to rejoin during the
+     *         join group phase.
+     */
+    public Map&lt;String, ClassicGroupMember&gt; notYetRejoinedMembers() {
+<span class="nc" id="L712">        Map&lt;String, ClassicGroupMember&gt; notYetRejoinedMembers = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L713">        members.values().forEach(member -&gt; {</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">            if (!member.isAwaitingJoin()) {</span>
+<span class="nc" id="L715">                notYetRejoinedMembers.put(member.memberId(), member);</span>
+            }
+<span class="nc" id="L717">        });</span>
+<span class="nc" id="L718">        return notYetRejoinedMembers;</span>
+    }
+
+    /**
+     * @return whether all members have joined.
+     */
+    public boolean hasAllMembersJoined() {
+<span class="nc bnc" id="L725" title="All 4 branches missed.">        return members.size() == numMembersAwaitingJoinResponse &amp;&amp; pendingJoinMembers.isEmpty();</span>
+    }
+
+    /**
+     * @return the ids of all members in the group.
+     */
+    public Set&lt;String&gt; allMemberIds() {
+<span class="nc" id="L732">        return members.keySet();</span>
+    }
+
+    /**
+     * @return the ids of all static members in the group.
+     */
+    public Set&lt;String&gt; allStaticMemberIds() {
+<span class="nc" id="L739">        return new HashSet&lt;&gt;(staticMembers.values());</span>
+    }
+
+    // For testing only.
+    public Set&lt;String&gt; allDynamicMemberIds() {
+<span class="nc" id="L744">        Set&lt;String&gt; dynamicMemberSet = new HashSet&lt;&gt;(allMemberIds());</span>
+<span class="nc" id="L745">        staticMembers.values().forEach(dynamicMemberSet::remove);</span>
+<span class="nc" id="L746">        return dynamicMemberSet;</span>
+    }
+
+    /**
+     * @return number of members waiting for a join group response.
+     */
+    public int numAwaitingJoinResponse() {
+<span class="nc" id="L753">        return numMembersAwaitingJoinResponse;</span>
+    }
+
+    /**
+     * @return all members.
+     */
+    public Collection&lt;ClassicGroupMember&gt; allMembers() {
+<span class="nc" id="L760">        return members.values();</span>
+    }
+
+    /**
+     * @return the group's rebalance timeout in milliseconds.
+     *         It is the max of all members' rebalance timeout.
+     */
+    public int rebalanceTimeoutMs() {
+<span class="nc" id="L768">        int maxRebalanceTimeoutMs = 0;</span>
+<span class="nc bnc" id="L769" title="All 2 branches missed.">        for (ClassicGroupMember member : members.values()) {</span>
+<span class="nc" id="L770">            maxRebalanceTimeoutMs = Math.max(maxRebalanceTimeoutMs, member.rebalanceTimeoutMs());</span>
+<span class="nc" id="L771">        }</span>
+<span class="nc" id="L772">        return maxRebalanceTimeoutMs;</span>
+    }
+
+    /**
+     * Generate a member id from the given client and group instance ids.
+     *
+     * @param clientId         the client id.
+     * @param groupInstanceId  the group instance id.
+     * @return the generated id.
+     */
+    public String generateMemberId(String clientId, Optional&lt;String&gt; groupInstanceId) {
+<span class="nc" id="L783">        return groupInstanceId.map(s -&gt; s + MEMBER_ID_DELIMITER + UUID.randomUUID())</span>
+<span class="nc" id="L784">            .orElseGet(() -&gt; clientId + MEMBER_ID_DELIMITER + UUID.randomUUID());</span>
+    }
+
+    /**
+     * Validates that (1) the group instance id exists and is mapped to the member id
+     * if the group instance id is provided; and (2) the member id exists in the group.
+     *
+     * @param memberId          The member id.
+     * @param groupInstanceId   The group instance id.
+     * @param operation         The operation.
+     *
+     * @throws UnknownMemberIdException
+     * @throws FencedInstanceIdException
+     */
+    public void validateMember(
+        String memberId,
+        String groupInstanceId,
+        String operation
+    ) throws UnknownMemberIdException, FencedInstanceIdException {
+<span class="nc bnc" id="L803" title="All 2 branches missed.">        if (groupInstanceId != null) {</span>
+<span class="nc" id="L804">            String existingMemberId = staticMemberId(groupInstanceId);</span>
+<span class="nc bnc" id="L805" title="All 2 branches missed.">            if (existingMemberId == null) {</span>
+<span class="nc" id="L806">                throw Errors.UNKNOWN_MEMBER_ID.exception();</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">            } else if (!existingMemberId.equals(memberId)) {</span>
+<span class="nc" id="L808">                log.info(&quot;Request memberId={} for static member with groupInstanceId={} &quot; +</span>
+                         &quot;is fenced by existing memberId={} during operation {}&quot;,
+                    memberId, groupInstanceId, existingMemberId, operation);
+<span class="nc" id="L811">                throw Errors.FENCED_INSTANCE_ID.exception();</span>
+            }
+        }
+
+<span class="nc bnc" id="L815" title="All 2 branches missed.">        if (!hasMember(memberId)) {</span>
+<span class="nc" id="L816">            throw Errors.UNKNOWN_MEMBER_ID.exception();</span>
+        }
+<span class="nc" id="L818">    }</span>
+
+    /**
+     * Validates the OffsetCommit request.
+     *
+     * @param memberId          The member id.
+     * @param groupInstanceId   The group instance id.
+     * @param generationId      The generation id.
+     * @param isTransactional   Whether the offset commit is transactional or not.
+     * @param apiVersion        The api version.
+     * @return A validator for per-partition validation.
+     */
+    @Override
+    public CommitPartitionValidator validateOffsetCommit(
+        String memberId,
+        String groupInstanceId,
+        int generationId,
+        boolean isTransactional,
+        int apiVersion
+    ) throws CoordinatorNotAvailableException, UnknownMemberIdException, IllegalGenerationException, FencedInstanceIdException {
+<span class="nc bnc" id="L838" title="All 2 branches missed.">        if (isInState(DEAD)) {</span>
+<span class="nc" id="L839">            throw Errors.COORDINATOR_NOT_AVAILABLE.exception();</span>
+        }
+
+<span class="nc bnc" id="L842" title="All 4 branches missed.">        if (generationId &lt; 0 &amp;&amp; isInState(EMPTY)) {</span>
+            // When the generation id is -1, the request comes from either the admin client
+            // or a consumer which does not use the group management facility. In this case,
+            // the request can commit offsets if the group is empty.
+<span class="nc" id="L846">            return CommitPartitionValidator.NO_OP;</span>
+        }
+
+<span class="nc bnc" id="L849" title="All 6 branches missed.">        if (generationId &gt;= 0 || !memberId.isEmpty() || groupInstanceId != null) {</span>
+<span class="nc bnc" id="L850" title="All 2 branches missed.">            validateMember(memberId, groupInstanceId, isTransactional ? &quot;offset-commit&quot; : &quot;txn-offset-commit&quot;);</span>
+
+<span class="nc bnc" id="L852" title="All 2 branches missed.">            if (generationId != this.generationId) {</span>
+<span class="nc" id="L853">                throw Errors.ILLEGAL_GENERATION.exception();</span>
+            }
+<span class="nc bnc" id="L855" title="All 4 branches missed.">        } else if (!isTransactional &amp;&amp; !isInState(EMPTY)) {</span>
+            // If the request does not contain the member id and the generation id (version 0),
+            // offset commits are only accepted when the group is empty.
+            // This does not apply to transactional offset commits, since the older versions
+            // of this protocol do not require member id and generation id.
+<span class="nc" id="L860">            throw Errors.UNKNOWN_MEMBER_ID.exception();</span>
+        }
+
+<span class="nc bnc" id="L863" title="All 4 branches missed.">        if (!isTransactional &amp;&amp; isInState(COMPLETING_REBALANCE)) {</span>
+            // We should not receive a commit request if the group has not completed rebalance;
+            // but since the consumer's member.id and generation is valid, it means it has received
+            // the latest group generation information from the JoinResponse.
+            // So let's return a REBALANCE_IN_PROGRESS to let consumer handle it gracefully.
+            // This does not apply to transactional offset commits, since the group state
+            // is not enforced for those.
+<span class="nc" id="L870">            throw Errors.REBALANCE_IN_PROGRESS.exception();</span>
+        }
+
+<span class="nc" id="L873">        return CommitPartitionValidator.NO_OP;</span>
+    }
+
+    /**
+     * Validates the OffsetFetch request.
+     *
+     * @param memberId              The member id. This is not provided for classic groups.
+     * @param memberEpoch           The member epoch for consumer groups. This is not provided for classic groups.
+     * @param lastCommittedOffset   The last committed offsets in the timeline.
+     */
+    @Override
+    public void validateOffsetFetch(
+        String memberId,
+        int memberEpoch,
+        long lastCommittedOffset
+    ) throws GroupIdNotFoundException {
+<span class="nc bnc" id="L889" title="All 2 branches missed.">        if (isInState(DEAD)) {</span>
+<span class="nc" id="L890">            throw new GroupIdNotFoundException(String.format(&quot;Group %s is in dead state.&quot;, groupId));</span>
+        }
+<span class="nc" id="L892">    }</span>
+
+    /**
+     * Validates the OffsetDelete request.
+     */
+    @Override
+    public void validateOffsetDelete() throws ApiException {
+<span class="nc bnc" id="L899" title="All 3 branches missed.">        switch (currentState()) {</span>
+            case DEAD:
+<span class="nc" id="L901">                throw new GroupIdNotFoundException(String.format(&quot;Group %s is in dead state.&quot;, groupId));</span>
+            case STABLE:
+            case PREPARING_REBALANCE:
+            case COMPLETING_REBALANCE:
+<span class="nc bnc" id="L905" title="All 2 branches missed.">                if (!usesConsumerGroupProtocol()) {</span>
+<span class="nc" id="L906">                    throw Errors.NON_EMPTY_GROUP.exception();</span>
+                }
+                break;
+            default:
+        }
+<span class="nc" id="L911">    }</span>
+
+    /**
+     * Validates the DeleteGroups request.
+     */
+    @Override
+    public void validateDeleteGroup() throws ApiException {
+<span class="nc bnc" id="L918" title="All 3 branches missed.">        switch (currentState()) {</span>
+            case DEAD:
+<span class="nc" id="L920">                throw new GroupIdNotFoundException(String.format(&quot;Group %s is in dead state.&quot;, groupId));</span>
+            case STABLE:
+            case PREPARING_REBALANCE:
+            case COMPLETING_REBALANCE:
+<span class="nc" id="L924">                throw Errors.NON_EMPTY_GROUP.exception();</span>
+            default:
+        }
+<span class="nc" id="L927">    }</span>
+
+    /**
+     * Populates the list of records with tombstone(s) for deleting the group.
+     *
+     * @param records The list of records.
+     */
+    @Override
+    public void createGroupTombstoneRecords(List&lt;CoordinatorRecord&gt; records) {
+<span class="nc" id="L936">        records.add(GroupCoordinatorRecordHelpers.newGroupMetadataTombstoneRecord(groupId()));</span>
+<span class="nc" id="L937">    }</span>
+
+    @Override
+    public boolean isEmpty() {
+<span class="nc" id="L941">        return isInState(EMPTY);</span>
+    }
+
+    /**
+     * Return the offset expiration condition to be used for this group. This is based on several factors
+     * such as the group state, the protocol type, and the GroupMetadata record version.
+     *
+     * See {@link org.apache.kafka.coordinator.group.OffsetExpirationCondition}
+     *
+     * @return The offset expiration condition for the group or Empty if no such condition exists.
+     */
+    @Override
+    public Optional&lt;OffsetExpirationCondition&gt; offsetExpirationCondition() {
+<span class="nc bnc" id="L954" title="All 2 branches missed.">        if (protocolType.isPresent()) {</span>
+<span class="nc bnc" id="L955" title="All 2 branches missed.">            if (isInState(EMPTY)) {</span>
+                // No members exist in the group =&gt;
+                // - If current state timestamp exists and retention period has passed since group became Empty,
+                //   expire all offsets with no pending offset commit;
+                // - If there is no current state timestamp (old group metadata schema) and retention period has passed
+                //   since the last commit timestamp, expire the offset
+<span class="nc" id="L961">                return Optional.of(new OffsetExpirationConditionImpl(</span>
+<span class="nc" id="L962">                    offsetAndMetadata -&gt; currentStateTimestamp.orElse(offsetAndMetadata.commitTimestampMs))</span>
+                );
+<span class="nc bnc" id="L964" title="All 6 branches missed.">            } else if (usesConsumerGroupProtocol() &amp;&amp; subscribedTopics.isPresent() &amp;&amp; isInState(STABLE)) {</span>
+                // Consumers exist in the group and group is Stable =&gt;
+                // - If the group is aware of the subscribed topics and retention period has passed since the
+                //   last commit timestamp, expire the offset.
+<span class="nc" id="L968">                return Optional.of(new OffsetExpirationConditionImpl(offsetAndMetadata -&gt; offsetAndMetadata.commitTimestampMs));</span>
+            }
+        } else {
+            // protocolType is None =&gt; standalone (simple) consumer, that uses Kafka for offset storage. Only
+            // expire offsets where retention period has passed since their last commit.
+<span class="nc" id="L973">            return Optional.of(new OffsetExpirationConditionImpl(offsetAndMetadata -&gt; offsetAndMetadata.commitTimestampMs));</span>
+        }
+        // If none of the conditions above are met, do not expire any offsets.
+<span class="nc" id="L976">        return Optional.empty();</span>
+    }
+
+    @Override
+    public boolean isInStates(Set&lt;String&gt; statesFilter, long committedOffset) {
+<span class="nc" id="L981">        return statesFilter.contains(state.toLowerCaseString());</span>
+    }
+
+    /**
+     * @return whether the group can rebalance.
+     */
+    public boolean canRebalance() {
+<span class="nc" id="L988">        return PREPARING_REBALANCE.validPreviousStates().contains(state);</span>
+    }
+
+    /**
+     * Transition to a group state.
+     * @param groupState the group state.
+     */
+    public void transitionTo(ClassicGroupState groupState) {
+<span class="nc" id="L996">        assertValidTransition(groupState);</span>
+<span class="nc" id="L997">        previousState = state;</span>
+<span class="nc" id="L998">        state = groupState;</span>
+<span class="nc" id="L999">        currentStateTimestamp = Optional.of(time.milliseconds());</span>
+<span class="nc" id="L1000">    }</span>
+
+    /**
+     * Select a protocol that will be used for this group. Each member
+     * will vote for a protocol and the one with the most votes will
+     * be selected. Only a protocol that is supported by all members
+     * can be selected.
+     *
+     * @return the name of the selected protocol.
+     */
+    public String selectProtocol() {
+<span class="nc bnc" id="L1011" title="All 2 branches missed.">        if (members.isEmpty()) {</span>
+<span class="nc" id="L1012">            throw new IllegalStateException(&quot;Cannot select protocol for empty group&quot;);</span>
+        }
+
+        // select the protocol for this group which is supported by all members
+<span class="nc" id="L1016">        Set&lt;String&gt; candidates = candidateProtocols();</span>
+
+        // let each member vote for one of the protocols
+<span class="nc" id="L1019">        Map&lt;String, Integer&gt; votesByProtocol = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1020">        allMembers().stream().map(member -&gt; member.vote(candidates))</span>
+<span class="nc" id="L1021">            .forEach(protocolName -&gt; {</span>
+<span class="nc" id="L1022">                int count = votesByProtocol.getOrDefault(protocolName, 0);</span>
+<span class="nc" id="L1023">                votesByProtocol.put(protocolName, count + 1);</span>
+<span class="nc" id="L1024">            });</span>
+
+        // choose the one with the most votes
+<span class="nc" id="L1027">        return votesByProtocol.entrySet().stream()</span>
+<span class="nc" id="L1028">            .max(Comparator.comparingInt(Map.Entry::getValue))</span>
+<span class="nc" id="L1029">            .map(Map.Entry::getKey).orElse(null);</span>
+    }
+
+    /**
+     * Increment the protocol count for all of the member's
+     * supported protocols.
+     *
+     * @param member the member.
+     */
+    private void incrementSupportedProtocols(ClassicGroupMember member) {
+<span class="nc" id="L1039">        member.supportedProtocols().forEach(protocol -&gt; {</span>
+<span class="nc" id="L1040">            int count = supportedProtocols.getOrDefault(protocol.name(), 0);</span>
+<span class="nc" id="L1041">            supportedProtocols.put(protocol.name(), count + 1);</span>
+<span class="nc" id="L1042">        });</span>
+<span class="nc" id="L1043">    }</span>
+
+    /**
+     * Decrement the protocol count for all of the member's
+     * supported protocols.
+     *
+     * @param member the member.
+     */
+    private void decrementSupportedProtocols(ClassicGroupMember member) {
+<span class="nc" id="L1052">        member.supportedProtocols().forEach(protocol -&gt; {</span>
+<span class="nc" id="L1053">            int count = supportedProtocols.getOrDefault(protocol.name(), 0);</span>
+<span class="nc" id="L1054">            supportedProtocols.put(protocol.name(), count - 1);</span>
+<span class="nc" id="L1055">        });</span>
+<span class="nc" id="L1056">    }</span>
+
+    /**
+     * A candidate protocol must be supported by all members.
+     *
+     * @return a set of candidate protocols that can be chosen as the protocol
+     *         for the group.
+     */
+    private Set&lt;String&gt; candidateProtocols() {
+        // get the set of protocols that are commonly supported by all members
+<span class="nc" id="L1066">        return supportedProtocols.entrySet().stream()</span>
+<span class="nc bnc" id="L1067" title="All 2 branches missed.">            .filter(protocol -&gt; protocol.getValue() == members.size())</span>
+<span class="nc" id="L1068">            .map(Map.Entry::getKey).collect(Collectors.toSet());</span>
+    }
+
+    /**
+     * Checks whether at least one of the given protocols can be supported. A
+     * protocol can be supported if it is supported by all members.
+     *
+     * @param member               the member to check.
+     *
+     * @return a boolean based on the condition mentioned above.
+     */
+    public boolean supportsProtocols(ClassicGroupMember member) {
+<span class="nc" id="L1080">        return supportsProtocols(</span>
+<span class="nc" id="L1081">            member.protocolType(),</span>
+<span class="nc" id="L1082">            ClassicGroupMember.plainProtocolSet(member.supportedProtocols())</span>
+        );
+    }
+
+    /**
+     * Checks whether at least one of the given protocols can be supported. A
+     * protocol can be supported if it is supported by all members.
+     *
+     * @param memberProtocolType  the member protocol type.
+     * @param memberProtocols     the set of protocol names.
+     *
+     * @return a boolean based on the condition mentioned above.
+     */
+    public boolean supportsProtocols(
+        String memberProtocolType,
+        JoinGroupRequestProtocolCollection memberProtocols
+    ) {
+<span class="nc" id="L1099">        return supportsProtocols(</span>
+            memberProtocolType,
+<span class="nc" id="L1101">            ClassicGroupMember.plainProtocolSet(memberProtocols)</span>
+        );
+    }
+
+    /**
+     * Checks whether at least one of the given protocols can be supported. A
+     * protocol can be supported if it is supported by all members.
+     *
+     * @param memberProtocolType  the member protocol type.
+     * @param memberProtocols     the set of protocol names.
+     *
+     * @return a boolean based on the condition mentioned above.
+     */
+    public boolean supportsProtocols(String memberProtocolType, Set&lt;String&gt; memberProtocols) {
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">        if (isInState(EMPTY)) {</span>
+<span class="nc bnc" id="L1116" title="All 4 branches missed.">            return !memberProtocolType.isEmpty() &amp;&amp; !memberProtocols.isEmpty();</span>
+        } else {
+<span class="nc bnc" id="L1118" title="All 2 branches missed.">            return protocolType.map(type -&gt; type.equals(memberProtocolType)).orElse(false) &amp;&amp;</span>
+<span class="nc" id="L1119">                memberProtocols.stream()</span>
+<span class="nc bnc" id="L1120" title="All 4 branches missed.">                    .anyMatch(name -&gt; supportedProtocols.getOrDefault(name, 0) == members.size());</span>
+        }
+    }
+
+    /**
+     * @return the topics that the group is subscribed to.
+     */
+    public Optional&lt;Set&lt;String&gt;&gt; subscribedTopics() {
+<span class="nc" id="L1128">        return subscribedTopics;</span>
+    }
+
+    /**
+     * Returns true if the classic group is actively subscribed to the topic. When the classic group does not know,
+     * because the information is not available yet or because it has failed to parse the Consumer Protocol, we
+     * consider the group not subscribed to the topic if the group is not using any protocol or not using the
+     * consumer group protocol.
+     *
+     * @param topic  The topic name.
+     *
+     * @return whether the group is subscribed to the topic.
+     */
+    public boolean isSubscribedToTopic(String topic) {
+<span class="nc" id="L1142">        return subscribedTopics.map(topics -&gt; topics.contains(topic))</span>
+<span class="nc" id="L1143">            .orElse(usesConsumerGroupProtocol());</span>
+    }
+
+    /**
+     * Collects the set of topics that the members are subscribed to when the Protocol Type is equal
+     * to 'consumer'. Empty is returned if
+     * - the protocol type is not equal to 'consumer';
+     * - the protocol is not defined yet; or
+     * - the protocol metadata does not comply with the schema.
+     *
+     * @return the subscribed topics or Empty based on the condition above.
+     */
+    public Optional&lt;Set&lt;String&gt;&gt; computeSubscribedTopics() {
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">        if (protocolType.isEmpty()) {</span>
+<span class="nc" id="L1157">            return Optional.empty();</span>
+        }
+<span class="nc" id="L1159">        String type = protocolType.get();</span>
+<span class="nc bnc" id="L1160" title="All 2 branches missed.">        if (!type.equals(ConsumerProtocol.PROTOCOL_TYPE)) {</span>
+<span class="nc" id="L1161">            return Optional.empty();</span>
+        }
+<span class="nc bnc" id="L1163" title="All 2 branches missed.">        if (members.isEmpty()) {</span>
+<span class="nc" id="L1164">            return Optional.of(Set.of());</span>
+        }
+
+<span class="nc bnc" id="L1167" title="All 2 branches missed.">        if (protocolName.isPresent()) {</span>
+            try {
+<span class="nc" id="L1169">                Set&lt;String&gt; allSubscribedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1170">                members.values().forEach(member -&gt; {</span>
+                    // The consumer protocol is parsed with V0 which is the based prefix of all versions.
+                    // This way the consumer group manager does not depend on any specific existing or
+                    // future versions of the consumer protocol. VO must prefix all new versions.
+<span class="nc" id="L1174">                    ByteBuffer buffer = ByteBuffer.wrap(member.metadata(protocolName.get()));</span>
+<span class="nc" id="L1175">                    ConsumerProtocol.deserializeVersion(buffer);</span>
+<span class="nc" id="L1176">                    allSubscribedTopics.addAll(new HashSet&lt;&gt;(</span>
+<span class="nc" id="L1177">                        ConsumerProtocol.deserializeConsumerProtocolSubscription(buffer, (short) 0).topics()</span>
+                    ));
+<span class="nc" id="L1179">                });</span>
+<span class="nc" id="L1180">                return Optional.of(allSubscribedTopics);</span>
+<span class="nc" id="L1181">            } catch (SchemaException e) {</span>
+<span class="nc" id="L1182">                log.warn(&quot;Failed to parse Consumer Protocol {}:{} of group {}. Consumer group coordinator is not aware of the subscribed topics.&quot;,</span>
+<span class="nc" id="L1183">                        ConsumerProtocol.PROTOCOL_TYPE, protocolName.get(), groupId, e);</span>
+            }
+        }
+
+<span class="nc" id="L1187">        return Optional.empty();</span>
+    }
+
+    /**
+     * Update a member.
+     *
+     * @param member              the member.
+     * @param protocols           the list of protocols.
+     * @param rebalanceTimeoutMs  the rebalance timeout in milliseconds.
+     * @param sessionTimeoutMs    the session timeout in milliseconds.
+     * @param future              the future that is invoked once the join phase is complete.
+     */
+    public void updateMember(
+        ClassicGroupMember member,
+        JoinGroupRequestProtocolCollection protocols,
+        int rebalanceTimeoutMs,
+        int sessionTimeoutMs,
+        CompletableFuture&lt;JoinGroupResponseData&gt; future
+    ) {
+<span class="nc" id="L1206">        decrementSupportedProtocols(member);</span>
+<span class="nc" id="L1207">        member.setSupportedProtocols(protocols);</span>
+<span class="nc" id="L1208">        incrementSupportedProtocols(member);</span>
+<span class="nc" id="L1209">        member.setRebalanceTimeoutMs(rebalanceTimeoutMs);</span>
+<span class="nc" id="L1210">        member.setSessionTimeoutMs(sessionTimeoutMs);</span>
+
+<span class="nc bnc" id="L1212" title="All 4 branches missed.">        if (future != null &amp;&amp; !member.isAwaitingJoin()) {</span>
+<span class="nc" id="L1213">            numMembersAwaitingJoinResponse++;</span>
+<span class="nc bnc" id="L1214" title="All 4 branches missed.">        } else if (future == null &amp;&amp; member.isAwaitingJoin()) {</span>
+<span class="nc" id="L1215">            numMembersAwaitingJoinResponse--;</span>
+        }
+<span class="nc" id="L1217">        member.setAwaitingJoinFuture(future);</span>
+<span class="nc" id="L1218">    }</span>
+
+    /**
+     * Complete the join future.
+     *
+     * @param member    the member.
+     * @param response  the join response to complete the future with.
+     * @return true if a join future actually completes.
+     */
+    public boolean completeJoinFuture(
+        ClassicGroupMember member,
+        JoinGroupResponseData response
+    ) {
+<span class="nc bnc" id="L1231" title="All 2 branches missed.">        if (member.isAwaitingJoin()) {</span>
+<span class="nc" id="L1232">            member.awaitingJoinFuture().complete(response);</span>
+<span class="nc" id="L1233">            member.setAwaitingJoinFuture(null);</span>
+<span class="nc" id="L1234">            numMembersAwaitingJoinResponse--;</span>
+<span class="nc" id="L1235">            return true;</span>
+        }
+<span class="nc" id="L1237">        return false;</span>
+    }
+
+    /**
+     * Complete all the awaiting join future with the given error.
+     *
+     * @param error  the error to complete the future with.
+     */
+    public void completeAllJoinFutures(
+        Errors error
+    ) {
+<span class="nc" id="L1248">        members.forEach((memberId, member) -&gt; completeJoinFuture(</span>
+            member,
+            new JoinGroupResponseData()
+<span class="nc" id="L1251">                .setMemberId(memberId)</span>
+<span class="nc" id="L1252">                .setErrorCode(error.code())</span>
+        ));
+<span class="nc" id="L1254">    }</span>
+
+    /**
+     * Complete a member's sync future.
+     *
+     * @param member    the member.
+     * @param response  the sync response to complete the future with.
+     * @return true if a sync future actually completes.
+     */
+    public boolean completeSyncFuture(
+        ClassicGroupMember member,
+        SyncGroupResponseData response
+    ) {
+<span class="nc bnc" id="L1267" title="All 2 branches missed.">        if (member.isAwaitingSync()) {</span>
+<span class="nc" id="L1268">            member.awaitingSyncFuture().complete(response);</span>
+<span class="nc" id="L1269">            member.setAwaitingSyncFuture(null);</span>
+<span class="nc" id="L1270">            return true;</span>
+        }
+<span class="nc" id="L1272">        return false;</span>
+    }
+
+    /**
+     * Complete all the awaiting sync future with the give error.
+     *
+     * @param error  the error to complete the future with.
+     */
+    public void completeAllSyncFutures(
+        Errors error
+    ) {
+<span class="nc" id="L1283">        members.forEach((__, member) -&gt; completeSyncFuture(</span>
+            member,
+            new SyncGroupResponseData()
+<span class="nc" id="L1286">                .setErrorCode(error.code())</span>
+        ));
+<span class="nc" id="L1288">    }</span>
+
+    /**
+     * Initiate the next generation for the group.
+     */
+    public void initNextGeneration() {
+<span class="nc" id="L1294">        generationId++;</span>
+<span class="nc bnc" id="L1295" title="All 2 branches missed.">        if (!members.isEmpty()) {</span>
+<span class="nc" id="L1296">            setProtocolName(Optional.of(selectProtocol()));</span>
+<span class="nc" id="L1297">            subscribedTopics = computeSubscribedTopics();</span>
+<span class="nc" id="L1298">            transitionTo(COMPLETING_REBALANCE);</span>
+        } else {
+<span class="nc" id="L1300">            setProtocolName(Optional.empty());</span>
+<span class="nc" id="L1301">            subscribedTopics = computeSubscribedTopics();</span>
+<span class="nc" id="L1302">            transitionTo(EMPTY);</span>
+        }
+<span class="nc" id="L1304">        clearPendingSyncMembers();</span>
+<span class="nc" id="L1305">    }</span>
+
+    /**
+     * Get all members formatted as a join response.
+     *
+     * @return the members.
+     */
+    public List&lt;JoinGroupResponseMember&gt; currentClassicGroupMembers() {
+<span class="nc bnc" id="L1313" title="All 4 branches missed.">        if (isInState(DEAD) || isInState(PREPARING_REBALANCE)) {</span>
+<span class="nc" id="L1314">            throw new IllegalStateException(&quot;Cannot obtain classic member metadata for group &quot; +</span>
+                groupId + &quot; in state &quot; + state);
+        }
+
+<span class="nc" id="L1318">        return members.values().stream().map(member -&gt;</span>
+<span class="nc" id="L1319">            new JoinGroupResponseMember()</span>
+<span class="nc" id="L1320">                .setMemberId(member.memberId())</span>
+<span class="nc" id="L1321">                .setGroupInstanceId(member.groupInstanceId().orElse(null))</span>
+<span class="nc" id="L1322">                .setMetadata(member.metadata(protocolName.orElse(null))))</span>
+<span class="nc" id="L1323">            .toList();</span>
+    }
+
+    /**
+     * @return the group formatted as a list group response based on the committed offset.
+     */
+    public ListGroupsResponseData.ListedGroup asListedGroup(long committedOffset) {
+<span class="nc" id="L1330">        return new ListGroupsResponseData.ListedGroup()</span>
+<span class="nc" id="L1331">            .setGroupId(groupId)</span>
+<span class="nc" id="L1332">            .setProtocolType(protocolType.orElse(&quot;&quot;))</span>
+<span class="nc" id="L1333">            .setGroupState(state.toString())</span>
+<span class="nc" id="L1334">            .setGroupType(type().toString());</span>
+    }
+
+    /**
+     * @return All member assignments keyed by member id.
+     */
+    public Map&lt;String, byte[]&gt; groupAssignment() {
+<span class="nc" id="L1341">        return allMembers().stream().collect(Collectors.toMap(</span>
+            ClassicGroupMember::memberId, ClassicGroupMember::assignment
+        ));
+    }
+
+    /**
+     * Convert the given ConsumerGroup to a corresponding ClassicGroup.
+     *
+     * @param consumerGroup  The converted ConsumerGroup.
+     * @param leavingMembers The members that will not be converted in the ClassicGroup.
+     * @param joiningMember  The member that needs to be converted and added to the ClassicGroup.
+     *                       When not null, must have an instanceId that matches an existing member.
+     * @param logContext     The logContext to create the ClassicGroup.
+     * @param time           The time to create the ClassicGroup.
+     * @param image          The MetadataImage.
+     * @return The created ClassicGroup.
+     */
+    public static ClassicGroup fromConsumerGroup(
+        ConsumerGroup consumerGroup,
+        Set&lt;ConsumerGroupMember&gt; leavingMembers,
+        ConsumerGroupMember joiningMember,
+        LogContext logContext,
+        Time time,
+        CoordinatorMetadataImage image
+    ) {
+<span class="nc" id="L1366">        ClassicGroup classicGroup = new ClassicGroup(</span>
+            logContext,
+<span class="nc" id="L1368">            consumerGroup.groupId(),</span>
+            ClassicGroupState.STABLE,
+            time,
+<span class="nc" id="L1371">            consumerGroup.groupEpoch(),</span>
+<span class="nc" id="L1372">            Optional.of(ConsumerProtocol.PROTOCOL_TYPE),</span>
+<span class="nc" id="L1373">            Optional.empty(),</span>
+<span class="nc" id="L1374">            Optional.empty(),</span>
+<span class="nc" id="L1375">            Optional.of(time.milliseconds())</span>
+        );
+
+<span class="nc" id="L1378">        consumerGroup.members().forEach((memberId, member) -&gt; {</span>
+<span class="nc bnc" id="L1379" title="All 4 branches missed.">            if (!leavingMembers.contains(member) &amp;&amp;</span>
+<span class="nc bnc" id="L1380" title="All 4 branches missed.">                (joiningMember == null || joiningMember.instanceId() == null || !joiningMember.instanceId().equals(member.instanceId()))) {</span>
+<span class="nc" id="L1381">                classicGroup.add(</span>
+                    new ClassicGroupMember(
+                        memberId,
+<span class="nc" id="L1384">                        Optional.ofNullable(member.instanceId()),</span>
+<span class="nc" id="L1385">                        member.clientId(),</span>
+<span class="nc" id="L1386">                        member.clientHost(),</span>
+<span class="nc" id="L1387">                        member.rebalanceTimeoutMs(),</span>
+<span class="nc" id="L1388">                        member.classicProtocolSessionTimeout().get(),</span>
+                        ConsumerProtocol.PROTOCOL_TYPE,
+<span class="nc" id="L1390">                        member.supportedJoinGroupRequestProtocols(),</span>
+                        null
+                    )
+                );
+            }
+<span class="nc" id="L1395">        });</span>
+
+<span class="nc bnc" id="L1397" title="All 2 branches missed.">        if (joiningMember != null) {</span>
+<span class="nc" id="L1398">            classicGroup.add(</span>
+                new ClassicGroupMember(
+<span class="nc" id="L1400">                    joiningMember.memberId(),</span>
+<span class="nc" id="L1401">                    Optional.ofNullable(joiningMember.instanceId()),</span>
+<span class="nc" id="L1402">                    joiningMember.clientId(),</span>
+<span class="nc" id="L1403">                    joiningMember.clientHost(),</span>
+<span class="nc" id="L1404">                    joiningMember.rebalanceTimeoutMs(),</span>
+<span class="nc" id="L1405">                    joiningMember.classicProtocolSessionTimeout().get(),</span>
+                    ConsumerProtocol.PROTOCOL_TYPE,
+<span class="nc" id="L1407">                    joiningMember.supportedJoinGroupRequestProtocols(),</span>
+                    null
+                )
+            );
+        }
+
+<span class="nc" id="L1413">        classicGroup.setProtocolName(Optional.of(classicGroup.selectProtocol()));</span>
+<span class="nc" id="L1414">        classicGroup.setSubscribedTopics(classicGroup.computeSubscribedTopics());</span>
+
+<span class="nc" id="L1416">        classicGroup.allMembers().forEach(classicGroupMember -&gt; {</span>
+            // Set the assignment with serializing the ConsumerGroup's targetAssignment.
+            // The serializing version should align with that of the member's JoinGroupRequestProtocol.
+<span class="nc" id="L1419">            String memberId = classicGroupMember.memberId();</span>
+<span class="nc bnc" id="L1420" title="All 4 branches missed.">            if (joiningMember != null &amp;&amp; memberId.equals(joiningMember.memberId())) {</span>
+                // If the downgraded is triggered by the joining static member replacing
+                // the leaving static member, the joining member should take the assignment
+                // of the leaving one.
+<span class="nc" id="L1424">                ConsumerGroupMember replacedMember = consumerGroup.staticMember(joiningMember.instanceId());</span>
+<span class="nc bnc" id="L1425" title="All 2 branches missed.">                if (replacedMember == null) {</span>
+<span class="nc" id="L1426">                    throw new IllegalArgumentException(&quot;joiningMember must be a static member when not null.&quot;);</span>
+                }
+<span class="nc" id="L1428">                memberId = replacedMember.memberId();</span>
+            }
+<span class="nc" id="L1430">            byte[] assignment = Utils.toArray(ConsumerProtocol.serializeAssignment(</span>
+<span class="nc" id="L1431">                toConsumerProtocolAssignment(</span>
+<span class="nc" id="L1432">                    consumerGroup.targetAssignment(memberId).partitions(),</span>
+                    image
+                ),
+<span class="nc" id="L1435">                ConsumerProtocol.deserializeVersion(</span>
+<span class="nc" id="L1436">                    ByteBuffer.wrap(classicGroupMember.metadata(classicGroup.protocolName().orElse(&quot;&quot;)))</span>
+                )
+            ));
+
+<span class="nc" id="L1440">            classicGroupMember.setAssignment(assignment);</span>
+<span class="nc" id="L1441">        });</span>
+
+<span class="nc" id="L1443">        return classicGroup;</span>
+    }
+
+    /**
+     * Populate the record list with the records needed to create the given classic group.
+     *
+     * @param records           The list to which the new records are added.
+     */
+    public void createClassicGroupRecords(
+        List&lt;CoordinatorRecord&gt; records
+    ) {
+<span class="nc" id="L1454">        Map&lt;String, byte[]&gt; assignments = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1455">        allMembers().forEach(classicGroupMember -&gt;</span>
+<span class="nc" id="L1456">            assignments.put(classicGroupMember.memberId(), classicGroupMember.assignment())</span>
+        );
+
+<span class="nc" id="L1459">        records.add(GroupCoordinatorRecordHelpers.newGroupMetadataRecord(this, assignments));</span>
+<span class="nc" id="L1460">    }</span>
+
+    /**
+     * Checks whether the transition to the target state is valid.
+     *
+     * @param targetState the target state to transition to.
+     */
+    private void assertValidTransition(ClassicGroupState targetState) {
+<span class="nc bnc" id="L1468" title="All 2 branches missed.">        if (!targetState.validPreviousStates().contains(state)) {</span>
+<span class="nc" id="L1469">            throw new IllegalStateException(&quot;Group &quot; + groupId + &quot; should be in one of &quot; +</span>
+<span class="nc" id="L1470">                targetState.validPreviousStates() + &quot; states before moving to &quot; + targetState +</span>
+                &quot; state. Instead it is in &quot; + state + &quot; state.&quot;);
+        }
+<span class="nc" id="L1473">    }</span>
+
+    /**
+     * For testing only.
+     */
+    public void setLeaderId(Optional&lt;String&gt; leaderId) {
+<span class="nc" id="L1479">        this.leaderId = leaderId;</span>
+<span class="nc" id="L1480">    }</span>
+
+    @Override
+    public String toString() {
+<span class="nc" id="L1484">        return &quot;ClassicGroupMetadata(&quot; +</span>
+            &quot;groupId=&quot; + groupId + &quot;, &quot; +
+            &quot;generation=&quot; + generationId + &quot;, &quot; +
+            &quot;protocolType=&quot; + protocolType + &quot;, &quot; +
+<span class="nc" id="L1488">            &quot;currentState=&quot; + currentState() + &quot;, &quot; +</span>
+            &quot;members=&quot; + members + &quot;)&quot;;
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

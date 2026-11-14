@@ -1,0 +1,14 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "dlua-script-private.h"
+
+int dluaL_error(lua_State *L, const char *fmt, ...)
+{
+	va_list argp;
+	va_start(argp, fmt);
+	(void)dlua_push_vfstring(L, fmt, argp);
+	va_end(argp);
+	(void)lua_error(L);
+	i_unreached();
+}

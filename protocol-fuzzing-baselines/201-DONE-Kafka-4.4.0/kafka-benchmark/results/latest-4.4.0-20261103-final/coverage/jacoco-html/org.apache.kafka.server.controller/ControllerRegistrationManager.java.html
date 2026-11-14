@@ -1,0 +1,376 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ControllerRegistrationManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.controller</a> &gt; <span class="el_source">ControllerRegistrationManager.java</span></div><h1>ControllerRegistrationManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server.controller;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.ControllerRegistrationRequestData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.ControllerRegistrationRequest;
+import org.apache.kafka.common.requests.ControllerRegistrationResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.ExponentialBackoff;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.image.MetadataDelta;
+import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.image.loader.LoaderManifest;
+import org.apache.kafka.image.publisher.MetadataPublisher;
+import org.apache.kafka.metadata.ControllerRegistration;
+import org.apache.kafka.metadata.ListenerInfo;
+import org.apache.kafka.metadata.VersionRange;
+import org.apache.kafka.queue.EventQueue;
+import org.apache.kafka.queue.KafkaEventQueue;
+import org.apache.kafka.server.common.ControllerRequestCompletionHandler;
+import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NodeToControllerChannelManager;
+
+import org.slf4j.Logger;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * The controller registration manager handles registering this controller with the controller
+ * quorum. This support was added by KIP-919, and requires a metadata version of 3.7 or higher.
+ *
+ * This code uses an event queue paradigm. Modifications get translated into events, which
+ * are placed on the queue to be processed sequentially. As described in the JavaDoc for
+ * each variable, most mutable state can be accessed only from that event queue thread.
+ */
+public class ControllerRegistrationManager implements MetadataPublisher {
+    
+    private final Logger logger;
+    private final int nodeId;
+    private final Time time;
+    private final Map&lt;String, VersionRange&gt; supportedFeatures;
+    private final Uuid incarnationId;
+    private final ListenerInfo listenerInfo;
+    private final ExponentialBackoff resendExponentialBackoff;
+
+    /**
+     * The event queue.
+     */
+    private final KafkaEventQueue eventQueue;
+
+    /**
+     * True if there is a pending RPC. Only read or written from the event queue thread.
+     */
+<span class="nc" id="L73">    private boolean pendingRpc = false;</span>
+
+    /**
+     * The number of RPCs that we successfully sent.
+     * Only read or written from the event queue thread.
+     */
+<span class="nc" id="L79">    private long successfulRpcs = 0L;</span>
+
+    /**
+     * The number of RPCs that we failed to send, or got back a failure response for. This is
+     * cleared after a success. Only read or written from the event queue thread.
+     */
+<span class="nc" id="L85">    private long failedRpcs = 0L;</span>
+
+    /**
+     * The current metadata version that is in effect. Only read or written from the event queue thread.
+     */
+<span class="nc" id="L90">    private Optional&lt;MetadataVersion&gt; metadataVersion = Optional.empty();</span>
+
+    /**
+     * True if we're registered. Only read or written from the event queue thread.
+     */
+<span class="nc" id="L95">    private boolean registeredInLog = false;</span>
+
+    /**
+     * The channel manager, or null if this manager has not been started yet. This variable
+     * can only be read or written from the event queue thread.
+     */
+    private NodeToControllerChannelManager channelManager;
+
+    public ControllerRegistrationManager(
+            int nodeId,
+            Time time,
+            String threadNamePrefix,
+            Map&lt;String, VersionRange&gt; supportedFeatures,
+            Uuid incarnationId,
+            ListenerInfo listenerInfo) {
+<span class="nc" id="L110">        this(nodeId, time, threadNamePrefix, supportedFeatures, incarnationId, listenerInfo, new ExponentialBackoff(100, 2, 120000L, 0.02));</span>
+<span class="nc" id="L111">    }</span>
+
+    public ControllerRegistrationManager(
+            int nodeId,
+            Time time,
+            String threadNamePrefix,
+            Map&lt;String, VersionRange&gt; supportedFeatures,
+            Uuid incarnationId,
+            ListenerInfo listenerInfo,
+            ExponentialBackoff resendExponentialBackoff
+<span class="nc" id="L121">    )  {</span>
+<span class="nc" id="L122">        this.nodeId = nodeId;</span>
+<span class="nc" id="L123">        this.time = time;</span>
+<span class="nc" id="L124">        this.supportedFeatures = supportedFeatures;</span>
+<span class="nc" id="L125">        this.incarnationId = incarnationId;</span>
+<span class="nc" id="L126">        this.listenerInfo = listenerInfo;</span>
+<span class="nc" id="L127">        this.resendExponentialBackoff = resendExponentialBackoff;</span>
+<span class="nc" id="L128">        LogContext logContext = new LogContext(&quot;[ControllerRegistrationManager&quot; +</span>
+                &quot; id=&quot; + this.nodeId +
+                &quot; incarnation=&quot; + this.incarnationId +
+                &quot;] &quot;);
+<span class="nc" id="L132">        this.logger = logContext.logger(ControllerRegistrationManager.class);</span>
+<span class="nc" id="L133">        this.eventQueue = new KafkaEventQueue(time,</span>
+                logContext,
+                threadNamePrefix + &quot;registration-manager-&quot;,
+                new ShutdownEvent());
+<span class="nc" id="L137">    }</span>
+    
+    @Override 
+    public String name() {
+<span class="nc" id="L141">        return &quot;ControllerRegistrationManager&quot;;</span>
+    }
+
+<span class="nc" id="L144">    private class ShutdownEvent implements EventQueue.Event {</span>
+        
+        @Override 
+        public void run() {
+            try {
+<span class="nc" id="L149">                logger.info(&quot;shutting down.&quot;);</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">                if (channelManager != null) {</span>
+<span class="nc" id="L151">                    channelManager.shutdown();</span>
+<span class="nc" id="L152">                    channelManager = null;</span>
+                }
+<span class="nc" id="L154">            } catch (Throwable t) {</span>
+<span class="nc" id="L155">                logger.error(&quot;ControllerRegistrationManager.stop error&quot;, t);</span>
+<span class="nc" id="L156">            }</span>
+<span class="nc" id="L157">        }</span>
+    }
+
+    /**
+     * Start the ControllerRegistrationManager.
+     *
+     * @param channelManager The channel manager to use.
+     */
+    public void start(NodeToControllerChannelManager channelManager) {
+<span class="nc" id="L166">        eventQueue.append(() -&gt; {</span>
+            try {
+<span class="nc" id="L168">                logger.info(&quot;initialized channel manager.&quot;);</span>
+<span class="nc" id="L169">                this.channelManager = channelManager;</span>
+<span class="nc" id="L170">                maybeSendControllerRegistration();</span>
+<span class="nc" id="L171">            } catch (Throwable t) {</span>
+<span class="nc" id="L172">                logger.error(&quot;start error&quot;, t);</span>
+<span class="nc" id="L173">            }</span>
+<span class="nc" id="L174">        });</span>
+<span class="nc" id="L175">    }</span>
+
+    /**
+     * Start shutting down the ControllerRegistrationManager, but do not block.
+     */
+    void beginShutdown() {
+<span class="nc" id="L181">        eventQueue.beginShutdown(&quot;beginShutdown&quot;);</span>
+<span class="nc" id="L182">    }</span>
+
+    /**
+     * Shut down the ControllerRegistrationManager and block until all threads are joined.
+     */
+    @Override 
+    public void close() throws Exception {
+<span class="nc" id="L189">        beginShutdown();</span>
+<span class="nc" id="L190">        eventQueue.close();</span>
+<span class="nc" id="L191">    }</span>
+
+    @Override 
+    public void onMetadataUpdate(MetadataDelta delta, MetadataImage newImage, LoaderManifest manifest) {
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (delta.featuresDelta() != null ||</span>
+<span class="nc bnc" id="L196" title="All 4 branches missed.">                (delta.clusterDelta() != null &amp;&amp; delta.clusterDelta().changedControllers().containsKey(nodeId))) {</span>
+<span class="nc" id="L197">            eventQueue.append(new MetadataUpdateEvent(delta, newImage));</span>
+        }
+<span class="nc" id="L199">    }</span>
+
+    private class MetadataUpdateEvent implements EventQueue.Event {
+
+        private final MetadataDelta delta;
+        private final MetadataImage newImage;
+
+<span class="nc" id="L206">        MetadataUpdateEvent(MetadataDelta delta, MetadataImage newImage) {</span>
+<span class="nc" id="L207">            this.delta = delta;</span>
+<span class="nc" id="L208">            this.newImage = newImage;</span>
+<span class="nc" id="L209">        }</span>
+            
+        @Override 
+        public void run() {
+            try {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                if (delta.featuresDelta() != null) {</span>
+<span class="nc" id="L215">                    metadataVersion = newImage.features().metadataVersion();</span>
+                }
+<span class="nc bnc" id="L217" title="All 2 branches missed.">                if (delta.clusterDelta() != null) {</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">                    if (delta.clusterDelta().changedControllers().containsKey(nodeId)) {</span>
+<span class="nc" id="L219">                        ControllerRegistration curRegistration = newImage.cluster().controllers().get(nodeId);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                        if (curRegistration == null) {</span>
+<span class="nc" id="L221">                            logger.info(&quot;Registration removed for this node ID.&quot;);</span>
+<span class="nc" id="L222">                            registeredInLog = false;</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                        } else if (!curRegistration.incarnationId().equals(incarnationId)) {</span>
+<span class="nc" id="L224">                            logger.info(&quot;Found registration for {} instead of our incarnation.&quot;, curRegistration.incarnationId());</span>
+<span class="nc" id="L225">                            registeredInLog = false;</span>
+                        } else {
+<span class="nc" id="L227">                            logger.info(&quot;Our registration has been persisted to the metadata log.&quot;);</span>
+<span class="nc" id="L228">                            registeredInLog = true;</span>
+                        }
+                    }
+                }
+<span class="nc" id="L232">                maybeSendControllerRegistration();</span>
+<span class="nc" id="L233">            } catch (Throwable t) {</span>
+<span class="nc" id="L234">                logger.error(&quot;onMetadataUpdate error&quot;, t);</span>
+<span class="nc" id="L235">            }</span>
+<span class="nc" id="L236">        }</span>
+    }
+
+    private void maybeSendControllerRegistration() {
+<span class="nc" id="L240">        Optional&lt;MetadataVersion&gt; metadataVersion = this.metadataVersion;</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">        if (registeredInLog) {</span>
+<span class="nc" id="L242">            logger.debug(&quot;maybeSendControllerRegistration: controller is already registered.&quot;);</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        } else if (channelManager == null) {</span>
+<span class="nc" id="L244">            logger.debug(&quot;maybeSendControllerRegistration: cannot register yet because the channel manager has not been initialized.&quot;);</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        } else if (metadataVersion.isEmpty()) {</span>
+<span class="nc" id="L246">            logger.info(&quot;maybeSendControllerRegistration: cannot register yet because the metadata.version is not known yet.&quot;);</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        } else if (!metadataVersion.get().isControllerRegistrationSupported()) {</span>
+<span class="nc" id="L248">            logger.info(&quot;maybeSendControllerRegistration: cannot register yet because the metadata.version is &quot; +</span>
+                    &quot;still {}, which does not support KIP-919 controller registration.&quot;, metadataVersion);
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        } else if (pendingRpc) {</span>
+<span class="nc" id="L251">            logger.info(&quot;maybeSendControllerRegistration: waiting for the previous RPC to complete.&quot;);</span>
+        } else {
+<span class="nc" id="L253">            sendControllerRegistration();</span>
+        }
+<span class="nc" id="L255">    }</span>
+
+    private void sendControllerRegistration() {
+<span class="nc" id="L258">        ControllerRegistrationRequestData.FeatureCollection features = new ControllerRegistrationRequestData.FeatureCollection();</span>
+<span class="nc" id="L259">        supportedFeatures.forEach((name, range) -&gt; features.add(new ControllerRegistrationRequestData.Feature().</span>
+<span class="nc" id="L260">                setName(name).</span>
+<span class="nc" id="L261">                setMinSupportedVersion(range.min()).</span>
+<span class="nc" id="L262">                setMaxSupportedVersion(range.max())));</span>
+<span class="nc" id="L263">        ControllerRegistrationRequestData data = new ControllerRegistrationRequestData().</span>
+<span class="nc" id="L264">            setControllerId(nodeId).</span>
+<span class="nc" id="L265">            setFeatures(features).</span>
+<span class="nc" id="L266">            setIncarnationId(incarnationId).</span>
+<span class="nc" id="L267">            setListeners(listenerInfo.toControllerRegistrationRequest()).</span>
+<span class="nc" id="L268">            setZkMigrationReady(false);</span>
+
+<span class="nc" id="L270">        logger.info(&quot;sendControllerRegistration: attempting to send {}&quot;, data);</span>
+<span class="nc" id="L271">        channelManager.sendRequest(new ControllerRegistrationRequest.Builder(data),</span>
+                new RegistrationResponseHandler());
+<span class="nc" id="L273">        pendingRpc = true;</span>
+<span class="nc" id="L274">    }</span>
+
+<span class="nc" id="L276">    private class RegistrationResponseHandler implements ControllerRequestCompletionHandler {</span>
+        
+        @Override 
+        public void onComplete(ClientResponse response) {
+<span class="nc" id="L280">            eventQueue.append(new RequestCompleteEvent(response));</span>
+<span class="nc" id="L281">        }</span>
+
+        @Override
+        public void onTimeout() {
+<span class="nc" id="L285">            eventQueue.append(new RequestTimeoutEvent());</span>
+<span class="nc" id="L286">        }</span>
+    }
+
+    private class RequestCompleteEvent implements EventQueue.Event {
+
+        private final ClientResponse response;
+        
+<span class="nc" id="L293">        RequestCompleteEvent(ClientResponse response) {</span>
+<span class="nc" id="L294">            this.response = response;</span>
+<span class="nc" id="L295">        }</span>
+        
+        @Override 
+        public void run() {
+<span class="nc" id="L299">            pendingRpc = false;</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            if (response.authenticationException() != null) {</span>
+<span class="nc" id="L301">                logger.error(&quot;RegistrationResponseHandler: authentication error&quot;, response.authenticationException());</span>
+<span class="nc" id="L302">                scheduleNextCommunicationAfterFailure();</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            } else if (response.versionMismatch() != null) {</span>
+<span class="nc" id="L304">                logger.error(&quot;RegistrationResponseHandler: unsupported API version error&quot;, response.versionMismatch());</span>
+<span class="nc" id="L305">                scheduleNextCommunicationAfterFailure();</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">            } else if (response.responseBody() == null) {</span>
+<span class="nc" id="L307">                logger.error(&quot;RegistrationResponseHandler: unknown error&quot;);</span>
+<span class="nc" id="L308">                scheduleNextCommunicationAfterFailure();</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            } else if (!(response.responseBody() instanceof ControllerRegistrationResponse message)) {</span>
+<span class="nc" id="L310">                logger.error(&quot;RegistrationResponseHandler: invalid response type error&quot;);</span>
+<span class="nc" id="L311">                scheduleNextCommunicationAfterFailure();</span>
+            } else {
+<span class="nc" id="L313">                Errors errorCode = Errors.forCode(message.data().errorCode());</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                if (errorCode == Errors.NONE) {</span>
+<span class="nc" id="L315">                    successfulRpcs = successfulRpcs + 1;</span>
+<span class="nc" id="L316">                    failedRpcs = 0;</span>
+<span class="nc" id="L317">                    logger.info(&quot;RegistrationResponseHandler: controller acknowledged ControllerRegistrationRequest.&quot;);</span>
+                } else {
+<span class="nc" id="L319">                    logger.info(&quot;RegistrationResponseHandler: controller returned error {} ({})&quot;, errorCode, message.data().errorMessage());</span>
+<span class="nc" id="L320">                    scheduleNextCommunicationAfterFailure();</span>
+                }
+            }
+<span class="nc" id="L323">        }</span>
+    }
+
+<span class="nc" id="L326">    private class RequestTimeoutEvent implements EventQueue.Event {</span>
+        
+        @Override 
+        public void run() {
+<span class="nc" id="L330">            pendingRpc = false;</span>
+<span class="nc" id="L331">            logger.error(&quot;RegistrationResponseHandler: channel manager timed out before sending the request.&quot;);</span>
+<span class="nc" id="L332">            scheduleNextCommunicationAfterFailure();</span>
+<span class="nc" id="L333">        }</span>
+    }
+
+    private void scheduleNextCommunicationAfterFailure() {
+<span class="nc" id="L337">        long delayMs = resendExponentialBackoff.backoff(failedRpcs);</span>
+<span class="nc" id="L338">        failedRpcs = failedRpcs + 1;</span>
+<span class="nc" id="L339">        scheduleNextCommunication(delayMs);</span>
+<span class="nc" id="L340">    }</span>
+
+    private void scheduleNextCommunication(long intervalMs) {
+<span class="nc" id="L343">        logger.trace(&quot;Scheduling next communication at {} ms from now.&quot;, intervalMs);</span>
+<span class="nc" id="L344">        long deadlineNs = time.nanoseconds() + TimeUnit.MILLISECONDS.toNanos(intervalMs);</span>
+<span class="nc" id="L345">        eventQueue.scheduleDeferred(&quot;communication&quot;,</span>
+                new EventQueue.DeadlineFunction(deadlineNs),
+                this::maybeSendControllerRegistration);
+<span class="nc" id="L348">    }</span>
+
+    // Only for testing
+    public KafkaEventQueue eventQueue() {
+<span class="nc" id="L352">        return eventQueue;</span>
+    }
+
+    // Only for testing
+    public boolean registeredInLog() {
+<span class="nc" id="L357">        return registeredInLog;</span>
+    }
+
+    // Only for testing
+    public boolean pendingRpc() {
+<span class="nc" id="L362">        return pendingRpc;</span>
+    }
+
+    // Only for testing
+    public long successfulRpcs() {
+<span class="nc" id="L367">        return successfulRpcs;</span>
+    }
+
+    // Only for testing
+    public long failedRpcs() {
+<span class="nc" id="L372">        return failedRpcs;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

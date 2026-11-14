@@ -1,0 +1,61 @@
+include $(top_srcdir)/Makefile.test.include
+
+pkgsysconfdir = $(sysconfdir)/dovecot
+
+noinst_LTLIBRARIES = liblogin.la
+
+AM_CPPFLAGS = \
+	-I$(top_srcdir)/src/lib \
+	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-sasl \
+	-I$(top_srcdir)/src/lib-auth-client \
+	-I$(top_srcdir)/src/lib-master
+
+liblogin_la_SOURCES = \
+	login-client.c \
+	login-server.c \
+	login-server-auth.c
+
+headers = \
+	login-client.h \
+	login-interface.h \
+	login-server.h \
+	login-server-auth.h
+
+pkginc_libdir=$(pkgincludedir)
+pkginc_lib_HEADERS = $(headers)
+
+test_programs = \
+	test-login-server-auth
+
+test_libs = \
+	liblogin.la \
+	../lib-master/libmaster.la \
+	../lib-auth-client/libauth-client.la \
+	../lib-dns-client/libdns-client.la  \
+	../lib-dns/libdns.la \
+	../lib-ssl-iostream/libssl_iostream.la \
+	../lib-settings/libsettings.la \
+	../lib-dns/libdns.la \
+	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
+	../lib-test/libtest.la \
+	../lib/liblib.la
+
+test_deps = \
+	liblogin.la \
+	../lib-master/libmaster.la \
+	../lib-auth-client/libauth-client.la \
+	../lib-dns-client/libdns-client.la  \
+	../lib-dns/libdns.la \
+	../lib-ssl-iostream/libssl_iostream.la \
+	../lib-settings/libsettings.la \
+	../lib-dns/libdns.la \
+	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
+	../lib-test/libtest.la \
+	../lib/liblib.la
+
+test_login_server_auth_SOURCES = test-login-server-auth.c
+test_login_server_auth_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+test_login_server_auth_DEPENDENCIES = $(test_deps)

@@ -1,0 +1,1482 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Selector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.network</a> &gt; <span class="el_source">Selector.java</span></div><h1>Selector.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.network;
+
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.errors.AuthenticationException;
+import org.apache.kafka.common.memory.MemoryPool;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.IntGaugeSuite;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.CumulativeSum;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.metrics.stats.Meter;
+import org.apache.kafka.common.metrics.stats.SampledStat;
+import org.apache.kafka.common.metrics.stats.WindowedCount;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.channels.CancelledKeyException;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.SocketChannel;
+import java.nio.channels.UnresolvedAddressException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * A nioSelector interface for doing non-blocking multi-connection network I/O.
+ * &lt;p&gt;
+ * This class works with {@link NetworkSend} and {@link NetworkReceive} to transmit size-delimited network requests and
+ * responses.
+ * &lt;p&gt;
+ * A connection can be added to the nioSelector associated with an integer id by doing
+ *
+ * &lt;pre&gt;
+ * nioSelector.connect(&amp;quot;42&amp;quot;, new InetSocketAddress(&amp;quot;google.com&amp;quot;, server.port), 64000, 64000);
+ * &lt;/pre&gt;
+ *
+ * The connect call does not block on the creation of the TCP connection, so the connect method only begins initiating
+ * the connection. The successful invocation of this method does not mean a valid connection has been established.
+ *
+ * Sending requests, receiving responses, processing connection completions, and disconnections on the existing
+ * connections are all done using the &lt;code&gt;poll()&lt;/code&gt; call.
+ *
+ * &lt;pre&gt;
+ * nioSelector.send(new NetworkSend(myDestination, myBytes));
+ * nioSelector.send(new NetworkSend(myOtherDestination, myOtherBytes));
+ * nioSelector.poll(TIMEOUT_MS);
+ * &lt;/pre&gt;
+ *
+ * The nioSelector maintains several lists that are reset by each call to &lt;code&gt;poll()&lt;/code&gt; which are available via
+ * various getters. These are reset by each call to &lt;code&gt;poll()&lt;/code&gt;.
+ *
+ * This class is not thread safe!
+ */
+public class Selector implements Selectable, AutoCloseable {
+
+    public static final long NO_IDLE_TIMEOUT_MS = -1;
+    public static final int NO_FAILED_AUTHENTICATION_DELAY = 0;
+
+<span class="nc" id="L93">    private enum CloseMode {</span>
+<span class="nc" id="L94">        GRACEFUL(true),            // process outstanding buffered receives, notify disconnect</span>
+<span class="nc" id="L95">        NOTIFY_ONLY(true),         // discard any outstanding receives, notify disconnect</span>
+<span class="nc" id="L96">        DISCARD_NO_NOTIFY(false);  // discard any outstanding receives, no disconnect notification</span>
+
+        final boolean notifyDisconnect;
+
+<span class="nc" id="L100">        CloseMode(boolean notifyDisconnect) {</span>
+<span class="nc" id="L101">            this.notifyDisconnect = notifyDisconnect;</span>
+<span class="nc" id="L102">        }</span>
+    }
+
+    private final Logger log;
+    private final java.nio.channels.Selector nioSelector;
+    private final Map&lt;String, KafkaChannel&gt; channels;
+    private final Set&lt;KafkaChannel&gt; explicitlyMutedChannels;
+    private boolean outOfMemory;
+    private final List&lt;NetworkSend&gt; completedSends;
+    private final LinkedHashMap&lt;String, NetworkReceive&gt; completedReceives;
+    private final Set&lt;SelectionKey&gt; immediatelyConnectedKeys;
+    private final Map&lt;String, KafkaChannel&gt; closingChannels;
+    private Set&lt;SelectionKey&gt; keysWithBufferedRead;
+    private final Map&lt;String, ChannelState&gt; disconnected;
+    private final List&lt;String&gt; connected;
+    private final List&lt;String&gt; failedSends;
+    private final Time time;
+    private final SelectorMetrics sensors;
+    private final ChannelBuilder channelBuilder;
+    private final int maxReceiveSize;
+    private final boolean recordTimePerConnection;
+    private final IdleExpiryManager idleExpiryManager;
+    private final LinkedHashMap&lt;String, DelayedAuthenticationFailureClose&gt; delayedClosingChannels;
+    private final MemoryPool memoryPool;
+    private final long lowMemThreshold;
+    private final int failedAuthenticationDelayMs;
+
+    //indicates if the previous call to poll was able to make progress in reading already-buffered data.
+    //this is used to prevent tight loops when memory is not available to read any more data
+<span class="nc" id="L131">    private boolean madeReadProgressLastPoll = true;</span>
+
+    /**
+     * Create a new nioSelector
+     * @param maxReceiveSize Max size in bytes of a single network receive (use {@link NetworkReceive#UNLIMITED} for no limit)
+     * @param connectionMaxIdleMs Max idle connection time (use {@link #NO_IDLE_TIMEOUT_MS} to disable idle timeout)
+     * @param failedAuthenticationDelayMs Minimum time by which failed authentication response and channel close should be delayed by.
+     *                                    Use {@link #NO_FAILED_AUTHENTICATION_DELAY} to disable this delay.
+     * @param metrics Registry for Selector metrics
+     * @param time Time implementation
+     * @param metricGrpPrefix Prefix for the group of metrics registered by Selector
+     * @param metricTags Additional tags to add to metrics registered by Selector
+     * @param metricsPerConnection Whether or not to enable per-connection metrics
+     * @param channelBuilder Channel builder for every new connection
+     * @param logContext Context for logging with additional info
+     */
+    public Selector(int maxReceiveSize,
+            long connectionMaxIdleMs,
+            int failedAuthenticationDelayMs,
+            Metrics metrics,
+            Time time,
+            String metricGrpPrefix,
+            Map&lt;String, String&gt; metricTags,
+            boolean metricsPerConnection,
+            boolean recordTimePerConnection,
+            ChannelBuilder channelBuilder,
+            MemoryPool memoryPool,
+<span class="nc" id="L158">            LogContext logContext) {</span>
+        try {
+<span class="nc" id="L160">            this.nioSelector = java.nio.channels.Selector.open();</span>
+<span class="nc" id="L161">        } catch (IOException e) {</span>
+<span class="nc" id="L162">            throw new KafkaException(e);</span>
+<span class="nc" id="L163">        }</span>
+<span class="nc" id="L164">        this.maxReceiveSize = maxReceiveSize;</span>
+<span class="nc" id="L165">        this.time = time;</span>
+<span class="nc" id="L166">        this.channels = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L167">        this.explicitlyMutedChannels = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L168">        this.outOfMemory = false;</span>
+<span class="nc" id="L169">        this.completedSends = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L170">        this.completedReceives = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L171">        this.immediatelyConnectedKeys = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L172">        this.closingChannels = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L173">        this.keysWithBufferedRead = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L174">        this.connected = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L175">        this.disconnected = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L176">        this.failedSends = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L177">        this.log = logContext.logger(Selector.class);</span>
+<span class="nc" id="L178">        this.sensors = new SelectorMetrics(metrics, metricGrpPrefix, metricTags, metricsPerConnection);</span>
+<span class="nc" id="L179">        this.channelBuilder = channelBuilder;</span>
+<span class="nc" id="L180">        this.recordTimePerConnection = recordTimePerConnection;</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        this.idleExpiryManager = connectionMaxIdleMs &lt; 0 ? null : new IdleExpiryManager(time, connectionMaxIdleMs);</span>
+<span class="nc" id="L182">        this.memoryPool = memoryPool;</span>
+<span class="nc" id="L183">        this.lowMemThreshold = (long) (0.1 * this.memoryPool.size());</span>
+<span class="nc" id="L184">        this.failedAuthenticationDelayMs = failedAuthenticationDelayMs;</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        this.delayedClosingChannels = (failedAuthenticationDelayMs &gt; NO_FAILED_AUTHENTICATION_DELAY) ? new LinkedHashMap&lt;&gt;() : null;</span>
+<span class="nc" id="L186">    }</span>
+
+    public Selector(int maxReceiveSize,
+                    long connectionMaxIdleMs,
+                    Metrics metrics,
+                    Time time,
+                    String metricGrpPrefix,
+                    Map&lt;String, String&gt; metricTags,
+                    boolean metricsPerConnection,
+                    boolean recordTimePerConnection,
+                    ChannelBuilder channelBuilder,
+                    MemoryPool memoryPool,
+                    LogContext logContext) {
+<span class="nc" id="L199">        this(maxReceiveSize, connectionMaxIdleMs, NO_FAILED_AUTHENTICATION_DELAY, metrics, time, metricGrpPrefix, metricTags,</span>
+                metricsPerConnection, recordTimePerConnection, channelBuilder, memoryPool, logContext);
+<span class="nc" id="L201">    }</span>
+
+    public Selector(int maxReceiveSize,
+                    long connectionMaxIdleMs,
+                    int failedAuthenticationDelayMs,
+                    Metrics metrics,
+                    Time time,
+                    String metricGrpPrefix,
+                    Map&lt;String, String&gt; metricTags,
+                    boolean metricsPerConnection,
+                    ChannelBuilder channelBuilder,
+                    LogContext logContext) {
+<span class="nc" id="L213">        this(maxReceiveSize, connectionMaxIdleMs, failedAuthenticationDelayMs, metrics, time, metricGrpPrefix, metricTags, metricsPerConnection, false, channelBuilder, MemoryPool.NONE, logContext);</span>
+<span class="nc" id="L214">    }</span>
+
+    public Selector(int maxReceiveSize,
+                    long connectionMaxIdleMs,
+                    Metrics metrics,
+                    Time time,
+                    String metricGrpPrefix,
+                    Map&lt;String, String&gt; metricTags,
+                    boolean metricsPerConnection,
+                    ChannelBuilder channelBuilder,
+                    LogContext logContext) {
+<span class="nc" id="L225">        this(maxReceiveSize, connectionMaxIdleMs, NO_FAILED_AUTHENTICATION_DELAY, metrics, time, metricGrpPrefix, metricTags, metricsPerConnection, channelBuilder, logContext);</span>
+<span class="nc" id="L226">    }</span>
+
+    public Selector(long connectionMaxIdleMS, Metrics metrics, Time time, String metricGrpPrefix, ChannelBuilder channelBuilder, LogContext logContext) {
+<span class="nc" id="L229">        this(NetworkReceive.UNLIMITED, connectionMaxIdleMS, metrics, time, metricGrpPrefix, Map.of(), true, channelBuilder, logContext);</span>
+<span class="nc" id="L230">    }</span>
+
+    public Selector(long connectionMaxIdleMS, int failedAuthenticationDelayMs, Metrics metrics, Time time, String metricGrpPrefix, ChannelBuilder channelBuilder, LogContext logContext) {
+<span class="nc" id="L233">        this(NetworkReceive.UNLIMITED, connectionMaxIdleMS, failedAuthenticationDelayMs, metrics, time, metricGrpPrefix, Map.of(), true, channelBuilder, logContext);</span>
+<span class="nc" id="L234">    }</span>
+
+    /**
+     * Begin connecting to the given address and add the connection to this nioSelector associated with the given id
+     * number.
+     * &lt;p&gt;
+     * Note that this call only initiates the connection, which will be completed on a future {@link #poll(long)}
+     * call. Check {@link #connected()} to see which (if any) connections have completed after a given poll call.
+     * @param id The id for the new connection
+     * @param address The address to connect to
+     * @param sendBufferSize The send buffer for the new connection
+     * @param receiveBufferSize The receive buffer for the new connection
+     * @throws IllegalStateException if there is already a connection for that id
+     * @throws IOException if DNS resolution fails on the hostname or if the broker is down
+     */
+    @Override
+    public void connect(String id, InetSocketAddress address, int sendBufferSize, int receiveBufferSize) throws IOException {
+<span class="nc" id="L251">        ensureNotRegistered(id);</span>
+<span class="nc" id="L252">        SocketChannel socketChannel = SocketChannel.open();</span>
+<span class="nc" id="L253">        SelectionKey key = null;</span>
+        try {
+<span class="nc" id="L255">            configureSocketChannel(socketChannel, sendBufferSize, receiveBufferSize);</span>
+<span class="nc" id="L256">            boolean connected = doConnect(socketChannel, address);</span>
+<span class="nc" id="L257">            key = registerChannel(id, socketChannel, SelectionKey.OP_CONNECT);</span>
+
+<span class="nc bnc" id="L259" title="All 2 branches missed.">            if (connected) {</span>
+                // OP_CONNECT won't trigger for immediately connected channels
+<span class="nc" id="L261">                log.debug(&quot;Immediately connected to node {}&quot;, id);</span>
+<span class="nc" id="L262">                immediatelyConnectedKeys.add(key);</span>
+<span class="nc" id="L263">                key.interestOps(0);</span>
+            }
+<span class="nc" id="L265">        } catch (IOException | RuntimeException e) {</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            if (key != null)</span>
+<span class="nc" id="L267">                immediatelyConnectedKeys.remove(key);</span>
+<span class="nc" id="L268">            channels.remove(id);</span>
+<span class="nc" id="L269">            socketChannel.close();</span>
+<span class="nc" id="L270">            throw e;</span>
+<span class="nc" id="L271">        }</span>
+<span class="nc" id="L272">    }</span>
+
+    // Visible to allow test cases to override. In particular, we use this to implement a blocking connect
+    // in order to simulate &quot;immediately connected&quot; sockets.
+    protected boolean doConnect(SocketChannel channel, InetSocketAddress address) throws IOException {
+        try {
+<span class="nc" id="L278">            return channel.connect(address);</span>
+<span class="nc" id="L279">        } catch (UnresolvedAddressException e) {</span>
+<span class="nc" id="L280">            throw new IOException(&quot;Can't resolve address: &quot; + address, e);</span>
+        }
+    }
+
+    private void configureSocketChannel(SocketChannel socketChannel, int sendBufferSize, int receiveBufferSize)
+            throws IOException {
+<span class="nc" id="L286">        socketChannel.configureBlocking(false);</span>
+<span class="nc" id="L287">        Socket socket = socketChannel.socket();</span>
+<span class="nc" id="L288">        socket.setKeepAlive(true);</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (sendBufferSize != Selectable.USE_DEFAULT_BUFFER_SIZE)</span>
+<span class="nc" id="L290">            socket.setSendBufferSize(sendBufferSize);</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (receiveBufferSize != Selectable.USE_DEFAULT_BUFFER_SIZE)</span>
+<span class="nc" id="L292">            socket.setReceiveBufferSize(receiveBufferSize);</span>
+<span class="nc" id="L293">        socket.setTcpNoDelay(true);</span>
+<span class="nc" id="L294">    }</span>
+
+    /**
+     * Register the nioSelector with an existing channel
+     * Use this on server-side, when a connection is accepted by a different thread but processed by the Selector
+     * &lt;p&gt;
+     * If a connection already exists with the same connection id in `channels` or `closingChannels`,
+     * an exception is thrown. Connection ids must be chosen to avoid conflict when remote ports are reused.
+     * Kafka brokers add an incrementing index to the connection id to avoid reuse in the timing window
+     * where an existing connection may not yet have been closed by the broker when a new connection with
+     * the same remote host:port is processed.
+     * &lt;/p&gt;&lt;p&gt;
+     * If a `KafkaChannel` cannot be created for this connection, the `socketChannel` is closed
+     * and its selection key cancelled.
+     * &lt;/p&gt;
+     */
+    public void register(String id, SocketChannel socketChannel) throws IOException {
+<span class="nc" id="L311">        ensureNotRegistered(id);</span>
+<span class="nc" id="L312">        registerChannel(id, socketChannel, SelectionKey.OP_READ);</span>
+<span class="nc" id="L313">        this.sensors.connectionCreated.record();</span>
+        // Default to empty client information as the ApiVersionsRequest is not
+        // mandatory. In this case, we still want to account for the connection.
+<span class="nc" id="L316">        ChannelMetadataRegistry metadataRegistry = this.channel(id).channelMetadataRegistry();</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (metadataRegistry.clientInformation() == null)</span>
+<span class="nc" id="L318">            metadataRegistry.registerClientInformation(ClientInformation.EMPTY);</span>
+<span class="nc" id="L319">    }</span>
+
+    private void ensureNotRegistered(String id) {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        if (this.channels.containsKey(id))</span>
+<span class="nc" id="L323">            throw new IllegalStateException(&quot;There is already a connection for id &quot; + id);</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">        if (this.closingChannels.containsKey(id))</span>
+<span class="nc" id="L325">            throw new IllegalStateException(&quot;There is already a connection for id &quot; + id + &quot; that is still being closed&quot;);</span>
+<span class="nc" id="L326">    }</span>
+
+    protected SelectionKey registerChannel(String id, SocketChannel socketChannel, int interestedOps) throws IOException {
+<span class="nc" id="L329">        SelectionKey key = socketChannel.register(nioSelector, interestedOps);</span>
+<span class="nc" id="L330">        KafkaChannel channel = buildAndAttachKafkaChannel(socketChannel, id, key);</span>
+<span class="nc" id="L331">        this.channels.put(id, channel);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        if (idleExpiryManager != null)</span>
+<span class="nc" id="L333">            idleExpiryManager.update(channel.id(), time.nanoseconds());</span>
+<span class="nc" id="L334">        return key;</span>
+    }
+
+    private KafkaChannel buildAndAttachKafkaChannel(SocketChannel socketChannel, String id, SelectionKey key) throws IOException {
+<span class="nc" id="L338">        ChannelMetadataRegistry metadataRegistry = null;</span>
+        try {
+<span class="nc" id="L340">            metadataRegistry = new SelectorChannelMetadataRegistry();</span>
+<span class="nc" id="L341">            KafkaChannel channel = channelBuilder.buildChannel(id, key, maxReceiveSize, memoryPool, metadataRegistry);</span>
+<span class="nc" id="L342">            key.attach(channel);</span>
+<span class="nc" id="L343">            return channel;</span>
+<span class="nc" id="L344">        } catch (Exception e) {</span>
+            try {
+<span class="nc" id="L346">                socketChannel.close();</span>
+            } finally {
+<span class="nc" id="L348">                key.cancel();</span>
+            }
+            // Ideally, these resources are closed by the KafkaChannel but if the KafkaChannel is not created to an
+            // error, this builder should close the resources it has created instead.
+<span class="nc" id="L352">            Utils.closeQuietly(metadataRegistry, &quot;metadataRegistry&quot;);</span>
+<span class="nc" id="L353">            throw new IOException(&quot;Channel could not be created for socket &quot; + socketChannel, e);</span>
+        }
+    }
+
+    /**
+     * Interrupt the nioSelector if it is blocked waiting to do I/O.
+     */
+    @Override
+    public void wakeup() {
+<span class="nc" id="L362">        this.nioSelector.wakeup();</span>
+<span class="nc" id="L363">    }</span>
+
+    /**
+     * Close this selector and all associated connections
+     */
+    @Override
+    public void close() {
+<span class="nc" id="L370">        List&lt;String&gt; connections = new ArrayList&lt;&gt;(channels.keySet());</span>
+<span class="nc" id="L371">        AtomicReference&lt;Throwable&gt; firstException = new AtomicReference&lt;&gt;();</span>
+<span class="nc" id="L372">        Utils.closeAllQuietly(firstException, &quot;release connections&quot;,</span>
+<span class="nc" id="L373">                connections.stream().map(id -&gt; (AutoCloseable) () -&gt; close(id)).toArray(AutoCloseable[]::new));</span>
+        // If there is any exception thrown in close(id), we should still be able
+        // to close the remaining objects, especially the sensors because keeping
+        // the sensors may lead to failure to start up the ReplicaFetcherThread if
+        // the old sensors with the same names has not yet been cleaned up.
+<span class="nc" id="L378">        Utils.closeQuietly(nioSelector, &quot;nioSelector&quot;, firstException);</span>
+<span class="nc" id="L379">        Utils.closeQuietly(sensors, &quot;sensors&quot;, firstException);</span>
+<span class="nc" id="L380">        Utils.closeQuietly(channelBuilder, &quot;channelBuilder&quot;, firstException);</span>
+<span class="nc" id="L381">        Throwable exception = firstException.get();</span>
+<span class="nc bnc" id="L382" title="All 4 branches missed.">        if (exception instanceof RuntimeException &amp;&amp; !(exception instanceof SecurityException)) {</span>
+<span class="nc" id="L383">            throw (RuntimeException) exception;</span>
+        }
+<span class="nc" id="L385">    }</span>
+
+    /**
+     * Queue the given request for sending in the subsequent {@link #poll(long)} calls
+     * @param send The request to send
+     */
+    public void send(NetworkSend send) {
+<span class="nc" id="L392">        String connectionId = send.destinationId();</span>
+<span class="nc" id="L393">        KafkaChannel channel = openOrClosingChannelOrFail(connectionId);</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        if (closingChannels.containsKey(connectionId)) {</span>
+            // ensure notification via `disconnected`, leave channel in the state in which closing was triggered
+<span class="nc" id="L396">            this.failedSends.add(connectionId);</span>
+        } else {
+            try {
+<span class="nc" id="L399">                channel.setSend(send);</span>
+<span class="nc" id="L400">            } catch (Exception e) {</span>
+                // update the state for consistency, the channel will be discarded after `close`
+<span class="nc" id="L402">                channel.state(ChannelState.FAILED_SEND);</span>
+                // ensure notification via `disconnected` when `failedSends` are processed in the next poll
+<span class="nc" id="L404">                this.failedSends.add(connectionId);</span>
+<span class="nc" id="L405">                close(channel, CloseMode.DISCARD_NO_NOTIFY);</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">                if (!(e instanceof CancelledKeyException)) {</span>
+<span class="nc" id="L407">                    log.error(&quot;Unexpected exception during send, closing connection {} and rethrowing exception.&quot;,</span>
+                            connectionId, e);
+<span class="nc" id="L409">                    throw e;</span>
+                }
+<span class="nc" id="L411">            }</span>
+        }
+<span class="nc" id="L413">    }</span>
+
+    /**
+     * Do whatever I/O can be done on each connection without blocking. This includes completing connections, completing
+     * disconnections, initiating new sends, or making progress on in-progress sends or receives.
+     *
+     * When this call is completed the user can check for completed sends, receives, connections or disconnects using
+     * {@link #completedSends()}, {@link #completedReceives()}, {@link #connected()}, {@link #disconnected()}. These
+     * lists will be cleared at the beginning of each `poll` call and repopulated by the call if there is
+     * any completed I/O.
+     *
+     * In the &quot;Plaintext&quot; setting, we are using socketChannel to read &amp; write to the network. But for the &quot;SSL&quot; setting,
+     * we encrypt the data before we use socketChannel to write data to the network, and decrypt before we return the responses.
+     * This requires additional buffers to be maintained as we are reading from network, since the data on the wire is encrypted
+     * we won't be able to read exact no.of bytes as kafka protocol requires. We read as many bytes as we can, up to SSLEngine's
+     * application buffer size. This means we might be reading additional bytes than the requested size.
+     * If there is no further data to read from socketChannel selector won't invoke that channel and we have additional bytes
+     * in the buffer. To overcome this issue we added &quot;keysWithBufferedRead&quot; map which tracks channels which have data in the SSL
+     * buffers. If there are channels with buffered data that can by processed, we set &quot;timeout&quot; to 0 and process the data even
+     * if there is no more data to read from the socket.
+     *
+     * At most one entry is added to &quot;completedReceives&quot; for a channel in each poll. This is necessary to guarantee that
+     * requests from a channel are processed on the broker in the order they are sent. Since outstanding requests added
+     * by SocketServer to the request queue may be processed by different request handler threads, requests on each
+     * channel must be processed one-at-a-time to guarantee ordering.
+     *
+     * @param timeout The amount of time to wait, in milliseconds, which must be non-negative
+     * @throws IllegalArgumentException If `timeout` is negative
+     * @throws IllegalStateException If a send is given for which we have no existing connection or for which there is
+     *         already an in-progress send
+     */
+    @Override
+    public void poll(long timeout) throws IOException {
+<span class="nc bnc" id="L446" title="All 2 branches missed.">        if (timeout &lt; 0)</span>
+<span class="nc" id="L447">            throw new IllegalArgumentException(&quot;timeout should be &gt;= 0&quot;);</span>
+
+<span class="nc" id="L449">        boolean madeReadProgressLastCall = madeReadProgressLastPoll;</span>
+<span class="nc" id="L450">        clear();</span>
+
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        boolean dataInBuffers = !keysWithBufferedRead.isEmpty();</span>
+
+<span class="nc bnc" id="L454" title="All 6 branches missed.">        if (!immediatelyConnectedKeys.isEmpty() || (madeReadProgressLastCall &amp;&amp; dataInBuffers))</span>
+<span class="nc" id="L455">            timeout = 0;</span>
+
+<span class="nc bnc" id="L457" title="All 4 branches missed.">        if (!memoryPool.isOutOfMemory() &amp;&amp; outOfMemory) {</span>
+            //we have recovered from memory pressure. unmute any channel not explicitly muted for other reasons
+<span class="nc" id="L459">            log.trace(&quot;Broker no longer low on memory - unmuting incoming sockets&quot;);</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">            for (KafkaChannel channel : channels.values()) {</span>
+<span class="nc bnc" id="L461" title="All 4 branches missed.">                if (channel.isInMutableState() &amp;&amp; !explicitlyMutedChannels.contains(channel)) {</span>
+<span class="nc" id="L462">                    channel.maybeUnmute();</span>
+                }
+<span class="nc" id="L464">            }</span>
+<span class="nc" id="L465">            outOfMemory = false;</span>
+        }
+
+        /* check ready keys */
+<span class="nc" id="L469">        long startSelect = time.nanoseconds();</span>
+<span class="nc" id="L470">        int numReadyKeys = select(timeout);</span>
+<span class="nc" id="L471">        long endSelect = time.nanoseconds();</span>
+<span class="nc" id="L472">        this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds(), false);</span>
+
+<span class="nc bnc" id="L474" title="All 6 branches missed.">        if (numReadyKeys &gt; 0 || !immediatelyConnectedKeys.isEmpty() || dataInBuffers) {</span>
+<span class="nc" id="L475">            Set&lt;SelectionKey&gt; readyKeys = this.nioSelector.selectedKeys();</span>
+
+            // Poll from channels that have buffered data (but nothing more from the underlying socket)
+<span class="nc bnc" id="L478" title="All 2 branches missed.">            if (dataInBuffers) {</span>
+<span class="nc" id="L479">                keysWithBufferedRead.removeAll(readyKeys); //so no channel gets polled twice</span>
+<span class="nc" id="L480">                Set&lt;SelectionKey&gt; toPoll = keysWithBufferedRead;</span>
+<span class="nc" id="L481">                keysWithBufferedRead = new HashSet&lt;&gt;(); //poll() calls will repopulate if needed</span>
+<span class="nc" id="L482">                pollSelectionKeys(toPoll, false, endSelect);</span>
+            }
+
+            // Poll from channels where the underlying socket has more data
+<span class="nc" id="L486">            pollSelectionKeys(readyKeys, false, endSelect);</span>
+            // Clear all selected keys so that they are excluded from the ready count for the next select
+<span class="nc" id="L488">            readyKeys.clear();</span>
+
+<span class="nc" id="L490">            pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);</span>
+<span class="nc" id="L491">            immediatelyConnectedKeys.clear();</span>
+<span class="nc" id="L492">        } else {</span>
+<span class="nc" id="L493">            madeReadProgressLastPoll = true; //no work is also &quot;progress&quot;</span>
+        }
+
+<span class="nc" id="L496">        long endIo = time.nanoseconds();</span>
+<span class="nc" id="L497">        this.sensors.ioTime.record(endIo - endSelect, time.milliseconds(), false);</span>
+
+        // Close channels that were delayed and are now ready to be closed
+<span class="nc" id="L500">        completeDelayedChannelClose(endIo);</span>
+
+        // we use the time at the end of select to ensure that we don't close any connections that
+        // have just been processed in pollSelectionKeys
+<span class="nc" id="L504">        maybeCloseOldestConnection(endSelect);</span>
+<span class="nc" id="L505">    }</span>
+
+    /**
+     * handle any ready I/O on a set of selection keys
+     * @param selectionKeys set of keys to handle
+     * @param isImmediatelyConnected true if running over a set of keys for just-connected sockets
+     * @param currentTimeNanos time at which set of keys was determined
+     */
+    // package-private for testing
+    void pollSelectionKeys(Set&lt;SelectionKey&gt; selectionKeys,
+                           boolean isImmediatelyConnected,
+                           long currentTimeNanos) {
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        for (SelectionKey key : determineHandlingOrder(selectionKeys)) {</span>
+<span class="nc" id="L518">            KafkaChannel channel = channel(key);</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">            long channelStartTimeNanos = recordTimePerConnection ? time.nanoseconds() : 0;</span>
+<span class="nc" id="L520">            boolean sendFailed = false;</span>
+<span class="nc" id="L521">            String nodeId = channel.id();</span>
+
+            // register all per-connection metrics at once
+<span class="nc" id="L524">            sensors.maybeRegisterConnectionMetrics(nodeId);</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            if (idleExpiryManager != null)</span>
+<span class="nc" id="L526">                idleExpiryManager.update(nodeId, currentTimeNanos);</span>
+
+            try {
+                /* complete any connections that have finished their handshake (either normally or immediately) */
+<span class="nc bnc" id="L530" title="All 4 branches missed.">                if (isImmediatelyConnected || key.isConnectable()) {</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                    if (channel.finishConnect()) {</span>
+<span class="nc" id="L532">                        this.connected.add(nodeId);</span>
+<span class="nc" id="L533">                        this.sensors.connectionCreated.record();</span>
+
+<span class="nc" id="L535">                        SocketChannel socketChannel = (SocketChannel) key.channel();</span>
+<span class="nc" id="L536">                        log.debug(&quot;Created socket with SO_RCVBUF = {}, SO_SNDBUF = {}, SO_TIMEOUT = {} to node {}&quot;,</span>
+<span class="nc" id="L537">                                socketChannel.socket().getReceiveBufferSize(),</span>
+<span class="nc" id="L538">                                socketChannel.socket().getSendBufferSize(),</span>
+<span class="nc" id="L539">                                socketChannel.socket().getSoTimeout(),</span>
+                                nodeId);
+<span class="nc" id="L541">                    } else {</span>
+                        continue;
+                    }
+                }
+
+                /* if channel is not ready finish prepare */
+<span class="nc bnc" id="L547" title="All 4 branches missed.">                if (channel.isConnected() &amp;&amp; !channel.ready()) {</span>
+<span class="nc" id="L548">                    channel.prepare();</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">                    if (channel.ready()) {</span>
+<span class="nc" id="L550">                        long readyTimeMs = time.milliseconds();</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">                        boolean isReauthentication = channel.successfulAuthentications() &gt; 1;</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">                        if (isReauthentication) {</span>
+<span class="nc" id="L553">                            sensors.successfulReauthentication.record(1.0, readyTimeMs);</span>
+<span class="nc" id="L554">                            channel.maybeAddWriteInterestAfterReauth();</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">                            if (channel.reauthenticationLatencyMs() == null)</span>
+<span class="nc" id="L556">                                log.warn(</span>
+                                    &quot;Should never happen: re-authentication latency for a re-authenticated channel was null; continuing...&quot;);
+                            else
+<span class="nc" id="L559">                                sensors.reauthenticationLatency</span>
+<span class="nc" id="L560">                                    .record(channel.reauthenticationLatencyMs().doubleValue(), readyTimeMs);</span>
+                        } else {
+<span class="nc" id="L562">                            sensors.successfulAuthentication.record(1.0, readyTimeMs);</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">                            if (!channel.connectedClientSupportsReauthentication())</span>
+<span class="nc" id="L564">                                sensors.successfulAuthenticationNoReauth.record(1.0, readyTimeMs);</span>
+                        }
+<span class="nc bnc" id="L566" title="All 2 branches missed.">                        log.debug(&quot;Successfully {}authenticated with {}&quot;, isReauthentication ?</span>
+<span class="nc" id="L567">                            &quot;re-&quot; : &quot;&quot;, channel.socketDescription());</span>
+                    }
+                }
+<span class="nc bnc" id="L570" title="All 4 branches missed.">                if (channel.ready() &amp;&amp; channel.state() == ChannelState.NOT_CONNECTED)</span>
+<span class="nc" id="L571">                    channel.state(ChannelState.READY);</span>
+<span class="nc" id="L572">                Optional&lt;NetworkReceive&gt; responseReceivedDuringReauthentication = channel.pollResponseReceivedDuringReauthentication();</span>
+<span class="nc" id="L573">                responseReceivedDuringReauthentication.ifPresent(receive -&gt; {</span>
+<span class="nc" id="L574">                    long currentTimeMs = time.milliseconds();</span>
+<span class="nc" id="L575">                    addToCompletedReceives(channel, receive, currentTimeMs);</span>
+<span class="nc" id="L576">                });</span>
+
+                //if channel is ready and has bytes to read from socket or buffer, and has no
+                //previous completed receive then read from it
+<span class="nc bnc" id="L580" title="All 8 branches missed.">                if (channel.ready() &amp;&amp; (key.isReadable() || channel.hasBytesBuffered()) &amp;&amp; !hasCompletedReceive(channel)</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">                        &amp;&amp; !explicitlyMutedChannels.contains(channel)) {</span>
+<span class="nc" id="L582">                    attemptRead(channel);</span>
+                }
+
+<span class="nc bnc" id="L585" title="All 4 branches missed.">                if (channel.hasBytesBuffered() &amp;&amp; !explicitlyMutedChannels.contains(channel)) {</span>
+                    //this channel has bytes enqueued in intermediary buffers that we could not read
+                    //(possibly because no memory). it may be the case that the underlying socket will
+                    //not come up in the next poll() and so we need to remember this channel for the
+                    //next poll call otherwise data may be stuck in said buffers forever. If we attempt
+                    //to process buffered data and no progress is made, the channel buffered status is
+                    //cleared to avoid the overhead of checking every time.
+<span class="nc" id="L592">                    keysWithBufferedRead.add(key);</span>
+                }
+
+                /* if channel is ready write to any sockets that have space in their buffer and for which we have data */
+
+<span class="nc bnc" id="L597" title="All 2 branches missed.">                long nowNanos = channelStartTimeNanos != 0 ? channelStartTimeNanos : currentTimeNanos;</span>
+                try {
+<span class="nc" id="L599">                    attemptWrite(key, channel, nowNanos);</span>
+<span class="nc" id="L600">                } catch (Exception e) {</span>
+<span class="nc" id="L601">                    sendFailed = true;</span>
+<span class="nc" id="L602">                    throw e;</span>
+<span class="nc" id="L603">                }</span>
+
+                /* cancel any defunct sockets */
+<span class="nc bnc" id="L606" title="All 2 branches missed.">                if (!key.isValid())</span>
+<span class="nc" id="L607">                    close(channel, CloseMode.GRACEFUL);</span>
+
+<span class="nc" id="L609">            } catch (Exception e) {</span>
+<span class="nc" id="L610">                String desc = String.format(&quot;%s (channelId=%s)&quot;, channel.socketDescription(), channel.id());</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">                if (e instanceof IOException) {</span>
+<span class="nc" id="L612">                    log.debug(&quot;Connection with {} disconnected&quot;, desc, e);</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">                } else if (e instanceof AuthenticationException) {</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">                    boolean isReauthentication = channel.successfulAuthentications() &gt; 0;</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">                    if (isReauthentication)</span>
+<span class="nc" id="L616">                        sensors.failedReauthentication.record();</span>
+                    else
+<span class="nc" id="L618">                        sensors.failedAuthentication.record();</span>
+<span class="nc" id="L619">                    String exceptionMessage = e.getMessage();</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">                    if (e instanceof DelayedResponseAuthenticationException)</span>
+<span class="nc" id="L621">                        exceptionMessage = e.getCause().getMessage();</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">                    log.info(&quot;Failed {}authentication with {} ({})&quot;, isReauthentication ? &quot;re-&quot; : &quot;&quot;,</span>
+                        desc, exceptionMessage);
+<span class="nc" id="L624">                } else {</span>
+<span class="nc" id="L625">                    log.warn(&quot;Unexpected error from {}; closing connection&quot;, desc, e);</span>
+                }
+
+<span class="nc bnc" id="L628" title="All 2 branches missed.">                if (e instanceof DelayedResponseAuthenticationException)</span>
+<span class="nc" id="L629">                    maybeDelayCloseOnAuthenticationFailure(channel);</span>
+                else
+<span class="nc bnc" id="L631" title="All 2 branches missed.">                    close(channel, sendFailed ? CloseMode.NOTIFY_ONLY : CloseMode.GRACEFUL);</span>
+            } finally {
+<span class="nc" id="L633">                maybeRecordTimePerConnection(channel, channelStartTimeNanos);</span>
+            }
+<span class="nc" id="L635">        }</span>
+<span class="nc" id="L636">    }</span>
+
+    private void attemptWrite(SelectionKey key, KafkaChannel channel, long nowNanos) throws IOException {
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (channel.hasSend()</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">                &amp;&amp; channel.ready()</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">                &amp;&amp; key.isWritable()</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">                &amp;&amp; !channel.maybeBeginClientReauthentication(() -&gt; nowNanos)) {</span>
+<span class="nc" id="L643">            write(channel);</span>
+        }
+<span class="nc" id="L645">    }</span>
+
+    // package-private for testing
+    void write(KafkaChannel channel) throws IOException {
+<span class="nc" id="L649">        String nodeId = channel.id();</span>
+<span class="nc" id="L650">        long bytesSent = channel.write();</span>
+<span class="nc" id="L651">        NetworkSend send = channel.maybeCompleteSend();</span>
+        // We may complete the send with bytesSent &lt; 1 if `TransportLayer.hasPendingWrites` was true and `channel.write()`
+        // caused the pending writes to be written to the socket channel buffer
+<span class="nc bnc" id="L654" title="All 4 branches missed.">        if (bytesSent &gt; 0 || send != null) {</span>
+<span class="nc" id="L655">            long currentTimeMs = time.milliseconds();</span>
+<span class="nc bnc" id="L656" title="All 2 branches missed.">            if (bytesSent &gt; 0)</span>
+<span class="nc" id="L657">                this.sensors.recordBytesSent(nodeId, bytesSent, currentTimeMs);</span>
+<span class="nc bnc" id="L658" title="All 2 branches missed.">            if (send != null) {</span>
+<span class="nc" id="L659">                this.completedSends.add(send);</span>
+<span class="nc" id="L660">                this.sensors.recordCompletedSend(nodeId, send.size(), currentTimeMs);</span>
+            }
+        }
+<span class="nc" id="L663">    }</span>
+
+    private Collection&lt;SelectionKey&gt; determineHandlingOrder(Set&lt;SelectionKey&gt; selectionKeys) {
+        //it is possible that the iteration order over selectionKeys is the same every invocation.
+        //this may cause starvation of reads when memory is low. to address this we shuffle the keys if memory is low.
+<span class="nc bnc" id="L668" title="All 4 branches missed.">        if (!outOfMemory &amp;&amp; memoryPool.availableMemory() &lt; lowMemThreshold) {</span>
+<span class="nc" id="L669">            List&lt;SelectionKey&gt; shuffledKeys = new ArrayList&lt;&gt;(selectionKeys);</span>
+<span class="nc" id="L670">            Collections.shuffle(shuffledKeys);</span>
+<span class="nc" id="L671">            return shuffledKeys;</span>
+        } else {
+<span class="nc" id="L673">            return selectionKeys;</span>
+        }
+    }
+
+    private void attemptRead(KafkaChannel channel) throws IOException {
+<span class="nc" id="L678">        String nodeId = channel.id();</span>
+
+<span class="nc" id="L680">        long bytesReceived = channel.read();</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">        if (bytesReceived != 0) {</span>
+<span class="nc" id="L682">            long currentTimeMs = time.milliseconds();</span>
+<span class="nc" id="L683">            sensors.recordBytesReceived(nodeId, bytesReceived, currentTimeMs);</span>
+<span class="nc" id="L684">            madeReadProgressLastPoll = true;</span>
+
+<span class="nc" id="L686">            NetworkReceive receive = channel.maybeCompleteReceive();</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            if (receive != null) {</span>
+<span class="nc" id="L688">                addToCompletedReceives(channel, receive, currentTimeMs);</span>
+            }
+        }
+<span class="nc bnc" id="L691" title="All 2 branches missed.">        if (channel.isMuted()) {</span>
+<span class="nc" id="L692">            outOfMemory = true; //channel has muted itself due to memory pressure.</span>
+        } else {
+<span class="nc" id="L694">            madeReadProgressLastPoll = true;</span>
+        }
+<span class="nc" id="L696">    }</span>
+
+    private boolean maybeReadFromClosingChannel(KafkaChannel channel) {
+        boolean hasPending;
+<span class="nc bnc" id="L700" title="All 2 branches missed.">        if (channel.state().state() != ChannelState.State.READY)</span>
+<span class="nc" id="L701">            hasPending = false;</span>
+<span class="nc bnc" id="L702" title="All 4 branches missed.">        else if (explicitlyMutedChannels.contains(channel) || hasCompletedReceive(channel))</span>
+<span class="nc" id="L703">            hasPending = true;</span>
+        else {
+            try {
+<span class="nc" id="L706">                attemptRead(channel);</span>
+<span class="nc" id="L707">                hasPending = hasCompletedReceive(channel);</span>
+<span class="nc" id="L708">            } catch (Exception e) {</span>
+<span class="nc" id="L709">                log.trace(&quot;Read from closing channel failed, ignoring exception&quot;, e);</span>
+<span class="nc" id="L710">                hasPending = false;</span>
+<span class="nc" id="L711">            }</span>
+        }
+<span class="nc" id="L713">        return hasPending;</span>
+    }
+
+    // Record time spent in pollSelectionKeys for channel (moved into a method to keep checkstyle happy)
+    private void maybeRecordTimePerConnection(KafkaChannel channel, long startTimeNanos) {
+<span class="nc bnc" id="L718" title="All 2 branches missed.">        if (recordTimePerConnection)</span>
+<span class="nc" id="L719">            channel.addNetworkThreadTimeNanos(time.nanoseconds() - startTimeNanos);</span>
+<span class="nc" id="L720">    }</span>
+
+    @Override
+    public List&lt;NetworkSend&gt; completedSends() {
+<span class="nc" id="L724">        return this.completedSends;</span>
+    }
+
+    @Override
+    public Collection&lt;NetworkReceive&gt; completedReceives() {
+<span class="nc" id="L729">        return this.completedReceives.values();</span>
+    }
+
+    @Override
+    public Map&lt;String, ChannelState&gt; disconnected() {
+<span class="nc" id="L734">        return this.disconnected;</span>
+    }
+
+    @Override
+    public List&lt;String&gt; connected() {
+<span class="nc" id="L739">        return this.connected;</span>
+    }
+
+    @Override
+    public void mute(String id) {
+<span class="nc" id="L744">        KafkaChannel channel = openOrClosingChannelOrFail(id);</span>
+<span class="nc" id="L745">        mute(channel);</span>
+<span class="nc" id="L746">    }</span>
+
+    private void mute(KafkaChannel channel) {
+<span class="nc" id="L749">        channel.mute();</span>
+<span class="nc" id="L750">        explicitlyMutedChannels.add(channel);</span>
+<span class="nc" id="L751">        keysWithBufferedRead.remove(channel.selectionKey());</span>
+<span class="nc" id="L752">    }</span>
+
+    @Override
+    public void unmute(String id) {
+<span class="nc" id="L756">        KafkaChannel channel = openOrClosingChannelOrFail(id);</span>
+<span class="nc" id="L757">        unmute(channel);</span>
+<span class="nc" id="L758">    }</span>
+
+    private void unmute(KafkaChannel channel) {
+        // Remove the channel from explicitlyMutedChannels only if the channel has been actually unmuted.
+<span class="nc bnc" id="L762" title="All 2 branches missed.">        if (channel.maybeUnmute()) {</span>
+<span class="nc" id="L763">            explicitlyMutedChannels.remove(channel);</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">            if (channel.hasBytesBuffered()) {</span>
+<span class="nc" id="L765">                keysWithBufferedRead.add(channel.selectionKey());</span>
+<span class="nc" id="L766">                madeReadProgressLastPoll = true;</span>
+            }
+        }
+<span class="nc" id="L769">    }</span>
+
+    @Override
+    public void muteAll() {
+<span class="nc bnc" id="L773" title="All 2 branches missed.">        for (KafkaChannel channel : this.channels.values())</span>
+<span class="nc" id="L774">            mute(channel);</span>
+<span class="nc" id="L775">    }</span>
+
+    @Override
+    public void unmuteAll() {
+<span class="nc bnc" id="L779" title="All 2 branches missed.">        for (KafkaChannel channel : this.channels.values())</span>
+<span class="nc" id="L780">            unmute(channel);</span>
+<span class="nc" id="L781">    }</span>
+
+    // package-private for testing
+    void completeDelayedChannelClose(long currentTimeNanos) {
+<span class="nc bnc" id="L785" title="All 2 branches missed.">        if (delayedClosingChannels == null)</span>
+<span class="nc" id="L786">            return;</span>
+
+<span class="nc bnc" id="L788" title="All 2 branches missed.">        while (!delayedClosingChannels.isEmpty()) {</span>
+<span class="nc" id="L789">            DelayedAuthenticationFailureClose delayedClose = delayedClosingChannels.values().iterator().next();</span>
+<span class="nc bnc" id="L790" title="All 2 branches missed.">            if (!delayedClose.tryClose(currentTimeNanos))</span>
+<span class="nc" id="L791">                break;</span>
+<span class="nc" id="L792">        }</span>
+<span class="nc" id="L793">    }</span>
+
+    private void maybeCloseOldestConnection(long currentTimeNanos) {
+<span class="nc bnc" id="L796" title="All 2 branches missed.">        if (idleExpiryManager == null)</span>
+<span class="nc" id="L797">            return;</span>
+
+<span class="nc" id="L799">        Map.Entry&lt;String, Long&gt; expiredConnection = idleExpiryManager.pollExpiredConnection(currentTimeNanos);</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">        if (expiredConnection != null) {</span>
+<span class="nc" id="L801">            String connectionId = expiredConnection.getKey();</span>
+<span class="nc" id="L802">            KafkaChannel channel = this.channels.get(connectionId);</span>
+<span class="nc bnc" id="L803" title="All 2 branches missed.">            if (channel != null) {</span>
+<span class="nc bnc" id="L804" title="All 2 branches missed.">                if (log.isTraceEnabled())</span>
+<span class="nc" id="L805">                    log.trace(&quot;About to close the idle connection from {} due to being idle for {} millis&quot;,</span>
+<span class="nc" id="L806">                            connectionId, (currentTimeNanos - expiredConnection.getValue()) / 1000 / 1000);</span>
+<span class="nc" id="L807">                channel.state(ChannelState.EXPIRED);</span>
+<span class="nc" id="L808">                close(channel, CloseMode.GRACEFUL);</span>
+            }
+        }
+<span class="nc" id="L811">    }</span>
+
+    /**
+     * Clears completed receives. This is used by SocketServer to remove references to
+     * receive buffers after processing completed receives, without waiting for the next
+     * poll().
+     */
+    public void clearCompletedReceives() {
+<span class="nc" id="L819">        this.completedReceives.clear();</span>
+<span class="nc" id="L820">    }</span>
+
+    /**
+     * Clears completed sends. This is used by SocketServer to remove references to
+     * send buffers after processing completed sends, without waiting for the next
+     * poll().
+     */
+    public void clearCompletedSends() {
+<span class="nc" id="L828">        this.completedSends.clear();</span>
+<span class="nc" id="L829">    }</span>
+
+    /**
+     * Clears all the results from the previous poll. This is invoked by Selector at the start of
+     * a poll() when all the results from the previous poll are expected to have been handled.
+     * &lt;p&gt;
+     * SocketServer uses {@link #clearCompletedSends()} and {@link #clearCompletedReceives()} to
+     * clear `completedSends` and `completedReceives` as soon as they are processed to avoid
+     * holding onto large request/response buffers from multiple connections longer than necessary.
+     * Clients rely on Selector invoking {@link #clear()} at the start of each poll() since memory usage
+     * is less critical and clearing once-per-poll provides the flexibility to process these results in
+     * any order before the next poll.
+     */
+    private void clear() {
+<span class="nc" id="L843">        this.completedSends.clear();</span>
+<span class="nc" id="L844">        this.completedReceives.clear();</span>
+<span class="nc" id="L845">        this.connected.clear();</span>
+<span class="nc" id="L846">        this.disconnected.clear();</span>
+
+        // Remove closed channels after all their buffered receives have been processed or if a send was requested
+<span class="nc bnc" id="L849" title="All 2 branches missed.">        for (Iterator&lt;Map.Entry&lt;String, KafkaChannel&gt;&gt; it = closingChannels.entrySet().iterator(); it.hasNext(); ) {</span>
+<span class="nc" id="L850">            KafkaChannel channel = it.next().getValue();</span>
+<span class="nc" id="L851">            boolean sendFailed = failedSends.remove(channel.id());</span>
+<span class="nc" id="L852">            boolean hasPending = false;</span>
+<span class="nc bnc" id="L853" title="All 2 branches missed.">            if (!sendFailed)</span>
+<span class="nc" id="L854">                hasPending = maybeReadFromClosingChannel(channel);</span>
+<span class="nc bnc" id="L855" title="All 2 branches missed.">            if (!hasPending) {</span>
+<span class="nc" id="L856">                doClose(channel, true);</span>
+<span class="nc" id="L857">                it.remove();</span>
+            }
+<span class="nc" id="L859">        }</span>
+
+<span class="nc bnc" id="L861" title="All 2 branches missed.">        for (String channel : this.failedSends)</span>
+<span class="nc" id="L862">            this.disconnected.put(channel, ChannelState.FAILED_SEND);</span>
+<span class="nc" id="L863">        this.failedSends.clear();</span>
+<span class="nc" id="L864">        this.madeReadProgressLastPoll = false;</span>
+<span class="nc" id="L865">    }</span>
+
+    /**
+     * Check for data, waiting up to the given timeout.
+     *
+     * @param timeoutMs Length of time to wait, in milliseconds, which must be non-negative
+     * @return The number of keys ready
+     */
+    private int select(long timeoutMs) throws IOException {
+<span class="nc bnc" id="L874" title="All 2 branches missed.">        if (timeoutMs &lt; 0L)</span>
+<span class="nc" id="L875">            throw new IllegalArgumentException(&quot;timeout should be &gt;= 0&quot;);</span>
+
+<span class="nc bnc" id="L877" title="All 2 branches missed.">        if (timeoutMs == 0L)</span>
+<span class="nc" id="L878">            return this.nioSelector.selectNow();</span>
+        else
+<span class="nc" id="L880">            return this.nioSelector.select(timeoutMs);</span>
+    }
+
+    /**
+     * Close the connection identified by the given id
+     */
+    public void close(String id) {
+<span class="nc" id="L887">        KafkaChannel channel = this.channels.get(id);</span>
+<span class="nc bnc" id="L888" title="All 2 branches missed.">        if (channel != null) {</span>
+            // There is no disconnect notification for local close, but updating
+            // channel state here anyway to avoid confusion.
+<span class="nc" id="L891">            channel.state(ChannelState.LOCAL_CLOSE);</span>
+<span class="nc" id="L892">            close(channel, CloseMode.DISCARD_NO_NOTIFY);</span>
+        } else {
+<span class="nc" id="L894">            KafkaChannel closingChannel = this.closingChannels.remove(id);</span>
+            // Close any closing channel, leave the channel in the state in which closing was triggered
+<span class="nc bnc" id="L896" title="All 2 branches missed.">            if (closingChannel != null)</span>
+<span class="nc" id="L897">                doClose(closingChannel, false);</span>
+        }
+<span class="nc" id="L899">    }</span>
+
+    private void maybeDelayCloseOnAuthenticationFailure(KafkaChannel channel) {
+<span class="nc" id="L902">        DelayedAuthenticationFailureClose delayedClose = new DelayedAuthenticationFailureClose(channel, failedAuthenticationDelayMs);</span>
+<span class="nc bnc" id="L903" title="All 2 branches missed.">        if (delayedClosingChannels != null)</span>
+<span class="nc" id="L904">            delayedClosingChannels.put(channel.id(), delayedClose);</span>
+        else
+<span class="nc" id="L906">            delayedClose.closeNow();</span>
+<span class="nc" id="L907">    }</span>
+
+    private void handleCloseOnAuthenticationFailure(KafkaChannel channel) {
+        try {
+<span class="nc" id="L911">            channel.completeCloseOnAuthenticationFailure();</span>
+<span class="nc" id="L912">        } catch (Exception e) {</span>
+<span class="nc" id="L913">            log.error(&quot;Exception handling close on authentication failure node {}&quot;, channel.id(), e);</span>
+        } finally {
+<span class="nc" id="L915">            close(channel, CloseMode.GRACEFUL);</span>
+        }
+<span class="nc" id="L917">    }</span>
+
+    /**
+     * Begin closing this connection.
+     * If 'closeMode' is `CloseMode.GRACEFUL`, the channel is disconnected here, but outstanding receives
+     * are processed. The channel is closed when there are no outstanding receives or if a send is
+     * requested. For other values of `closeMode`, outstanding receives are discarded and the channel
+     * is closed immediately.
+     *
+     * The channel will be added to disconnect list when it is actually closed if `closeMode.notifyDisconnect`
+     * is true.
+     */
+    private void close(KafkaChannel channel, CloseMode closeMode) {
+<span class="nc" id="L930">        channel.disconnect();</span>
+
+        // Ensure that `connected` does not have closed channels. This could happen if `prepare` throws an exception
+        // in the `poll` invocation when `finishConnect` succeeds
+<span class="nc" id="L934">        connected.remove(channel.id());</span>
+
+        // Keep track of closed channels with pending receives so that all received records
+        // may be processed. For example, when producer with acks=0 sends some records and
+        // closes its connections, a single poll() in the broker may receive records and
+        // handle close(). When the remote end closes its connection, the channel is retained until
+        // a send fails or all outstanding receives are processed. Mute state of disconnected channels
+        // are tracked to ensure that requests are processed one-by-one by the broker to preserve ordering.
+<span class="nc bnc" id="L942" title="All 4 branches missed.">        if (closeMode == CloseMode.GRACEFUL &amp;&amp; maybeReadFromClosingChannel(channel)) {</span>
+<span class="nc" id="L943">            closingChannels.put(channel.id(), channel);</span>
+<span class="nc" id="L944">            log.debug(&quot;Tracking closing connection {} to process outstanding requests&quot;, channel.id());</span>
+        } else {
+<span class="nc" id="L946">            doClose(channel, closeMode.notifyDisconnect);</span>
+        }
+<span class="nc" id="L948">        this.channels.remove(channel.id());</span>
+
+<span class="nc bnc" id="L950" title="All 2 branches missed.">        if (delayedClosingChannels != null)</span>
+<span class="nc" id="L951">            delayedClosingChannels.remove(channel.id());</span>
+
+<span class="nc bnc" id="L953" title="All 2 branches missed.">        if (idleExpiryManager != null)</span>
+<span class="nc" id="L954">            idleExpiryManager.remove(channel.id());</span>
+<span class="nc" id="L955">    }</span>
+
+    private void doClose(KafkaChannel channel, boolean notifyDisconnect) {
+<span class="nc" id="L958">        SelectionKey key = channel.selectionKey();</span>
+        try {
+<span class="nc" id="L960">            immediatelyConnectedKeys.remove(key);</span>
+<span class="nc" id="L961">            keysWithBufferedRead.remove(key);</span>
+<span class="nc" id="L962">            channel.close();</span>
+<span class="nc" id="L963">        } catch (IOException e) {</span>
+<span class="nc" id="L964">            log.error(&quot;Exception closing connection to node {}:&quot;, channel.id(), e);</span>
+        } finally {
+<span class="nc" id="L966">            key.cancel();</span>
+<span class="nc" id="L967">            key.attach(null);</span>
+        }
+
+<span class="nc" id="L970">        this.sensors.connectionClosed.record();</span>
+<span class="nc" id="L971">        this.explicitlyMutedChannels.remove(channel);</span>
+<span class="nc bnc" id="L972" title="All 2 branches missed.">        if (notifyDisconnect)</span>
+<span class="nc" id="L973">            this.disconnected.put(channel.id(), channel.state());</span>
+<span class="nc" id="L974">    }</span>
+
+    /**
+     * check if channel is ready
+     */
+    @Override
+    public boolean isChannelReady(String id) {
+<span class="nc" id="L981">        KafkaChannel channel = this.channels.get(id);</span>
+<span class="nc bnc" id="L982" title="All 4 branches missed.">        return channel != null &amp;&amp; channel.ready();</span>
+    }
+
+    private KafkaChannel openOrClosingChannelOrFail(String id) {
+<span class="nc" id="L986">        KafkaChannel channel = this.channels.get(id);</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">        if (channel == null)</span>
+<span class="nc" id="L988">            channel = this.closingChannels.get(id);</span>
+<span class="nc bnc" id="L989" title="All 2 branches missed.">        if (channel == null)</span>
+<span class="nc" id="L990">            throw new IllegalStateException(&quot;Attempt to retrieve channel for which there is no connection. Connection id &quot; + id + &quot; existing connections &quot; + channels.keySet());</span>
+<span class="nc" id="L991">        return channel;</span>
+    }
+
+    /**
+     * Return the selector channels.
+     */
+    public List&lt;KafkaChannel&gt; channels() {
+<span class="nc" id="L998">        return new ArrayList&lt;&gt;(channels.values());</span>
+    }
+
+    /**
+     * Return the channel associated with this connection or `null` if there is no channel associated with the
+     * connection.
+     */
+    public KafkaChannel channel(String id) {
+<span class="nc" id="L1006">        return this.channels.get(id);</span>
+    }
+
+    /**
+     * Return the channel with the specified id if it was disconnected, but not yet closed
+     * since there are outstanding messages to be processed.
+     */
+    public KafkaChannel closingChannel(String id) {
+<span class="nc" id="L1014">        return closingChannels.get(id);</span>
+    }
+
+    /**
+     * Returns the lowest priority channel chosen using the following sequence:
+     *   1) If one or more channels are in closing state, return any one of them
+     *   2) If idle expiry manager is enabled, return the least recently updated channel
+     *   3) Otherwise return any of the channels
+     *
+     * This method is used to close a channel to accommodate a new channel on the inter-broker listener
+     * when broker-wide `max.connections` limit is enabled.
+     */
+    public KafkaChannel lowestPriorityChannel() {
+<span class="nc" id="L1027">        KafkaChannel channel = null;</span>
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">        if (!closingChannels.isEmpty()) {</span>
+<span class="nc" id="L1029">            channel = closingChannels.values().iterator().next();</span>
+<span class="nc bnc" id="L1030" title="All 4 branches missed.">        } else if (idleExpiryManager != null &amp;&amp; !idleExpiryManager.lruConnections.isEmpty()) {</span>
+<span class="nc" id="L1031">            String channelId = idleExpiryManager.lruConnections.keySet().iterator().next();</span>
+<span class="nc" id="L1032">            channel = channel(channelId);</span>
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">        } else if (!channels.isEmpty()) {</span>
+<span class="nc" id="L1034">            channel = channels.values().iterator().next();</span>
+        }
+<span class="nc" id="L1036">        return channel;</span>
+    }
+
+    /**
+     * Get the channel associated with selectionKey
+     */
+    private KafkaChannel channel(SelectionKey key) {
+<span class="nc" id="L1043">        return (KafkaChannel) key.attachment();</span>
+    }
+
+    /**
+     * Check if given channel has a completed receive
+     */
+    private boolean hasCompletedReceive(KafkaChannel channel) {
+<span class="nc" id="L1050">        return completedReceives.containsKey(channel.id());</span>
+    }
+
+    /**
+     * adds a receive to completed receives
+     */
+    private void addToCompletedReceives(KafkaChannel channel, NetworkReceive networkReceive, long currentTimeMs) {
+<span class="nc bnc" id="L1057" title="All 2 branches missed.">        if (hasCompletedReceive(channel))</span>
+<span class="nc" id="L1058">            throw new IllegalStateException(&quot;Attempting to add second completed receive to channel &quot; + channel.id());</span>
+
+<span class="nc" id="L1060">        this.completedReceives.put(channel.id(), networkReceive);</span>
+<span class="nc" id="L1061">        sensors.recordCompletedReceive(channel.id(), networkReceive.size(), currentTimeMs);</span>
+<span class="nc" id="L1062">    }</span>
+
+    // only for testing
+    public Set&lt;SelectionKey&gt; keys() {
+<span class="nc" id="L1066">        return new HashSet&lt;&gt;(nioSelector.keys());</span>
+    }
+
+
+<span class="nc" id="L1070">    class SelectorChannelMetadataRegistry implements ChannelMetadataRegistry {</span>
+        private CipherInformation cipherInformation;
+        private ClientInformation clientInformation;
+
+        @Override
+        public void registerCipherInformation(final CipherInformation cipherInformation) {
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">            if (this.cipherInformation != null) {</span>
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">                if (this.cipherInformation.equals(cipherInformation))</span>
+<span class="nc" id="L1078">                    return;</span>
+<span class="nc" id="L1079">                sensors.connectionsByCipher.decrement(this.cipherInformation);</span>
+            }
+
+<span class="nc" id="L1082">            this.cipherInformation = cipherInformation;</span>
+<span class="nc" id="L1083">            sensors.connectionsByCipher.increment(cipherInformation);</span>
+<span class="nc" id="L1084">        }</span>
+
+        @Override
+        public CipherInformation cipherInformation() {
+<span class="nc" id="L1088">            return cipherInformation;</span>
+        }
+
+        @Override
+        public void registerClientInformation(final ClientInformation clientInformation) {
+<span class="nc bnc" id="L1093" title="All 2 branches missed.">            if (this.clientInformation != null) {</span>
+<span class="nc bnc" id="L1094" title="All 2 branches missed.">                if (this.clientInformation.equals(clientInformation))</span>
+<span class="nc" id="L1095">                    return;</span>
+<span class="nc" id="L1096">                sensors.connectionsByClient.decrement(this.clientInformation);</span>
+            }
+
+<span class="nc" id="L1099">            this.clientInformation = clientInformation;</span>
+<span class="nc" id="L1100">            sensors.connectionsByClient.increment(clientInformation);</span>
+<span class="nc" id="L1101">        }</span>
+
+        @Override
+        public ClientInformation clientInformation() {
+<span class="nc" id="L1105">            return clientInformation;</span>
+        }
+
+        @Override
+        public void close() {
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">            if (this.cipherInformation != null) {</span>
+<span class="nc" id="L1111">                sensors.connectionsByCipher.decrement(this.cipherInformation);</span>
+<span class="nc" id="L1112">                this.cipherInformation = null;</span>
+            }
+
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">            if (this.clientInformation != null) {</span>
+<span class="nc" id="L1116">                sensors.connectionsByClient.decrement(this.clientInformation);</span>
+<span class="nc" id="L1117">                this.clientInformation = null;</span>
+            }
+<span class="nc" id="L1119">        }</span>
+    }
+
+    class SelectorMetrics implements AutoCloseable {
+        private final Metrics metrics;
+        private final Map&lt;String, String&gt; metricTags;
+        private final boolean metricsPerConnection;
+        private final String metricGrpName;
+        private final String perConnectionMetricGrpName;
+
+        public final Sensor connectionClosed;
+        public final Sensor connectionCreated;
+        public final Sensor successfulAuthentication;
+        public final Sensor successfulReauthentication;
+        public final Sensor successfulAuthenticationNoReauth;
+        public final Sensor reauthenticationLatency;
+        public final Sensor failedAuthentication;
+        public final Sensor failedReauthentication;
+        public final Sensor bytesTransferred;
+        public final Sensor bytesSent;
+        public final Sensor requestsSent;
+        public final Sensor bytesReceived;
+        public final Sensor responsesReceived;
+        public final Sensor selectTime;
+        public final Sensor ioTime;
+        public final IntGaugeSuite&lt;CipherInformation&gt; connectionsByCipher;
+        public final IntGaugeSuite&lt;ClientInformation&gt; connectionsByClient;
+
+        /* Names of metrics that are not registered through sensors */
+<span class="nc" id="L1148">        private final List&lt;MetricName&gt; topLevelMetricNames = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1149">        private final List&lt;Sensor&gt; sensors = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L1151">        public SelectorMetrics(Metrics metrics, String metricGrpPrefix, Map&lt;String, String&gt; metricTags, boolean metricsPerConnection) {</span>
+<span class="nc" id="L1152">            this.metrics = metrics;</span>
+<span class="nc" id="L1153">            this.metricTags = metricTags;</span>
+<span class="nc" id="L1154">            this.metricsPerConnection = metricsPerConnection;</span>
+<span class="nc" id="L1155">            this.metricGrpName = metricGrpPrefix + &quot;-metrics&quot;;</span>
+<span class="nc" id="L1156">            this.perConnectionMetricGrpName = metricGrpPrefix + &quot;-node-metrics&quot;;</span>
+<span class="nc" id="L1157">            StringBuilder tagsSuffix = new StringBuilder();</span>
+
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">            for (Map.Entry&lt;String, String&gt; tag: metricTags.entrySet()) {</span>
+<span class="nc" id="L1160">                tagsSuffix.append(tag.getKey());</span>
+<span class="nc" id="L1161">                tagsSuffix.append(&quot;-&quot;);</span>
+<span class="nc" id="L1162">                tagsSuffix.append(tag.getValue());</span>
+<span class="nc" id="L1163">            }</span>
+
+<span class="nc" id="L1165">            this.connectionClosed = sensor(&quot;connections-closed:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1166">            this.connectionClosed.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    &quot;connection-close&quot;, &quot;connections closed&quot;));
+
+<span class="nc" id="L1169">            this.connectionCreated = sensor(&quot;connections-created:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1170">            this.connectionCreated.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    &quot;connection-creation&quot;, &quot;new connections established&quot;));
+
+<span class="nc" id="L1173">            this.successfulAuthentication = sensor(&quot;successful-authentication:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1174">            this.successfulAuthentication.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    &quot;successful-authentication&quot;, &quot;connections with successful authentication&quot;));
+
+<span class="nc" id="L1177">            this.successfulReauthentication = sensor(&quot;successful-reauthentication:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1178">            this.successfulReauthentication.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    &quot;successful-reauthentication&quot;, &quot;successful re-authentication of connections&quot;));
+
+<span class="nc" id="L1181">            this.successfulAuthenticationNoReauth = sensor(&quot;successful-authentication-no-reauth:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1182">            MetricName successfulAuthenticationNoReauthMetricName = metrics.metricName(</span>
+                    &quot;successful-authentication-no-reauth-total&quot;, metricGrpName,
+                    &quot;The total number of connections with successful authentication where the client does not support re-authentication&quot;,
+                    metricTags);
+<span class="nc" id="L1186">            this.successfulAuthenticationNoReauth.add(successfulAuthenticationNoReauthMetricName, new CumulativeSum());</span>
+
+<span class="nc" id="L1188">            this.failedAuthentication = sensor(&quot;failed-authentication:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1189">            this.failedAuthentication.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    &quot;failed-authentication&quot;, &quot;connections with failed authentication&quot;));
+
+<span class="nc" id="L1192">            this.failedReauthentication = sensor(&quot;failed-reauthentication:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1193">            this.failedReauthentication.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    &quot;failed-reauthentication&quot;, &quot;failed re-authentication of connections&quot;));
+
+<span class="nc" id="L1196">            this.reauthenticationLatency = sensor(&quot;reauthentication-latency:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1197">            MetricName reauthenticationLatencyMaxMetricName = metrics.metricName(&quot;reauthentication-latency-max&quot;,</span>
+                    metricGrpName, &quot;The max latency observed due to re-authentication&quot;,
+                    metricTags);
+<span class="nc" id="L1200">            this.reauthenticationLatency.add(reauthenticationLatencyMaxMetricName, new Max());</span>
+<span class="nc" id="L1201">            MetricName reauthenticationLatencyAvgMetricName = metrics.metricName(&quot;reauthentication-latency-avg&quot;,</span>
+                    metricGrpName, &quot;The average latency observed due to re-authentication&quot;,
+                    metricTags);
+<span class="nc" id="L1204">            this.reauthenticationLatency.add(reauthenticationLatencyAvgMetricName, new Avg());</span>
+
+<span class="nc" id="L1206">            this.bytesTransferred = sensor(&quot;bytes-sent-received:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1207">            bytesTransferred.add(createMeter(metrics, metricGrpName, metricTags, new WindowedCount(),</span>
+                    &quot;network-io&quot;, &quot;network operations (reads or writes) on all connections&quot;));
+
+<span class="nc" id="L1210">            this.bytesSent = sensor(&quot;bytes-sent:&quot; + tagsSuffix, bytesTransferred);</span>
+<span class="nc" id="L1211">            this.bytesSent.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    &quot;outgoing-byte&quot;, &quot;outgoing bytes sent to all servers&quot;));
+
+<span class="nc" id="L1214">            this.requestsSent = sensor(&quot;requests-sent:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1215">            this.requestsSent.add(createMeter(metrics, metricGrpName, metricTags, new WindowedCount(),</span>
+                    &quot;request&quot;, &quot;requests sent&quot;));
+<span class="nc" id="L1217">            MetricName metricName = metrics.metricName(&quot;request-size-avg&quot;, metricGrpName, &quot;The average size of requests sent.&quot;, metricTags);</span>
+<span class="nc" id="L1218">            this.requestsSent.add(metricName, new Avg());</span>
+<span class="nc" id="L1219">            metricName = metrics.metricName(&quot;request-size-max&quot;, metricGrpName, &quot;The maximum size of any request sent.&quot;, metricTags);</span>
+<span class="nc" id="L1220">            this.requestsSent.add(metricName, new Max());</span>
+
+<span class="nc" id="L1222">            this.bytesReceived = sensor(&quot;bytes-received:&quot; + tagsSuffix, bytesTransferred);</span>
+<span class="nc" id="L1223">            this.bytesReceived.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    &quot;incoming-byte&quot;, &quot;bytes read off all sockets&quot;));
+
+<span class="nc" id="L1226">            this.responsesReceived = sensor(&quot;responses-received:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1227">            this.responsesReceived.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    new WindowedCount(), &quot;response&quot;, &quot;responses received&quot;));
+
+<span class="nc" id="L1230">            this.selectTime = sensor(&quot;select-time:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1231">            this.selectTime.add(createMeter(metrics, metricGrpName, metricTags,</span>
+                    new WindowedCount(), &quot;select&quot;, &quot;times the I/O layer checked for new I/O to perform&quot;));
+<span class="nc" id="L1233">            metricName = metrics.metricName(&quot;io-wait-time-ns-avg&quot;, metricGrpName, &quot;The average length of time the I/O thread spent waiting for a socket ready for reads or writes in nanoseconds.&quot;, metricTags);</span>
+<span class="nc" id="L1234">            this.selectTime.add(metricName, new Avg());</span>
+<span class="nc" id="L1235">            this.selectTime.add(createIOThreadRatioMeter(metrics, metricGrpName, metricTags, &quot;io-wait&quot;, &quot;waiting&quot;));</span>
+
+<span class="nc" id="L1237">            this.ioTime = sensor(&quot;io-time:&quot; + tagsSuffix);</span>
+<span class="nc" id="L1238">            metricName = metrics.metricName(&quot;io-time-ns-avg&quot;, metricGrpName, &quot;The average length of time for I/O per select call in nanoseconds.&quot;, metricTags);</span>
+<span class="nc" id="L1239">            this.ioTime.add(metricName, new Avg());</span>
+<span class="nc" id="L1240">            this.ioTime.add(createIOThreadRatioMeter(metrics, metricGrpName, metricTags, &quot;io&quot;, &quot;doing I/O&quot;));</span>
+
+<span class="nc" id="L1242">            this.connectionsByCipher = new IntGaugeSuite&lt;&gt;(log, &quot;sslCiphers&quot;, metrics,</span>
+                cipherInformation -&gt; {
+<span class="nc" id="L1244">                    Map&lt;String, String&gt; tags = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L1245">                    tags.put(&quot;cipher&quot;, cipherInformation.cipher());</span>
+<span class="nc" id="L1246">                    tags.put(&quot;protocol&quot;, cipherInformation.protocol());</span>
+<span class="nc" id="L1247">                    tags.putAll(metricTags);</span>
+<span class="nc" id="L1248">                    return metrics.metricName(&quot;connections&quot;, metricGrpName, &quot;The number of connections with this SSL cipher and protocol.&quot;, tags);</span>
+                }, 100);
+
+<span class="nc" id="L1251">            this.connectionsByClient = new IntGaugeSuite&lt;&gt;(log, &quot;clients&quot;, metrics,</span>
+                clientInformation -&gt; {
+<span class="nc" id="L1253">                    Map&lt;String, String&gt; tags = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L1254">                    tags.put(&quot;clientSoftwareName&quot;, clientInformation.softwareName());</span>
+<span class="nc" id="L1255">                    tags.put(&quot;clientSoftwareVersion&quot;, clientInformation.softwareVersion());</span>
+<span class="nc" id="L1256">                    tags.putAll(metricTags);</span>
+<span class="nc" id="L1257">                    return metrics.metricName(&quot;connections&quot;, metricGrpName, &quot;The number of connections with this client and version.&quot;, tags);</span>
+                }, 100);
+
+<span class="nc" id="L1260">            metricName = metrics.metricName(&quot;connection-count&quot;, metricGrpName, &quot;The current number of active connections.&quot;, metricTags);</span>
+<span class="nc" id="L1261">            topLevelMetricNames.add(metricName);</span>
+<span class="nc" id="L1262">            this.metrics.addMetric(metricName, (config, now) -&gt; channels.size());</span>
+<span class="nc" id="L1263">        }</span>
+
+        private Meter createMeter(Metrics metrics, String groupName, Map&lt;String, String&gt; metricTags,
+                SampledStat stat, String baseName, String descriptiveName) {
+<span class="nc" id="L1267">            MetricName rateMetricName = metrics.metricName(baseName + &quot;-rate&quot;, groupName,</span>
+<span class="nc" id="L1268">                            String.format(&quot;The number of %s per second&quot;, descriptiveName), metricTags);</span>
+<span class="nc" id="L1269">            MetricName totalMetricName = metrics.metricName(baseName + &quot;-total&quot;, groupName,</span>
+<span class="nc" id="L1270">                            String.format(&quot;The total number of %s&quot;, descriptiveName), metricTags);</span>
+<span class="nc bnc" id="L1271" title="All 2 branches missed.">            if (stat == null)</span>
+<span class="nc" id="L1272">                return new Meter(rateMetricName, totalMetricName);</span>
+            else
+<span class="nc" id="L1274">                return new Meter(stat, rateMetricName, totalMetricName);</span>
+        }
+
+        private Meter createMeter(Metrics metrics, String groupName,  Map&lt;String, String&gt; metricTags,
+                String baseName, String descriptiveName) {
+<span class="nc" id="L1279">            return createMeter(metrics, groupName, metricTags, null, baseName, descriptiveName);</span>
+        }
+
+        private Meter createIOThreadRatioMeter(Metrics metrics, String groupName,  Map&lt;String, String&gt; metricTags,
+                                               String baseName, String action) {
+<span class="nc" id="L1284">            MetricName rateMetricName = metrics.metricName(baseName + &quot;-ratio&quot;, groupName,</span>
+<span class="nc" id="L1285">                String.format(&quot;The fraction of time the I/O thread spent %s&quot;, action), metricTags);</span>
+<span class="nc" id="L1286">            MetricName totalMetricName = metrics.metricName(baseName + &quot;-time-ns-total&quot;, groupName,</span>
+<span class="nc" id="L1287">                String.format(&quot;The total time the I/O thread spent %s&quot;, action), metricTags);</span>
+<span class="nc" id="L1288">            return new Meter(TimeUnit.NANOSECONDS, rateMetricName, totalMetricName);</span>
+        }
+
+        private Sensor sensor(String name, Sensor... parents) {
+<span class="nc" id="L1292">            Sensor sensor = metrics.sensor(name, parents);</span>
+<span class="nc" id="L1293">            sensors.add(sensor);</span>
+<span class="nc" id="L1294">            return sensor;</span>
+        }
+
+        public void maybeRegisterConnectionMetrics(String connectionId) {
+<span class="nc bnc" id="L1298" title="All 4 branches missed.">            if (!connectionId.isEmpty() &amp;&amp; metricsPerConnection) {</span>
+                // if one sensor of the metrics has been registered for the connection,
+                // then all other sensors should have been registered; and vice versa
+<span class="nc" id="L1301">                String nodeRequestName = &quot;node-&quot; + connectionId + &quot;.requests-sent&quot;;</span>
+<span class="nc" id="L1302">                Sensor nodeRequest = this.metrics.getSensor(nodeRequestName);</span>
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">                if (nodeRequest == null) {</span>
+<span class="nc" id="L1304">                    Map&lt;String, String&gt; tags = new LinkedHashMap&lt;&gt;(metricTags);</span>
+<span class="nc" id="L1305">                    tags.put(&quot;node-id&quot;, &quot;node-&quot; + connectionId);</span>
+
+<span class="nc" id="L1307">                    nodeRequest = sensor(nodeRequestName);</span>
+<span class="nc" id="L1308">                    nodeRequest.add(createMeter(metrics, perConnectionMetricGrpName, tags, new WindowedCount(), &quot;request&quot;, &quot;requests sent&quot;));</span>
+<span class="nc" id="L1309">                    MetricName metricName = metrics.metricName(&quot;request-size-avg&quot;, perConnectionMetricGrpName, &quot;The average size of requests sent.&quot;, tags);</span>
+<span class="nc" id="L1310">                    nodeRequest.add(metricName, new Avg());</span>
+<span class="nc" id="L1311">                    metricName = metrics.metricName(&quot;request-size-max&quot;, perConnectionMetricGrpName, &quot;The maximum size of any request sent.&quot;, tags);</span>
+<span class="nc" id="L1312">                    nodeRequest.add(metricName, new Max());</span>
+
+<span class="nc" id="L1314">                    String bytesSentName = &quot;node-&quot; + connectionId + &quot;.bytes-sent&quot;;</span>
+<span class="nc" id="L1315">                    Sensor bytesSent = sensor(bytesSentName);</span>
+<span class="nc" id="L1316">                    bytesSent.add(createMeter(metrics, perConnectionMetricGrpName, tags, &quot;outgoing-byte&quot;, &quot;outgoing bytes&quot;));</span>
+
+<span class="nc" id="L1318">                    String nodeResponseName = &quot;node-&quot; + connectionId + &quot;.responses-received&quot;;</span>
+<span class="nc" id="L1319">                    Sensor nodeResponse = sensor(nodeResponseName);</span>
+<span class="nc" id="L1320">                    nodeResponse.add(createMeter(metrics, perConnectionMetricGrpName, tags, new WindowedCount(), &quot;response&quot;, &quot;responses received&quot;));</span>
+
+<span class="nc" id="L1322">                    String bytesReceivedName = &quot;node-&quot; + connectionId + &quot;.bytes-received&quot;;</span>
+<span class="nc" id="L1323">                    Sensor bytesReceive = sensor(bytesReceivedName);</span>
+<span class="nc" id="L1324">                    bytesReceive.add(createMeter(metrics, perConnectionMetricGrpName, tags, &quot;incoming-byte&quot;, &quot;incoming bytes&quot;));</span>
+
+<span class="nc" id="L1326">                    String nodeTimeName = &quot;node-&quot; + connectionId + &quot;.latency&quot;;</span>
+<span class="nc" id="L1327">                    Sensor nodeRequestTime = sensor(nodeTimeName);</span>
+<span class="nc" id="L1328">                    metricName = metrics.metricName(&quot;request-latency-avg&quot;, perConnectionMetricGrpName, tags);</span>
+<span class="nc" id="L1329">                    nodeRequestTime.add(metricName, new Avg());</span>
+<span class="nc" id="L1330">                    metricName = metrics.metricName(&quot;request-latency-max&quot;, perConnectionMetricGrpName, tags);</span>
+<span class="nc" id="L1331">                    nodeRequestTime.add(metricName, new Max());</span>
+                }
+            }
+<span class="nc" id="L1334">        }</span>
+
+        public void recordBytesSent(String connectionId, long bytes, long currentTimeMs) {
+<span class="nc" id="L1337">            this.bytesSent.record(bytes, currentTimeMs, false);</span>
+<span class="nc bnc" id="L1338" title="All 2 branches missed.">            if (!connectionId.isEmpty()) {</span>
+<span class="nc" id="L1339">                String bytesSentName = &quot;node-&quot; + connectionId + &quot;.bytes-sent&quot;;</span>
+<span class="nc" id="L1340">                Sensor bytesSent = this.metrics.getSensor(bytesSentName);</span>
+<span class="nc bnc" id="L1341" title="All 2 branches missed.">                if (bytesSent != null)</span>
+<span class="nc" id="L1342">                    bytesSent.record(bytes, currentTimeMs);</span>
+            }
+<span class="nc" id="L1344">        }</span>
+
+        public void recordCompletedSend(String connectionId, long totalBytes, long currentTimeMs) {
+<span class="nc" id="L1347">            requestsSent.record(totalBytes, currentTimeMs, false);</span>
+<span class="nc bnc" id="L1348" title="All 2 branches missed.">            if (!connectionId.isEmpty()) {</span>
+<span class="nc" id="L1349">                String nodeRequestName = &quot;node-&quot; + connectionId + &quot;.requests-sent&quot;;</span>
+<span class="nc" id="L1350">                Sensor nodeRequest = this.metrics.getSensor(nodeRequestName);</span>
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">                if (nodeRequest != null)</span>
+<span class="nc" id="L1352">                    nodeRequest.record(totalBytes, currentTimeMs);</span>
+            }
+<span class="nc" id="L1354">        }</span>
+
+        public void recordBytesReceived(String connectionId, long bytes, long currentTimeMs) {
+<span class="nc" id="L1357">            this.bytesReceived.record(bytes, currentTimeMs, false);</span>
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">            if (!connectionId.isEmpty()) {</span>
+<span class="nc" id="L1359">                String bytesReceivedName = &quot;node-&quot; + connectionId + &quot;.bytes-received&quot;;</span>
+<span class="nc" id="L1360">                Sensor bytesReceived = this.metrics.getSensor(bytesReceivedName);</span>
+<span class="nc bnc" id="L1361" title="All 2 branches missed.">                if (bytesReceived != null)</span>
+<span class="nc" id="L1362">                    bytesReceived.record(bytes, currentTimeMs);</span>
+            }
+<span class="nc" id="L1364">        }</span>
+
+        public void recordCompletedReceive(String connectionId, long totalBytes, long currentTimeMs) {
+<span class="nc" id="L1367">            responsesReceived.record(totalBytes, currentTimeMs, false);</span>
+<span class="nc bnc" id="L1368" title="All 2 branches missed.">            if (!connectionId.isEmpty()) {</span>
+<span class="nc" id="L1369">                String nodeRequestName = &quot;node-&quot; + connectionId + &quot;.responses-received&quot;;</span>
+<span class="nc" id="L1370">                Sensor nodeRequest = this.metrics.getSensor(nodeRequestName);</span>
+<span class="nc bnc" id="L1371" title="All 2 branches missed.">                if (nodeRequest != null)</span>
+<span class="nc" id="L1372">                    nodeRequest.record(totalBytes, currentTimeMs);</span>
+            }
+<span class="nc" id="L1374">        }</span>
+
+        public void close() {
+<span class="nc bnc" id="L1377" title="All 2 branches missed.">            for (MetricName metricName : topLevelMetricNames)</span>
+<span class="nc" id="L1378">                metrics.removeMetric(metricName);</span>
+<span class="nc bnc" id="L1379" title="All 2 branches missed.">            for (Sensor sensor : sensors)</span>
+<span class="nc" id="L1380">                metrics.removeSensor(sensor.name());</span>
+<span class="nc" id="L1381">            connectionsByCipher.close();</span>
+<span class="nc" id="L1382">            connectionsByClient.close();</span>
+<span class="nc" id="L1383">        }</span>
+    }
+
+    /**
+     * Encapsulate a channel that must be closed after a specific delay has elapsed due to authentication failure.
+     */
+    private class DelayedAuthenticationFailureClose {
+        private final KafkaChannel channel;
+        private final long endTimeNanos;
+        private boolean closed;
+
+        /**
+         * @param channel The channel whose close is being delayed
+         * @param delayMs The amount of time by which the operation should be delayed
+         */
+<span class="nc" id="L1398">        public DelayedAuthenticationFailureClose(KafkaChannel channel, int delayMs) {</span>
+<span class="nc" id="L1399">            this.channel = channel;</span>
+<span class="nc" id="L1400">            this.endTimeNanos = time.nanoseconds() + (delayMs * 1000L * 1000L);</span>
+<span class="nc" id="L1401">            this.closed = false;</span>
+<span class="nc" id="L1402">        }</span>
+
+        /**
+         * Try to close this channel if the delay has expired.
+         * @param currentTimeNanos The current time
+         * @return True if the delay has expired and the channel was closed; false otherwise
+         */
+        public final boolean tryClose(long currentTimeNanos) {
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">            if (endTimeNanos &lt;= currentTimeNanos)</span>
+<span class="nc" id="L1411">                closeNow();</span>
+<span class="nc" id="L1412">            return closed;</span>
+        }
+
+        /**
+         * Close the channel now, regardless of whether the delay has expired or not.
+         */
+        public final void closeNow() {
+<span class="nc bnc" id="L1419" title="All 2 branches missed.">            if (closed)</span>
+<span class="nc" id="L1420">                throw new IllegalStateException(&quot;Attempt to close a channel that has already been closed&quot;);</span>
+<span class="nc" id="L1421">            handleCloseOnAuthenticationFailure(channel);</span>
+<span class="nc" id="L1422">            closed = true;</span>
+<span class="nc" id="L1423">        }</span>
+    }
+
+    // helper class for tracking least recently used connections to enable idle connection closing
+    private static class IdleExpiryManager {
+        private final Map&lt;String, Long&gt; lruConnections;
+        private final long connectionsMaxIdleNanos;
+        private long nextIdleCloseCheckTime;
+
+<span class="nc" id="L1432">        public IdleExpiryManager(Time time, long connectionsMaxIdleMs) {</span>
+<span class="nc" id="L1433">            this.connectionsMaxIdleNanos = connectionsMaxIdleMs * 1000 * 1000;</span>
+            // initial capacity and load factor are default, we set them explicitly because we want to set accessOrder = true
+<span class="nc" id="L1435">            this.lruConnections = new LinkedHashMap&lt;&gt;(16, .75F, true);</span>
+<span class="nc" id="L1436">            this.nextIdleCloseCheckTime = time.nanoseconds() + this.connectionsMaxIdleNanos;</span>
+<span class="nc" id="L1437">        }</span>
+
+        public void update(String connectionId, long currentTimeNanos) {
+<span class="nc" id="L1440">            lruConnections.put(connectionId, currentTimeNanos);</span>
+<span class="nc" id="L1441">        }</span>
+
+        public Map.Entry&lt;String, Long&gt; pollExpiredConnection(long currentTimeNanos) {
+<span class="nc bnc" id="L1444" title="All 2 branches missed.">            if (currentTimeNanos &lt;= nextIdleCloseCheckTime)</span>
+<span class="nc" id="L1445">                return null;</span>
+
+<span class="nc bnc" id="L1447" title="All 2 branches missed.">            if (lruConnections.isEmpty()) {</span>
+<span class="nc" id="L1448">                nextIdleCloseCheckTime = currentTimeNanos + connectionsMaxIdleNanos;</span>
+<span class="nc" id="L1449">                return null;</span>
+            }
+
+<span class="nc" id="L1452">            Map.Entry&lt;String, Long&gt; oldestConnectionEntry = lruConnections.entrySet().iterator().next();</span>
+<span class="nc" id="L1453">            Long connectionLastActiveTime = oldestConnectionEntry.getValue();</span>
+<span class="nc" id="L1454">            nextIdleCloseCheckTime = connectionLastActiveTime + connectionsMaxIdleNanos;</span>
+
+<span class="nc bnc" id="L1456" title="All 2 branches missed.">            if (currentTimeNanos &gt; nextIdleCloseCheckTime)</span>
+<span class="nc" id="L1457">                return oldestConnectionEntry;</span>
+            else
+<span class="nc" id="L1459">                return null;</span>
+        }
+
+        public void remove(String connectionId) {
+<span class="nc" id="L1463">            lruConnections.remove(connectionId);</span>
+<span class="nc" id="L1464">        }</span>
+    }
+
+    //package-private for testing
+    boolean isOutOfMemory() {
+<span class="nc" id="L1469">        return outOfMemory;</span>
+    }
+
+    //package-private for testing
+    boolean isMadeReadProgressLastPoll() {
+<span class="nc" id="L1474">        return madeReadProgressLastPoll;</span>
+    }
+
+    // package-private for testing
+    Map&lt;?, ?&gt; delayedClosingChannels() {
+<span class="nc" id="L1479">        return delayedClosingChannels;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

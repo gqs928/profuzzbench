@@ -1,0 +1,494 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AssignmentsManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server</a> &gt; <span class="el_source">AssignmentsManager.java</span></div><h1>AssignmentsManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.server;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.AssignReplicasToDirsRequestData;
+import org.apache.kafka.common.message.AssignReplicasToDirsRequestData.DirectoryData;
+import org.apache.kafka.common.message.AssignReplicasToDirsRequestData.PartitionData;
+import org.apache.kafka.common.message.AssignReplicasToDirsRequestData.TopicData;
+import org.apache.kafka.common.message.AssignReplicasToDirsResponseData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.AssignReplicasToDirsRequest;
+import org.apache.kafka.common.requests.AssignReplicasToDirsResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.ExponentialBackoff;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.image.TopicImage;
+import org.apache.kafka.queue.EventQueue;
+import org.apache.kafka.queue.KafkaEventQueue;
+import org.apache.kafka.server.common.ControllerRequestCompletionHandler;
+import org.apache.kafka.server.common.NodeToControllerChannelManager;
+import org.apache.kafka.server.common.TopicIdPartition;
+import org.apache.kafka.server.metrics.KafkaYammerMetrics;
+
+import com.yammer.metrics.core.Gauge;
+import com.yammer.metrics.core.MetricName;
+import com.yammer.metrics.core.MetricsRegistry;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.common.requests.AssignReplicasToDirsRequest.MAX_ASSIGNMENTS_PER_REQUEST;
+
+public final class AssignmentsManager {
+<span class="nc" id="L63">    static final ExponentialBackoff STANDARD_BACKOFF = new ExponentialBackoff(</span>
+<span class="nc" id="L64">            TimeUnit.MILLISECONDS.toNanos(100),</span>
+            2,
+<span class="nc" id="L66">            TimeUnit.SECONDS.toNanos(10),</span>
+            0.02);
+
+    /**
+     * The minimum amount of time we will wait before logging individual assignment failures.
+     */
+<span class="nc" id="L72">    static final long MIN_NOISY_FAILURE_INTERVAL_NS = TimeUnit.MINUTES.toNanos(2);</span>
+
+    @Deprecated(since = &quot;4.2&quot;)
+<span class="nc" id="L75">    static final MetricName DEPRECATED_QUEUED_REPLICA_TO_DIR_ASSIGNMENTS_METRIC =</span>
+<span class="nc" id="L76">            KafkaYammerMetrics.getMetricName(&quot;org.apache.kafka.server&quot;, &quot;AssignmentsManager&quot;, &quot;QueuedReplicaToDirAssignments&quot;);</span>
+
+    /**
+     * The metric reflecting the number of pending assignments.
+     */
+<span class="nc" id="L81">    static final MetricName QUEUED_REPLICA_TO_DIR_ASSIGNMENTS_METRIC =</span>
+<span class="nc" id="L82">            KafkaYammerMetrics.getMetricName(&quot;kafka.server&quot;, &quot;AssignmentsManager&quot;, &quot;QueuedReplicaToDirAssignments&quot;);</span>
+
+    /**
+     * The event at which we send assignments, if appropriate.
+     */
+    static final String MAYBE_SEND_ASSIGNMENTS_EVENT = &quot;MaybeSendAssignmentsEvent&quot;;
+
+    /**
+     * The log4j object.
+     */
+    private final Logger log;
+
+    /**
+     * The exponential backoff strategy to use.
+     */
+    private final ExponentialBackoff backoff;
+
+    /**
+     * The clock object to use.
+     */
+    private final Time time;
+
+    /**
+     * Used to send messages to the controller.
+     */
+    private final NodeToControllerChannelManager channelManager;
+
+    /**
+     * The node ID.
+     */
+    private final int nodeId;
+
+    /**
+     * Supplies the latest MetadataImage.
+     */
+    private final Supplier&lt;MetadataImage&gt; metadataImageSupplier;
+
+    /**
+     * Maps directory IDs to descriptions for logging purposes.
+     */
+    private final Function&lt;Uuid, String&gt; directoryIdToDescription;
+
+    /**
+     * Maps partitions to assignments that are ready to send.
+     */
+    private final ConcurrentHashMap&lt;TopicIdPartition, Assignment&gt; ready;
+
+    /**
+     * Maps partitions to assignments that are in-flight. Older entries come first.
+     */
+    private volatile Map&lt;TopicIdPartition, Assignment&gt; inflight;
+
+    /**
+     * The registry to register our metrics with.
+     */
+    private final MetricsRegistry metricsRegistry;
+
+    /**
+     * The number of global failures we had previously (cleared after any success).
+     */
+    private int previousGlobalFailures;
+
+    /**
+     * The event queue.
+     */
+    private final KafkaEventQueue eventQueue;
+
+    public AssignmentsManager(
+        Time time,
+        NodeToControllerChannelManager channelManager,
+        int nodeId,
+        Supplier&lt;MetadataImage&gt; metadataImageSupplier,
+        Function&lt;Uuid, String&gt; directoryIdToDescription
+    ) {
+<span class="nc" id="L156">        this(STANDARD_BACKOFF,</span>
+            time,
+            channelManager,
+            nodeId,
+            metadataImageSupplier,
+            directoryIdToDescription,
+<span class="nc" id="L162">            KafkaYammerMetrics.defaultRegistry());</span>
+<span class="nc" id="L163">    }</span>
+
+    AssignmentsManager(
+        ExponentialBackoff backoff,
+        Time time,
+        NodeToControllerChannelManager channelManager,
+        int nodeId,
+        Supplier&lt;MetadataImage&gt; metadataImageSupplier,
+        Function&lt;Uuid, String&gt; directoryIdToDescription,
+        MetricsRegistry metricsRegistry
+<span class="nc" id="L173">    ) {</span>
+<span class="nc" id="L174">        this.log = new LogContext(&quot;[AssignmentsManager id=&quot; + nodeId + &quot;] &quot;).</span>
+<span class="nc" id="L175">            logger(AssignmentsManager.class);</span>
+<span class="nc" id="L176">        this.backoff = backoff;</span>
+<span class="nc" id="L177">        this.time = time;</span>
+<span class="nc" id="L178">        this.channelManager = channelManager;</span>
+<span class="nc" id="L179">        this.nodeId = nodeId;</span>
+<span class="nc" id="L180">        this.directoryIdToDescription = directoryIdToDescription;</span>
+<span class="nc" id="L181">        this.metadataImageSupplier = metadataImageSupplier;</span>
+<span class="nc" id="L182">        this.ready = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L183">        this.inflight = Map.of();</span>
+<span class="nc" id="L184">        this.metricsRegistry = metricsRegistry;</span>
+<span class="nc" id="L185">        this.metricsRegistry.newGauge(DEPRECATED_QUEUED_REPLICA_TO_DIR_ASSIGNMENTS_METRIC, new Gauge&lt;Integer&gt;() {</span>
+            @Override
+            public Integer value() {
+<span class="nc" id="L188">                return numPending();</span>
+            }
+        });
+<span class="nc" id="L191">        this.metricsRegistry.newGauge(QUEUED_REPLICA_TO_DIR_ASSIGNMENTS_METRIC, new Gauge&lt;Integer&gt;() {</span>
+            @Override
+            public Integer value() {
+<span class="nc" id="L194">                return numPending();</span>
+            }
+        });
+<span class="nc" id="L197">        this.previousGlobalFailures = 0;</span>
+<span class="nc" id="L198">        this.eventQueue = new KafkaEventQueue(time,</span>
+            new LogContext(&quot;[AssignmentsManager id=&quot; + nodeId + &quot;]&quot;),
+            &quot;broker-&quot; + nodeId + &quot;-directory-assignments-manager-&quot;,
+            new ShutdownEvent());
+<span class="nc" id="L202">        channelManager.start();</span>
+<span class="nc" id="L203">    }</span>
+
+    public int numPending() {
+<span class="nc" id="L206">        return ready.size() + inflight.size();</span>
+    }
+
+    public void close() throws InterruptedException {
+<span class="nc" id="L210">        eventQueue.close();</span>
+<span class="nc" id="L211">    }</span>
+
+    public void onAssignment(
+        TopicIdPartition topicIdPartition,
+        Uuid directoryId,
+        String reason,
+        Runnable successCallback
+    ) {
+<span class="nc" id="L219">        long nowNs = time.nanoseconds();</span>
+<span class="nc" id="L220">        Assignment assignment = new Assignment(</span>
+                topicIdPartition, directoryId, nowNs, successCallback);
+<span class="nc" id="L222">        ready.put(topicIdPartition, assignment);</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (log.isTraceEnabled()) {</span>
+<span class="nc" id="L224">            String topicDescription = Optional.ofNullable(metadataImageSupplier.get().topics().</span>
+<span class="nc" id="L225">                getTopic(assignment.topicIdPartition().topicId())).</span>
+<span class="nc" id="L226">                    map(TopicImage::name).orElse(assignment.topicIdPartition().topicId().toString());</span>
+<span class="nc" id="L227">            log.trace(&quot;Registered assignment {}: {}, moving {}-{} into {}&quot;,</span>
+                assignment,
+                reason,
+                topicDescription,
+<span class="nc" id="L231">                topicIdPartition.partitionId(),</span>
+<span class="nc" id="L232">                directoryIdToDescription.apply(assignment.directoryId()));</span>
+        }
+<span class="nc" id="L234">        rescheduleMaybeSendAssignmentsEvent(nowNs);</span>
+<span class="nc" id="L235">    }</span>
+
+    void rescheduleMaybeSendAssignmentsEvent(long nowNs) {
+<span class="nc" id="L238">        eventQueue.scheduleDeferred(MAYBE_SEND_ASSIGNMENTS_EVENT,</span>
+            new AssignmentsManagerDeadlineFunction(backoff,
+<span class="nc bnc" id="L240" title="All 2 branches missed.">                nowNs, previousGlobalFailures, !inflight.isEmpty(), ready.size()),</span>
+            new MaybeSendAssignmentsEvent());
+<span class="nc" id="L242">    }</span>
+
+    /**
+     * Handles shutdown.
+     */
+<span class="nc" id="L247">    private class ShutdownEvent implements EventQueue.Event {</span>
+        @Override
+        public void run() {
+<span class="nc" id="L250">            log.info(&quot;shutting down.&quot;);</span>
+            try {
+<span class="nc" id="L252">                channelManager.shutdown();</span>
+<span class="nc" id="L253">            } catch (Exception e) {</span>
+<span class="nc" id="L254">                log.error(&quot;Unexpected exception shutting down NodeToControllerChannelManager&quot;, e);</span>
+<span class="nc" id="L255">            }</span>
+            try {
+<span class="nc" id="L257">                metricsRegistry.removeMetric(DEPRECATED_QUEUED_REPLICA_TO_DIR_ASSIGNMENTS_METRIC);</span>
+<span class="nc" id="L258">                metricsRegistry.removeMetric(QUEUED_REPLICA_TO_DIR_ASSIGNMENTS_METRIC);</span>
+<span class="nc" id="L259">            } catch (Exception e) {</span>
+<span class="nc" id="L260">                log.error(&quot;Unexpected exception removing metrics.&quot;, e);</span>
+<span class="nc" id="L261">            }</span>
+<span class="nc" id="L262">        }</span>
+    }
+
+    /**
+     * An event that processes the assignments in the ready map.
+     */
+<span class="nc" id="L268">    private class MaybeSendAssignmentsEvent implements EventQueue.Event {</span>
+        @Override
+        public void run() {
+            try {
+<span class="nc" id="L272">                maybeSendAssignments();</span>
+<span class="nc" id="L273">            } catch (Exception e) {</span>
+<span class="nc" id="L274">                log.error(&quot;Unexpected exception in MaybeSendAssignmentsEvent&quot;, e);</span>
+<span class="nc" id="L275">            }</span>
+<span class="nc" id="L276">        }</span>
+    }
+
+    /**
+     * An event that handles the controller's response to our request.
+     */
+    private class HandleResponseEvent implements EventQueue.Event {
+        private final Map&lt;TopicIdPartition, Assignment&gt; sent;
+        private final Optional&lt;ClientResponse&gt; response;
+
+        HandleResponseEvent(
+            Map&lt;TopicIdPartition, Assignment&gt; sent,
+            Optional&lt;ClientResponse&gt; response
+<span class="nc" id="L289">        ) {</span>
+<span class="nc" id="L290">            this.sent = sent;</span>
+<span class="nc" id="L291">            this.response = response;</span>
+<span class="nc" id="L292">        }</span>
+
+        @Override
+        public void run() {
+            try {
+<span class="nc" id="L297">                handleResponse(sent, response);</span>
+<span class="nc" id="L298">            } catch (Exception e) {</span>
+<span class="nc" id="L299">                log.error(&quot;Unexpected exception in HandleResponseEvent&quot;, e);</span>
+            } finally {
+<span class="nc bnc" id="L301" title="All 2 branches missed.">                if (!ready.isEmpty()) {</span>
+<span class="nc" id="L302">                    rescheduleMaybeSendAssignmentsEvent(time.nanoseconds());</span>
+                }
+            }
+<span class="nc" id="L305">        }</span>
+    }
+
+    /**
+     * A callback object that handles the controller's response to our request.
+     */
+    private class CompletionHandler implements ControllerRequestCompletionHandler {
+        private final Map&lt;TopicIdPartition, Assignment&gt; sent;
+
+<span class="nc" id="L314">        CompletionHandler(Map&lt;TopicIdPartition, Assignment&gt; sent) {</span>
+<span class="nc" id="L315">            this.sent = sent;</span>
+<span class="nc" id="L316">        }</span>
+
+        @Override
+        public void onTimeout() {
+<span class="nc" id="L320">            eventQueue.append(new HandleResponseEvent(sent, Optional.empty()));</span>
+<span class="nc" id="L321">        }</span>
+
+        @Override
+        public void onComplete(ClientResponse response) {
+<span class="nc" id="L325">            eventQueue.append(new HandleResponseEvent(sent, Optional.of(response)));</span>
+<span class="nc" id="L326">        }</span>
+    }
+
+    void maybeSendAssignments() {
+<span class="nc" id="L330">        int inflightSize = inflight.size();</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        if (log.isTraceEnabled()) {</span>
+<span class="nc" id="L332">            log.trace(&quot;maybeSendAssignments: inflightSize = {}.&quot;, inflightSize);</span>
+        }
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if (inflightSize &gt; 0) {</span>
+<span class="nc" id="L335">            log.trace(&quot;maybeSendAssignments: cannot send new assignments because there are &quot; +</span>
+<span class="nc" id="L336">                &quot;{} still in flight.&quot;, inflightSize);</span>
+<span class="nc" id="L337">            return;</span>
+        }
+<span class="nc" id="L339">        MetadataImage image = metadataImageSupplier.get();</span>
+<span class="nc" id="L340">        Map&lt;TopicIdPartition, Assignment&gt; newInFlight = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L341">        int numInvalid = 0;</span>
+<span class="nc" id="L342">        for (Iterator&lt;Assignment&gt; iterator = ready.values().iterator();</span>
+<span class="nc bnc" id="L343" title="All 4 branches missed.">             iterator.hasNext() &amp;&amp; newInFlight.size() &lt; MAX_ASSIGNMENTS_PER_REQUEST;</span>
+             ) {
+<span class="nc" id="L345">            Assignment assignment = iterator.next();</span>
+<span class="nc" id="L346">            iterator.remove();</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            if (assignment.valid(nodeId, image)) {</span>
+<span class="nc" id="L348">                newInFlight.put(assignment.topicIdPartition(), assignment);</span>
+            } else {
+<span class="nc" id="L350">                numInvalid++;</span>
+            }
+<span class="nc" id="L352">        }</span>
+<span class="nc" id="L353">        log.info(&quot;maybeSendAssignments: sending {} assignments; invalidated {} assignments &quot; +</span>
+<span class="nc" id="L354">            &quot;prior to sending.&quot;, newInFlight.size(), numInvalid);</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        if (!newInFlight.isEmpty()) {</span>
+<span class="nc" id="L356">            sendAssignments(image.cluster().brokerEpoch(nodeId), newInFlight);</span>
+        }
+<span class="nc" id="L358">    }</span>
+
+    void sendAssignments(long brokerEpoch, Map&lt;TopicIdPartition, Assignment&gt; newInflight) {
+<span class="nc" id="L361">        CompletionHandler completionHandler = new CompletionHandler(newInflight);</span>
+<span class="nc" id="L362">        channelManager.sendRequest(new AssignReplicasToDirsRequest.Builder(</span>
+<span class="nc" id="L363">            buildRequestData(nodeId, brokerEpoch, newInflight)),</span>
+            completionHandler);
+<span class="nc" id="L365">        inflight = newInflight;</span>
+<span class="nc" id="L366">    }</span>
+
+    void handleResponse(
+        Map&lt;TopicIdPartition, Assignment&gt; sent,
+        Optional&lt;ClientResponse&gt; assignmentResponse
+    ) {
+<span class="nc" id="L372">        inflight = Map.of();</span>
+<span class="nc" id="L373">        Optional&lt;String&gt; globalResponseError = globalResponseError(assignmentResponse);</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        if (globalResponseError.isPresent()) {</span>
+<span class="nc" id="L375">            previousGlobalFailures++;</span>
+<span class="nc" id="L376">            log.error(&quot;handleResponse: {} assignments failed; global error: {}. Retrying.&quot;,</span>
+<span class="nc" id="L377">                sent.size(), globalResponseError.get());</span>
+<span class="nc" id="L378">            sent.forEach(ready::putIfAbsent);</span>
+<span class="nc" id="L379">            return;</span>
+        }
+<span class="nc" id="L381">        previousGlobalFailures = 0;</span>
+<span class="nc" id="L382">        AssignReplicasToDirsResponseData responseData =</span>
+<span class="nc" id="L383">            ((AssignReplicasToDirsResponse) assignmentResponse.get().responseBody()).data();</span>
+<span class="nc" id="L384">        long nowNs = time.nanoseconds();</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        for (AssignReplicasToDirsResponseData.DirectoryData directoryData : responseData.directories()) {</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">            for (AssignReplicasToDirsResponseData.TopicData topicData : directoryData.topics()) {</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                for (AssignReplicasToDirsResponseData.PartitionData partitionData : topicData.partitions()) {</span>
+<span class="nc" id="L388">                    TopicIdPartition topicIdPartition =</span>
+<span class="nc" id="L389">                        new TopicIdPartition(topicData.topicId(), partitionData.partitionIndex());</span>
+<span class="nc" id="L390">                    handleAssignmentResponse(topicIdPartition, sent,</span>
+<span class="nc" id="L391">                            Errors.forCode(partitionData.errorCode()), nowNs);</span>
+<span class="nc" id="L392">                    sent.remove(topicIdPartition);</span>
+<span class="nc" id="L393">                }</span>
+<span class="nc" id="L394">            }</span>
+<span class="nc" id="L395">        }</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        for (Assignment assignment : sent.values()) {</span>
+<span class="nc" id="L397">            ready.putIfAbsent(assignment.topicIdPartition(), assignment);</span>
+<span class="nc" id="L398">            log.error(&quot;handleResponse: no result in response for partition {}.&quot;,</span>
+<span class="nc" id="L399">                assignment.topicIdPartition());</span>
+<span class="nc" id="L400">        }</span>
+<span class="nc" id="L401">    }</span>
+
+    void handleAssignmentResponse(
+        TopicIdPartition topicIdPartition,
+        Map&lt;TopicIdPartition, Assignment&gt; sent,
+        Errors error,
+        long nowNs
+    ) {
+<span class="nc" id="L409">        Assignment assignment = sent.get(topicIdPartition);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">        if (assignment == null) {</span>
+<span class="nc" id="L411">            log.error(&quot;handleResponse: response contained topicIdPartition {}, but this was not &quot; +</span>
+                &quot;in the request.&quot;, topicIdPartition);
+<span class="nc bnc" id="L413" title="All 2 branches missed.">        } else if (error.equals(Errors.NONE)) {</span>
+            try {
+<span class="nc" id="L415">                assignment.successCallback().run();</span>
+<span class="nc" id="L416">            } catch (Exception e) {</span>
+<span class="nc" id="L417">                log.error(&quot;handleResponse: unexpected callback exception&quot;, e);</span>
+<span class="nc" id="L418">            }</span>
+        } else {
+<span class="nc" id="L420">            ready.putIfAbsent(topicIdPartition, assignment);</span>
+<span class="nc bnc" id="L421" title="All 4 branches missed.">            if (log.isDebugEnabled() || nowNs &gt; assignment.submissionTimeNs() + MIN_NOISY_FAILURE_INTERVAL_NS) {</span>
+<span class="nc" id="L422">                log.error(&quot;handleResponse: error assigning {}: {}.&quot;, assignment.topicIdPartition(), error);</span>
+            }
+        }
+<span class="nc" id="L425">    }</span>
+
+    int previousGlobalFailures() throws ExecutionException, InterruptedException {
+<span class="nc" id="L428">        CompletableFuture&lt;Integer&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L429">        eventQueue.append(() -&gt; future.complete(previousGlobalFailures));</span>
+<span class="nc" id="L430">        return future.get();</span>
+    }
+
+    int numInFlight() {
+<span class="nc" id="L434">        return inflight.size();</span>
+    }
+
+    static Optional&lt;String&gt; globalResponseError(Optional&lt;ClientResponse&gt; response) {
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        if (response.isEmpty()) {</span>
+<span class="nc" id="L439">            return Optional.of(&quot;Timeout&quot;);</span>
+        }
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        if (response.get().authenticationException() != null) {</span>
+<span class="nc" id="L442">            return Optional.of(&quot;AuthenticationException&quot;);</span>
+        }
+<span class="nc bnc" id="L444" title="All 2 branches missed.">        if (response.get().wasTimedOut()) {</span>
+<span class="nc" id="L445">            return Optional.of(&quot;Disconnected[Timeout]&quot;);</span>
+        }
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        if (response.get().wasDisconnected()) {</span>
+<span class="nc" id="L448">            return Optional.of(&quot;Disconnected&quot;);</span>
+        }
+<span class="nc bnc" id="L450" title="All 2 branches missed.">        if (response.get().versionMismatch() != null) {</span>
+<span class="nc" id="L451">            return Optional.of(&quot;UnsupportedVersionException&quot;);</span>
+        }
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if (response.get().responseBody() == null) {</span>
+<span class="nc" id="L454">            return Optional.of(&quot;EmptyResponse&quot;);</span>
+        }
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        if (!(response.get().responseBody() instanceof AssignReplicasToDirsResponse)) {</span>
+<span class="nc" id="L457">            return Optional.of(&quot;ClassCastException&quot;);</span>
+        }
+<span class="nc" id="L459">        AssignReplicasToDirsResponseData data = ((AssignReplicasToDirsResponse)</span>
+<span class="nc" id="L460">            response.get().responseBody()).data();</span>
+<span class="nc" id="L461">        Errors error = Errors.forCode(data.errorCode());</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        if (error != Errors.NONE) {</span>
+<span class="nc" id="L463">            return Optional.of(&quot;Response-level error: &quot; + error.name());</span>
+        }
+<span class="nc" id="L465">        return Optional.empty();</span>
+    }
+
+    static AssignReplicasToDirsRequestData buildRequestData(
+        int nodeId,
+        long brokerEpoch,
+        Map&lt;TopicIdPartition, Assignment&gt; assignments
+    ) {
+<span class="nc" id="L473">        Map&lt;Uuid, DirectoryData&gt; directoryMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L474">        Map&lt;Uuid, Map&lt;Uuid, TopicData&gt;&gt; topicMap = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">        for (Map.Entry&lt;TopicIdPartition, Assignment&gt; entry : assignments.entrySet()) {</span>
+<span class="nc" id="L476">            TopicIdPartition topicPartition = entry.getKey();</span>
+<span class="nc" id="L477">            Uuid directoryId = entry.getValue().directoryId();</span>
+<span class="nc" id="L478">            DirectoryData directory = directoryMap.computeIfAbsent(directoryId, d -&gt; new DirectoryData().setId(directoryId));</span>
+<span class="nc" id="L479">            TopicData topic = topicMap.computeIfAbsent(directoryId, d -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L480">                    .computeIfAbsent(topicPartition.topicId(), topicId -&gt; {</span>
+<span class="nc" id="L481">                        TopicData data = new TopicData().setTopicId(topicId);</span>
+<span class="nc" id="L482">                        directory.topics().add(data);</span>
+<span class="nc" id="L483">                        return data;</span>
+                    });
+<span class="nc" id="L485">            PartitionData partition = new PartitionData().setPartitionIndex(topicPartition.partitionId());</span>
+<span class="nc" id="L486">            topic.partitions().add(partition);</span>
+<span class="nc" id="L487">        }</span>
+<span class="nc" id="L488">        return new AssignReplicasToDirsRequestData()</span>
+<span class="nc" id="L489">                .setBrokerId(nodeId)</span>
+<span class="nc" id="L490">                .setBrokerEpoch(brokerEpoch)</span>
+<span class="nc" id="L491">                .setDirectories(new ArrayList&lt;&gt;(directoryMap.values()));</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

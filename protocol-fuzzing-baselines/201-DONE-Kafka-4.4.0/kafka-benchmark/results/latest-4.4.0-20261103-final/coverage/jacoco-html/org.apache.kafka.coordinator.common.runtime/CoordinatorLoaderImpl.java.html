@@ -1,0 +1,352 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CoordinatorLoaderImpl.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.common.runtime</a> &gt; <span class="el_source">CoordinatorLoaderImpl.java</span></div><h1>CoordinatorLoaderImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.coordinator.common.runtime;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
+import org.apache.kafka.common.record.internal.ControlRecordType;
+import org.apache.kafka.common.record.internal.FileRecords;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.MutableRecordBatch;
+import org.apache.kafka.common.record.internal.Record;
+import org.apache.kafka.common.record.internal.Records;
+import org.apache.kafka.common.requests.TransactionResult;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.server.storage.log.FetchIsolation;
+import org.apache.kafka.server.util.KafkaScheduler;
+import org.apache.kafka.storage.internals.log.FetchDataInfo;
+import org.apache.kafka.storage.internals.log.UnifiedLog;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+
+/**
+ * Coordinator loader which reads records from a partition and replays them
+ * to a group coordinator.
+ *
+ * @param &lt;T&gt; The record type.
+ */
+public class CoordinatorLoaderImpl&lt;T&gt; implements CoordinatorLoader&lt;T&gt; {
+
+    /**
+     * The interval between updating the last committed offset during loading, in offsets. Smaller
+     * values commit more often at the expense of loading times when the workload is simple and does
+     * not create collections that need to participate in {@link CoordinatorPlayback} snapshotting.
+     * Larger values commit less often and allow more temporary data to accumulate before the next
+     * commit when the workload creates many temporary collections that need to be snapshotted.
+     *
+     * The value of 16,384 was chosen as a trade-off between the performance of these two workloads.
+     *
+     * When changing this value, please run the GroupCoordinatorShardLoadingBenchmark to evaluate
+     * the relative change in performance.
+     */
+    public static final long DEFAULT_COMMIT_INTERVAL_OFFSETS = 16384;
+
+<span class="nc" id="L67">    private static final Logger LOG = LoggerFactory.getLogger(CoordinatorLoaderImpl.class);</span>
+
+    private final Time time;
+    private final Function&lt;TopicPartition, Optional&lt;UnifiedLog&gt;&gt; partitionLogSupplier;
+    private final Function&lt;TopicPartition, Optional&lt;Long&gt;&gt; partitionLogEndOffsetSupplier;
+    private final Deserializer&lt;T&gt; deserializer;
+    private final int loadBufferSize;
+    private final long commitIntervalOffsets;
+
+<span class="nc" id="L76">    private final AtomicBoolean isRunning = new AtomicBoolean(true);</span>
+<span class="nc" id="L77">    private final KafkaScheduler scheduler = new KafkaScheduler(1);</span>
+
+    public CoordinatorLoaderImpl(
+        Time time,
+        Function&lt;TopicPartition, Optional&lt;UnifiedLog&gt;&gt; partitionLogSupplier,
+        Function&lt;TopicPartition, Optional&lt;Long&gt;&gt; partitionLogEndOffsetSupplier,
+        Deserializer&lt;T&gt; deserializer,
+        int loadBufferSize,
+        long commitIntervalOffsets
+<span class="nc" id="L86">    ) {</span>
+<span class="nc" id="L87">        this.time = time;</span>
+<span class="nc" id="L88">        this.partitionLogSupplier = partitionLogSupplier;</span>
+<span class="nc" id="L89">        this.partitionLogEndOffsetSupplier = partitionLogEndOffsetSupplier;</span>
+<span class="nc" id="L90">        this.deserializer = deserializer;</span>
+<span class="nc" id="L91">        this.loadBufferSize = loadBufferSize;</span>
+<span class="nc" id="L92">        this.commitIntervalOffsets = commitIntervalOffsets;</span>
+<span class="nc" id="L93">        this.scheduler.startup();</span>
+<span class="nc" id="L94">    }</span>
+
+    /**
+     * Loads the coordinator by reading all the records from the TopicPartition
+     * and applying them to the Replayable object.
+     *
+     * @param tp          The TopicPartition to read from.
+     * @param coordinator The object to apply records to.
+     */
+    @Override
+    public CompletableFuture&lt;LoadSummary&gt; load(TopicPartition tp, CoordinatorPlayback&lt;T&gt; coordinator) {
+<span class="nc" id="L105">        final CompletableFuture&lt;LoadSummary&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L106">        long startTimeMs = time.milliseconds();</span>
+        try {
+<span class="nc" id="L108">            ScheduledFuture&lt;?&gt; result = scheduler.scheduleOnce(String.format(&quot;Load coordinator from %s&quot;, tp),</span>
+<span class="nc" id="L109">                () -&gt; doLoad(tp, coordinator, future, startTimeMs));</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">            if (result.isCancelled()) {</span>
+<span class="nc" id="L111">                future.completeExceptionally(new RuntimeException(&quot;Coordinator loader is closed.&quot;));</span>
+            }
+<span class="nc" id="L113">        } catch (Exception e) {</span>
+<span class="nc" id="L114">            future.completeExceptionally(e);</span>
+<span class="nc" id="L115">        }</span>
+<span class="nc" id="L116">        return future;</span>
+    }
+
+    private void doLoad(
+        TopicPartition tp,
+        CoordinatorPlayback&lt;T&gt; coordinator,
+        CompletableFuture&lt;LoadSummary&gt; future,
+        long startTimeMs
+    ) {
+<span class="nc" id="L125">        long schedulerQueueTimeMs = time.milliseconds() - startTimeMs;</span>
+        try {
+<span class="nc" id="L127">            Optional&lt;UnifiedLog&gt; logOpt = partitionLogSupplier.apply(tp);</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (logOpt.isEmpty()) {</span>
+<span class="nc" id="L129">                future.completeExceptionally(new NotLeaderOrFollowerException(</span>
+                    &quot;Could not load records from &quot; + tp + &quot; because the log does not exist.&quot;));
+<span class="nc" id="L131">                return;</span>
+            }
+
+<span class="nc" id="L134">            UnifiedLog log = logOpt.get();</span>
+
+            // Buffer may not be needed if records are read from memory.
+<span class="nc" id="L137">            ByteBuffer buffer = ByteBuffer.allocate(0);</span>
+<span class="nc" id="L138">            long currentOffset = log.logStartOffset();</span>
+<span class="nc" id="L139">            LoadStats stats = new LoadStats();</span>
+
+<span class="nc" id="L141">            long lastCommittedOffset = -1L;</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">            while (shouldFetchNextBatch(currentOffset, logEndOffset(tp), stats.readAtLeastOneRecord)) {</span>
+<span class="nc" id="L143">                FetchDataInfo fetchDataInfo = log.read(currentOffset, loadBufferSize, FetchIsolation.LOG_END, true);</span>
+
+<span class="nc bnc" id="L145" title="All 2 branches missed.">                stats.readAtLeastOneRecord = fetchDataInfo.records.sizeInBytes() &gt; 0;</span>
+
+                // Reuses a potentially larger buffer by updating it when reading from FileRecords.
+<span class="nc" id="L148">                MemoryRecords memoryRecords = toReadableMemoryRecords(tp, fetchDataInfo.records, buffer);</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">                if (fetchDataInfo.records instanceof FileRecords) {</span>
+<span class="nc" id="L150">                    buffer = memoryRecords.buffer();</span>
+                }
+
+<span class="nc" id="L153">                ReplayResult replayResult = processMemoryRecords(tp, log, memoryRecords, coordinator, stats, currentOffset, lastCommittedOffset);</span>
+<span class="nc" id="L154">                currentOffset = replayResult.nextOffset;</span>
+<span class="nc" id="L155">                lastCommittedOffset = replayResult.lastCommittedOffset;</span>
+<span class="nc" id="L156">            }</span>
+
+<span class="nc" id="L158">            long endTimeMs = time.milliseconds();</span>
+
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            if (logEndOffset(tp) == -1L) {</span>
+<span class="nc" id="L161">                future.completeExceptionally(new NotLeaderOrFollowerException(</span>
+<span class="nc" id="L162">                    String.format(&quot;Stopped loading records from %s because the partition is not online or is no longer the leader.&quot;, tp)));</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">            } else if (isRunning.get()) {</span>
+<span class="nc" id="L164">                future.complete(new LoadSummary(startTimeMs, endTimeMs, schedulerQueueTimeMs, stats.numRecords, stats.numBytes));</span>
+            } else {
+<span class="nc" id="L166">                future.completeExceptionally(new RuntimeException(&quot;Coordinator loader is closed.&quot;));</span>
+            }
+<span class="nc" id="L168">        } catch (Throwable ex) {</span>
+<span class="nc" id="L169">            future.completeExceptionally(ex);</span>
+<span class="nc" id="L170">        }</span>
+<span class="nc" id="L171">    }</span>
+
+    private long logEndOffset(TopicPartition tp) {
+<span class="nc" id="L174">        return partitionLogEndOffsetSupplier.apply(tp).orElse(-1L);</span>
+    }
+
+    /**
+     * Returns true if it's still valid to fetch the next batch of records.
+     * &lt;p&gt;
+     * This method ensures fetching continues only under safe and meaningful conditions:
+     * &lt;ul&gt;
+     * &lt;li&gt;The current offset is less than the log end offset.&lt;/li&gt;
+     * &lt;li&gt;At least one record was read in the previous fetch. This ensures that fetching stops even if the
+     * current offset remains smaller than the log end offset but the log is empty. This could happen with compacted topics.&lt;/li&gt;
+     * &lt;li&gt;The log end offset is not -1L, which ensures the partition is online and is still the leader.&lt;/li&gt;
+     * &lt;li&gt;The loader is still running.&lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+    private boolean shouldFetchNextBatch(long currentOffset, long logEndOffset, boolean readAtLeastOneRecord) {
+<span class="nc bnc" id="L190" title="All 6 branches missed.">        return currentOffset &lt; logEndOffset &amp;&amp; readAtLeastOneRecord &amp;&amp; isRunning.get();</span>
+    }
+
+    private MemoryRecords toReadableMemoryRecords(TopicPartition tp, Records records, ByteBuffer buffer) throws IOException {
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (records instanceof MemoryRecords memoryRecords) {</span>
+<span class="nc" id="L195">            return memoryRecords;</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        } else if (records instanceof FileRecords fileRecords) {</span>
+<span class="nc" id="L197">            int sizeInBytes = fileRecords.sizeInBytes();</span>
+<span class="nc" id="L198">            int bytesNeeded = Math.max(loadBufferSize, sizeInBytes);</span>
+
+            // minOneMessage = true in the above log.read() means that the buffer may need to
+            // be grown to ensure progress can be made.
+<span class="nc bnc" id="L202" title="All 2 branches missed.">            if (buffer.capacity() &lt; bytesNeeded) {</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">                if (loadBufferSize &lt; bytesNeeded) {</span>
+<span class="nc" id="L204">                    LOG.warn(&quot;Loaded metadata from {} with buffer larger ({} bytes) than&quot; +</span>
+<span class="nc" id="L205">                        &quot; configured buffer size ({} bytes).&quot;, tp, bytesNeeded, loadBufferSize);</span>
+                }
+
+<span class="nc" id="L208">                buffer = ByteBuffer.allocate(bytesNeeded);</span>
+            } else {
+<span class="nc" id="L210">                buffer.clear();</span>
+            }
+
+<span class="nc" id="L213">            fileRecords.readInto(buffer, 0);</span>
+<span class="nc" id="L214">            return MemoryRecords.readableRecords(buffer);</span>
+        } else {
+<span class="nc" id="L216">            throw new IllegalArgumentException(&quot;Unsupported record type: &quot; + records.getClass());</span>
+        }
+    }
+
+    private ReplayResult processMemoryRecords(
+        TopicPartition tp,
+        UnifiedLog log,
+        MemoryRecords memoryRecords,
+        CoordinatorPlayback&lt;T&gt; coordinator,
+        LoadStats loadStats,
+        long currentOffset,
+        long lastCommittedOffset
+    ) {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        for (MutableRecordBatch batch : memoryRecords.batches()) {</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            if (batch.isControlBatch()) {</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">                for (Record record : batch) {</span>
+<span class="nc" id="L232">                    loadStats.numRecords++;</span>
+
+<span class="nc" id="L234">                    ControlRecordType controlRecord = ControlRecordType.parse(record.key());</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                    if (controlRecord == ControlRecordType.COMMIT) {</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">                        if (LOG.isTraceEnabled()) {</span>
+<span class="nc" id="L237">                            LOG.trace(&quot;Replaying end transaction marker from {} at offset {} to commit&quot; +</span>
+                                &quot; transaction with producer id {} and producer epoch {}.&quot;,
+<span class="nc" id="L239">                                tp, record.offset(), batch.producerId(), batch.producerEpoch());</span>
+                        }
+<span class="nc" id="L241">                        coordinator.replayEndTransactionMarker(</span>
+<span class="nc" id="L242">                                batch.producerId(),</span>
+<span class="nc" id="L243">                                batch.producerEpoch(),</span>
+                                TransactionResult.COMMIT
+                        );
+<span class="nc bnc" id="L246" title="All 2 branches missed.">                    } else if (controlRecord == ControlRecordType.ABORT) {</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                        if (LOG.isTraceEnabled()) {</span>
+<span class="nc" id="L248">                            LOG.trace(&quot;Replaying end transaction marker from {} at offset {} to abort&quot; +</span>
+                                &quot; transaction with producer id {} and producer epoch {}.&quot;,
+<span class="nc" id="L250">                                tp, record.offset(), batch.producerId(), batch.producerEpoch());</span>
+                        }
+<span class="nc" id="L252">                        coordinator.replayEndTransactionMarker(</span>
+<span class="nc" id="L253">                                batch.producerId(),</span>
+<span class="nc" id="L254">                                batch.producerEpoch(),</span>
+                                TransactionResult.ABORT
+                        );
+                    }
+<span class="nc" id="L258">                }</span>
+            } else {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                for (Record record : batch) {</span>
+<span class="nc" id="L261">                    loadStats.numRecords++;</span>
+
+<span class="nc" id="L263">                    Optional&lt;T&gt; coordinatorRecordOpt = Optional.empty();</span>
+                    try {
+<span class="nc" id="L265">                        coordinatorRecordOpt = Optional.ofNullable(deserializer.deserialize(record.key(), record.value()));</span>
+<span class="nc" id="L266">                    } catch (Deserializer.UnknownRecordTypeException ex) {</span>
+<span class="nc" id="L267">                        LOG.warn(&quot;Unknown record type {} while loading offsets and group metadata from {}.&quot; +</span>
+<span class="nc" id="L268">                            &quot; Ignoring it. It could be a left over from an aborted upgrade.&quot;, ex.unknownType(), tp);</span>
+<span class="nc" id="L269">                    } catch (RuntimeException ex) {</span>
+<span class="nc" id="L270">                        String msg = String.format(&quot;Deserializing record %s from %s failed.&quot;, record, tp);</span>
+<span class="nc" id="L271">                        LOG.error(msg, ex);</span>
+<span class="nc" id="L272">                        throw new RuntimeException(msg, ex);</span>
+<span class="nc" id="L273">                    }</span>
+
+<span class="nc" id="L275">                    coordinatorRecordOpt.ifPresent(coordinatorRecord -&gt; {</span>
+                        try {
+<span class="nc bnc" id="L277" title="All 2 branches missed.">                            if (LOG.isTraceEnabled()) {</span>
+<span class="nc" id="L278">                                LOG.trace(&quot;Replaying record {} from {} at offset {} with producer id {}&quot; +</span>
+<span class="nc" id="L279">                                    &quot; and producer epoch {}.&quot;, coordinatorRecord, tp, record.offset(), batch.producerId(), batch.producerEpoch());</span>
+                            }
+<span class="nc" id="L281">                            coordinator.replay(</span>
+<span class="nc" id="L282">                                record.offset(),</span>
+<span class="nc" id="L283">                                batch.producerId(),</span>
+<span class="nc" id="L284">                                batch.producerEpoch(),</span>
+                                coordinatorRecord
+                            );
+<span class="nc" id="L287">                        } catch (RuntimeException ex) {</span>
+<span class="nc" id="L288">                            String msg = String.format(&quot;Replaying record %s from %s at offset %d with producer id %d and&quot; +</span>
+<span class="nc" id="L289">                                &quot; producer epoch %d failed.&quot;, coordinatorRecord, tp, record.offset(),</span>
+<span class="nc" id="L290">                                batch.producerId(), batch.producerEpoch());</span>
+<span class="nc" id="L291">                            LOG.error(msg, ex);</span>
+<span class="nc" id="L292">                            throw new RuntimeException(msg, ex);</span>
+<span class="nc" id="L293">                        }</span>
+<span class="nc" id="L294">                    });</span>
+<span class="nc" id="L295">                }</span>
+            }
+
+            // Note that the high watermark can be greater than the current offset but as we load more records
+            // the current offset will eventually surpass the high watermark. Also note that the high watermark
+            // will continue to advance while loading.
+<span class="nc" id="L301">            currentOffset = batch.nextOffset();</span>
+<span class="nc" id="L302">            long currentHighWatermark = log.highWatermark();</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            if (currentOffset &gt;= currentHighWatermark) {</span>
+<span class="nc" id="L304">                coordinator.updateLastWrittenOffset(currentOffset);</span>
+
+<span class="nc bnc" id="L306" title="All 2 branches missed.">                if (currentHighWatermark &gt; lastCommittedOffset) {</span>
+<span class="nc" id="L307">                    coordinator.updateLastCommittedOffset(currentHighWatermark);</span>
+<span class="nc" id="L308">                    lastCommittedOffset = currentHighWatermark;</span>
+                }
+<span class="nc bnc" id="L310" title="All 2 branches missed.">            } else if (currentOffset - lastCommittedOffset &gt;= commitIntervalOffsets) {</span>
+<span class="nc" id="L311">                coordinator.updateLastWrittenOffset(currentOffset);</span>
+<span class="nc" id="L312">                coordinator.updateLastCommittedOffset(currentOffset);</span>
+<span class="nc" id="L313">                lastCommittedOffset = currentOffset;</span>
+            }
+<span class="nc" id="L315">        }</span>
+<span class="nc" id="L316">        loadStats.numBytes += memoryRecords.sizeInBytes();</span>
+<span class="nc" id="L317">        return new ReplayResult(currentOffset, lastCommittedOffset);</span>
+    }
+
+    /**
+     * Closes the loader.
+     */
+    @Override
+    public void close() throws Exception {
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (!isRunning.compareAndSet(true, false)) {</span>
+<span class="nc" id="L326">            LOG.warn(&quot;Coordinator loader is already shutting down.&quot;);</span>
+<span class="nc" id="L327">            return;</span>
+        }
+<span class="nc" id="L329">        scheduler.shutdown();</span>
+<span class="nc" id="L330">    }</span>
+
+    /**
+     * A helper class to track key metrics during the data loading operation.
+     */
+<span class="nc" id="L335">    private static class LoadStats {</span>
+<span class="nc" id="L336">        private long numRecords = 0L;</span>
+<span class="nc" id="L337">        private long numBytes = 0L;</span>
+<span class="nc" id="L338">        private boolean readAtLeastOneRecord = true;</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L342">            return &quot;LoadStats(&quot; +</span>
+                &quot;numRecords=&quot; + numRecords +
+                &quot;, numBytes=&quot; + numBytes +
+                &quot;, readAtLeastOneRecord=&quot; + readAtLeastOneRecord +
+                ')';
+        }
+    }
+
+<span class="nc" id="L350">    private record ReplayResult(long nextOffset, long lastCommittedOffset) { }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

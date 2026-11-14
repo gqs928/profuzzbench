@@ -1,0 +1,204 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "str.h"
+#include "net.h"
+#include "json-istream.h"
+#include "istream.h"
+#include "auth-gs2.h"
+#include "sasl-oauth2.h"
+#include "dsasl-client-private.h"
+
+struct oauthbearer_dsasl_client {
+	struct dsasl_client client;
+	const char *status;
+	bool output_sent;
+};
+
+static enum dsasl_client_result
+mech_oauthbearer_input(struct dsasl_client *_client,
+		       const unsigned char *input, size_t input_len,
+		       const char **error_r)
+{
+	struct oauthbearer_dsasl_client *client =
+		container_of(_client, struct oauthbearer_dsasl_client, client);
+
+	if (!client->output_sent) {
+		if (input_len > 0) {
+			*error_r = "Server sent non-empty initial response";
+			return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
+		}
+	} else {
+		client->status = "";
+		/* if response is empty, authentication has *SUCCEEDED* */
+		if (input_len == 0)
+			return DSASL_CLIENT_RESULT_OK;
+
+		/* authentication has failed, try parse status.
+		   we are only interested in extracting status if possible
+		   so we don't really need to much error handling. */
+		struct istream *is = i_stream_create_from_data(input, input_len);
+		struct json_node jnode;
+		struct json_istream *jis = json_istream_create_object(
+			is, NULL, JSON_PARSER_FLAG_NUMBERS_AS_STRING);
+		const char *error;
+		int ret;
+
+		i_stream_unref(&is);
+
+		ret = 1;
+		while (ret > 0) {
+			ret = json_istream_read(jis, &jnode);
+			i_assert(ret != 0);
+			if (ret < 0)
+				break;
+			i_assert(jnode.name != NULL);
+			if (strcmp(jnode.name, "status") == 0) {
+				if (!json_node_is_string(&jnode) &&
+				    !json_node_is_number(&jnode)) {
+					*error_r = "Status field in response is not a string or a number.";
+					return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
+				}
+				client->status = p_strdup(
+					_client->pool,
+					json_node_get_str(&jnode));
+			}
+			json_istream_skip(jis);
+		}
+
+		ret = json_istream_finish(&jis, &error);
+		i_assert(ret != 0);
+		if (ret < 0) {
+			*error_r = t_strdup_printf(
+				"Error parsing JSON reply: %s", error);
+			return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
+		}
+
+		if (client->status == NULL) {
+			*error_r = "Error parsing JSON reply: "
+				"Status value missing";
+			return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
+		}
+
+		*error_r = t_strdup_printf("Failed to authenticate: %s",
+					   client->status);
+		return DSASL_CLIENT_RESULT_AUTH_FAILED;
+	}
+	return DSASL_CLIENT_RESULT_OK;
+}
+
+static enum dsasl_client_result
+mech_oauthbearer_output(struct dsasl_client *_client,
+			const unsigned char **output_r, size_t *output_len_r,
+			const char **error_r)
+{
+	struct oauthbearer_dsasl_client *client =
+		container_of(_client, struct oauthbearer_dsasl_client, client);
+	string_t *str;
+
+	if (_client->set.authid == NULL) {
+		*error_r = "authid not set";
+		return DSASL_CLIENT_RESULT_ERR_INTERNAL;
+	}
+	if (_client->password == NULL) {
+		*error_r = "password not set";
+		return DSASL_CLIENT_RESULT_ERR_INTERNAL;
+	}
+	if (!sasl_oauth2_kvpair_check_value(_client->password)) {
+		*error_r = "password contains unsupported characters";
+		return DSASL_CLIENT_RESULT_ERR_INTERNAL;
+	}
+	if (_client->set.host != NULL &&
+	    !sasl_oauth2_kvpair_check_value(_client->set.host)) {
+		*error_r = "host contains unsupported characters";
+		return DSASL_CLIENT_RESULT_ERR_INTERNAL;
+	}
+
+	struct auth_gs2_header gs2_header = {
+		.authzid = _client->set.authid,
+	};
+
+	str = str_new(_client->pool, 64);
+	auth_gs2_header_encode(&gs2_header, str);
+	str_append_c(str, '\x01');
+	if (_client->set.host != NULL && *_client->set.host != '\0')
+		str_printfa(str, "host=%s\x01", _client->set.host);
+	if (_client->set.port > 0)
+		str_printfa(str, "port=%u\x01", _client->set.port);
+	str_printfa(str, "auth=Bearer %s\x01", _client->password);
+	str_append_c(str, '\x01');
+
+	*output_r = str_data(str);
+	*output_len_r = str_len(str);
+	client->output_sent = TRUE;
+	return DSASL_CLIENT_RESULT_OK;
+}
+
+static enum dsasl_client_result
+mech_xoauth2_output(struct dsasl_client *_client,
+		    const unsigned char **output_r, size_t *output_len_r,
+		    const char **error_r)
+{
+	struct oauthbearer_dsasl_client *client =
+		(struct oauthbearer_dsasl_client *)_client;
+	string_t *str;
+
+	if (_client->set.authid == NULL) {
+		*error_r = "authid not set";
+		return DSASL_CLIENT_RESULT_ERR_INTERNAL;
+	}
+	if (_client->password == NULL) {
+		*error_r = "password not set";
+		return DSASL_CLIENT_RESULT_ERR_INTERNAL;
+	}
+	if (strchr(_client->password, 0x01) != NULL) {
+		*error_r = "password contains unsupported characters";
+		return DSASL_CLIENT_RESULT_ERR_INTERNAL;
+	}
+
+	str = str_new(_client->pool, 64);
+
+	str_printfa(str, "user=%s\x01", _client->set.authid);
+	str_printfa(str, "auth=Bearer %s\x01", _client->password);
+	str_append_c(str, '\x01');
+
+	*output_r = str_data(str);
+	*output_len_r = str_len(str);
+	client->output_sent = TRUE;
+	return DSASL_CLIENT_RESULT_OK;
+}
+
+static int
+mech_oauthbearer_get_result(struct dsasl_client *_client, const char *key,
+			    const char **value_r,
+			    const char **error_r ATTR_UNUSED)
+{
+	struct oauthbearer_dsasl_client *client =
+		container_of(_client, struct oauthbearer_dsasl_client, client);
+
+	if (strcmp(key, "status") == 0) {
+		/* this is set to value after login attempt */
+		i_assert(client->status != NULL);
+		*value_r = client->status;
+		return 1;
+	}
+	return 0;
+}
+
+const struct dsasl_client_mech dsasl_client_mech_oauthbearer = {
+	.name = SASL_MECH_NAME_OAUTHBEARER,
+	.struct_size = sizeof(struct oauthbearer_dsasl_client),
+
+	.input = mech_oauthbearer_input,
+	.output = mech_oauthbearer_output,
+	.get_result = mech_oauthbearer_get_result,
+};
+
+const struct dsasl_client_mech dsasl_client_mech_xoauth2 = {
+	.name = SASL_MECH_NAME_XOAUTH2,
+	.struct_size = sizeof(struct oauthbearer_dsasl_client),
+
+	.input = mech_oauthbearer_input,
+	.output = mech_xoauth2_output,
+	.get_result = mech_oauthbearer_get_result,
+};

@@ -1,0 +1,400 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "lib-signals.h"
+#include "hostpid.h"
+#include "array.h"
+#include "ioloop.h"
+#include "sleep.h"
+#include "time-util.h"
+#include "test-common.h"
+#include "test-private.h"
+#include "test-subprocess.h"
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+struct test_subprocess {
+	pid_t pid;
+};
+
+volatile sig_atomic_t test_subprocess_child_mark = 0;
+static volatile bool test_subprocess_notification_signal_received[SIGUSR1 + 1];
+static ARRAY(struct test_subprocess *) test_subprocesses = ARRAY_INIT;
+static void
+test_subprocess_notification_signal(const siginfo_t *si, void *context);
+
+static void
+test_subprocess_signal(const siginfo_t *si ATTR_UNUSED,
+		       void *context ATTR_UNUSED)
+{
+	io_loop_stop(current_ioloop);
+}
+
+static void test_subprocess_free_all(void)
+{
+	struct test_subprocess *subp;
+
+	if (!array_is_created(&test_subprocesses))
+		return;
+	array_foreach_elem(&test_subprocesses, subp)
+		i_free(subp);
+	array_free(&test_subprocesses);
+}
+
+static void ATTR_NORETURN
+test_subprocess_child(int (*func)(void *context), void *context,
+		      bool continue_test)
+{
+	int ret;
+
+	if (!continue_test)
+		test_forked_end();
+
+	hostpid_init();
+
+	lib_signals_deinit();
+	lib_signals_init();
+
+	lib_signals_set_handler(SIGTERM,
+		LIBSIG_FLAG_DELAYED | LIBSIG_FLAG_IOLOOP_AUTOMOVE,
+		test_subprocess_signal, NULL);
+	lib_signals_set_handler(SIGQUIT,
+		LIBSIG_FLAG_DELAYED | LIBSIG_FLAG_IOLOOP_AUTOMOVE,
+		test_subprocess_signal, NULL);
+	lib_signals_set_handler(SIGINT,
+		LIBSIG_FLAG_DELAYED | LIBSIG_FLAG_IOLOOP_AUTOMOVE,
+		test_subprocess_signal, NULL);
+	lib_signals_set_handler(SIGUSR1, LIBSIG_FLAG_RESTART,
+		test_subprocess_notification_signal, NULL);
+
+	ret = func(context);
+
+	/* Prevent race condition */
+	lib_signals_clear_handlers_and_ignore(SIGTERM);
+
+	test_forked_deinit();
+	lib_signals_deinit();
+
+	if (!continue_test) {
+		lib_deinit();
+		lib_exit(ret);
+	}
+	test_exit((test_has_failed() ? 1 : 0));
+}
+
+#undef test_subprocess_fork
+pid_t test_subprocess_fork(int (*func)(void *context), void *context,
+			   bool continue_test)
+{
+	struct test_subprocess *subprocess;
+
+	subprocess = i_new(struct test_subprocess, 1);
+
+	lib_signals_ioloop_detach();
+
+	/* avoid races: fork the child process with test_subprocess_is_child
+	   set to 1 in case it immediately receives a signal. */
+	test_subprocess_child_mark = 1;
+	if ((subprocess->pid = fork()) == (pid_t)-1)
+		i_fatal("test: sub-process: fork() failed: %m");
+	if (subprocess->pid == 0) {
+		/* cannot include this in the list to avoid accidental
+		 * kill of PID 0, so just free it here explicitly. */
+		i_free(subprocess);
+		io_loop_recreate(current_ioloop);
+
+		test_subprocess_child_mark = 1;
+		test_subprocess_free_all();
+
+		test_subprocess_child(func, context, continue_test);
+		i_unreached();
+	}
+	test_subprocess_child_mark = 0;
+
+	array_push_back(&test_subprocesses, &subprocess);
+	lib_signals_ioloop_attach();
+	return subprocess->pid;
+}
+
+static void test_subprocess_verify_exit_status(int status)
+{
+	test_out_quiet("sub-process ended properly",
+		       WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (WIFEXITED(status)) {
+		if (WEXITSTATUS(status) != 0) {
+			e_warning(test_event,
+				  "Sub-process exited with status %d",
+				  WEXITSTATUS(status));
+		}
+	} else if (WIFSIGNALED(status)) {
+		e_warning(test_event,
+			  "Sub-process forcibly terminated with signal %d",
+		          WTERMSIG(status));
+	} else if (WIFSTOPPED(status)) {
+		e_warning(test_event,
+			  "Sub-process stopped with signal %d",
+			  WSTOPSIG(status));
+	} else {
+		e_warning(test_event,
+			  "Sub-process terminated abnormally with status %d",
+			  status);
+	}
+}
+
+static void test_subprocess_kill_forced(struct test_subprocess *subp)
+{
+	i_assert(subp->pid > 0);
+	(void)kill(subp->pid, SIGKILL);
+	(void)waitpid(subp->pid, NULL, 0);
+}
+
+static void
+test_subprocess_wait_for_children(unsigned int timeout_secs,
+				  unsigned int *subps_left_r)
+{
+	struct timeval tv_now;
+	struct test_subprocess **subps;
+	unsigned int subps_count, subps_left, i;
+	time_t deadline;
+
+	subps = array_get_modifiable(&test_subprocesses, &subps_count);
+	subps_left = 0;
+	for (i = 0; i < subps_count; i++) {
+		if (subps[i] == NULL ||
+		    subps[i]->pid == (pid_t)-1)
+			continue;
+		subps_left++;
+	}
+	if (timeout_secs == 0 || subps_left == 0) {
+		*subps_left_r = subps_left;
+		return;
+	}
+
+	i_gettimeofday(&tv_now);
+	deadline = tv_now.tv_sec + timeout_secs;
+
+	while (subps_left > 0) {
+		i_gettimeofday(&tv_now);
+		if (tv_now.tv_sec >= deadline)
+			break;
+
+		unsigned int timeout_left = deadline - tv_now.tv_sec;
+		int status;
+		pid_t wret = (pid_t)-1;
+
+		alarm(timeout_left);
+		wret = waitpid(-1, &status, 0);
+		alarm(0);
+
+		i_assert(wret != 0);
+		test_assert(wret > 0 || errno == ECHILD);
+		if (wret < 0) {
+			if (errno == EINTR) {
+				e_warning(test_event,
+					  "Wait for sub-processes timed out");
+				break;
+			}
+			if (errno == ECHILD) {
+				/* No more children apparently */
+				for (i = 0; i < subps_count; i++) {
+					if (subps[i] == NULL ||
+					   subps[i]->pid == (pid_t)-1)
+						continue;
+					i_assert(subps_left > 0);
+					i_free(subps[i]);
+					subps_left--;
+				}
+				i_assert(subps_left == 0);
+				break;
+			}
+			e_warning(test_event,
+				  "Wait for sub-processes failed: %m");
+			break;
+		}
+		if (wret > 0)
+			test_subprocess_verify_exit_status(status);
+		for (i = 0; i < subps_count; i++) {
+			if (subps[i] == NULL || subps[i]->pid != wret)
+				continue;
+			e_debug(test_event,
+				"Terminated sub-process [%u]", i);
+			i_free(subps[i]);
+			subps_left--;
+		}
+	}
+
+	*subps_left_r = subps_left;
+}
+
+void test_subprocess_wait_all(unsigned int timeout_secs)
+{
+	unsigned int subps_left ATTR_UNUSED;
+
+	test_subprocess_wait_for_children(timeout_secs, &subps_left);
+}
+
+void test_subprocess_kill_all(unsigned int timeout_secs)
+{
+	struct test_subprocess **subps;
+	unsigned int subps_count, subps_left, i;
+
+	subps = array_get_modifiable(&test_subprocesses, &subps_count);
+
+	/* Request children to terminate gently */
+	for (i = 0; i < subps_count; i++) {
+		if (subps[i] == NULL || subps[i]->pid == (pid_t)-1)
+			continue;
+
+		e_debug(test_event,
+			"Terminating sub-process [%u]", i);
+		if (kill(subps[i]->pid, SIGTERM) < 0) {
+			e_error(test_event,
+				"Failed to kill sub-process [%u] with SIGTERM: "
+				"%m", i);
+		}
+	}
+
+	/* Wait for children */
+	test_subprocess_wait_for_children(timeout_secs, &subps_left);
+
+	/* Kill disobedient ones with fire */
+	for (i = 0; i < subps_count; i++) {
+		if (subps[i] == NULL || subps[i]->pid == (pid_t)-1)
+			continue;
+		e_warning(test_event, "Forcibly killed sub-process [%u]", i);
+		test_subprocess_kill_forced(subps[i]);
+		i_assert(subps_left > 0);
+		i_free(subps[i]);
+		subps_left--;
+	}
+	i_assert(subps_left == 0);
+
+	array_clear(&test_subprocesses);
+}
+
+static void test_subprocess_kill_all_forced(void)
+{
+	struct test_subprocess **subps;
+	unsigned int subps_count, i;
+
+	if (!array_is_created(&test_subprocesses))
+		return;
+
+	/* This is also called from signal handler context, so no debug logging
+	   here.
+	 */
+
+	subps = array_get_modifiable(&test_subprocesses, &subps_count);
+
+	if (subps_count == 0)
+		return;
+
+	for (i = 0; i < subps_count; i++) {
+		if (subps[i] == NULL || subps[i]->pid == (pid_t)-1)
+			continue;
+		test_subprocess_kill_forced(subps[i]);
+		subps[i]->pid = (pid_t)-1;
+	}
+}
+
+/*
+ * Main
+ */
+
+bool test_subprocess_is_child(void)
+{
+	return (test_subprocess_child_mark != 0);
+}
+
+void test_subprocess_cleanup(void)
+{
+	/* We get here when the test ended normally, badly failed, crashed,
+	   terminated, or executed exit() unexpectedly. The cleanups performed
+	   here are important and must be executed at all times. */
+
+	/* While any unfreed memory will be handled by the system, lingering
+	   child processes will not be handled so well. So, we need to make sure
+	   here that we don't leave any pesky child processes alive. */
+	test_subprocess_kill_all_forced();
+}
+
+static void
+test_subprocess_alarm(const siginfo_t *si ATTR_UNUSED,
+		      void *context ATTR_UNUSED)
+{
+	/* We use alarm() to implement a simple timeout on waitpid(), which will
+	   exit with EINTR when SIGALRM is received. This handler overrides the
+	   default SIGALRM handler, so that the process is not killed and no
+	   messages are printed to terminal.
+	 */
+}
+
+void test_subprocess_notify_signal_send(int signo, pid_t pid)
+{
+	if (kill(pid, signo) < 0)
+		i_fatal("kill(%ld, SIG %d) failed: %m", (long)pid, signo);
+}
+
+void test_subprocess_notify_signal_send_parent(int signo)
+{
+	test_subprocess_notify_signal_send(signo, getppid());
+}
+
+void test_subprocess_notify_signal_all(int signo)
+{
+	struct test_subprocess *subprocess;
+	array_foreach_elem(&test_subprocesses, subprocess)
+		test_subprocess_notify_signal_send(signo, subprocess->pid);
+}
+
+void test_subprocess_notify_signal_reset(int signo)
+{
+	i_assert(signo >= 0 &&
+		 (unsigned int)signo < N_ELEMENTS(test_subprocess_notification_signal_received));
+	test_subprocess_notification_signal_received[signo] = FALSE;
+}
+
+void test_subprocess_notify_signal_wait(int signo, unsigned int timeout_msecs)
+{
+	unsigned int i, count = timeout_msecs / 10;
+
+	for (i = 0; i < count; i++) {
+		if (test_subprocess_notification_signal_received[signo])
+			return;
+		i_sleep_msecs(10);
+	}
+	i_fatal("Didn't receive wait notification signal from server");
+}
+
+static void
+test_subprocess_notification_signal(const siginfo_t *si,
+				    void *context ATTR_UNUSED)
+{
+	int signo = si->si_signo;
+
+	i_assert(signo >= 0 &&
+		 (unsigned int)signo < N_ELEMENTS(test_subprocess_notification_signal_received));
+	test_subprocess_notification_signal_received[signo] = TRUE;
+}
+
+void test_subprocesses_init(void)
+{
+	test_init();
+	test_init_signals();
+	lib_signals_set_handler(SIGHUP, LIBSIG_FLAG_RESTART,
+				test_subprocess_notification_signal, NULL);
+	lib_signals_set_handler(SIGUSR1, LIBSIG_FLAG_RESTART,
+				test_subprocess_notification_signal, NULL);
+	lib_signals_set_handler(SIGALRM, 0, test_subprocess_alarm, NULL);
+
+	i_array_init(&test_subprocesses, 8);
+}
+
+void test_subprocesses_deinit(void)
+{
+	test_subprocess_cleanup();
+	test_subprocess_free_all();
+	array_free(&test_subprocesses);
+}

@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AddPartitionsToTxnManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.transaction</a> &gt; <span class="el_source">AddPartitionsToTxnManager.java</span></div><h1>AddPartitionsToTxnManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.server.transaction;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.NetworkClient;
+import org.apache.kafka.clients.RequestCompletionHandler;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.internals.Topic;
+import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.AddPartitionsToTxnTopic;
+import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.AddPartitionsToTxnTopicCollection;
+import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.AddPartitionsToTxnTransaction;
+import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.AddPartitionsToTxnTransactionCollection;
+import org.apache.kafka.common.message.AddPartitionsToTxnResponseData;
+import org.apache.kafka.common.network.ListenerName;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.AddPartitionsToTxnRequest;
+import org.apache.kafka.common.requests.AddPartitionsToTxnResponse;
+import org.apache.kafka.common.requests.MetadataResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.metadata.MetadataCache;
+import org.apache.kafka.server.config.AbstractKafkaConfig;
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+import org.apache.kafka.server.util.InterBrokerSendThread;
+import org.apache.kafka.server.util.RequestAndCompletionHandler;
+
+import com.yammer.metrics.core.Histogram;
+import com.yammer.metrics.core.Meter;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.server.transaction.AddPartitionsToTxnManager.TransactionSupportedOperation.ADD_PARTITION;
+import static org.apache.kafka.server.transaction.AddPartitionsToTxnManager.TransactionSupportedOperation.DEFAULT_ERROR;
+import static org.apache.kafka.server.transaction.AddPartitionsToTxnManager.TransactionSupportedOperation.GENERIC_ERROR_SUPPORTED;
+
+public class AddPartitionsToTxnManager extends InterBrokerSendThread {
+
+    public static final String VERIFICATION_FAILURE_RATE_METRIC_NAME = &quot;VerificationFailureRate&quot;;
+    public static final String VERIFICATION_TIME_MS_METRIC_NAME = &quot;VerificationTimeMs&quot;;
+
+    /**
+     * handles the Partition Response based on the Request Version and the exact operation.
+     */
+<span class="nc" id="L70">    public enum TransactionSupportedOperation {</span>
+        /**
+         * This is the default workflow which maps to cases when the Produce Request Version or the
+         * Txn_offset_commit request was lower than the first version supporting the new Error Class.
+         */
+<span class="nc" id="L75">        DEFAULT_ERROR(false),</span>
+        /**
+         * This maps to the case when the clients are updated to handle the TransactionAbortableException.
+         */
+<span class="nc" id="L79">        GENERIC_ERROR_SUPPORTED(false),</span>
+        /**
+         * This allows the partition to be added to the transactions inflight with the Produce and TxnOffsetCommit requests.
+         * Plus the behaviors in genericErrorSupported.
+         */
+<span class="nc" id="L84">        ADD_PARTITION(true);</span>
+
+        public final boolean supportsEpochBump;
+
+<span class="nc" id="L88">        TransactionSupportedOperation(boolean supportsEpochBump) {</span>
+<span class="nc" id="L89">            this.supportsEpochBump = supportsEpochBump;</span>
+<span class="nc" id="L90">        }</span>
+    }
+
+    @FunctionalInterface
+    public interface AppendCallback {
+        void complete(Map&lt;TopicPartition, Errors&gt; partitionErrors);
+    }
+
+    public static TransactionSupportedOperation produceRequestVersionToTransactionSupportedOperation(short version) {
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        if (version &gt; 11) {</span>
+<span class="nc" id="L100">            return ADD_PARTITION;</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">        } else if (version &gt; 10) {</span>
+<span class="nc" id="L102">            return GENERIC_ERROR_SUPPORTED;</span>
+        } else {
+<span class="nc" id="L104">            return DEFAULT_ERROR;</span>
+        }
+    }
+
+    public static TransactionSupportedOperation txnOffsetCommitRequestVersionToTransactionSupportedOperation(int version) {
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        if (version &gt; 4) {</span>
+<span class="nc" id="L110">            return ADD_PARTITION;</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        } else if (version &gt; 3) {</span>
+<span class="nc" id="L112">            return GENERIC_ERROR_SUPPORTED;</span>
+        } else {
+<span class="nc" id="L114">            return DEFAULT_ERROR;</span>
+        }
+    }
+
+    /*
+     * Data structure to hold the transactional data to send to a node. Note -- at most one request per transactional ID
+     * will exist at a time in the map. If a given transactional ID exists in the map, and a new request with the same ID
+     * comes in, one request will be in the map and one will return to the producer with a response depending on the epoch.
+     */
+<span class="nc" id="L123">    public record TransactionDataAndCallbacks(</span>
+            AddPartitionsToTxnTransactionCollection transactionData,
+            Map&lt;String, AppendCallback&gt; callbacks,
+            Map&lt;String, Long&gt; startTimeMs,
+            TransactionSupportedOperation transactionSupportedOperation) { }
+
+    private class AddPartitionsToTxnHandler implements RequestCompletionHandler {
+        private final Node node;
+        private final TransactionDataAndCallbacks transactionDataAndCallbacks;
+
+<span class="nc" id="L133">        public AddPartitionsToTxnHandler(Node node, TransactionDataAndCallbacks transactionDataAndCallbacks) {</span>
+<span class="nc" id="L134">            this.node = node;</span>
+<span class="nc" id="L135">            this.transactionDataAndCallbacks = transactionDataAndCallbacks;</span>
+<span class="nc" id="L136">        }</span>
+
+        @Override
+        public void onComplete(ClientResponse response) {
+            // Note: Synchronization is not needed on inflightNodes since it is always accessed from this thread.
+<span class="nc" id="L141">            inflightNodes.remove(node);</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">            if (response.authenticationException() != null) {</span>
+<span class="nc" id="L143">                log.error(&quot;AddPartitionsToTxnRequest failed for node {} with an authentication exception.&quot;, response.destination(), response.authenticationException());</span>
+<span class="nc" id="L144">                sendCallbacksToAll(Errors.forException(response.authenticationException()).code());</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">            } else if (response.versionMismatch() != null) {</span>
+                // We may see unsupported version exception if we try to send a verify only request to a broker that can't handle it.
+                // In this case, skip verification.
+<span class="nc" id="L148">                log.warn(&quot;AddPartitionsToTxnRequest failed for node {} with invalid version exception. &quot; +</span>
+<span class="nc" id="L149">                        &quot;This suggests verification is not supported. Continuing handling the produce request.&quot;, response.destination());</span>
+<span class="nc" id="L150">                transactionDataAndCallbacks.callbacks().forEach((txnId, callback) -&gt;</span>
+<span class="nc" id="L151">                        sendCallback(callback, Map.of(), transactionDataAndCallbacks.startTimeMs.get(txnId)));</span>
+<span class="nc bnc" id="L152" title="All 4 branches missed.">            } else if (response.wasDisconnected() || response.wasTimedOut()) {</span>
+<span class="nc" id="L153">                log.warn(&quot;AddPartitionsToTxnRequest failed for node {} with a network exception.&quot;, response.destination());</span>
+<span class="nc" id="L154">                sendCallbacksToAll(Errors.NETWORK_EXCEPTION.code());</span>
+            } else {
+<span class="nc" id="L156">                AddPartitionsToTxnResponseData responseData = ((AddPartitionsToTxnResponse) response.responseBody()).data();</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">                if (responseData.errorCode() != 0) {</span>
+<span class="nc" id="L158">                    log.error(&quot;AddPartitionsToTxnRequest for node {} returned with error {}.&quot;,</span>
+<span class="nc" id="L159">                            response.destination(), Errors.forCode(responseData.errorCode()));</span>
+                    // The client should not be exposed to CLUSTER_AUTHORIZATION_FAILED so modify the error to signify the verification did not complete.
+                    // Return INVALID_TXN_STATE.
+<span class="nc bnc" id="L162" title="All 2 branches missed.">                    short finalError = responseData.errorCode() == Errors.CLUSTER_AUTHORIZATION_FAILED.code()</span>
+<span class="nc" id="L163">                            ? Errors.INVALID_TXN_STATE.code() : responseData.errorCode();</span>
+<span class="nc" id="L164">                    sendCallbacksToAll(finalError);</span>
+<span class="nc" id="L165">                } else {</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                    for (AddPartitionsToTxnResponseData.AddPartitionsToTxnResult txnResult : responseData.resultsByTransaction()) {</span>
+<span class="nc" id="L167">                        Map&lt;TopicPartition, Errors&gt; unverified = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                        for (AddPartitionsToTxnResponseData.AddPartitionsToTxnTopicResult topicResult : txnResult.topicResults()) {</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">                            for (AddPartitionsToTxnResponseData.AddPartitionsToTxnPartitionResult partitionResult : topicResult.resultsByPartition()) {</span>
+<span class="nc" id="L170">                                TopicPartition tp = new TopicPartition(topicResult.name(), partitionResult.partitionIndex());</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">                                if (partitionResult.partitionErrorCode() != Errors.NONE.code()) {</span>
+                                    // Producers expect to handle INVALID_PRODUCER_EPOCH in this scenario.
+                                    short code;
+<span class="nc bnc" id="L174" title="All 2 branches missed.">                                    if (partitionResult.partitionErrorCode() == Errors.PRODUCER_FENCED.code()) {</span>
+<span class="nc" id="L175">                                        code = Errors.INVALID_PRODUCER_EPOCH.code();</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                                    } else if (partitionResult.partitionErrorCode() == Errors.TRANSACTION_ABORTABLE.code()</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">                                            &amp;&amp; transactionDataAndCallbacks.transactionSupportedOperation().equals(DEFAULT_ERROR)) { // For backward compatibility with clients</span>
+<span class="nc" id="L178">                                        code = Errors.INVALID_TXN_STATE.code();</span>
+                                    } else {
+<span class="nc" id="L180">                                        code = partitionResult.partitionErrorCode();</span>
+                                    }
+<span class="nc" id="L182">                                    unverified.put(tp, Errors.forCode(code));</span>
+                                }
+<span class="nc" id="L184">                            }</span>
+<span class="nc" id="L185">                        }</span>
+<span class="nc" id="L186">                        verificationFailureRate.mark(unverified.size());</span>
+<span class="nc" id="L187">                        AppendCallback callback = transactionDataAndCallbacks.callbacks().get(txnResult.transactionalId());</span>
+<span class="nc" id="L188">                        sendCallback(callback, unverified, transactionDataAndCallbacks.startTimeMs.get(txnResult.transactionalId()));</span>
+<span class="nc" id="L189">                    }</span>
+                }
+            }
+<span class="nc" id="L192">            wakeup();</span>
+<span class="nc" id="L193">        }</span>
+
+        private Map&lt;TopicPartition, Errors&gt; buildErrorMap(String transactionalId, short errorCode) {
+<span class="nc" id="L196">            AddPartitionsToTxnTransaction transactionData = transactionDataAndCallbacks.transactionData.find(transactionalId);</span>
+<span class="nc" id="L197">            return topicPartitionsToError(transactionData, Errors.forCode(errorCode));</span>
+        }
+
+        private void sendCallbacksToAll(short errorCode) {
+<span class="nc" id="L201">            transactionDataAndCallbacks.callbacks.forEach((txnId, cb) -&gt;</span>
+<span class="nc" id="L202">                    sendCallback(cb, buildErrorMap(txnId, errorCode), transactionDataAndCallbacks.startTimeMs.get(txnId)));</span>
+<span class="nc" id="L203">        }</span>
+    }
+
+    private final MetadataCache metadataCache;
+    private final Function&lt;String, Integer&gt; partitionFor;
+    private final Time time;
+
+    private final ListenerName interBrokerListenerName;
+<span class="nc" id="L211">    private final Set&lt;Node&gt; inflightNodes = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L212">    private final Map&lt;Node, TransactionDataAndCallbacks&gt; nodesToTransactions = new HashMap&lt;&gt;();</span>
+
+    // For compatibility - this metrics group was previously defined within
+    // a Scala class named `kafka.server.AddPartitionsToTxnManager`
+<span class="nc" id="L216">    private final KafkaMetricsGroup metricsGroup = new KafkaMetricsGroup(&quot;kafka.server&quot;, &quot;AddPartitionsToTxnManager&quot;);</span>
+<span class="nc" id="L217">    private final Meter verificationFailureRate = metricsGroup.newMeter(VERIFICATION_FAILURE_RATE_METRIC_NAME, &quot;failures&quot;, TimeUnit.SECONDS);</span>
+<span class="nc" id="L218">    private final Histogram verificationTimeMs = metricsGroup.newHistogram(VERIFICATION_TIME_MS_METRIC_NAME);</span>
+
+    public AddPartitionsToTxnManager(
+            AbstractKafkaConfig config,
+            NetworkClient client,
+            MetadataCache metadataCache,
+            Function&lt;String, Integer&gt; partitionFor,
+            Time time) {
+<span class="nc" id="L226">        super(&quot;AddPartitionsToTxnSenderThread-&quot; + config.brokerId(), client, config.requestTimeoutMs(), time);</span>
+<span class="nc" id="L227">        this.interBrokerListenerName = config.interBrokerListenerName();</span>
+<span class="nc" id="L228">        this.metadataCache = metadataCache;</span>
+<span class="nc" id="L229">        this.partitionFor = partitionFor;</span>
+<span class="nc" id="L230">        this.time = time;</span>
+<span class="nc" id="L231">    }</span>
+
+    public void addOrVerifyTransaction(
+            String transactionalId,
+            long producerId,
+            short producerEpoch,
+            Collection&lt;TopicPartition&gt; topicPartitions,
+            AppendCallback callback,
+            TransactionSupportedOperation transactionSupportedOperation) {
+<span class="nc" id="L240">        Optional&lt;Node&gt; coordinator = getTransactionCoordinator(partitionFor.apply(transactionalId));</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">        if (coordinator.isEmpty()) {</span>
+<span class="nc" id="L242">            callback.complete(topicPartitions.stream().collect(</span>
+<span class="nc" id="L243">                    Collectors.toMap(Function.identity(), tp -&gt; Errors.COORDINATOR_NOT_AVAILABLE)));</span>
+        } else {
+<span class="nc" id="L245">            AddPartitionsToTxnTopicCollection topicCollection = new AddPartitionsToTxnTopicCollection();</span>
+<span class="nc" id="L246">            topicPartitions.forEach(tp -&gt; {</span>
+<span class="nc" id="L247">                var toTxnTopic = topicCollection.find(tp.topic());</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                if (toTxnTopic == null) {</span>
+<span class="nc" id="L249">                    toTxnTopic = new AddPartitionsToTxnTopic().setName(tp.topic());</span>
+<span class="nc" id="L250">                    topicCollection.add(toTxnTopic);</span>
+                }
+<span class="nc" id="L252">                toTxnTopic.partitions().add(tp.partition());</span>
+<span class="nc" id="L253">            });</span>
+
+<span class="nc" id="L255">            AddPartitionsToTxnTransaction transactionData = new AddPartitionsToTxnTransaction()</span>
+<span class="nc" id="L256">                    .setTransactionalId(transactionalId)</span>
+<span class="nc" id="L257">                    .setProducerId(producerId)</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                    .setProducerEpoch(producerEpoch)</span>
+<span class="nc" id="L259">                    .setVerifyOnly(!transactionSupportedOperation.supportsEpochBump)</span>
+<span class="nc" id="L260">                    .setTopics(topicCollection);</span>
+
+<span class="nc" id="L262">            addTxnData(coordinator.get(), transactionData, callback, transactionSupportedOperation);</span>
+        }
+<span class="nc" id="L264">    }</span>
+
+    private void addTxnData(
+            Node node,
+            AddPartitionsToTxnTransaction transactionData,
+            AppendCallback callback,
+            TransactionSupportedOperation transactionSupportedOperation) {
+<span class="nc" id="L271">        synchronized (nodesToTransactions) {</span>
+<span class="nc" id="L272">            long curTime = time.milliseconds();</span>
+            // Check if we have already had either node or individual transaction. Add the Node if it isn't there.
+<span class="nc" id="L274">            TransactionDataAndCallbacks existingNodeAndTransactionData = nodesToTransactions.computeIfAbsent(node,</span>
+<span class="nc" id="L275">                    ignored -&gt; new TransactionDataAndCallbacks(</span>
+                            new AddPartitionsToTxnTransactionCollection(1),
+                            new HashMap&lt;&gt;(),
+                            new HashMap&lt;&gt;(),
+                            transactionSupportedOperation));
+
+<span class="nc" id="L281">            AddPartitionsToTxnTransaction existingTransactionData = existingNodeAndTransactionData.transactionData.find(transactionData.transactionalId());</span>
+
+            // There are 3 cases if we already have existing data
+            // 1. Incoming data has a higher epoch -- return INVALID_PRODUCER_EPOCH for existing data since it is fenced
+            // 2. Incoming data has the same epoch -- return NETWORK_EXCEPTION for existing data, since the client is likely retrying and we want another retriable exception
+            // 3. Incoming data has a lower epoch -- return INVALID_PRODUCER_EPOCH for the incoming data since it is fenced, do not add incoming data to verify
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (existingTransactionData != null) {</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">                if (existingTransactionData.producerEpoch() &lt;= transactionData.producerEpoch()) {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">                    Errors error = (existingTransactionData.producerEpoch() &lt; transactionData.producerEpoch())</span>
+<span class="nc" id="L290">                            ? Errors.INVALID_PRODUCER_EPOCH : Errors.NETWORK_EXCEPTION;</span>
+<span class="nc" id="L291">                    AppendCallback oldCallback = existingNodeAndTransactionData.callbacks.get(transactionData.transactionalId());</span>
+<span class="nc" id="L292">                    existingNodeAndTransactionData.transactionData.remove(transactionData);</span>
+<span class="nc" id="L293">                    sendCallback(oldCallback, topicPartitionsToError(existingTransactionData, error), existingNodeAndTransactionData.startTimeMs.get(transactionData.transactionalId()));</span>
+<span class="nc" id="L294">                } else {</span>
+                    // If the incoming transactionData's epoch is lower, we can return with INVALID_PRODUCER_EPOCH immediately.
+<span class="nc" id="L296">                    sendCallback(callback, topicPartitionsToError(transactionData, Errors.INVALID_PRODUCER_EPOCH), curTime);</span>
+<span class="nc" id="L297">                    return;</span>
+                }
+            }
+
+<span class="nc" id="L301">            existingNodeAndTransactionData.transactionData.add(transactionData);</span>
+<span class="nc" id="L302">            existingNodeAndTransactionData.callbacks.put(transactionData.transactionalId(), callback);</span>
+<span class="nc" id="L303">            existingNodeAndTransactionData.startTimeMs.put(transactionData.transactionalId(), curTime);</span>
+<span class="nc" id="L304">            wakeup();</span>
+<span class="nc" id="L305">        }</span>
+<span class="nc" id="L306">    }</span>
+
+    private Optional&lt;Node&gt; getTransactionCoordinator(int partition) {
+<span class="nc" id="L309">        return metadataCache.getLeaderAndIsr(Topic.TRANSACTION_STATE_TOPIC_NAME, partition)</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">                .filter(leaderAndIsr -&gt; leaderAndIsr.leader() != MetadataResponse.NO_LEADER_ID)</span>
+<span class="nc" id="L311">                .flatMap(metadata -&gt; metadataCache.getAliveBrokerNode(metadata.leader(), interBrokerListenerName));</span>
+    }
+
+    private Map&lt;TopicPartition, Errors&gt; topicPartitionsToError(AddPartitionsToTxnTransaction txnData, Errors error) {
+<span class="nc" id="L315">        Map&lt;TopicPartition, Errors&gt; topicPartitionsToError = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L316">        txnData.topics().forEach(topic -&gt;</span>
+<span class="nc" id="L317">            topic.partitions().forEach(partition -&gt;</span>
+<span class="nc" id="L318">                topicPartitionsToError.put(new TopicPartition(topic.name(), partition), error)));</span>
+<span class="nc" id="L319">        verificationFailureRate.mark(topicPartitionsToError.size());</span>
+<span class="nc" id="L320">        return topicPartitionsToError;</span>
+    }
+
+    private void sendCallback(AppendCallback callback, Map&lt;TopicPartition, Errors&gt; errors, long startTimeMs) {
+<span class="nc" id="L324">        verificationTimeMs.update(time.milliseconds() - startTimeMs);</span>
+<span class="nc" id="L325">        callback.complete(errors);</span>
+<span class="nc" id="L326">    }</span>
+
+    @Override
+    public Collection&lt;RequestAndCompletionHandler&gt; generateRequests() {
+        // build and add requests to the queue
+<span class="nc" id="L331">        List&lt;RequestAndCompletionHandler&gt; list = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L332">        var currentTimeMs = time.milliseconds();</span>
+<span class="nc" id="L333">        synchronized (nodesToTransactions) {</span>
+<span class="nc" id="L334">            var iter = nodesToTransactions.entrySet().iterator();</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L336">                var entry = iter.next();</span>
+<span class="nc" id="L337">                var node = entry.getKey();</span>
+<span class="nc" id="L338">                var transactionDataAndCallbacks = entry.getValue();</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                if (!inflightNodes.contains(node)) {</span>
+<span class="nc" id="L340">                    list.add(new RequestAndCompletionHandler(</span>
+                            currentTimeMs,
+                            node,
+<span class="nc" id="L343">                            AddPartitionsToTxnRequest.Builder.forBroker(transactionDataAndCallbacks.transactionData()),</span>
+                            new AddPartitionsToTxnHandler(node, transactionDataAndCallbacks)
+                    ));
+<span class="nc" id="L346">                    inflightNodes.add(node);</span>
+<span class="nc" id="L347">                    iter.remove();</span>
+                }
+<span class="nc" id="L349">            }</span>
+<span class="nc" id="L350">        }</span>
+<span class="nc" id="L351">        return list;</span>
+    }
+
+    @Override
+    public void shutdown() throws InterruptedException {
+<span class="nc" id="L356">        super.shutdown();</span>
+<span class="nc" id="L357">        metricsGroup.removeMetric(VERIFICATION_FAILURE_RATE_METRIC_NAME);</span>
+<span class="nc" id="L358">        metricsGroup.removeMetric(VERIFICATION_TIME_MS_METRIC_NAME);</span>
+<span class="nc" id="L359">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

@@ -1,0 +1,715 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "ioloop.h"
+#include "array.h"
+#include "ostream.h"
+#include "connection.h"
+#include "llist.h"
+#include "time-util.h"
+#include "dns-client-cache.h"
+#include "dns-lookup.h"
+#include "settings.h"
+
+static struct event_category event_category_dns = {
+	.name = "dns"
+};
+
+struct dns_cache_lookup {
+	struct dns_client *client;
+	char *key;
+};
+
+struct dns_lookup {
+	struct dns_lookup *prev, *next;
+	struct dns_client *client;
+	pool_t pool;
+	bool ptr_lookup;
+	bool cached;
+
+	struct timeout *to;
+
+	struct timeval start_time;
+	unsigned int warn_msecs;
+
+	struct dns_lookup_result result;
+	struct event *event;
+	const char *cache_key; /* cache lookup key */
+
+	dns_lookup_callback_t *callback;
+	void *context;
+};
+
+struct dns_client {
+	struct connection conn;
+	struct connection_list *clist;
+	struct dns_lookup *head, *tail;
+	struct timeout *to_idle;
+	char *path;
+	struct dns_client_cache *cache;
+
+	unsigned int timeout_msecs;
+	unsigned int idle_timeout_msecs;
+
+	bool connected:1;
+	bool deinit_client_at_free:1;
+};
+
+static void dns_cache_lookup_free(struct dns_cache_lookup **_ctx)
+{
+	struct dns_cache_lookup *ctx = *_ctx;
+	*_ctx = NULL;
+
+	i_free(ctx->key);
+	i_free(ctx);
+}
+
+static void dns_client_cache_callback(const struct dns_lookup_result *result,
+				      struct dns_cache_lookup *ctx)
+{
+	if (result->ret < 0)
+		e_debug(ctx->client->conn.event,
+			"Background entry refresh failed for %s '%s': %s",
+			*ctx->key == 'I' ? "IP" : "name",
+			ctx->key + 1, result->error);
+	dns_cache_lookup_free(&ctx);
+}
+
+static void dns_client_cache_refresh(const char *cache_key,
+				     struct dns_client *client)
+{
+	struct dns_lookup *lookup;
+	struct dns_cache_lookup *ctx;
+
+	if (*cache_key == 'I') {
+		struct ip_addr ip;
+		if (net_addr2ip(cache_key + 1, &ip) < 0)
+			i_unreached();
+		ctx = i_new(struct dns_cache_lookup, 1);
+		ctx->key = i_strdup(cache_key);
+		ctx->client = client;
+		dns_client_lookup_ptr(client, &ip, client->conn.event,
+				      dns_client_cache_callback, ctx, &lookup);
+	} else if (*cache_key == 'N') {
+		ctx = i_new(struct dns_cache_lookup, 1);
+		ctx->key = i_strdup(cache_key);
+		ctx->client = client;
+		dns_client_lookup(client, cache_key + 1, client->conn.event,
+				  dns_client_cache_callback, ctx, &lookup);
+	} else {
+		i_unreached();
+	}
+}
+
+#undef dns_lookup
+#undef dns_lookup_ptr
+#undef dns_client_lookup
+#undef dns_client_lookup_ptr
+
+static void dns_lookup_free(struct dns_lookup **_lookup);
+
+static void dns_lookup_save_msecs(struct dns_lookup *lookup);
+
+static void dns_lookup_callback(struct dns_lookup *lookup)
+{
+	struct event_passthrough *e =
+		event_create_passthrough(lookup->event)->
+		set_name("dns_request_finished");
+
+	if (!lookup->cached && lookup->client != NULL) {
+		dns_client_cache_entry(lookup->client->cache, lookup->cache_key,
+				       &lookup->result);
+	}
+	dns_lookup_save_msecs(lookup);
+
+	if (lookup->result.ret != 0) {
+		i_assert(lookup->result.error != NULL);
+		e->add_int("error_code", lookup->result.ret);
+		e->add_str("error", lookup->result.error);
+		e_debug(e->event(), "Lookup failed after %u msecs: %s",
+			lookup->result.msecs, lookup->result.error);
+	} else {
+		e->add_str("cached", lookup->cached ? "yes" : "no");
+		e_debug(e->event(), "Lookup successful after %u msecs",
+			lookup->result.msecs);
+		i_assert(lookup->ptr_lookup || lookup->result.ips_count > 0);
+	}
+	if (lookup->callback != NULL)
+		lookup->callback(&lookup->result, lookup->context);
+}
+
+static void dns_lookup_callback_deferred(struct dns_lookup *lookup)
+{
+	timeout_remove(&lookup->to);
+	dns_lookup_callback(lookup);
+	dns_lookup_free(&lookup);
+}
+
+/* Complete a lookup whose result is already known (cache hit, IP literal,
+   gethostbyname() fallback, or an error) asynchronously. The callback is
+   always called from the ioloop, never directly from the lookup function,
+   so that all callers see consistent asynchronous behavior. */
+static void
+dns_lookup_async_finish(struct dns_lookup *lookup,
+			struct dns_lookup **lookup_r)
+{
+	struct ioloop *ioloop = current_ioloop;
+
+	if (lookup->client != NULL && lookup->client->conn.ioloop != NULL)
+		ioloop = lookup->client->conn.ioloop;
+	*lookup_r = lookup;
+	lookup->to = timeout_add_short_to(ioloop, 0,
+					  dns_lookup_callback_deferred, lookup);
+}
+
+static void dns_client_disconnect(struct dns_client *client, const char *error)
+{
+	struct dns_lookup *lookup, *next;
+
+	if (client->connected) {
+		timeout_remove(&client->to_idle);
+		connection_disconnect(&client->conn);
+		client->connected = FALSE;
+
+		e_debug(client->conn.event, "Disconnect: %s", error);
+	}
+
+	lookup = client->head;
+	client->head = NULL;
+	client->tail = NULL;
+	while (lookup != NULL) {
+		next = lookup->next;
+
+		i_zero(&lookup->result);
+		lookup->result.ret = EAI_FAIL;
+		lookup->result.error = error;
+
+		dns_lookup_callback(lookup);
+		dns_lookup_free(&lookup);
+		lookup = next;
+	}
+}
+
+static void dns_client_destroy(struct connection *conn)
+{
+	struct dns_client *client = container_of(conn, struct dns_client, conn);
+	bool deinit_client_at_free = client->deinit_client_at_free;
+
+	/* Temporarily clear deinit_client_at_free so that aborting the pending
+	   lookups below doesn't free the client (and this connection) from
+	   under us via dns_lookup_free() -> dns_client_deinit(). */
+	client->deinit_client_at_free = FALSE;
+	dns_client_disconnect(client, connection_disconnect_reason(&client->conn));
+	client->connected = FALSE;
+	timeout_remove(&client->to_idle);
+	connection_deinit(conn);
+
+	if (deinit_client_at_free) {
+		client->deinit_client_at_free = TRUE;
+		dns_client_deinit(&client);
+	}
+}
+
+static int dns_lookup_input_args(struct dns_lookup *lookup, const char *const *args)
+{
+	struct dns_lookup_result *result = &lookup->result;
+
+	if (str_to_int(args[0], &result->ret) < 0)
+		return -1;
+	if (args[1] == NULL)
+		return -1;
+	if (result->ret != 0) {
+		result->error = args[1];
+		return 0;
+	}
+
+	if (lookup->ptr_lookup) {
+		result->name = p_strdup(lookup->pool, args[1]);
+		return 0;
+	}
+
+	ARRAY(struct ip_addr) ips;
+	p_array_init(&ips, lookup->pool, 2);
+	for(unsigned int i = 1; args[i] != NULL; i++) {
+		struct ip_addr *ip = array_append_space(&ips);
+		if (net_addr2ip(args[i], ip) < 0)
+			return -1;
+	}
+	result->ips = array_get(&ips, &result->ips_count);
+
+	return 0;
+}
+
+static void dns_lookup_save_msecs(struct dns_lookup *lookup)
+{
+	struct timeval now;
+	long long diff;
+
+	i_gettimeofday(&now);
+
+	diff = timeval_diff_msecs(&now, &lookup->start_time);
+	if (diff > 0)
+		lookup->result.msecs = diff;
+}
+
+static int dns_client_input_args(struct connection *conn, const char *const *args)
+{
+	struct dns_client *client = container_of(conn, struct dns_client, conn);
+	struct dns_lookup *lookup = client->head;
+	bool retry = FALSE;
+
+	if (lookup == NULL) {
+		dns_client_disconnect(client, t_strdup_printf(
+			"Unexpected input from %s", conn->name));
+		return -1;
+	}
+
+	if (dns_lookup_input_args(lookup, args) < 0) {
+		dns_client_disconnect(client, t_strdup_printf(
+			"Invalid input from %s", conn->name));
+		return -1;
+	}
+	DLLIST2_REMOVE(&client->head, &client->tail, lookup);
+
+	dns_lookup_callback(lookup);
+	retry = !lookup->client->deinit_client_at_free;
+	dns_lookup_free(&lookup);
+
+	return retry ? 1 : -1;
+}
+
+static void dns_lookup_timeout(struct dns_lookup *lookup)
+{
+	long long duration_msecs = timeval_diff_msecs(&ioloop_timeval,
+						      &lookup->start_time);
+	/* Disconnection aborts all requests with this same log message.
+	   It's not exactly right for all requests, but it shouldn't be too
+	   far off. */
+	dns_client_disconnect(lookup->client, t_strdup_printf(
+		"Lookup timed out in %lld.%03lld secs",
+		duration_msecs / 1000, duration_msecs % 1000));
+}
+
+static struct dns_lookup *
+dns_lookup_create(pool_t pool,
+		  struct dns_client *client,
+		  bool ptr_lookup,
+		  const char *param,
+		  struct event *event,
+		  dns_lookup_callback_t *callback,
+		  void *context)
+{
+	struct dns_lookup *lookup = p_new(pool, struct dns_lookup, 1);
+	lookup->pool = pool;
+
+	i_gettimeofday(&lookup->start_time);
+
+	lookup->client = client;
+	lookup->callback = callback;
+	lookup->context = context;
+	lookup->ptr_lookup = ptr_lookup;
+	lookup->result.ret = EAI_FAIL;
+	if (event == NULL && client != NULL)
+		lookup->event = event_create(client->conn.event);
+	else {
+		lookup->event = event_create(event);
+		event_add_category(lookup->event, &event_category_dns);
+	}
+	lookup->cache_key = p_strdup_printf(lookup->pool, "%c%s",
+					    ptr_lookup ? 'I' : 'N', param);
+	event_set_append_log_prefix(lookup->event,
+				    t_strconcat("dns(", param, "): ", NULL));
+	return lookup;
+}
+
+static int
+dns_client_init_handle_failure(const struct dns_client_parameters *params,
+			       struct event *event_parent,
+			       const char *cmd_param,
+			       bool ptr_lookup,
+			       dns_lookup_callback_t *callback,
+			       void *context,
+			       struct dns_client **client_r,
+			       struct dns_lookup **lookup_r)
+{
+	const char *error;
+	int ret = dns_client_init(params, event_parent, client_r, &error);
+	if (ret < 0) {
+		pool_t pool = pool_alloconly_create("dns lookup", 512);
+		struct dns_lookup *lookup = dns_lookup_create(pool, NULL,
+							      ptr_lookup,
+							      cmd_param,
+							      event_parent,
+							      callback, context);
+		lookup->cached = TRUE;
+		lookup->result.ret = EAI_FAIL;
+		lookup->result.error = p_strdup(pool, error);
+		dns_lookup_async_finish(lookup, lookup_r);
+	}
+	return ret;
+}
+
+void dns_lookup(const char *host, const struct dns_client_parameters *params,
+		struct event *event_parent, dns_lookup_callback_t *callback,
+		void *context, struct dns_lookup **lookup_r)
+{
+	struct dns_client *client;
+
+	i_assert(params == NULL || params->cache_ttl_secs == 0);
+	if (dns_client_init_handle_failure(params, event_parent,
+					   host, FALSE, callback,
+					   context, &client, lookup_r) < 0) {
+		/* The failure is delivered asynchronously via the callback. */
+		return;
+	}
+	client->deinit_client_at_free = TRUE;
+	dns_client_lookup(client, host, client->conn.event, callback,
+			  context, lookup_r);
+}
+
+void dns_lookup_ptr(const struct ip_addr *ip,
+		    const struct dns_client_parameters *params,
+		    struct event *event_parent,
+		    dns_lookup_callback_t *callback, void *context,
+		    struct dns_lookup **lookup_r)
+{
+	struct dns_client *client;
+
+	i_assert(params == NULL || params->cache_ttl_secs == 0);
+	if (dns_client_init_handle_failure(params, event_parent,
+					   net_ip2addr(ip), TRUE,
+					   callback, context, &client,
+					   lookup_r) < 0) {
+		/* The failure is delivered asynchronously via the callback. */
+		return;
+	}
+	client->deinit_client_at_free = TRUE;
+	dns_client_lookup_ptr(client, ip, client->conn.event,
+			      callback, context, lookup_r);
+}
+
+static void dns_client_idle_timeout(struct dns_client *client)
+{
+	i_assert(client->head == NULL);
+
+	/* send QUIT */
+	o_stream_nsend_str(client->conn.output, "QUIT\n");
+	dns_client_disconnect(client, "Idle timeout");
+}
+
+static void dns_lookup_free(struct dns_lookup **_lookup)
+{
+	struct dns_lookup *lookup = *_lookup;
+	struct dns_client *client = lookup->client;
+
+	*_lookup = NULL;
+
+	timeout_remove(&lookup->to);
+	if (client != NULL) {
+		if (client->deinit_client_at_free)
+			dns_client_deinit(&client);
+		else if (client->head == NULL && client->connected &&
+			 client->to_idle == NULL) {
+			client->to_idle = timeout_add_to(client->conn.ioloop,
+							 client->idle_timeout_msecs,
+							 dns_client_idle_timeout, client);
+		}
+	}
+	event_unref(&lookup->event);
+	pool_unref(&lookup->pool);
+}
+
+void dns_lookup_abort(struct dns_lookup **_lookup)
+{
+	struct dns_lookup *lookup = *_lookup;
+
+	if (lookup == NULL)
+		return;
+	*_lookup = NULL;
+
+	struct dns_client *client = lookup->client;
+	if (client != NULL && client->deinit_client_at_free)
+		dns_client_deinit(&client);
+	else if (lookup->callback != NULL) {
+		dns_lookup_save_msecs(lookup);
+		lookup->result.ret = EAI_CANCELED,
+		lookup->result.error = "Lookup canceled";
+		lookup->callback(&lookup->result, lookup->context);
+		lookup->callback = NULL;
+	}
+}
+
+static void
+dns_lookup_switch_ioloop_real(struct dns_lookup *lookup, struct ioloop *ioloop)
+{
+	if (lookup->to != NULL)
+		lookup->to = io_loop_move_timeout_to(ioloop, &lookup->to);
+}
+
+void dns_lookup_switch_ioloop_to(struct dns_lookup *lookup,
+				 struct ioloop *ioloop)
+{
+	/* dns client ioloop switch switches all lookups too */
+	if (lookup->client->deinit_client_at_free)
+		dns_client_switch_ioloop_to(lookup->client, ioloop);
+	else
+		dns_lookup_switch_ioloop_real(lookup, ioloop);
+}
+
+void dns_lookup_switch_ioloop(struct dns_lookup *lookup)
+{
+	dns_lookup_switch_ioloop_to(lookup, current_ioloop);
+}
+
+static void dns_client_connected(struct connection *conn, bool success)
+{
+	struct dns_client *client = container_of(conn, struct dns_client, conn);
+	if (!success)
+		return;
+	client->connected = TRUE;
+}
+
+static const struct connection_vfuncs dns_client_vfuncs = {
+	.destroy = dns_client_destroy,
+	.input_args = dns_client_input_args,
+	.client_connected = dns_client_connected,
+};
+
+static const struct connection_settings dns_client_set = {
+	.service_name_in = "dns",
+	.service_name_out = "dns-client",
+	.major_version = 1,
+	.minor_version = 0,
+	.input_max_size = SIZE_MAX,
+	.output_max_size = SIZE_MAX,
+	.client = TRUE,
+};
+
+int dns_client_init(const struct dns_client_parameters *params,
+		    struct event *event_parent,
+		    struct dns_client **client_r,
+		    const char **error_r)
+{
+	struct dns_client *client;
+	struct dns_client_settings *set;
+	i_assert(event_parent != NULL);
+	if (settings_get(event_parent, &dns_client_setting_parser_info, 0, &set, error_r) < 0)
+		return -1;
+
+	client = i_new(struct dns_client, 1);
+	client->timeout_msecs = set->timeout_msecs;
+	client->idle_timeout_msecs = params == NULL ? 0 : params->idle_timeout_msecs;
+	client->clist = connection_list_init(&dns_client_set, &dns_client_vfuncs);
+	client->path = i_strdup(set->dns_client_socket_path);
+	client->conn.event_parent = event_parent;
+	client->conn.ioloop = (params != NULL ? params->ioloop : NULL);
+	connection_init_client_unix(client->clist, &client->conn, client->path);
+	event_add_category(client->conn.event, &event_category_dns);
+	if (params != NULL && params->cache_ttl_secs > 0) {
+		client->cache = dns_client_cache_init(params->cache_ttl_secs,
+			dns_client_cache_refresh, client);
+	}
+	settings_free(set);
+	*client_r = client;
+	return 0;
+}
+
+void dns_client_deinit(struct dns_client **_client)
+{
+	struct dns_client *client = *_client;
+	struct connection_list *clist = client->clist;
+	*_client = NULL;
+
+	client->deinit_client_at_free = FALSE; /* avoid recursion here */
+	dns_client_disconnect(client, "deinit");
+
+	/* dns_client_disconnect() is supposed to clear out all queries */
+	i_assert(client->head == NULL);
+	connection_list_deinit(&clist);
+
+	dns_client_cache_deinit(&client->cache);
+
+	i_free(client->path);
+	i_free(client);
+}
+
+int dns_client_connect(struct dns_client *client, const char **error_r)
+{
+	if (client->connected)
+		return 0;
+	int ret = connection_client_connect(&client->conn);
+	if (ret < 0)
+		*error_r = t_strdup_printf("Failed to connect to %s: %m",
+					   client->path);
+	return ret;
+}
+
+static int
+dns_client_send_request(struct dns_client *client, const char *cmd,
+			const char **error_r)
+{
+	int ret;
+
+	if (!client->connected) {
+		if (dns_client_connect(client, error_r) < 0)
+			return -1;
+	}
+
+	if ((ret = o_stream_send(client->conn.output, cmd, strlen(cmd))) < 0) {
+		*error_r = t_strdup_printf("write(%s) failed: %s",
+					   client->conn.name,
+					   o_stream_get_error(client->conn.output));
+		dns_client_disconnect(client, "Cannot send data");
+	}
+
+	return ret;
+}
+
+static void
+dns_client_lookup_common(struct dns_client *client,
+			 const char *cmd, const char *param, bool ptr_lookup,
+			 struct event *event,
+			 dns_lookup_callback_t *callback, void *context,
+			 struct dns_lookup **lookup_r)
+{
+	struct dns_lookup *lookup;
+	int ret;
+
+	i_assert(param != NULL && *param != '\0');
+	cmd = t_strdup_printf("%s\t%s\n", cmd, param);
+
+	pool_t pool = pool_alloconly_create("dns lookup", 512);
+	lookup = dns_lookup_create(pool, client, ptr_lookup, param,
+				   event, callback, context);
+	struct event_passthrough *e =
+		event_create_passthrough(lookup->event)->
+		set_name("dns_request_started");
+	e_debug(e->event(), "Lookup started");
+
+	if (dns_client_cache_lookup(client->cache, lookup->cache_key, pool,
+				    &lookup->result)) {
+		lookup->cached = TRUE;
+		dns_lookup_async_finish(lookup, lookup_r);
+		return;
+	}
+
+	if ((ret = dns_client_send_request(client, cmd, &lookup->result.error)) <= 0) {
+		if (ret == 0) {
+			/* retry once */
+			ret = dns_client_send_request(client, cmd,
+						      &lookup->result.error);
+		}
+		if (ret <= 0) {
+			/* The error is delivered asynchronously via the
+			   callback. */
+			i_assert(lookup->result.ret != 0);
+			lookup->result.error = p_strdup(pool,
+							lookup->result.error);
+			dns_lookup_async_finish(lookup, lookup_r);
+			return;
+		}
+	}
+
+	if (client->timeout_msecs != 0) {
+		lookup->to = timeout_add_to(client->conn.ioloop,
+					    client->timeout_msecs,
+					    dns_lookup_timeout, lookup);
+	}
+	timeout_remove(&client->to_idle);
+	DLLIST2_APPEND(&client->head, &client->tail, lookup);
+	*lookup_r = lookup;
+}
+
+void dns_client_lookup(struct dns_client *client, const char *host,
+		       struct event *event,
+		       dns_lookup_callback_t *callback, void *context,
+		       struct dns_lookup **lookup_r)
+{
+	i_assert(host != NULL);
+
+	if (*host == '\0') {
+		pool_t pool = pool_alloconly_create("dns_lookup", 512);
+		struct dns_lookup *lookup =
+			dns_lookup_create(pool, client, FALSE, "", event,
+					  callback, context);
+		lookup->cached = TRUE;
+		lookup->result.ret = EAI_FAIL;
+		lookup->result.error = "Empty hostname";
+		dns_lookup_async_finish(lookup, lookup_r);
+		return;
+	}
+	struct ip_addr ip;
+	if (net_addr2ip(host, &ip) == 0) {
+		pool_t pool = pool_alloconly_create("dns_lookup", 512);
+		struct dns_lookup *lookup =
+			dns_lookup_create(pool, client, FALSE, host, event,
+					  callback, context);
+		lookup->cached = TRUE;
+		lookup->result.ret = 0;
+		lookup->result.ips_count = 1;
+		lookup->result.ips = p_memdup(pool, &ip, sizeof(ip));
+		dns_lookup_async_finish(lookup, lookup_r);
+		return;
+	}
+	if (client->path[0] == '\0') {
+		/* Fallback to gethostbyname() */
+		pool_t pool = pool_alloconly_create("dns_lookup", 512);
+		struct dns_lookup *lookup =
+			dns_lookup_create(pool, client, FALSE, host, event,
+					  callback, context);
+		lookup->cached = TRUE;
+		unsigned int ips_count;
+		struct ip_addr *ips;
+		lookup->result.ret = net_gethostbyname(host, &ips, &ips_count);
+		if (lookup->result.ret != 0) {
+			lookup->result.error = p_strdup_printf(pool,
+				"net_gethostbyname() failed: %s",
+				net_gethosterror(lookup->result.ret));
+		}
+		lookup->result.ips_count = ips_count;
+		if (ips_count > 0)
+			lookup->result.ips =
+				p_memdup(pool, ips,
+					 sizeof(struct ip_addr) * ips_count);
+		dns_lookup_async_finish(lookup, lookup_r);
+		return;
+	}
+	T_BEGIN {
+		dns_client_lookup_common(client, "IP", host, FALSE, event,
+					 callback, context, lookup_r);
+	} T_END;
+}
+
+void dns_client_lookup_ptr(struct dns_client *client, const struct ip_addr *ip,
+			   struct event *event,
+			   dns_lookup_callback_t *callback, void *context,
+			   struct dns_lookup **lookup_r)
+{
+	T_BEGIN {
+		dns_client_lookup_common(client, "NAME", net_ip2addr(ip),
+					 TRUE, event, callback, context,
+					 lookup_r);
+	} T_END;
+}
+
+void dns_client_switch_ioloop_to(struct dns_client *client,
+				 struct ioloop *ioloop)
+{
+	struct dns_lookup *lookup;
+
+	connection_switch_ioloop_to(&client->conn, ioloop);
+	client->to_idle = io_loop_move_timeout(&client->to_idle);
+
+	for (lookup = client->head; lookup != NULL; lookup = lookup->next)
+		dns_lookup_switch_ioloop_real(lookup, ioloop);
+}
+
+void dns_client_switch_ioloop(struct dns_client *client)
+{
+	dns_client_switch_ioloop_to(client, current_ioloop);
+}
+
+bool dns_client_has_pending_queries(struct dns_client *client)
+{
+	return client->head != NULL;
+}

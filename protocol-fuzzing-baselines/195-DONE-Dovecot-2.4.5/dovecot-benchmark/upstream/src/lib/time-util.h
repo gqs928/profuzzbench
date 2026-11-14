@@ -1,0 +1,132 @@
+#ifndef TIME_UTIL_H
+#define TIME_UTIL_H
+
+#include <sys/time.h> /* for struct timeval */
+
+/* Same as gettimeofday(), but call i_fatal() if the call fails. */
+void i_gettimeofday(struct timeval *tv_r);
+/* Return nanoseconds since UNIX epoch (1970-01-01). */
+uint64_t i_nanoseconds(void);
+/* Return microseconds since UNIX epoch (1970-01-01). */
+static inline uint64_t i_microseconds(void) {
+	return i_nanoseconds() / 1000;
+}
+
+/* Returns -1 if tv1<tv2, 1 if tv1>tv2, 0 if they're equal. */
+int timeval_cmp(const struct timeval *tv1, const struct timeval *tv2);
+/* Same as timeval_cmp, but tv->usecs must differ by at least usec_margin */
+int timeval_cmp_margin(const struct timeval *tv1, const struct timeval *tv2,
+		       unsigned int usec_margin);
+/* Returns tv1-tv2 in microseconds. */
+long long timeval_diff_usecs(const struct timeval *tv1,
+			     const struct timeval *tv2);
+/* Returns tv1-tv2 in milliseconds. */
+static inline long long timeval_diff_msecs(const struct timeval *tv1,
+					   const struct timeval *tv2) {
+	return timeval_diff_usecs(tv1, tv2) / 1000;
+}
+
+static inline void
+timeval_from_usecs(struct timeval *tv_r, unsigned long usecs)
+{
+	i_assert(usecs != ULLONG_MAX);
+	tv_r->tv_sec = (time_t)(usecs / 1000000);
+	tv_r->tv_usec = usecs % 1000000;
+}
+
+static inline void
+timeval_add_usecs(struct timeval *tv, unsigned long long usecs)
+{
+	i_assert(usecs <= LLONG_MAX);
+	tv->tv_sec += (time_t)(usecs / 1000000);
+	tv->tv_usec += (usecs % 1000000);
+	if (tv->tv_usec >= 1000000) {
+		tv->tv_sec++;
+		tv->tv_usec -= 1000000;
+	}
+}
+
+static inline void
+timeval_sub_usecs(struct timeval *tv, unsigned long long usecs)
+{
+	i_assert(usecs <= LLONG_MAX);
+	tv->tv_sec -= (time_t)(usecs / 1000000);
+	tv->tv_usec -= (usecs % 1000000);
+	if (tv->tv_usec < 0) {
+		tv->tv_sec--;
+		tv->tv_usec += 1000000;
+	}
+}
+
+static inline void
+timeval_add_msecs(struct timeval *tv, unsigned int msecs)
+{
+	tv->tv_sec += msecs / 1000;
+	tv->tv_usec += (long)(msecs % 1000) * 1000;
+	if (tv->tv_usec >= 1000000) {
+		tv->tv_sec++;
+		tv->tv_usec -= 1000000;
+	}
+}
+
+static inline void
+timeval_sub_msecs(struct timeval *tv, unsigned int msecs)
+{
+	tv->tv_sec -= msecs / 1000;
+	tv->tv_usec -= (long)(msecs % 1000) * 1000;
+	if (tv->tv_usec < 0) {
+		tv->tv_sec--;
+		tv->tv_usec += 1000000;
+	}
+}
+
+static inline unsigned long long timeval_to_usecs(const struct timeval *tv)
+{
+	return (tv->tv_sec * 1000000ULL + tv->tv_usec);
+}
+
+static inline void timeval_add(struct timeval *tv, const struct timeval *val)
+{
+	i_assert(val->tv_usec < 1000000);
+	tv->tv_sec += val->tv_sec;
+	tv->tv_usec += val->tv_usec;
+	if (tv->tv_usec >= 1000000) {
+		tv->tv_sec++;
+		tv->tv_usec -= 1000000;
+	}
+}
+
+static inline time_t timeval_round(struct timeval *tv)
+{
+	return (tv->tv_usec < 500000 ? tv->tv_sec : tv->tv_sec + 1);
+}
+
+/* Convert t to local time and return timestamp on that day at 00:00:00. */
+time_t time_to_local_day_start(time_t t);
+
+/* Wrappers to strftime() */
+const char *t_strftime(const char *fmt, const struct tm *tm) ATTR_STRFTIME(1);
+const char *t_strflocaltime(const char *fmt, time_t t) ATTR_STRFTIME(1);
+const char *t_strfgmtime(const char *fmt, time_t t) ATTR_STRFTIME(1);
+
+/* Parse string as <unix timestamp>[.<usecs>] into timeval. <usecs> must not
+   have higher precision time, i.e. a maximum of 6 digits is allowed. Note that
+   ".1" is handled as ".1000000" so the string should have been written using
+   "%06u" printf format. */
+int str_to_timeval(const char *str, struct timeval *tv_r)
+	ATTR_WARN_UNUSED_RESULT;
+
+/* Largest time_t value this platform's time functions (gmtime(), etc.) can
+   reliably handle, as determined at configure time. */
+time_t time_max_safe_value(void);
+
+/* Add secs (may be negative) to base, returned via result_r.
+   Returns 0 on success, -1 (result_r untouched) if out of time_t range. */
+int time_add_secs(time_t base, int64_t secs, time_t *result_r)
+	ATTR_WARN_UNUSED_RESULT;
+/* Subtract secs (may be negative) from base, returned via result_r.
+   Returns 0 on success, -1 (result_r untouched) if out of time_t range. */
+int time_sub_secs(time_t base, int64_t secs, time_t *result_r)
+	ATTR_WARN_UNUSED_RESULT;
+
+#endif

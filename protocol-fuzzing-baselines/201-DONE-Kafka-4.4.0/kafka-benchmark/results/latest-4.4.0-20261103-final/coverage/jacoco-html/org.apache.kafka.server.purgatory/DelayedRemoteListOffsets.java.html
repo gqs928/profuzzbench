@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DelayedRemoteListOffsets.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.purgatory</a> &gt; <span class="el_source">DelayedRemoteListOffsets.java</span></div><h1>DelayedRemoteListOffsets.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server.purgatory;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.message.ListOffsetsResponseData;
+import org.apache.kafka.common.metrics.internals.MetricsUtils;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.FileRecords;
+import org.apache.kafka.common.requests.ListOffsetsResponse;
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+import org.apache.kafka.storage.internals.log.OffsetResultHolder;
+
+import com.yammer.metrics.core.Meter;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+
+public class DelayedRemoteListOffsets extends DelayedOperation {
+
+<span class="nc" id="L46">    private static final Logger LOG = LoggerFactory.getLogger(DelayedRemoteListOffsets.class);</span>
+
+    // For compatibility, metrics are defined to be under `kafka.server.DelayedRemoteListOffsetsMetrics` class
+<span class="nc" id="L49">    static final KafkaMetricsGroup METRICS_GROUP = new KafkaMetricsGroup(&quot;kafka.server&quot;, &quot;DelayedRemoteListOffsetsMetrics&quot;);</span>
+<span class="nc" id="L50">    static final Meter AGGREGATE_EXPIRATION_METER = METRICS_GROUP.newMeter(&quot;ExpiresPerSec&quot;, &quot;requests&quot;, TimeUnit.SECONDS);</span>
+<span class="nc" id="L51">    static final Map&lt;TopicPartition, Meter&gt; PARTITION_EXPIRATION_METERS = new ConcurrentHashMap&lt;&gt;();</span>
+
+    private final int version;
+    private final Map&lt;TopicPartition, ListOffsetsPartitionStatus&gt; statusByPartition;
+    private final Consumer&lt;TopicPartition&gt; partitionOrException;
+    private final Consumer&lt;Collection&lt;ListOffsetsResponseData.ListOffsetsTopicResponse&gt;&gt; responseCallback;
+
+    public DelayedRemoteListOffsets(long delayMs,
+                                    int version,
+                                    Map&lt;TopicPartition, ListOffsetsPartitionStatus&gt; statusByPartition,
+                                    Consumer&lt;TopicPartition&gt; partitionOrException,
+                                    Consumer&lt;Collection&lt;ListOffsetsResponseData.ListOffsetsTopicResponse&gt;&gt; responseCallback) {
+<span class="nc" id="L63">        super(delayMs);</span>
+<span class="nc" id="L64">        this.version = version;</span>
+<span class="nc" id="L65">        this.statusByPartition = statusByPartition;</span>
+<span class="nc" id="L66">        this.partitionOrException = partitionOrException;</span>
+<span class="nc" id="L67">        this.responseCallback = responseCallback;</span>
+        // Mark the status as completed, if there is no async task to track.
+        // If there is a task to track, then build the response as REQUEST_TIMED_OUT by default.
+<span class="nc" id="L70">        statusByPartition.forEach((topicPartition, status) -&gt; {</span>
+<span class="nc" id="L71">            status.completed(status.futureHolderOpt().isEmpty());</span>
+<span class="nc bnc" id="L72" title="All 2 branches missed.">            if (status.futureHolderOpt().isPresent()) {</span>
+<span class="nc" id="L73">                status.responseOpt(Optional.of(buildErrorResponse(Errors.REQUEST_TIMED_OUT, topicPartition.partition())));</span>
+            }
+<span class="nc" id="L75">            LOG.trace(&quot;Initial partition status for {} is {}&quot;, topicPartition, status);</span>
+<span class="nc" id="L76">        });</span>
+<span class="nc" id="L77">    }</span>
+
+    /**
+     * Call-back to execute when a delayed operation gets expired and hence forced to complete.
+     */
+    @Override
+    public void onExpiration() {
+<span class="nc" id="L84">        statusByPartition.forEach((topicPartition, status) -&gt; {</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">            if (!status.completed()) {</span>
+<span class="nc" id="L86">                LOG.debug(&quot;Expiring list offset request for partition {} with status {}&quot;, topicPartition, status);</span>
+<span class="nc" id="L87">                status.futureHolderOpt().ifPresent(futureHolder -&gt; futureHolder.jobFuture().cancel(true));</span>
+<span class="nc" id="L88">                recordExpiration(topicPartition);</span>
+            }
+<span class="nc" id="L90">        });</span>
+<span class="nc" id="L91">    }</span>
+
+    /**
+     * Process for completing an operation; This function needs to be defined
+     * in subclasses and will be called exactly once in forceComplete()
+     */
+    @Override
+    public void onComplete() {
+<span class="nc" id="L99">        Map&lt;String, ListOffsetsResponseData.ListOffsetsTopicResponse&gt; groupedByTopic = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L100">        statusByPartition.forEach((tp, status) -&gt; {</span>
+<span class="nc" id="L101">            ListOffsetsResponseData.ListOffsetsTopicResponse response = groupedByTopic.computeIfAbsent(tp.topic(), k -&gt;</span>
+<span class="nc" id="L102">                    new ListOffsetsResponseData.ListOffsetsTopicResponse().setName(tp.topic()));</span>
+<span class="nc" id="L103">            status.responseOpt().ifPresent(res -&gt; response.partitions().add(res));</span>
+<span class="nc" id="L104">        });</span>
+<span class="nc" id="L105">        responseCallback.accept(groupedByTopic.values());</span>
+<span class="nc" id="L106">    }</span>
+
+    /**
+     * Try to complete the delayed operation by first checking if the operation
+     * can be completed by now. If yes execute the completion logic by calling
+     * forceComplete() and return true iff forceComplete returns true; otherwise return false
+     */
+    @Override
+    public boolean tryComplete() {
+<span class="nc" id="L115">        AtomicBoolean completable = new AtomicBoolean(true);</span>
+<span class="nc" id="L116">        statusByPartition.forEach((partition, status) -&gt; {</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">            if (!status.completed()) {</span>
+                try {
+<span class="nc" id="L119">                    partitionOrException.accept(partition);</span>
+<span class="nc" id="L120">                } catch (ApiException e) {</span>
+<span class="nc" id="L121">                    status.futureHolderOpt().ifPresent(futureHolder -&gt; {</span>
+<span class="nc" id="L122">                        futureHolder.jobFuture().cancel(false);</span>
+<span class="nc" id="L123">                        futureHolder.taskFuture().complete(new OffsetResultHolder.FileRecordsOrError(Optional.of(e), Optional.empty()));</span>
+<span class="nc" id="L124">                    });</span>
+<span class="nc" id="L125">                }</span>
+
+<span class="nc" id="L127">                status.futureHolderOpt().ifPresent(futureHolder -&gt; {</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">                    if (futureHolder.taskFuture().isDone()) {</span>
+                        ListOffsetsResponseData.ListOffsetsPartitionResponse response;
+                        try {
+<span class="nc" id="L131">                            OffsetResultHolder.FileRecordsOrError taskFuture = futureHolder.taskFuture().get();</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">                            if (taskFuture.hasException()) {</span>
+<span class="nc" id="L133">                                response = buildErrorResponse(Errors.forException(taskFuture.exception().get()), partition.partition());</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">                            } else if (!taskFuture.hasTimestampAndOffset()) {</span>
+<span class="nc" id="L135">                                Errors error = status.maybeOffsetsError()</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">                                        .map(e -&gt; version &gt;= 5 ? Errors.forException(e) : Errors.LEADER_NOT_AVAILABLE)</span>
+<span class="nc" id="L137">                                        .orElse(Errors.NONE);</span>
+<span class="nc" id="L138">                                response = buildErrorResponse(error, partition.partition());</span>
+<span class="nc" id="L139">                            } else {</span>
+<span class="nc" id="L140">                                ListOffsetsResponseData.ListOffsetsPartitionResponse partitionResponse = buildErrorResponse(Errors.NONE, partition.partition());</span>
+<span class="nc" id="L141">                                FileRecords.TimestampAndOffset found = taskFuture.timestampAndOffset().get();</span>
+<span class="nc bnc" id="L142" title="All 4 branches missed.">                                if (status.lastFetchableOffset().isPresent() &amp;&amp; found.offset &gt;= status.lastFetchableOffset().get()) {</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">                                    if (status.maybeOffsetsError().isPresent()) {</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">                                        Errors error = version &gt;= 5 ? Errors.forException(status.maybeOffsetsError().get()) : Errors.LEADER_NOT_AVAILABLE;</span>
+<span class="nc" id="L145">                                        partitionResponse.setErrorCode(error.code());</span>
+<span class="nc" id="L146">                                    }</span>
+                                } else {
+<span class="nc" id="L148">                                    partitionResponse = new ListOffsetsResponseData.ListOffsetsPartitionResponse()</span>
+<span class="nc" id="L149">                                            .setPartitionIndex(partition.partition())</span>
+<span class="nc" id="L150">                                            .setErrorCode(Errors.NONE.code())</span>
+<span class="nc" id="L151">                                            .setTimestamp(found.timestamp)</span>
+<span class="nc" id="L152">                                            .setOffset(found.offset);</span>
+
+<span class="nc bnc" id="L154" title="All 4 branches missed.">                                    if (found.leaderEpoch.isPresent() &amp;&amp; version &gt;= 4) {</span>
+<span class="nc" id="L155">                                        partitionResponse.setLeaderEpoch(found.leaderEpoch.get());</span>
+                                    }
+                                }
+<span class="nc" id="L158">                                response = partitionResponse;</span>
+                            }
+<span class="nc" id="L160">                        } catch (InterruptedException | ExecutionException e) {</span>
+<span class="nc" id="L161">                            response = buildErrorResponse(Errors.forException(e), partition.partition());</span>
+<span class="nc" id="L162">                        }</span>
+<span class="nc" id="L163">                        status.responseOpt(Optional.of(response));</span>
+<span class="nc" id="L164">                        status.completed(true);</span>
+                    }
+<span class="nc bnc" id="L166" title="All 4 branches missed.">                    completable.set(completable.get() &amp;&amp; futureHolder.taskFuture().isDone());</span>
+<span class="nc" id="L167">                });</span>
+            }
+<span class="nc" id="L169">        });</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        if (completable.get()) {</span>
+<span class="nc" id="L171">            return forceComplete();</span>
+        } else {
+<span class="nc" id="L173">            return false;</span>
+        }
+    }
+
+    private ListOffsetsResponseData.ListOffsetsPartitionResponse buildErrorResponse(Errors e, int partitionIndex) {
+<span class="nc" id="L178">        return new ListOffsetsResponseData.ListOffsetsPartitionResponse()</span>
+<span class="nc" id="L179">                        .setPartitionIndex(partitionIndex)</span>
+<span class="nc" id="L180">                        .setErrorCode(e.code())</span>
+<span class="nc" id="L181">                        .setTimestamp(ListOffsetsResponse.UNKNOWN_TIMESTAMP)</span>
+<span class="nc" id="L182">                        .setOffset(ListOffsetsResponse.UNKNOWN_OFFSET);</span>
+    }
+
+    private static void recordExpiration(TopicPartition partition) {
+<span class="nc" id="L186">        AGGREGATE_EXPIRATION_METER.mark();</span>
+<span class="nc" id="L187">        PARTITION_EXPIRATION_METERS.computeIfAbsent(partition, tp -&gt; METRICS_GROUP.newMeter(&quot;ExpiresPerSec&quot;,</span>
+                &quot;requests&quot;,
+                TimeUnit.SECONDS,
+<span class="nc" id="L190">                MetricsUtils.getTags(&quot;topic&quot;, tp.topic(), &quot;partition&quot;, String.valueOf(tp.partition())))).mark();</span>
+<span class="nc" id="L191">    }</span>
+
+    public static void removePartitionMetrics(TopicPartition partition) {
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (PARTITION_EXPIRATION_METERS.remove(partition) != null) {</span>
+<span class="nc" id="L195">            METRICS_GROUP.removeMetric(&quot;ExpiresPerSec&quot;,</span>
+<span class="nc" id="L196">                    MetricsUtils.getTags(&quot;topic&quot;, partition.topic(), &quot;partition&quot;, String.valueOf(partition.partition())));</span>
+        }
+<span class="nc" id="L198">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

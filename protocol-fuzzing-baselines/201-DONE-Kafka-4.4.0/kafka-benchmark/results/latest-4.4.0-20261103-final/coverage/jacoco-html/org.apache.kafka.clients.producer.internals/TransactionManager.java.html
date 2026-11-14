@@ -1,0 +1,2065 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TransactionManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.producer.internals</a> &gt; <span class="el_source">TransactionManager.java</span></div><h1>TransactionManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.producer.internals;
+
+import org.apache.kafka.clients.ApiVersions;
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.Metadata;
+import org.apache.kafka.clients.NodeApiVersions;
+import org.apache.kafka.clients.RequestCompletionHandler;
+import org.apache.kafka.clients.consumer.CommitFailedException;
+import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.AuthenticationException;
+import org.apache.kafka.common.errors.ClusterAuthorizationException;
+import org.apache.kafka.common.errors.GroupAuthorizationException;
+import org.apache.kafka.common.errors.InvalidPidMappingException;
+import org.apache.kafka.common.errors.InvalidProducerEpochException;
+import org.apache.kafka.common.errors.InvalidTxnStateException;
+import org.apache.kafka.common.errors.OutOfOrderSequenceException;
+import org.apache.kafka.common.errors.ProducerFencedException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
+import org.apache.kafka.common.errors.TransactionAbortableException;
+import org.apache.kafka.common.errors.TransactionalIdAuthorizationException;
+import org.apache.kafka.common.errors.UnknownProducerIdException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.message.AddOffsetsToTxnRequestData;
+import org.apache.kafka.common.message.ApiVersionsResponseData.ApiVersion;
+import org.apache.kafka.common.message.EndTxnRequestData;
+import org.apache.kafka.common.message.FindCoordinatorRequestData;
+import org.apache.kafka.common.message.FindCoordinatorResponseData.Coordinator;
+import org.apache.kafka.common.message.InitProducerIdRequestData;
+import org.apache.kafka.common.message.TxnOffsetCommitRequestData;
+import org.apache.kafka.common.message.TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic;
+import org.apache.kafka.common.message.TxnOffsetCommitResponseData;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.requests.AddOffsetsToTxnRequest;
+import org.apache.kafka.common.requests.AddOffsetsToTxnResponse;
+import org.apache.kafka.common.requests.AddPartitionsToTxnRequest;
+import org.apache.kafka.common.requests.AddPartitionsToTxnResponse;
+import org.apache.kafka.common.requests.EndTxnRequest;
+import org.apache.kafka.common.requests.EndTxnResponse;
+import org.apache.kafka.common.requests.FindCoordinatorRequest;
+import org.apache.kafka.common.requests.FindCoordinatorRequest.CoordinatorType;
+import org.apache.kafka.common.requests.FindCoordinatorResponse;
+import org.apache.kafka.common.requests.InitProducerIdRequest;
+import org.apache.kafka.common.requests.InitProducerIdResponse;
+import org.apache.kafka.common.requests.ProduceResponse;
+import org.apache.kafka.common.requests.TransactionResult;
+import org.apache.kafka.common.requests.TxnOffsetCommitRequest;
+import org.apache.kafka.common.requests.TxnOffsetCommitRequest.CommittedOffset;
+import org.apache.kafka.common.requests.TxnOffsetCommitResponse;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.common.utils.internals.ProducerIdAndEpoch;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.function.Supplier;
+
+/**
+ * A class which maintains state for transactions. Also keeps the state necessary to ensure idempotent production.
+ */
+public class TransactionManager {
+    private static final int NO_INFLIGHT_REQUEST_CORRELATION_ID = -1;
+
+    private final Logger log;
+    private final String transactionalId;
+    private final int transactionTimeoutMs;
+    private final ApiVersions apiVersions;
+    private final Metadata metadata;
+
+    private final TxnPartitionMap txnPartitionMap;
+
+    private final Map&lt;TopicPartition, CommittedOffset&gt; pendingTxnOffsetCommits;
+
+    // If a batch bound for a partition expired locally after being sent at least once, the partition is considered
+    // to have an unresolved state. We keep track of such partitions here, and cannot assign any more sequence numbers
+    // for this partition until the unresolved state gets cleared. This may happen if other inflight batches returned
+    // successfully (indicating that the expired batch actually made it to the broker). If we don't get any successful
+    // responses for the partition once the inflight request count falls to zero, we reset the producer id and
+    // consequently clear this data structure as well.
+    // The value of the map is the sequence number of the batch following the expired one, computed by adding its
+    // record count to its sequence number. This is used to tell if a subsequent batch is the one immediately following
+    // the expired one.
+    private final Map&lt;TopicPartition, Integer&gt; partitionsWithUnresolvedSequences;
+
+    // The partitions that have received an error that triggers an epoch bump. When the epoch is bumped, these
+    // partitions will have the sequences of their in-flight batches rewritten
+    private final Set&lt;TopicPartition&gt; partitionsToRewriteSequences;
+
+    private final PriorityQueue&lt;TxnRequestHandler&gt; pendingRequests;
+    private final Set&lt;TopicPartition&gt; newPartitionsInTransaction;
+    private final Set&lt;TopicPartition&gt; pendingPartitionsInTransaction;
+    private final Set&lt;TopicPartition&gt; partitionsInTransaction;
+    private PendingStateTransition pendingTransition;
+
+    // This is used by the TxnRequestHandlers to control how long to back off before a given request is retried.
+    // For instance, this value is lowered by the AddPartitionsToTxnHandler when it receives a CONCURRENT_TRANSACTIONS
+    // error for the first AddPartitionsRequest in a transaction.
+    private final long retryBackoffMs;
+
+    // The retryBackoff is overridden to the following value if the first AddPartitions receives a
+    // CONCURRENT_TRANSACTIONS error.
+    private static final long ADD_PARTITIONS_RETRY_BACKOFF_MS = 20L;
+
+<span class="nc" id="L142">    private int inFlightRequestCorrelationId = NO_INFLIGHT_REQUEST_CORRELATION_ID;</span>
+    private Node transactionCoordinator;
+    private Node consumerGroupCoordinator;
+    private boolean coordinatorSupportsBumpingEpoch;
+
+<span class="nc" id="L147">    private volatile State currentState = State.UNINITIALIZED;</span>
+<span class="nc" id="L148">    private volatile RuntimeException lastError = null;</span>
+    private volatile ProducerIdAndEpoch producerIdAndEpoch;
+<span class="nc" id="L150">    private volatile boolean transactionStarted = false;</span>
+<span class="nc" id="L151">    private volatile boolean clientSideEpochBumpRequired = false;</span>
+<span class="nc" id="L152">    private volatile long latestFinalizedFeaturesEpoch = -1;</span>
+<span class="nc" id="L153">    private volatile boolean isTransactionV2Enabled = false;</span>
+    private final boolean enable2PC;
+<span class="nc" id="L155">    private volatile ProducerIdAndEpoch preparedTxnState = ProducerIdAndEpoch.NONE;</span>
+
+<span class="nc" id="L157">    private enum State {</span>
+<span class="nc" id="L158">        UNINITIALIZED,</span>
+<span class="nc" id="L159">        INITIALIZING,</span>
+<span class="nc" id="L160">        READY,</span>
+<span class="nc" id="L161">        IN_TRANSACTION,</span>
+<span class="nc" id="L162">        PREPARED_TRANSACTION,</span>
+<span class="nc" id="L163">        COMMITTING_TRANSACTION,</span>
+<span class="nc" id="L164">        ABORTING_TRANSACTION,</span>
+<span class="nc" id="L165">        ABORTABLE_ERROR,</span>
+<span class="nc" id="L166">        FATAL_ERROR;</span>
+
+        private boolean isTransitionValid(State source, State target) {
+<span class="nc bnc" id="L169" title="All 9 branches missed.">            switch (target) {</span>
+                case UNINITIALIZED:
+<span class="nc bnc" id="L171" title="All 4 branches missed.">                    return source == READY || source == ABORTABLE_ERROR;</span>
+                case INITIALIZING:
+<span class="nc bnc" id="L173" title="All 6 branches missed.">                    return source == UNINITIALIZED || source == COMMITTING_TRANSACTION || source == ABORTING_TRANSACTION;</span>
+                case READY:
+<span class="nc bnc" id="L175" title="All 6 branches missed.">                    return source == INITIALIZING || source == COMMITTING_TRANSACTION || source == ABORTING_TRANSACTION;</span>
+                case IN_TRANSACTION:
+<span class="nc bnc" id="L177" title="All 2 branches missed.">                    return source == READY;</span>
+                case PREPARED_TRANSACTION:
+<span class="nc bnc" id="L179" title="All 4 branches missed.">                    return source == IN_TRANSACTION || source == INITIALIZING;</span>
+                case COMMITTING_TRANSACTION:
+<span class="nc bnc" id="L181" title="All 4 branches missed.">                    return source == IN_TRANSACTION || source == PREPARED_TRANSACTION;</span>
+                case ABORTING_TRANSACTION:
+<span class="nc bnc" id="L183" title="All 6 branches missed.">                    return source == IN_TRANSACTION || source == PREPARED_TRANSACTION || source == ABORTABLE_ERROR;</span>
+                case ABORTABLE_ERROR:
+<span class="nc bnc" id="L185" title="All 8 branches missed.">                    return source == IN_TRANSACTION || source == COMMITTING_TRANSACTION || source == ABORTABLE_ERROR</span>
+                            || source == INITIALIZING;
+                case FATAL_ERROR:
+                default:
+                    // We can transition to FATAL_ERROR unconditionally.
+                    // FATAL_ERROR is never a valid starting state for any transition. So the only option is to close the
+                    // producer or do purely non transactional requests.
+<span class="nc" id="L192">                    return true;</span>
+            }
+        }
+    }
+
+    // We use the priority to determine the order in which requests need to be sent out. For instance, if we have
+    // a pending FindCoordinator request, that must always go first. Next, If we need a producer id, that must go second.
+    // The endTxn request must always go last, unless we are bumping the epoch (a special case of InitProducerId) as
+    // part of ending the transaction.
+<span class="nc" id="L201">    private enum Priority {</span>
+<span class="nc" id="L202">        FIND_COORDINATOR(0),</span>
+<span class="nc" id="L203">        INIT_PRODUCER_ID(1),</span>
+<span class="nc" id="L204">        ADD_PARTITIONS_OR_OFFSETS(2),</span>
+<span class="nc" id="L205">        END_TXN(3),</span>
+<span class="nc" id="L206">        EPOCH_BUMP(4);</span>
+
+        final int priority;
+
+<span class="nc" id="L210">        Priority(int priority) {</span>
+<span class="nc" id="L211">            this.priority = priority;</span>
+<span class="nc" id="L212">        }</span>
+    }
+    
+<span class="nc" id="L215">    private enum TransactionOperation {</span>
+<span class="nc" id="L216">        SEND(&quot;send&quot;),</span>
+<span class="nc" id="L217">        BEGIN_TRANSACTION(&quot;beginTransaction&quot;),</span>
+<span class="nc" id="L218">        PREPARE_TRANSACTION(&quot;prepareTransaction&quot;),</span>
+<span class="nc" id="L219">        SEND_OFFSETS_TO_TRANSACTION(&quot;sendOffsetsToTransaction&quot;);</span>
+        
+        final String displayName;
+
+<span class="nc" id="L223">        TransactionOperation(String displayName) {</span>
+<span class="nc" id="L224">            this.displayName = displayName;</span>
+<span class="nc" id="L225">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L229">            return displayName;</span>
+        }
+    }
+
+    public TransactionManager(final LogContext logContext,
+                              final String transactionalId,
+                              final int transactionTimeoutMs,
+                              final long retryBackoffMs,
+                              final ApiVersions apiVersions,
+                              final Metadata metadata,
+<span class="nc" id="L239">                              final boolean enable2PC) {</span>
+<span class="nc" id="L240">        this.producerIdAndEpoch = ProducerIdAndEpoch.NONE;</span>
+<span class="nc" id="L241">        this.transactionalId = transactionalId;</span>
+<span class="nc" id="L242">        this.log = logContext.logger(TransactionManager.class);</span>
+<span class="nc" id="L243">        this.transactionTimeoutMs = transactionTimeoutMs;</span>
+<span class="nc" id="L244">        this.transactionCoordinator = null;</span>
+<span class="nc" id="L245">        this.consumerGroupCoordinator = null;</span>
+<span class="nc" id="L246">        this.newPartitionsInTransaction = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L247">        this.pendingPartitionsInTransaction = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L248">        this.partitionsInTransaction = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L249">        this.pendingRequests = new PriorityQueue&lt;&gt;(10, Comparator.comparingInt(o -&gt; o.priority().priority));</span>
+<span class="nc" id="L250">        this.pendingTxnOffsetCommits = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L251">        this.partitionsWithUnresolvedSequences = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L252">        this.partitionsToRewriteSequences = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L253">        this.retryBackoffMs = retryBackoffMs;</span>
+<span class="nc" id="L254">        this.txnPartitionMap = new TxnPartitionMap(logContext);</span>
+<span class="nc" id="L255">        this.apiVersions = apiVersions;</span>
+<span class="nc" id="L256">        this.metadata = metadata;</span>
+<span class="nc" id="L257">        this.enable2PC = enable2PC;</span>
+<span class="nc" id="L258">    }</span>
+
+    /**
+     * During its normal course of operations, the transaction manager transitions through different internal
+     * states (i.e. by updating {@link #currentState}) to one of those defined in {@link State}. These state transitions
+     * result from actions on one of the following classes of threads:
+     *
+     * &lt;ul&gt;
+     *     &lt;li&gt;&lt;em&gt;Application&lt;/em&gt; threads that invokes {@link Producer} API calls&lt;/li&gt;
+     *     &lt;li&gt;&lt;em&gt;{@link Sender}&lt;/em&gt; thread operations&lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * When an invalid state transition is detected during execution on an &lt;em&gt;application&lt;/em&gt; thread, the
+     * {@link #currentState} is &lt;em&gt;not updated&lt;/em&gt; and an {@link IllegalStateException} is thrown. This gives the
+     * application the opportunity to fix the issue without permanently poisoning the state of the
+     * transaction manager. The {@link Producer} API calls that perform a state transition include:
+     *
+     * &lt;ul&gt;
+     *     &lt;li&gt;{@link Producer#initTransactions()} calls {@link #initializeTransactions(boolean)}&lt;/li&gt;
+     *     &lt;li&gt;{@link Producer#beginTransaction()} calls {@link #beginTransaction()}&lt;/li&gt;
+     *     &lt;li&gt;{@link Producer#commitTransaction()} calls {@link #beginCommit()}&lt;/li&gt;
+     *     &lt;li&gt;{@link Producer#abortTransaction()} calls {@link #beginAbort()}
+     *     &lt;/li&gt;
+     *     &lt;li&gt;{@link Producer#sendOffsetsToTransaction(Map, ConsumerGroupMetadata)} calls
+     *         {@link #sendOffsetsToTransaction(Map, ConsumerGroupMetadata)}
+     *     &lt;/li&gt;
+     *     &lt;li&gt;{@link Producer#send(ProducerRecord)} (and its variants) calls
+     *         {@link #maybeAddPartition(TopicPartition)} and
+     *         {@link #maybeTransitionToErrorState(RuntimeException)}
+     *     &lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * &lt;p/&gt;
+     *
+     * The {@link Producer} is implemented such that much of its work delegated to and performed asynchronously on the
+     * &lt;em&gt;{@link Sender}&lt;/em&gt; thread. This includes record batching, network I/O, broker response handlers, etc. If an
+     * invalid state transition is detected in the &lt;em&gt;{@link Sender}&lt;/em&gt; thread, in addition to throwing an
+     * {@link IllegalStateException}, the transaction manager intentionally &quot;poisons&quot; itself by setting its
+     * {@link #currentState} to {@link State#FATAL_ERROR}, a state from which it cannot recover.
+     *
+     * &lt;p/&gt;
+     *
+     * It's important to prevent possible corruption when the transaction manager has determined that it is in a
+     * fatal state. Subsequent transaction operations attempted via either the &lt;em&gt;application&lt;/em&gt; or the
+     * &lt;em&gt;{@link Sender}&lt;/em&gt; thread should fail. This is achieved when these operations invoke the
+     * {@link #maybeFailWithError()} method, as it causes a {@link KafkaException} to be thrown, ensuring the stated
+     * transactional guarantees are not violated.
+     *
+     * &lt;p/&gt;
+     *
+     * See KAFKA-14831 for more detail.
+     *
+     * @return {@code true} to set state to {@link State#FATAL_ERROR} before throwing an exception,
+     *         {@code false} to throw an exception without first changing the state
+     */
+    protected boolean shouldPoisonStateOnInvalidTransition() {
+<span class="nc" id="L314">        return Thread.currentThread() instanceof Sender.SenderThread;</span>
+    }
+
+    synchronized TransactionalRequestResult initializeTransactions(ProducerIdAndEpoch producerIdAndEpoch) {
+<span class="nc" id="L318">        return initializeTransactions(producerIdAndEpoch, false);</span>
+    }
+
+    public synchronized TransactionalRequestResult initializeTransactions(boolean keepPreparedTxn) {
+<span class="nc" id="L322">        return initializeTransactions(ProducerIdAndEpoch.NONE, keepPreparedTxn);</span>
+    }
+
+    synchronized TransactionalRequestResult initializeTransactions(
+        ProducerIdAndEpoch producerIdAndEpoch,
+        boolean keepPreparedTxn
+    ) {
+<span class="nc" id="L329">        maybeFailWithError();</span>
+
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        boolean isEpochBump = producerIdAndEpoch != ProducerIdAndEpoch.NONE;</span>
+<span class="nc" id="L332">        return handleCachedTransactionRequestResult(() -&gt; {</span>
+            // If this is an epoch bump, we will transition the state as part of handling the EndTxnRequest
+<span class="nc bnc" id="L334" title="All 2 branches missed.">            if (!isEpochBump) {</span>
+<span class="nc" id="L335">                transitionTo(State.INITIALIZING);</span>
+<span class="nc" id="L336">                log.info(&quot;Invoking InitProducerId for the first time in order to acquire a producer ID&quot;);</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                if (keepPreparedTxn) {</span>
+<span class="nc" id="L338">                    log.info(&quot;Invoking InitProducerId with keepPreparedTxn set to true for 2PC transactions&quot;);</span>
+                }
+            } else {
+<span class="nc" id="L341">                log.info(&quot;Invoking InitProducerId with current producer ID and epoch {} in order to bump the epoch&quot;, producerIdAndEpoch);</span>
+            }
+<span class="nc" id="L343">            InitProducerIdRequestData requestData = new InitProducerIdRequestData()</span>
+<span class="nc" id="L344">                    .setTransactionalId(transactionalId)</span>
+<span class="nc" id="L345">                    .setTransactionTimeoutMs(transactionTimeoutMs)</span>
+<span class="nc" id="L346">                    .setProducerId(producerIdAndEpoch.producerId)</span>
+<span class="nc" id="L347">                    .setProducerEpoch(producerIdAndEpoch.epoch);</span>
+
+<span class="nc" id="L349">            InitProducerIdHandler handler = new InitProducerIdHandler(new InitProducerIdRequest.Builder(requestData),</span>
+                    isEpochBump);
+<span class="nc" id="L351">            enqueueRequest(handler);</span>
+<span class="nc" id="L352">            return handler.result;</span>
+        }, State.INITIALIZING, &quot;initTransactions&quot;);
+    }
+
+    public synchronized void beginTransaction() {
+<span class="nc" id="L357">        ensureTransactional();</span>
+<span class="nc" id="L358">        throwIfPendingState(TransactionOperation.BEGIN_TRANSACTION);</span>
+<span class="nc" id="L359">        maybeFailWithError();</span>
+<span class="nc" id="L360">        transitionTo(State.IN_TRANSACTION);</span>
+<span class="nc" id="L361">    }</span>
+
+    /**
+     * Prepare a transaction for a two-phase commit.
+     * This transitions the transaction to the PREPARED_TRANSACTION state.
+     * The preparedTxnState is set with the current producer ID and epoch.
+     */
+    public synchronized void prepareTransaction() {
+<span class="nc" id="L369">        ensureTransactional();</span>
+<span class="nc" id="L370">        throwIfPendingState(TransactionOperation.PREPARE_TRANSACTION);</span>
+<span class="nc" id="L371">        maybeFailWithError();</span>
+<span class="nc" id="L372">        transitionTo(State.PREPARED_TRANSACTION);</span>
+<span class="nc" id="L373">        this.preparedTxnState = new ProducerIdAndEpoch(</span>
+            this.producerIdAndEpoch.producerId,
+            this.producerIdAndEpoch.epoch
+        );
+<span class="nc" id="L377">    }</span>
+
+    public synchronized TransactionalRequestResult beginCommit() {
+<span class="nc" id="L380">        return handleCachedTransactionRequestResult(() -&gt; {</span>
+<span class="nc" id="L381">            maybeFailWithError();</span>
+<span class="nc" id="L382">            transitionTo(State.COMMITTING_TRANSACTION);</span>
+<span class="nc" id="L383">            return beginCompletingTransaction(TransactionResult.COMMIT);</span>
+        }, State.COMMITTING_TRANSACTION, &quot;commitTransaction&quot;);
+    }
+
+    public synchronized TransactionalRequestResult beginAbort() {
+<span class="nc" id="L388">        return handleCachedTransactionRequestResult(() -&gt; {</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (currentState != State.ABORTABLE_ERROR)</span>
+<span class="nc" id="L390">                maybeFailWithError();</span>
+<span class="nc" id="L391">            transitionTo(State.ABORTING_TRANSACTION);</span>
+
+            // We're aborting the transaction, so there should be no need to add new partitions
+<span class="nc" id="L394">            newPartitionsInTransaction.clear();</span>
+<span class="nc" id="L395">            return beginCompletingTransaction(TransactionResult.ABORT);</span>
+        }, State.ABORTING_TRANSACTION, &quot;abortTransaction&quot;);
+    }
+
+    private TransactionalRequestResult beginCompletingTransaction(TransactionResult transactionResult) {
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (!newPartitionsInTransaction.isEmpty())</span>
+<span class="nc" id="L401">            enqueueRequest(addPartitionsToTransactionHandler());</span>
+
+<span class="nc" id="L403">        EndTxnRequest.Builder builder = new EndTxnRequest.Builder(</span>
+            new EndTxnRequestData()
+<span class="nc" id="L405">                .setTransactionalId(transactionalId)</span>
+<span class="nc" id="L406">                .setProducerId(producerIdAndEpoch.producerId)</span>
+<span class="nc" id="L407">                .setProducerEpoch(producerIdAndEpoch.epoch)</span>
+<span class="nc" id="L408">                .setCommitted(transactionResult.id),</span>
+            isTransactionV2Enabled
+        );
+
+        // Maybe update the transaction version here before we enqueue the EndTxn request so there are no races with
+        // completion of the EndTxn request. Since this method may update clientSideEpochBumpRequired, we want to update
+        // before the check below, but we also want to call it after the EndTxnRequest.Builder so we complete the transaction
+        // with the same version as it started.
+<span class="nc" id="L416">        maybeUpdateTransactionV2Enabled(false);</span>
+
+<span class="nc" id="L418">        EndTxnHandler handler = new EndTxnHandler(builder);</span>
+<span class="nc" id="L419">        enqueueRequest(handler);</span>
+
+        // If an epoch bump is required for recovery, initialize the transaction after completing the EndTxn request.
+        // If we are upgrading to TV2 transactions on the next transaction, also bump the epoch.
+<span class="nc bnc" id="L423" title="All 2 branches missed.">        if (clientSideEpochBumpRequired) {</span>
+<span class="nc" id="L424">            return initializeTransactions(this.producerIdAndEpoch);</span>
+        }
+
+<span class="nc" id="L427">        return handler.result;</span>
+    }
+
+    public synchronized TransactionalRequestResult sendOffsetsToTransaction(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets,
+                                                                            final ConsumerGroupMetadata groupMetadata) {
+<span class="nc" id="L432">        ensureTransactional();</span>
+<span class="nc" id="L433">        throwIfPendingState(TransactionOperation.SEND_OFFSETS_TO_TRANSACTION);</span>
+<span class="nc" id="L434">        maybeFailWithError();</span>
+
+<span class="nc bnc" id="L436" title="All 2 branches missed.">        if (currentState != State.IN_TRANSACTION) {</span>
+<span class="nc" id="L437">            throw new IllegalStateException(&quot;Cannot send offsets if a transaction is not in progress &quot; +</span>
+                &quot;(currentState= &quot; + currentState + &quot;)&quot;);
+        }
+
+        // In transaction V2, the client will skip sending AddOffsetsToTxn before sending txnOffsetCommit.
+        TxnRequestHandler handler;
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        if (isTransactionV2Enabled()) {</span>
+<span class="nc" id="L444">            log.debug(&quot;Begin adding offsets {} for consumer group {} to transaction with transaction protocol V2&quot;, offsets, groupMetadata);</span>
+<span class="nc" id="L445">            handler = txnOffsetCommitHandler(null, offsets, groupMetadata);</span>
+<span class="nc" id="L446">            transactionStarted = true;</span>
+        } else {
+<span class="nc" id="L448">            log.debug(&quot;Begin adding offsets {} for consumer group {} to transaction&quot;, offsets, groupMetadata);</span>
+<span class="nc" id="L449">            AddOffsetsToTxnRequest.Builder builder = new AddOffsetsToTxnRequest.Builder(</span>
+                    new AddOffsetsToTxnRequestData()
+<span class="nc" id="L451">                            .setTransactionalId(transactionalId)</span>
+<span class="nc" id="L452">                            .setProducerId(producerIdAndEpoch.producerId)</span>
+<span class="nc" id="L453">                            .setProducerEpoch(producerIdAndEpoch.epoch)</span>
+<span class="nc" id="L454">                            .setGroupId(groupMetadata.groupId())</span>
+            );
+<span class="nc" id="L456">            handler = new AddOffsetsToTxnHandler(builder, offsets, groupMetadata);</span>
+        }
+
+<span class="nc" id="L459">        enqueueRequest(handler);</span>
+<span class="nc" id="L460">        return handler.result;</span>
+    }
+
+    public synchronized void maybeAddPartition(TopicPartition topicPartition) {
+<span class="nc" id="L464">        maybeFailWithError();</span>
+<span class="nc" id="L465">        throwIfPendingState(TransactionOperation.SEND);</span>
+
+<span class="nc bnc" id="L467" title="All 2 branches missed.">        if (isTransactional()) {</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">            if (!hasProducerId()) {</span>
+<span class="nc" id="L469">                throw new IllegalStateException(&quot;Cannot add partition &quot; + topicPartition +</span>
+                    &quot; to transaction before completing a call to initTransactions&quot;);
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            } else if (currentState != State.IN_TRANSACTION) {</span>
+<span class="nc" id="L472">                throw new IllegalStateException(&quot;Cannot add partition &quot; + topicPartition +</span>
+                    &quot; to transaction while in state  &quot; + currentState);
+<span class="nc bnc" id="L474" title="All 2 branches missed.">            } else if (isTransactionV2Enabled()) {</span>
+<span class="nc" id="L475">                txnPartitionMap.getOrCreate(topicPartition);</span>
+<span class="nc" id="L476">                partitionsInTransaction.add(topicPartition);</span>
+<span class="nc" id="L477">                transactionStarted = true;</span>
+<span class="nc bnc" id="L478" title="All 4 branches missed.">            } else if (transactionContainsPartition(topicPartition) || isPartitionPendingAdd(topicPartition)) {</span>
+<span class="nc" id="L479">                return;</span>
+            } else {
+<span class="nc" id="L481">                log.debug(&quot;Begin adding new partition {} to transaction&quot;, topicPartition);</span>
+<span class="nc" id="L482">                txnPartitionMap.getOrCreate(topicPartition);</span>
+<span class="nc" id="L483">                newPartitionsInTransaction.add(topicPartition);</span>
+            }
+        }
+<span class="nc" id="L486">    }</span>
+
+    RuntimeException lastError() {
+<span class="nc" id="L489">        return lastError;</span>
+    }
+
+    synchronized boolean isSendToPartitionAllowed(TopicPartition tp) {
+<span class="nc bnc" id="L493" title="All 2 branches missed.">        if (hasFatalError())</span>
+<span class="nc" id="L494">            return false;</span>
+<span class="nc bnc" id="L495" title="All 4 branches missed.">        return !isTransactional() || partitionsInTransaction.contains(tp);</span>
+    }
+
+    public String transactionalId() {
+<span class="nc" id="L499">        return transactionalId;</span>
+    }
+
+    public boolean hasProducerId() {
+<span class="nc" id="L503">        return producerIdAndEpoch.isValid();</span>
+    }
+
+    public boolean isTransactional() {
+<span class="nc bnc" id="L507" title="All 2 branches missed.">        return transactionalId != null;</span>
+    }
+
+    /**
+     *  Check all the finalized features from apiVersions to verify whether the transaction V2 is enabled.
+     *  Sets clientSideEpochBumpRequired if upgrading to V2 since we need to bump the epoch.
+     *  This is because V2 no longer adds partitions explicitly and there are some edge cases on upgrade
+     *  that can be avoided by fencing the old V1 transaction epoch. For example, we won't consider
+     *  partitions from the previous transaction as already added to the new V2 transaction if the epoch is fenced.
+     */
+
+    public synchronized void maybeUpdateTransactionV2Enabled(boolean onInitiatialization) {
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        if (latestFinalizedFeaturesEpoch &gt;= apiVersions.getMaxFinalizedFeaturesEpoch()) {</span>
+<span class="nc" id="L520">            return;</span>
+        }
+<span class="nc" id="L522">        ApiVersions.FinalizedFeaturesInfo info = apiVersions.getFinalizedFeaturesInfo();</span>
+<span class="nc" id="L523">        latestFinalizedFeaturesEpoch = info.finalizedFeaturesEpoch;</span>
+<span class="nc" id="L524">        Short transactionVersion = info.finalizedFeatures.get(&quot;transaction.version&quot;);</span>
+<span class="nc" id="L525">        boolean wasTransactionV2Enabled = isTransactionV2Enabled;</span>
+<span class="nc bnc" id="L526" title="All 4 branches missed.">        isTransactionV2Enabled = transactionVersion != null &amp;&amp; transactionVersion &gt;= 2;</span>
+<span class="nc" id="L527">        log.debug(&quot;Updating isTV2 enabled to {} with FinalizedFeaturesEpoch {}&quot;, isTransactionV2Enabled, latestFinalizedFeaturesEpoch);</span>
+<span class="nc bnc" id="L528" title="All 6 branches missed.">        if (!onInitiatialization &amp;&amp; !wasTransactionV2Enabled &amp;&amp; isTransactionV2Enabled)</span>
+<span class="nc" id="L529">            clientSideEpochBumpRequired = true;</span>
+<span class="nc" id="L530">    }</span>
+
+    public boolean isTransactionV2Enabled() {
+<span class="nc" id="L533">        return isTransactionV2Enabled;</span>
+    }
+
+    public boolean is2PCEnabled() {
+<span class="nc" id="L537">        return enable2PC;</span>
+    }
+
+    synchronized boolean hasPartitionsToAdd() {
+<span class="nc bnc" id="L541" title="All 4 branches missed.">        return !newPartitionsInTransaction.isEmpty() || !pendingPartitionsInTransaction.isEmpty();</span>
+    }
+
+    synchronized boolean isCompleting() {
+<span class="nc bnc" id="L545" title="All 4 branches missed.">        return currentState == State.COMMITTING_TRANSACTION || currentState == State.ABORTING_TRANSACTION;</span>
+    }
+
+    synchronized boolean hasError() {
+<span class="nc bnc" id="L549" title="All 4 branches missed.">        return currentState == State.ABORTABLE_ERROR || currentState == State.FATAL_ERROR;</span>
+    }
+
+    synchronized boolean isAborting() {
+<span class="nc bnc" id="L553" title="All 2 branches missed.">        return currentState == State.ABORTING_TRANSACTION;</span>
+    }
+
+    synchronized void transitionToAbortableError(RuntimeException exception) {
+<span class="nc bnc" id="L557" title="All 2 branches missed.">        if (currentState == State.ABORTING_TRANSACTION) {</span>
+<span class="nc" id="L558">            log.debug(&quot;Skipping transition to abortable error state since the transaction is already being &quot; +</span>
+                    &quot;aborted. Underlying exception: &quot;, exception);
+<span class="nc" id="L560">            return;</span>
+        }
+
+<span class="nc" id="L563">        log.info(&quot;Transiting to abortable error state due to {}&quot;, exception.toString());</span>
+<span class="nc" id="L564">        transitionTo(State.ABORTABLE_ERROR, exception);</span>
+<span class="nc" id="L565">    }</span>
+
+    synchronized void transitionToFatalError(RuntimeException exception) {
+<span class="nc" id="L568">        log.info(&quot;Transiting to fatal error state due to {}&quot;, exception.toString());</span>
+<span class="nc" id="L569">        transitionTo(State.FATAL_ERROR, exception);</span>
+
+<span class="nc bnc" id="L571" title="All 2 branches missed.">        if (pendingTransition != null) {</span>
+<span class="nc" id="L572">            pendingTransition.result.fail(exception);</span>
+        }
+<span class="nc" id="L574">    }</span>
+
+    /**
+     * Transitions to an abortable error state if the coordinator can handle an abortable error or
+     * to a fatal error if not.
+     *
+     * @param abortableException    The exception in case of an abortable error.
+     * @param fatalException        The exception in case of a fatal error.
+     */
+    private void transitionToAbortableErrorOrFatalError(
+        RuntimeException abortableException,
+        RuntimeException fatalException
+    ) {
+<span class="nc bnc" id="L587" title="All 2 branches missed.">        if (canHandleAbortableError()) {</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">            if (needToTriggerEpochBumpFromClient())</span>
+<span class="nc" id="L589">                clientSideEpochBumpRequired = true;</span>
+<span class="nc" id="L590">            transitionToAbortableError(abortableException);</span>
+        } else {
+<span class="nc" id="L592">            transitionToFatalError(fatalException);</span>
+        }
+<span class="nc" id="L594">    }</span>
+
+    // visible for testing
+    synchronized boolean isPartitionPendingAdd(TopicPartition partition) {
+<span class="nc bnc" id="L598" title="All 4 branches missed.">        return newPartitionsInTransaction.contains(partition) || pendingPartitionsInTransaction.contains(partition);</span>
+    }
+
+    /**
+     * Get the current producer id and epoch without blocking. Callers must use {@link ProducerIdAndEpoch#isValid()} to
+     * verify that the result is valid.
+     *
+     * @return the current ProducerIdAndEpoch.
+     */
+    ProducerIdAndEpoch producerIdAndEpoch() {
+<span class="nc" id="L608">        return producerIdAndEpoch;</span>
+    }
+
+    public synchronized void maybeUpdateProducerIdAndEpoch(TopicPartition topicPartition) {
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        if (hasFatalError()) {</span>
+<span class="nc" id="L613">            log.debug(&quot;Ignoring producer ID and epoch update request since the producer is in fatal error state&quot;);</span>
+<span class="nc" id="L614">            return;</span>
+        }
+
+<span class="nc bnc" id="L617" title="All 4 branches missed.">        if (hasStaleProducerIdAndEpoch(topicPartition) &amp;&amp; !hasInflightBatches(topicPartition)) {</span>
+            // If the batch was on a different ID and/or epoch (due to an epoch bump) and all its in-flight batches
+            // have completed, reset the partition sequence so that the next batch (with the new epoch) starts from 0
+<span class="nc" id="L620">            txnPartitionMap.startSequencesAtBeginning(topicPartition, this.producerIdAndEpoch);</span>
+<span class="nc" id="L621">            log.debug(&quot;ProducerId of partition {} set to {} with epoch {}. Reinitialize sequence at beginning.&quot;,</span>
+<span class="nc" id="L622">                      topicPartition, producerIdAndEpoch.producerId, producerIdAndEpoch.epoch);</span>
+        }
+<span class="nc" id="L624">    }</span>
+
+    /**
+     * Set the producer id and epoch atomically.
+     */
+    private void setProducerIdAndEpoch(ProducerIdAndEpoch producerIdAndEpoch) {
+        // With TV2, the epoch bump is common and frequent. Only log if it is at debug level or the producer ID is changed.
+<span class="nc bnc" id="L631" title="All 6 branches missed.">        if (!isTransactional() || !isTransactionV2Enabled || producerIdAndEpoch.producerId != this.producerIdAndEpoch.producerId) {</span>
+<span class="nc" id="L632">            log.info(&quot;ProducerId set to {} with epoch {}&quot;, producerIdAndEpoch.producerId, producerIdAndEpoch.epoch);</span>
+        } else {
+<span class="nc" id="L634">            log.debug(&quot;ProducerId set to {} with epoch {}&quot;, producerIdAndEpoch.producerId, producerIdAndEpoch.epoch);</span>
+        }
+<span class="nc" id="L636">        this.producerIdAndEpoch = producerIdAndEpoch;</span>
+<span class="nc" id="L637">    }</span>
+
+    /**
+     * This method resets the producer ID and epoch and sets the state to UNINITIALIZED, which will trigger a new
+     * InitProducerId request. This method is only called when the producer epoch is exhausted; we will bump the epoch
+     * instead.
+     */
+    private void resetIdempotentProducerId() {
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (isTransactional())</span>
+<span class="nc" id="L646">            throw new IllegalStateException(&quot;Cannot reset producer state for a transactional producer. &quot; +</span>
+                    &quot;You must either abort the ongoing transaction or reinitialize the transactional producer instead&quot;);
+<span class="nc" id="L648">        log.debug(&quot;Resetting idempotent producer ID. ID and epoch before reset are {}&quot;, this.producerIdAndEpoch);</span>
+<span class="nc" id="L649">        setProducerIdAndEpoch(ProducerIdAndEpoch.NONE);</span>
+<span class="nc" id="L650">        transitionTo(State.UNINITIALIZED);</span>
+<span class="nc" id="L651">    }</span>
+
+    private void resetSequenceForPartition(TopicPartition topicPartition) {
+<span class="nc" id="L654">        txnPartitionMap.remove(topicPartition);</span>
+<span class="nc" id="L655">        this.partitionsWithUnresolvedSequences.remove(topicPartition);</span>
+<span class="nc" id="L656">    }</span>
+
+    private void resetSequenceNumbers() {
+<span class="nc" id="L659">        txnPartitionMap.reset();</span>
+<span class="nc" id="L660">        this.partitionsWithUnresolvedSequences.clear();</span>
+<span class="nc" id="L661">    }</span>
+
+    /**
+     * This method is used to trigger an epoch bump for non-transactional idempotent producers.
+     */
+    synchronized void requestIdempotentEpochBumpForPartition(TopicPartition tp) {
+<span class="nc" id="L667">        clientSideEpochBumpRequired = true;</span>
+<span class="nc" id="L668">        this.partitionsToRewriteSequences.add(tp);</span>
+<span class="nc" id="L669">    }</span>
+
+    private void bumpIdempotentProducerEpoch() {
+<span class="nc bnc" id="L672" title="All 2 branches missed.">        if (this.producerIdAndEpoch.epoch == Short.MAX_VALUE) {</span>
+<span class="nc" id="L673">            resetIdempotentProducerId();</span>
+        } else {
+<span class="nc" id="L675">            setProducerIdAndEpoch(new ProducerIdAndEpoch(this.producerIdAndEpoch.producerId, (short) (this.producerIdAndEpoch.epoch + 1)));</span>
+<span class="nc" id="L676">            log.debug(&quot;Incremented producer epoch, current producer ID and epoch are now {}&quot;, this.producerIdAndEpoch);</span>
+        }
+
+        // When the epoch is bumped, rewrite all in-flight sequences for the partition(s) that triggered the epoch bump
+<span class="nc bnc" id="L680" title="All 2 branches missed.">        for (TopicPartition topicPartition : this.partitionsToRewriteSequences) {</span>
+<span class="nc" id="L681">            this.txnPartitionMap.startSequencesAtBeginning(topicPartition, this.producerIdAndEpoch);</span>
+<span class="nc" id="L682">            this.partitionsWithUnresolvedSequences.remove(topicPartition);</span>
+<span class="nc" id="L683">        }</span>
+<span class="nc" id="L684">        this.partitionsToRewriteSequences.clear();</span>
+
+<span class="nc" id="L686">        clientSideEpochBumpRequired = false;</span>
+<span class="nc" id="L687">    }</span>
+
+    synchronized void bumpIdempotentEpochAndResetIdIfNeeded() {
+<span class="nc bnc" id="L690" title="All 2 branches missed.">        if (!isTransactional()) {</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">            if (clientSideEpochBumpRequired) {</span>
+<span class="nc" id="L692">                bumpIdempotentProducerEpoch();</span>
+            }
+<span class="nc bnc" id="L694" title="All 4 branches missed.">            if (currentState != State.INITIALIZING &amp;&amp; !hasProducerId()) {</span>
+<span class="nc" id="L695">                transitionTo(State.INITIALIZING);</span>
+<span class="nc" id="L696">                InitProducerIdRequestData requestData = new InitProducerIdRequestData()</span>
+<span class="nc" id="L697">                        .setTransactionalId(null)</span>
+<span class="nc" id="L698">                        .setTransactionTimeoutMs(Integer.MAX_VALUE);</span>
+<span class="nc" id="L699">                InitProducerIdHandler handler = new InitProducerIdHandler(new InitProducerIdRequest.Builder(requestData), false);</span>
+<span class="nc" id="L700">                enqueueRequest(handler);</span>
+            }
+        }
+<span class="nc" id="L703">    }</span>
+
+    /**
+     * Returns the next sequence number to be written to the given TopicPartition.
+     */
+    synchronized int sequenceNumber(TopicPartition topicPartition) {
+<span class="nc" id="L709">        return txnPartitionMap.getOrCreate(topicPartition).nextSequence();</span>
+    }
+
+    /**
+     * Returns the current producer id/epoch of the given TopicPartition.
+     */
+    synchronized ProducerIdAndEpoch producerIdAndEpoch(TopicPartition topicPartition) {
+<span class="nc" id="L716">        return txnPartitionMap.getOrCreate(topicPartition).producerIdAndEpoch();</span>
+    }
+
+    synchronized void incrementSequenceNumber(TopicPartition topicPartition, int increment) {
+<span class="nc" id="L720">        txnPartitionMap.get(topicPartition).incrementSequence(increment);</span>
+<span class="nc" id="L721">    }</span>
+
+    synchronized void addInFlightBatch(ProducerBatch batch) {
+<span class="nc bnc" id="L724" title="All 2 branches missed.">        if (!batch.hasSequence())</span>
+<span class="nc" id="L725">            throw new IllegalStateException(&quot;Can't track batch for partition &quot; + batch.topicPartition + &quot; when sequence is not set.&quot;);</span>
+<span class="nc" id="L726">        txnPartitionMap.get(batch.topicPartition).addInflightBatch(batch);</span>
+<span class="nc" id="L727">    }</span>
+
+    /**
+     * Returns the first inflight sequence for a given partition. This is the base sequence of an inflight batch with
+     * the lowest sequence number.
+     * @return the lowest inflight sequence if the transaction manager is tracking inflight requests for this partition.
+     *         If there are no inflight requests being tracked for this partition, this method will return
+     *         RecordBatch.NO_SEQUENCE.
+     */
+    synchronized int firstInFlightSequence(TopicPartition topicPartition) {
+<span class="nc bnc" id="L737" title="All 2 branches missed.">        if (!hasInflightBatches(topicPartition))</span>
+<span class="nc" id="L738">            return RecordBatch.NO_SEQUENCE;</span>
+<span class="nc" id="L739">        ProducerBatch batch = nextBatchBySequence(topicPartition);</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">        return batch == null ? RecordBatch.NO_SEQUENCE : batch.baseSequence();</span>
+    }
+
+    synchronized ProducerBatch nextBatchBySequence(TopicPartition topicPartition) {
+<span class="nc" id="L744">        return txnPartitionMap.nextBatchBySequence(topicPartition);</span>
+    }
+
+    synchronized void removeInFlightBatch(ProducerBatch batch) {
+<span class="nc bnc" id="L748" title="All 2 branches missed.">        if (hasInflightBatches(batch.topicPartition))</span>
+<span class="nc" id="L749">            txnPartitionMap.removeInFlightBatch(batch);</span>
+<span class="nc" id="L750">    }</span>
+
+    private int maybeUpdateLastAckedSequence(TopicPartition topicPartition, int sequence) {
+<span class="nc" id="L753">        return txnPartitionMap.maybeUpdateLastAckedSequence(topicPartition, sequence);</span>
+    }
+
+    synchronized OptionalInt lastAckedSequence(TopicPartition topicPartition) {
+<span class="nc" id="L757">        return txnPartitionMap.lastAckedSequence(topicPartition);</span>
+    }
+
+    synchronized OptionalLong lastAckedOffset(TopicPartition topicPartition) {
+<span class="nc" id="L761">        return txnPartitionMap.lastAckedOffset(topicPartition);</span>
+    }
+
+    private void updateLastAckedOffset(ProduceResponse.PartitionResponse response, ProducerBatch batch) {
+<span class="nc bnc" id="L765" title="All 2 branches missed.">        if (response.baseOffset == ProduceResponse.INVALID_OFFSET)</span>
+<span class="nc" id="L766">            return;</span>
+<span class="nc" id="L767">        long lastOffset = response.baseOffset + batch.recordCount - 1;</span>
+<span class="nc" id="L768">        txnPartitionMap.updateLastAckedOffset(batch.topicPartition, isTransactional(), lastOffset);</span>
+<span class="nc" id="L769">    }</span>
+
+    public synchronized void handleCompletedBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response) {
+<span class="nc" id="L772">        int lastAckedSequence = maybeUpdateLastAckedSequence(batch.topicPartition, batch.lastSequence());</span>
+<span class="nc" id="L773">        log.trace(&quot;ProducerId: {}; Set last ack'd sequence number for topic-partition {} to {}&quot;,</span>
+<span class="nc" id="L774">                batch.producerId(),</span>
+                batch.topicPartition,
+<span class="nc" id="L776">                lastAckedSequence);</span>
+
+<span class="nc" id="L778">        updateLastAckedOffset(response, batch);</span>
+<span class="nc" id="L779">        removeInFlightBatch(batch);</span>
+<span class="nc" id="L780">    }</span>
+
+    public synchronized void transitionToUninitialized(RuntimeException exception) {
+<span class="nc" id="L783">        transitionTo(State.UNINITIALIZED);</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">        if (pendingTransition != null) {</span>
+<span class="nc" id="L785">            pendingTransition.result.fail(exception);</span>
+        }
+<span class="nc" id="L787">        lastError = null;</span>
+<span class="nc" id="L788">    }</span>
+
+    public synchronized void maybeTransitionToErrorState(RuntimeException exception) {
+<span class="nc bnc" id="L791" title="All 10 branches missed.">        if (exception instanceof ClusterAuthorizationException</span>
+                || exception instanceof TransactionalIdAuthorizationException
+                || exception instanceof ProducerFencedException
+                || exception instanceof UnsupportedVersionException
+                || exception instanceof InvalidPidMappingException) {
+<span class="nc" id="L796">            transitionToFatalError(exception);</span>
+<span class="nc bnc" id="L797" title="All 2 branches missed.">        } else if (isTransactional()) {</span>
+            // RetriableExceptions from the Sender thread are converted to Abortable errors
+            // because they indicate that the transaction cannot be completed after all retry attempts.
+            // This conversion ensures the application layer treats these errors as abortable,
+            // preventing duplicate message delivery.
+<span class="nc bnc" id="L802" title="All 4 branches missed.">            if (exception instanceof RetriableException ||</span>
+                    exception instanceof InvalidTxnStateException) {
+<span class="nc" id="L804">                exception = new TransactionAbortableException(&quot;Transaction Request was aborted after exhausting retries.&quot;, exception);</span>
+            }
+
+<span class="nc bnc" id="L807" title="All 4 branches missed.">            if (needToTriggerEpochBumpFromClient() &amp;&amp; !isCompleting()) {</span>
+<span class="nc" id="L808">                clientSideEpochBumpRequired = true;</span>
+            }
+<span class="nc" id="L810">            transitionToAbortableError(exception);</span>
+        }
+<span class="nc" id="L812">    }</span>
+
+    synchronized void handleFailedBatch(ProducerBatch batch, RuntimeException exception, boolean adjustSequenceNumbers) {
+<span class="nc" id="L815">        maybeTransitionToErrorState(exception);</span>
+<span class="nc" id="L816">        removeInFlightBatch(batch);</span>
+
+<span class="nc bnc" id="L818" title="All 2 branches missed.">        if (hasFatalError()) {</span>
+<span class="nc" id="L819">            log.debug(&quot;Ignoring batch {} with producer id {}, epoch {}, and sequence number {} &quot; +</span>
+<span class="nc" id="L820">                            &quot;since the producer is already in fatal error state&quot;, batch, batch.producerId(),</span>
+<span class="nc" id="L821">                    batch.producerEpoch(), batch.baseSequence(), exception);</span>
+<span class="nc" id="L822">            return;</span>
+        }
+
+<span class="nc bnc" id="L825" title="All 4 branches missed.">        if (exception instanceof OutOfOrderSequenceException &amp;&amp; !isTransactional()) {</span>
+<span class="nc" id="L826">            log.error(&quot;The broker returned {} for topic-partition {} with producerId {}, epoch {}, and sequence number {}&quot;,</span>
+<span class="nc" id="L827">                    exception, batch.topicPartition, batch.producerId(), batch.producerEpoch(), batch.baseSequence());</span>
+
+            // If we fail with an OutOfOrderSequenceException, we have a gap in the log. Bump the epoch for this
+            // partition, which will reset the sequence number to 0 and allow us to continue
+<span class="nc" id="L831">            requestIdempotentEpochBumpForPartition(batch.topicPartition);</span>
+<span class="nc bnc" id="L832" title="All 2 branches missed.">        } else if (exception instanceof UnknownProducerIdException) {</span>
+            // If we get an UnknownProducerId for a partition, then the broker has no state for that producer. It will
+            // therefore accept a write with sequence number 0. We reset the sequence number for the partition here so
+            // that the producer can continue after aborting the transaction. All inflight-requests to this partition
+            // will also fail with an UnknownProducerId error, so the sequence will remain at 0. Note that if the
+            // broker supports bumping the epoch, we will later reset all sequence numbers after calling InitProducerId
+<span class="nc" id="L838">            resetSequenceForPartition(batch.topicPartition);</span>
+        } else {
+<span class="nc bnc" id="L840" title="All 2 branches missed.">            if (adjustSequenceNumbers) {</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">                if (!isTransactional()) {</span>
+<span class="nc" id="L842">                    requestIdempotentEpochBumpForPartition(batch.topicPartition);</span>
+                } else {
+<span class="nc" id="L844">                    txnPartitionMap.adjustSequencesDueToFailedBatch(batch);</span>
+                }
+            }
+        }
+<span class="nc" id="L848">    }</span>
+
+    synchronized boolean hasInflightBatches(TopicPartition topicPartition) {
+<span class="nc" id="L851">        return txnPartitionMap.getOrCreate(topicPartition).hasInflightBatches();</span>
+    }
+
+    synchronized boolean hasStaleProducerIdAndEpoch(TopicPartition topicPartition) {
+<span class="nc bnc" id="L855" title="All 2 branches missed.">        return !producerIdAndEpoch.equals(txnPartitionMap.getOrCreate(topicPartition).producerIdAndEpoch());</span>
+    }
+
+    synchronized boolean hasUnresolvedSequences() {
+<span class="nc bnc" id="L859" title="All 2 branches missed.">        return !partitionsWithUnresolvedSequences.isEmpty();</span>
+    }
+
+    synchronized boolean hasUnresolvedSequence(TopicPartition topicPartition) {
+<span class="nc" id="L863">        return partitionsWithUnresolvedSequences.containsKey(topicPartition);</span>
+    }
+
+    synchronized void markSequenceUnresolved(ProducerBatch batch) {
+<span class="nc" id="L867">        int nextSequence = batch.lastSequence() + 1;</span>
+<span class="nc" id="L868">        partitionsWithUnresolvedSequences.compute(batch.topicPartition,</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">            (k, v) -&gt; v == null ? nextSequence : Math.max(v, nextSequence));</span>
+<span class="nc" id="L870">        log.debug(&quot;Marking partition {} unresolved with next sequence number {}&quot;, batch.topicPartition,</span>
+<span class="nc" id="L871">                partitionsWithUnresolvedSequences.get(batch.topicPartition));</span>
+<span class="nc" id="L872">    }</span>
+
+    // Attempts to resolve unresolved sequences. If all in-flight requests are complete and some partitions are still
+    // unresolved, either bump the epoch if possible, or transition to a fatal error
+    synchronized void maybeResolveSequences() {
+<span class="nc bnc" id="L877" title="All 2 branches missed.">        for (Iterator&lt;TopicPartition&gt; iter = partitionsWithUnresolvedSequences.keySet().iterator(); iter.hasNext(); ) {</span>
+<span class="nc" id="L878">            TopicPartition topicPartition = iter.next();</span>
+<span class="nc bnc" id="L879" title="All 2 branches missed.">            if (!hasInflightBatches(topicPartition)) {</span>
+                // The partition has been fully drained. At this point, the last ack'd sequence should be one less than
+                // next sequence destined for the partition. If so, the partition is fully resolved. If not, we should
+                // reset the sequence number if necessary.
+<span class="nc bnc" id="L883" title="All 2 branches missed.">                if (isNextSequence(topicPartition, sequenceNumber(topicPartition))) {</span>
+                    // This would happen when a batch was expired, but subsequent batches succeeded.
+<span class="nc" id="L885">                    iter.remove();</span>
+                } else {
+                    // We would enter this branch if all in flight batches were ultimately expired in the producer.
+<span class="nc bnc" id="L888" title="All 2 branches missed.">                    if (isTransactional()) {</span>
+                        // For the transactional producer, we bump the epoch if possible, otherwise we transition to a fatal error
+<span class="nc" id="L890">                        String unackedMessagesErr = &quot;The client hasn't received acknowledgment for some previously &quot; +</span>
+                                &quot;sent messages and can no longer retry them. &quot;;
+<span class="nc" id="L892">                        KafkaException abortableException = new KafkaException(unackedMessagesErr + &quot;It is safe to abort &quot; +</span>
+                                &quot;the transaction and continue.&quot;);
+<span class="nc" id="L894">                        KafkaException fatalException = new KafkaException(unackedMessagesErr + &quot;It isn't safe to continue.&quot;);</span>
+
+<span class="nc" id="L896">                        transitionToAbortableErrorOrFatalError(abortableException, fatalException);</span>
+<span class="nc" id="L897">                    } else {</span>
+                        // For the idempotent producer, bump the epoch
+<span class="nc" id="L899">                        log.info(&quot;No inflight batches remaining for {}, last ack'd sequence for partition is {}, next sequence is {}. &quot; +</span>
+                                        &quot;Going to bump epoch and reset sequence numbers.&quot;, topicPartition,
+<span class="nc" id="L901">                                lastAckedSequence(topicPartition).orElse(TxnPartitionEntry.NO_LAST_ACKED_SEQUENCE_NUMBER), sequenceNumber(topicPartition));</span>
+<span class="nc" id="L902">                        requestIdempotentEpochBumpForPartition(topicPartition);</span>
+                    }
+
+<span class="nc" id="L905">                    iter.remove();</span>
+                }
+            }
+<span class="nc" id="L908">        }</span>
+<span class="nc" id="L909">    }</span>
+
+    private boolean isNextSequence(TopicPartition topicPartition, int sequence) {
+<span class="nc bnc" id="L912" title="All 2 branches missed.">        return sequence - lastAckedSequence(topicPartition).orElse(TxnPartitionEntry.NO_LAST_ACKED_SEQUENCE_NUMBER) == 1;</span>
+    }
+
+    private boolean isNextSequenceForUnresolvedPartition(TopicPartition topicPartition, int sequence) {
+<span class="nc bnc" id="L916" title="All 2 branches missed.">        return this.hasUnresolvedSequence(topicPartition) &amp;&amp;</span>
+<span class="nc bnc" id="L917" title="All 2 branches missed.">                sequence == this.partitionsWithUnresolvedSequences.get(topicPartition);</span>
+    }
+
+    synchronized TxnRequestHandler nextRequest(boolean hasIncompleteBatches) {
+<span class="nc bnc" id="L921" title="All 2 branches missed.">        if (!newPartitionsInTransaction.isEmpty())</span>
+<span class="nc" id="L922">            enqueueRequest(addPartitionsToTransactionHandler());</span>
+
+<span class="nc" id="L924">        TxnRequestHandler nextRequestHandler = pendingRequests.peek();</span>
+<span class="nc bnc" id="L925" title="All 2 branches missed.">        if (nextRequestHandler == null)</span>
+<span class="nc" id="L926">            return null;</span>
+
+        // Do not send the EndTxn until all batches have been flushed
+<span class="nc bnc" id="L929" title="All 4 branches missed.">        if (nextRequestHandler.isEndTxn() &amp;&amp; hasIncompleteBatches)</span>
+<span class="nc" id="L930">            return null;</span>
+
+<span class="nc" id="L932">        pendingRequests.poll();</span>
+<span class="nc bnc" id="L933" title="All 2 branches missed.">        if (maybeTerminateRequestWithError(nextRequestHandler)) {</span>
+<span class="nc" id="L934">            log.trace(&quot;Not sending transactional request {} because we are in an error state&quot;,</span>
+<span class="nc" id="L935">                    nextRequestHandler.requestBuilder());</span>
+<span class="nc" id="L936">            return null;</span>
+        }
+
+<span class="nc bnc" id="L939" title="All 4 branches missed.">        if (nextRequestHandler.isEndTxn() &amp;&amp; !transactionStarted) {</span>
+<span class="nc" id="L940">            nextRequestHandler.result.done();</span>
+<span class="nc bnc" id="L941" title="All 2 branches missed.">            if (currentState != State.FATAL_ERROR) {</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">                if (isTransactionV2Enabled) {</span>
+<span class="nc" id="L943">                    log.debug(&quot;Not sending EndTxn for completed transaction since no send &quot; +</span>
+                            &quot;or sendOffsetsToTransaction were triggered&quot;);
+                } else {
+<span class="nc" id="L946">                    log.debug(&quot;Not sending EndTxn for completed transaction since no partitions &quot; +</span>
+                            &quot;or offsets were successfully added&quot;);
+                }
+<span class="nc" id="L949">                resetTransactionState();</span>
+            }
+<span class="nc" id="L951">            nextRequestHandler = pendingRequests.poll();</span>
+        }
+
+<span class="nc bnc" id="L954" title="All 2 branches missed.">        if (nextRequestHandler != null)</span>
+<span class="nc" id="L955">            log.trace(&quot;Request {} dequeued for sending&quot;, nextRequestHandler.requestBuilder());</span>
+
+<span class="nc" id="L957">        return nextRequestHandler;</span>
+    }
+
+    synchronized void retry(TxnRequestHandler request) {
+<span class="nc" id="L961">        request.setRetry();</span>
+<span class="nc" id="L962">        enqueueRequest(request);</span>
+<span class="nc" id="L963">    }</span>
+
+    synchronized void authenticationFailed(AuthenticationException e) {
+<span class="nc bnc" id="L966" title="All 2 branches missed.">        for (TxnRequestHandler request : pendingRequests)</span>
+<span class="nc" id="L967">            request.fatalError(e);</span>
+<span class="nc" id="L968">    }</span>
+
+    synchronized void failPendingRequests(RuntimeException exception) {
+<span class="nc" id="L971">        pendingRequests.forEach(handler -&gt;</span>
+<span class="nc" id="L972">                handler.abortableError(exception));</span>
+<span class="nc" id="L973">    }</span>
+
+    synchronized void close() {
+<span class="nc" id="L976">        KafkaException shutdownException = new KafkaException(&quot;The producer closed forcefully&quot;);</span>
+<span class="nc" id="L977">        pendingRequests.forEach(handler -&gt;</span>
+<span class="nc" id="L978">                handler.fatalError(shutdownException));</span>
+<span class="nc bnc" id="L979" title="All 2 branches missed.">        if (pendingTransition != null) {</span>
+<span class="nc" id="L980">            pendingTransition.result.fail(shutdownException);</span>
+        }
+<span class="nc" id="L982">    }</span>
+
+    Node coordinator(FindCoordinatorRequest.CoordinatorType type) {
+<span class="nc bnc" id="L985" title="All 3 branches missed.">        switch (type) {</span>
+            case GROUP:
+<span class="nc" id="L987">                return consumerGroupCoordinator;</span>
+            case TRANSACTION:
+<span class="nc" id="L989">                return transactionCoordinator;</span>
+            default:
+<span class="nc" id="L991">                throw new IllegalStateException(&quot;Received an invalid coordinator type: &quot; + type);</span>
+        }
+    }
+
+    void lookupCoordinator(TxnRequestHandler request) {
+<span class="nc" id="L996">        lookupCoordinator(request.coordinatorType(), request.coordinatorKey());</span>
+<span class="nc" id="L997">    }</span>
+
+    void setInFlightCorrelationId(int correlationId) {
+<span class="nc" id="L1000">        inFlightRequestCorrelationId = correlationId;</span>
+<span class="nc" id="L1001">    }</span>
+
+    private void clearInFlightCorrelationId() {
+<span class="nc" id="L1004">        inFlightRequestCorrelationId = NO_INFLIGHT_REQUEST_CORRELATION_ID;</span>
+<span class="nc" id="L1005">    }</span>
+
+    boolean hasInFlightRequest() {
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">        return inFlightRequestCorrelationId != NO_INFLIGHT_REQUEST_CORRELATION_ID;</span>
+    }
+
+    // visible for testing.
+    boolean hasFatalError() {
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">        return currentState == State.FATAL_ERROR;</span>
+    }
+
+    // visible for testing.
+    boolean hasAbortableError() {
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">        return currentState == State.ABORTABLE_ERROR;</span>
+    }
+
+    // visible for testing
+    public synchronized boolean transactionContainsPartition(TopicPartition topicPartition) {
+<span class="nc" id="L1023">        return partitionsInTransaction.contains(topicPartition);</span>
+    }
+
+    // visible for testing
+    synchronized boolean hasPendingOffsetCommits() {
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">        return !pendingTxnOffsetCommits.isEmpty();</span>
+    }
+
+    synchronized boolean hasPendingRequests() {
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">        return !pendingRequests.isEmpty();</span>
+    }
+
+    // visible for testing
+    synchronized boolean hasOngoingTransaction() {
+        // transactions are considered ongoing once started until completion or a fatal error
+<span class="nc bnc" id="L1038" title="All 6 branches missed.">        return currentState == State.IN_TRANSACTION || isCompleting() || hasAbortableError();</span>
+    }
+
+    synchronized boolean canRetry(ProduceResponse.PartitionResponse response, ProducerBatch batch) {
+<span class="nc" id="L1042">        Errors error = response.error;</span>
+
+        // An UNKNOWN_PRODUCER_ID means that we have lost the producer state on the broker. Depending on the log start
+        // offset, we may want to retry these, as described for each case below. If none of those apply, then for the
+        // idempotent producer, we will locally bump the epoch and reset the sequence numbers of in-flight batches from
+        // sequence 0, then retry the failed batch, which should now succeed. For the transactional producer, allow the
+        // batch to fail. When processing the failed batch, we will transition to an abortable error and set a flag
+        // indicating that we need to bump the epoch (if supported by the broker).
+<span class="nc bnc" id="L1050" title="All 2 branches missed.">        if (error == Errors.UNKNOWN_PRODUCER_ID) {</span>
+<span class="nc bnc" id="L1051" title="All 2 branches missed.">            if (response.logStartOffset == -1) {</span>
+                // We don't know the log start offset with this response. We should just retry the request until we get it.
+                // The UNKNOWN_PRODUCER_ID error code was added along with the new ProduceResponse which includes the
+                // logStartOffset. So the '-1' sentinel is not for backward compatibility. Instead, it is possible for
+                // a broker to not know the logStartOffset at when it is returning the response because the partition
+                // may have moved away from the broker from the time the error was initially raised to the time the
+                // response was being constructed. In these cases, we should just retry the request: we are guaranteed
+                // to eventually get a logStartOffset once things settle down.
+<span class="nc" id="L1059">                return true;</span>
+            }
+
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">            if (batch.sequenceHasBeenReset()) {</span>
+                // When the first inflight batch fails due to the truncation case, then the sequences of all the other
+                // in flight batches would have been restarted from the beginning. However, when those responses
+                // come back from the broker, they would also come with an UNKNOWN_PRODUCER_ID error. In this case, we should not
+                // reset the sequence numbers to the beginning.
+<span class="nc" id="L1067">                return true;</span>
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">            } else if (lastAckedOffset(batch.topicPartition).orElse(TxnPartitionEntry.NO_LAST_ACKED_SEQUENCE_NUMBER) &lt; response.logStartOffset) {</span>
+                // The head of the log has been removed, probably due to the retention time elapsing. In this case,
+                // we expect to lose the producer state. For the transactional producer, reset the sequences of all
+                // inflight batches to be from the beginning and retry them, so that the transaction does not need to
+                // be aborted. For the idempotent producer, bump the epoch to avoid reusing (sequence, epoch) pairs
+<span class="nc bnc" id="L1073" title="All 2 branches missed.">                if (isTransactional()) {</span>
+<span class="nc" id="L1074">                    txnPartitionMap.startSequencesAtBeginning(batch.topicPartition, this.producerIdAndEpoch);</span>
+                } else {
+<span class="nc" id="L1076">                    requestIdempotentEpochBumpForPartition(batch.topicPartition);</span>
+                }
+<span class="nc" id="L1078">                return true;</span>
+            }
+
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">            if (!isTransactional()) {</span>
+                // For the idempotent producer, always retry UNKNOWN_PRODUCER_ID errors. If the batch has the current
+                // producer ID and epoch, request a bump of the epoch. Otherwise just retry the produce.
+<span class="nc" id="L1084">                requestIdempotentEpochBumpForPartition(batch.topicPartition);</span>
+<span class="nc" id="L1085">                return true;</span>
+            }
+<span class="nc bnc" id="L1087" title="All 2 branches missed.">        } else if (error == Errors.OUT_OF_ORDER_SEQUENCE_NUMBER) {</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">            if (!hasUnresolvedSequence(batch.topicPartition) &amp;&amp;</span>
+<span class="nc bnc" id="L1089" title="All 4 branches missed.">                    (batch.sequenceHasBeenReset() || !isNextSequence(batch.topicPartition, batch.baseSequence()))) {</span>
+                // We should retry the OutOfOrderSequenceException if the batch is _not_ the next batch, ie. its base
+                // sequence isn't the lastAckedSequence + 1.
+<span class="nc" id="L1092">                return true;</span>
+<span class="nc bnc" id="L1093" title="All 2 branches missed.">            } else if (!isTransactional()) {</span>
+                // For the idempotent producer, retry all OUT_OF_ORDER_SEQUENCE_NUMBER errors. If there are no
+                // unresolved sequences, or this batch is the one immediately following an unresolved sequence, we know
+                // there is actually a gap in the sequences, and we bump the epoch. Otherwise, retry without bumping
+                // and wait to see if the sequence resolves
+<span class="nc bnc" id="L1098" title="All 2 branches missed.">                if (!hasUnresolvedSequence(batch.topicPartition) ||</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">                        isNextSequenceForUnresolvedPartition(batch.topicPartition, batch.baseSequence())) {</span>
+<span class="nc" id="L1100">                    requestIdempotentEpochBumpForPartition(batch.topicPartition);</span>
+                }
+<span class="nc" id="L1102">                return true;</span>
+            }
+        }
+
+        // If neither of the above cases are true, retry if the exception is retriable
+<span class="nc" id="L1107">        return error.exception() instanceof RetriableException;</span>
+    }
+
+    // visible for testing
+    synchronized boolean isReady() {
+<span class="nc bnc" id="L1112" title="All 4 branches missed.">        return isTransactional() &amp;&amp; currentState == State.READY;</span>
+    }
+
+    // visible for testing
+    synchronized boolean isInitializing() {
+<span class="nc bnc" id="L1117" title="All 4 branches missed.">        return isTransactional() &amp;&amp; currentState == State.INITIALIZING;</span>
+    }
+
+    /**
+     * Check if the transaction is in the prepared state.
+     *
+     * @return true if the current state is PREPARED_TRANSACTION
+     */
+    public synchronized boolean isPrepared() {
+<span class="nc bnc" id="L1126" title="All 2 branches missed.">        return currentState == State.PREPARED_TRANSACTION;</span>
+    }
+
+    void handleCoordinatorReady() {
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">        NodeApiVersions nodeApiVersions = transactionCoordinator != null ?</span>
+<span class="nc" id="L1131">                apiVersions.get(transactionCoordinator.idString()) :</span>
+<span class="nc" id="L1132">                null;</span>
+<span class="nc bnc" id="L1133" title="All 2 branches missed.">        ApiVersion initProducerIdVersion = nodeApiVersions != null ?</span>
+<span class="nc" id="L1134">                nodeApiVersions.apiVersion(ApiKeys.INIT_PRODUCER_ID) :</span>
+<span class="nc" id="L1135">                null;</span>
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">        this.coordinatorSupportsBumpingEpoch = initProducerIdVersion != null &amp;&amp;</span>
+<span class="nc bnc" id="L1137" title="All 2 branches missed.">                initProducerIdVersion.maxVersion() &gt;= 3;</span>
+<span class="nc" id="L1138">    }</span>
+
+    private void transitionTo(State target) {
+<span class="nc" id="L1141">        transitionTo(target, null);</span>
+<span class="nc" id="L1142">    }</span>
+
+    private void transitionTo(State target, RuntimeException error) {
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">        if (!currentState.isTransitionValid(currentState, target)) {</span>
+<span class="nc bnc" id="L1146" title="All 2 branches missed.">            String idString = transactionalId == null ?  &quot;&quot; : &quot;TransactionalId &quot; + transactionalId + &quot;: &quot;;</span>
+<span class="nc" id="L1147">            String message = idString + &quot;Invalid transition attempted from state &quot;</span>
+<span class="nc" id="L1148">                    + currentState.name() + &quot; to state &quot; + target.name();</span>
+
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">            if (shouldPoisonStateOnInvalidTransition()) {</span>
+<span class="nc" id="L1151">                currentState = State.FATAL_ERROR;</span>
+<span class="nc" id="L1152">                lastError = new IllegalStateException(message);</span>
+<span class="nc" id="L1153">                throw lastError;</span>
+            } else {
+<span class="nc" id="L1155">                throw new IllegalStateException(message);</span>
+            }
+<span class="nc bnc" id="L1157" title="All 4 branches missed.">        } else if (target == State.FATAL_ERROR || target == State.ABORTABLE_ERROR) {</span>
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">            if (error == null)</span>
+<span class="nc" id="L1159">                throw new IllegalArgumentException(&quot;Cannot transition to &quot; + target + &quot; with a null exception&quot;);</span>
+<span class="nc" id="L1160">            lastError = error;</span>
+        } else {
+<span class="nc" id="L1162">            lastError = null;</span>
+        }
+
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">        if (lastError != null)</span>
+<span class="nc" id="L1166">            log.debug(&quot;Transition from state {} to error state {}&quot;, currentState, target, lastError);</span>
+        else
+<span class="nc" id="L1168">            log.debug(&quot;Transition from state {} to {}&quot;, currentState, target);</span>
+
+<span class="nc" id="L1170">        currentState = target;</span>
+<span class="nc" id="L1171">    }</span>
+
+    private void ensureTransactional() {
+<span class="nc bnc" id="L1174" title="All 2 branches missed.">        if (!isTransactional())</span>
+<span class="nc" id="L1175">            throw new IllegalStateException(&quot;Transactional method invoked on a non-transactional producer.&quot;);</span>
+<span class="nc" id="L1176">    }</span>
+
+    private void maybeFailWithError() {
+<span class="nc bnc" id="L1179" title="All 2 branches missed.">        if (!hasError()) {</span>
+<span class="nc" id="L1180">            return;</span>
+        }
+        // for ProducerFencedException, do not wrap it as a KafkaException
+        // but create a new instance without the call trace since it was not thrown because of the current call
+<span class="nc bnc" id="L1184" title="All 2 branches missed.">        if (lastError instanceof ProducerFencedException) {</span>
+<span class="nc" id="L1185">            throw new ProducerFencedException(&quot;Producer with transactionalId '&quot; + transactionalId</span>
+                    + &quot;' and &quot; + producerIdAndEpoch + &quot; has been fenced by another producer &quot; +
+                    &quot;with the same transactionalId&quot;);
+        }
+<span class="nc bnc" id="L1189" title="All 2 branches missed.">        if (lastError instanceof InvalidProducerEpochException) {</span>
+<span class="nc" id="L1190">            throw new InvalidProducerEpochException(&quot;Producer with transactionalId '&quot; + transactionalId</span>
+                    + &quot;' and &quot; + producerIdAndEpoch + &quot; attempted to produce with an old epoch&quot;);
+        }
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">        if (lastError instanceof IllegalStateException) {</span>
+<span class="nc" id="L1194">            throw new IllegalStateException(&quot;Producer with transactionalId '&quot; + transactionalId</span>
+                    + &quot;' and &quot; + producerIdAndEpoch + &quot; cannot execute transactional method because of previous invalid state transition attempt&quot;, lastError);
+        }
+<span class="nc" id="L1197">        throw new KafkaException(&quot;Cannot execute transactional method because we are in an error state&quot;, lastError);</span>
+    }
+
+    private boolean maybeTerminateRequestWithError(TxnRequestHandler requestHandler) {
+<span class="nc bnc" id="L1201" title="All 2 branches missed.">        if (hasError()) {</span>
+<span class="nc bnc" id="L1202" title="All 4 branches missed.">            if (hasAbortableError() &amp;&amp; requestHandler instanceof FindCoordinatorHandler)</span>
+                // No harm letting the FindCoordinator request go through if we're expecting to abort
+<span class="nc" id="L1204">                return false;</span>
+
+<span class="nc" id="L1206">            requestHandler.fail(lastError);</span>
+<span class="nc" id="L1207">            return true;</span>
+        }
+<span class="nc" id="L1209">        return false;</span>
+    }
+
+    private void enqueueRequest(TxnRequestHandler requestHandler) {
+<span class="nc" id="L1213">        log.debug(&quot;Enqueuing transactional request {}&quot;, requestHandler.requestBuilder());</span>
+<span class="nc" id="L1214">        pendingRequests.add(requestHandler);</span>
+<span class="nc" id="L1215">    }</span>
+
+    private void lookupCoordinator(FindCoordinatorRequest.CoordinatorType type, String coordinatorKey) {
+<span class="nc bnc" id="L1218" title="All 3 branches missed.">        switch (type) {</span>
+            case GROUP:
+<span class="nc" id="L1220">                consumerGroupCoordinator = null;</span>
+<span class="nc" id="L1221">                break;</span>
+            case TRANSACTION:
+<span class="nc" id="L1223">                transactionCoordinator = null;</span>
+<span class="nc" id="L1224">                break;</span>
+            default:
+<span class="nc" id="L1226">                throw new IllegalStateException(&quot;Invalid coordinator type: &quot; + type);</span>
+        }
+
+<span class="nc" id="L1229">        FindCoordinatorRequestData data = new FindCoordinatorRequestData()</span>
+<span class="nc" id="L1230">                .setKeyType(type.id())</span>
+<span class="nc" id="L1231">                .setKey(coordinatorKey);</span>
+<span class="nc" id="L1232">        FindCoordinatorRequest.Builder builder = new FindCoordinatorRequest.Builder(data);</span>
+<span class="nc" id="L1233">        enqueueRequest(new FindCoordinatorHandler(builder));</span>
+<span class="nc" id="L1234">    }</span>
+
+    private TxnRequestHandler addPartitionsToTransactionHandler() {
+<span class="nc" id="L1237">        pendingPartitionsInTransaction.addAll(newPartitionsInTransaction);</span>
+<span class="nc" id="L1238">        newPartitionsInTransaction.clear();</span>
+<span class="nc" id="L1239">        AddPartitionsToTxnRequest.Builder builder =</span>
+<span class="nc" id="L1240">            AddPartitionsToTxnRequest.Builder.forClient(transactionalId,</span>
+                producerIdAndEpoch.producerId,
+                producerIdAndEpoch.epoch,
+                new ArrayList&lt;&gt;(pendingPartitionsInTransaction));
+<span class="nc" id="L1244">        return new AddPartitionsToTxnHandler(builder);</span>
+    }
+
+    private TxnOffsetCommitHandler txnOffsetCommitHandler(TransactionalRequestResult result,
+                                                          Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets,
+                                                          ConsumerGroupMetadata groupMetadata) {
+        // Resolve topic ids from the metadata cache at request build time.
+        // KafkaProducer.sendOffsetsToTransaction has already ensured the cache
+        // is fresh for these topics, so this is a non-blocking lookup.
+<span class="nc" id="L1253">        var topicIds = metadata.topicIds();</span>
+<span class="nc" id="L1254">        var requestTopicsByName = new HashMap&lt;String, TxnOffsetCommitRequestTopic&gt;();</span>
+<span class="nc" id="L1255">        var topicNamesByIds = new HashMap&lt;Uuid, String&gt;();</span>
+<span class="nc" id="L1256">        var topics = new ArrayList&lt;TxnOffsetCommitRequestTopic&gt;();</span>
+<span class="nc" id="L1257">        var allHaveTopicIds = true;</span>
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">        for (var entry : offsets.entrySet()) {</span>
+<span class="nc" id="L1259">            var tp = entry.getKey();</span>
+<span class="nc" id="L1260">            var offsetAndMetadata = entry.getValue();</span>
+<span class="nc" id="L1261">            pendingTxnOffsetCommits.put(</span>
+                tp,
+                new CommittedOffset(
+<span class="nc" id="L1264">                    offsetAndMetadata.offset(),</span>
+<span class="nc" id="L1265">                    offsetAndMetadata.metadata(),</span>
+<span class="nc" id="L1266">                    offsetAndMetadata.leaderEpoch()</span>
+                )
+            );
+<span class="nc" id="L1269">            var topicId = topicIds.getOrDefault(tp.topic(), Uuid.ZERO_UUID);</span>
+<span class="nc bnc" id="L1270" title="All 2 branches missed.">            allHaveTopicIds &amp;= !topicId.equals(Uuid.ZERO_UUID);</span>
+<span class="nc" id="L1271">            var topic = requestTopicsByName.computeIfAbsent(tp.topic(), name -&gt; {</span>
+<span class="nc" id="L1272">                var t = new TxnOffsetCommitRequestTopic().setName(name).setTopicId(topicId);</span>
+<span class="nc" id="L1273">                topics.add(t);</span>
+<span class="nc bnc" id="L1274" title="All 2 branches missed.">                if (!topicId.equals(Uuid.ZERO_UUID)) {</span>
+<span class="nc" id="L1275">                    topicNamesByIds.put(topicId, name);</span>
+                }
+<span class="nc" id="L1277">                return t;</span>
+            });
+<span class="nc" id="L1279">            topic.partitions().add(new TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition()</span>
+<span class="nc" id="L1280">                .setPartitionIndex(tp.partition())</span>
+<span class="nc" id="L1281">                .setCommittedOffset(offsetAndMetadata.offset())</span>
+<span class="nc" id="L1282">                .setCommittedLeaderEpoch(offsetAndMetadata.leaderEpoch().orElse(RecordBatch.NO_PARTITION_LEADER_EPOCH))</span>
+<span class="nc" id="L1283">                .setCommittedMetadata(offsetAndMetadata.metadata()));</span>
+<span class="nc" id="L1284">        }</span>
+
+<span class="nc" id="L1286">        var data = new TxnOffsetCommitRequestData()</span>
+<span class="nc" id="L1287">            .setTransactionalId(transactionalId)</span>
+<span class="nc" id="L1288">            .setGroupId(groupMetadata.groupId())</span>
+<span class="nc" id="L1289">            .setProducerId(producerIdAndEpoch.producerId)</span>
+<span class="nc" id="L1290">            .setProducerEpoch(producerIdAndEpoch.epoch)</span>
+<span class="nc" id="L1291">            .setMemberId(groupMetadata.memberId())</span>
+<span class="nc" id="L1292">            .setGenerationIdOrMemberEpoch(groupMetadata.generationId())</span>
+<span class="nc" id="L1293">            .setGroupInstanceId(groupMetadata.groupInstanceId().orElse(null))</span>
+<span class="nc" id="L1294">            .setTopics(topics);</span>
+<span class="nc bnc" id="L1295" title="All 2 branches missed.">        var builder = allHaveTopicIds</span>
+<span class="nc" id="L1296">            ? TxnOffsetCommitRequest.Builder.forTopicIdsOrNames(data, isTransactionV2Enabled())</span>
+<span class="nc" id="L1297">            : TxnOffsetCommitRequest.Builder.forTopicNames(data, isTransactionV2Enabled());</span>
+<span class="nc bnc" id="L1298" title="All 2 branches missed.">        if (result == null) {</span>
+            // In this case, transaction V2 is in use.
+<span class="nc" id="L1300">            return new TxnOffsetCommitHandler(builder, topicNamesByIds);</span>
+        }
+<span class="nc" id="L1302">        return new TxnOffsetCommitHandler(result, builder, topicNamesByIds);</span>
+    }
+
+    private void throwIfPendingState(TransactionOperation operation) {
+<span class="nc bnc" id="L1306" title="All 2 branches missed.">        if (pendingTransition != null) {</span>
+<span class="nc bnc" id="L1307" title="All 2 branches missed.">            if (pendingTransition.result.isAcked()) {</span>
+<span class="nc" id="L1308">                pendingTransition = null;</span>
+            } else {
+<span class="nc" id="L1310">                throw new IllegalStateException(&quot;Cannot attempt operation `&quot; + operation + &quot;` &quot;</span>
+                    + &quot;because the previous call to `&quot; + pendingTransition.operation + &quot;` &quot;
+                    + &quot;timed out and must be retried&quot;);
+            }
+        }
+<span class="nc" id="L1315">    }</span>
+
+    private TransactionalRequestResult handleCachedTransactionRequestResult(
+        Supplier&lt;TransactionalRequestResult&gt; transactionalRequestResultSupplier,
+        State nextState,
+        String operation
+    ) {
+<span class="nc" id="L1322">        ensureTransactional();</span>
+
+<span class="nc bnc" id="L1324" title="All 2 branches missed.">        if (pendingTransition != null) {</span>
+<span class="nc bnc" id="L1325" title="All 2 branches missed.">            if (pendingTransition.result.isAcked()) {</span>
+<span class="nc" id="L1326">                pendingTransition = null;</span>
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">            } else if (nextState != pendingTransition.state) {</span>
+<span class="nc" id="L1328">                throw new IllegalStateException(&quot;Cannot attempt operation `&quot; + operation + &quot;` &quot;</span>
+                    + &quot;because the previous call to `&quot; + pendingTransition.operation + &quot;` &quot;
+                    + &quot;timed out and must be retried&quot;);
+            } else {
+<span class="nc" id="L1332">                return pendingTransition.result;</span>
+            }
+        }
+
+<span class="nc" id="L1336">        TransactionalRequestResult result = transactionalRequestResultSupplier.get();</span>
+<span class="nc" id="L1337">        pendingTransition = new PendingStateTransition(result, nextState, operation);</span>
+<span class="nc" id="L1338">        return result;</span>
+    }
+
+    /**
+     * Determines if an epoch bump can be triggered manually based on the api versions.
+     *
+     * &lt;b&gt;NOTE:&lt;/b&gt;
+     * This method should only be used for transactional producers.
+     * For non-transactional producers epoch bumping is always allowed.
+     *
+     * &lt;ol&gt;
+     *   &lt;li&gt;&lt;b&gt;Client-Triggered Epoch Bump&lt;/b&gt;:
+     *          If the coordinator supports epoch bumping (initProducerIdVersion.maxVersion() &gt;= 3),
+     *          client-triggered epoch bumping is allowed, returns true.
+     *          &lt;code&gt;clientSideEpochBumpTriggerRequired&lt;/code&gt; must be set to true in this case.&lt;/li&gt;
+     *
+     *   &lt;li&gt;&lt;b&gt;No Epoch Bump Allowed&lt;/b&gt;:
+     *          If the coordinator does not support epoch bumping, returns false.&lt;/li&gt;
+     *
+     *   &lt;li&gt;&lt;b&gt;Server-Triggered Only&lt;/b&gt;:
+     *          When TransactionV2 is enabled, epoch bumping is handled automatically
+     *          by the server in EndTxn, so manual epoch bumping is not required, returns false.&lt;/li&gt;
+     * &lt;/ol&gt;
+     *
+     * @return true if a client-triggered epoch bump is allowed, otherwise false.
+     */
+    // package-private for testing
+    boolean needToTriggerEpochBumpFromClient() {
+<span class="nc bnc" id="L1366" title="All 4 branches missed.">        return coordinatorSupportsBumpingEpoch &amp;&amp; !isTransactionV2Enabled;</span>
+    }
+
+    /**
+     * Determines if the coordinator can handle an abortable error.
+     * Recovering from an abortable error requires an epoch bump which can be triggered by the client
+     * or automatically taken care of at the end of every transaction (Transaction V2).
+     * Use &lt;code&gt;needToTriggerEpochBumpFromClient&lt;/code&gt; to check whether the epoch bump needs to be triggered
+     * manually.
+     *
+     * &lt;b&gt;NOTE:&lt;/b&gt;
+     * This method should only be used for transactional producers.
+     * There is no concept of abortable errors for idempotent producers.
+     *
+     * @return true if an abortable error can be handled, otherwise false.
+     */
+    boolean canHandleAbortableError() {
+<span class="nc bnc" id="L1383" title="All 4 branches missed.">        return coordinatorSupportsBumpingEpoch || isTransactionV2Enabled;</span>
+    }
+
+    private void resetTransactionState() {
+<span class="nc bnc" id="L1387" title="All 2 branches missed.">        if (clientSideEpochBumpRequired) {</span>
+<span class="nc" id="L1388">            transitionTo(State.INITIALIZING);</span>
+        } else {
+<span class="nc" id="L1390">            transitionTo(State.READY);</span>
+        }
+<span class="nc" id="L1392">        lastError = null;</span>
+<span class="nc" id="L1393">        clientSideEpochBumpRequired = false;</span>
+<span class="nc" id="L1394">        transactionStarted = false;</span>
+<span class="nc" id="L1395">        newPartitionsInTransaction.clear();</span>
+<span class="nc" id="L1396">        pendingPartitionsInTransaction.clear();</span>
+<span class="nc" id="L1397">        partitionsInTransaction.clear();</span>
+<span class="nc" id="L1398">        preparedTxnState = ProducerIdAndEpoch.NONE;</span>
+<span class="nc" id="L1399">    }</span>
+
+    abstract class TxnRequestHandler implements RequestCompletionHandler {
+        protected final TransactionalRequestResult result;
+<span class="nc" id="L1403">        private boolean isRetry = false;</span>
+
+<span class="nc" id="L1405">        TxnRequestHandler(TransactionalRequestResult result) {</span>
+<span class="nc" id="L1406">            this.result = result;</span>
+<span class="nc" id="L1407">        }</span>
+
+        TxnRequestHandler(String operation) {
+<span class="nc" id="L1410">            this(new TransactionalRequestResult(operation));</span>
+<span class="nc" id="L1411">        }</span>
+
+        void fatalError(RuntimeException e) {
+<span class="nc" id="L1414">            result.fail(e);</span>
+<span class="nc" id="L1415">            transitionToFatalError(e);</span>
+<span class="nc" id="L1416">        }</span>
+
+        void abortableError(RuntimeException e) {
+<span class="nc" id="L1419">            result.fail(e);</span>
+<span class="nc" id="L1420">            transitionToAbortableError(e);</span>
+<span class="nc" id="L1421">        }</span>
+
+        /**
+         * Determines if an error should be treated as abortable or fatal, based on transaction state and configuration.
+         * &lt;ol&gt;&lt;l&gt; NOTE: Only use this method for transactional producers &lt;/l&gt;&lt;/ol&gt;
+         *
+         * - &lt;b&gt;Abortable Error&lt;/b&gt;:
+         *     An abortable error can be handled effectively, if epoch bumping is supported.
+         *     1) If transactionV2 is enabled, automatic epoch bumping happens at the end of every transaction.
+         *     2) If the client can trigger an epoch bump, the abortable error can be handled.
+         *
+         *- &lt;b&gt;Fatal Error&lt;/b&gt;:
+         *      If epoch bumping is not supported, the system cannot recover and the error must be treated as fatal.
+         * @param e the error to determine as either abortable or fatal.
+         */
+        void abortableErrorIfPossible(RuntimeException e) {
+<span class="nc bnc" id="L1437" title="All 2 branches missed.">            if (canHandleAbortableError()) {</span>
+<span class="nc bnc" id="L1438" title="All 2 branches missed.">                if (needToTriggerEpochBumpFromClient())</span>
+<span class="nc" id="L1439">                    clientSideEpochBumpRequired = true;</span>
+<span class="nc" id="L1440">                abortableError(e);</span>
+            } else {
+<span class="nc" id="L1442">                fatalError(e);</span>
+            }
+<span class="nc" id="L1444">        }</span>
+
+        void fail(RuntimeException e) {
+<span class="nc" id="L1447">            result.fail(e);</span>
+<span class="nc" id="L1448">        }</span>
+
+        void reenqueue() {
+<span class="nc" id="L1451">            synchronized (TransactionManager.this) {</span>
+<span class="nc" id="L1452">                this.isRetry = true;</span>
+<span class="nc" id="L1453">                enqueueRequest(this);</span>
+<span class="nc" id="L1454">            }</span>
+<span class="nc" id="L1455">        }</span>
+
+        long retryBackoffMs() {
+<span class="nc" id="L1458">            return retryBackoffMs;</span>
+        }
+
+        @Override
+        public void onComplete(ClientResponse response) {
+<span class="nc bnc" id="L1463" title="All 2 branches missed.">            if (response.requestHeader().correlationId() != inFlightRequestCorrelationId) {</span>
+<span class="nc" id="L1464">                fatalError(new RuntimeException(&quot;Detected more than one in-flight transactional request.&quot;));</span>
+            } else {
+<span class="nc" id="L1466">                clearInFlightCorrelationId();</span>
+<span class="nc bnc" id="L1467" title="All 2 branches missed.">                if (response.wasDisconnected()) {</span>
+<span class="nc" id="L1468">                    log.debug(&quot;Disconnected from {}. Will retry.&quot;, response.destination());</span>
+<span class="nc bnc" id="L1469" title="All 2 branches missed.">                    if (this.needsCoordinator())</span>
+<span class="nc" id="L1470">                        lookupCoordinator(this.coordinatorType(), this.coordinatorKey());</span>
+<span class="nc" id="L1471">                    reenqueue();</span>
+<span class="nc bnc" id="L1472" title="All 2 branches missed.">                } else if (response.versionMismatch() != null) {</span>
+<span class="nc" id="L1473">                    fatalError(response.versionMismatch());</span>
+<span class="nc bnc" id="L1474" title="All 2 branches missed.">                } else if (response.hasResponse()) {</span>
+<span class="nc" id="L1475">                    log.trace(&quot;Received transactional response {} for request {}&quot;, response.responseBody(),</span>
+<span class="nc" id="L1476">                            requestBuilder());</span>
+<span class="nc" id="L1477">                    synchronized (TransactionManager.this) {</span>
+<span class="nc" id="L1478">                        handleResponse(response.responseBody());</span>
+<span class="nc" id="L1479">                    }</span>
+                } else {
+<span class="nc" id="L1481">                    fatalError(new KafkaException(&quot;Could not execute transactional request for unknown reasons&quot;));</span>
+                }
+            }
+<span class="nc" id="L1484">        }</span>
+
+        boolean needsCoordinator() {
+<span class="nc bnc" id="L1487" title="All 2 branches missed.">            return coordinatorType() != null;</span>
+        }
+
+        FindCoordinatorRequest.CoordinatorType coordinatorType() {
+<span class="nc" id="L1491">            return FindCoordinatorRequest.CoordinatorType.TRANSACTION;</span>
+        }
+
+        String coordinatorKey() {
+<span class="nc" id="L1495">            return transactionalId;</span>
+        }
+
+        void setRetry() {
+<span class="nc" id="L1499">            this.isRetry = true;</span>
+<span class="nc" id="L1500">        }</span>
+
+        boolean isRetry() {
+<span class="nc" id="L1503">            return isRetry;</span>
+        }
+
+        boolean isEndTxn() {
+<span class="nc" id="L1507">            return false;</span>
+        }
+
+        abstract AbstractRequest.Builder&lt;?&gt; requestBuilder();
+
+        abstract void handleResponse(AbstractResponse responseBody);
+
+        abstract Priority priority();
+    }
+
+    private class InitProducerIdHandler extends TxnRequestHandler {
+        private final InitProducerIdRequest.Builder builder;
+        private final boolean isEpochBump;
+
+<span class="nc" id="L1521">        private InitProducerIdHandler(InitProducerIdRequest.Builder builder, boolean isEpochBump) {</span>
+<span class="nc" id="L1522">            super(&quot;InitProducerId&quot;);</span>
+<span class="nc" id="L1523">            this.builder = builder;</span>
+<span class="nc" id="L1524">            this.isEpochBump = isEpochBump;</span>
+<span class="nc" id="L1525">        }</span>
+
+        @Override
+        InitProducerIdRequest.Builder requestBuilder() {
+<span class="nc" id="L1529">            return builder;</span>
+        }
+
+        @Override
+        Priority priority() {
+<span class="nc bnc" id="L1534" title="All 2 branches missed.">            return this.isEpochBump ? Priority.EPOCH_BUMP : Priority.INIT_PRODUCER_ID;</span>
+        }
+
+        @Override
+        FindCoordinatorRequest.CoordinatorType coordinatorType() {
+<span class="nc bnc" id="L1539" title="All 2 branches missed.">            if (isTransactional()) {</span>
+<span class="nc" id="L1540">                return FindCoordinatorRequest.CoordinatorType.TRANSACTION;</span>
+            } else {
+<span class="nc" id="L1542">                return null;</span>
+            }
+        }
+
+        @Override
+        public void handleResponse(AbstractResponse response) {
+<span class="nc" id="L1548">            InitProducerIdResponse initProducerIdResponse = (InitProducerIdResponse) response;</span>
+<span class="nc" id="L1549">            Errors error = initProducerIdResponse.error();</span>
+
+<span class="nc bnc" id="L1551" title="All 2 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc" id="L1552">                ProducerIdAndEpoch producerIdAndEpoch = new ProducerIdAndEpoch(initProducerIdResponse.data().producerId(),</span>
+<span class="nc" id="L1553">                        initProducerIdResponse.data().producerEpoch());</span>
+<span class="nc" id="L1554">                setProducerIdAndEpoch(producerIdAndEpoch);</span>
+                // If this is a transaction with keepPreparedTxn=true, transition directly
+                // to PREPARED_TRANSACTION state IFF there is an ongoing transaction.
+<span class="nc bnc" id="L1557" title="All 2 branches missed.">                if (builder.data.keepPreparedTxn() &amp;&amp;</span>
+<span class="nc bnc" id="L1558" title="All 2 branches missed.">                    initProducerIdResponse.data().ongoingTxnProducerId() != RecordBatch.NO_PRODUCER_ID</span>
+                ) {
+<span class="nc" id="L1560">                    transitionTo(State.PREPARED_TRANSACTION);</span>
+                    // Update the preparedTxnState with the ongoing pid and epoch from the response.
+                    // This will be used to complete the transaction later.
+<span class="nc" id="L1563">                    TransactionManager.this.preparedTxnState = new ProducerIdAndEpoch(</span>
+<span class="nc" id="L1564">                        initProducerIdResponse.data().ongoingTxnProducerId(),</span>
+<span class="nc" id="L1565">                        initProducerIdResponse.data().ongoingTxnProducerEpoch()</span>
+                    );
+                } else {
+<span class="nc" id="L1568">                    transitionTo(State.READY);</span>
+                }
+<span class="nc" id="L1570">                lastError = null;</span>
+<span class="nc bnc" id="L1571" title="All 2 branches missed.">                if (this.isEpochBump) {</span>
+<span class="nc" id="L1572">                    resetSequenceNumbers();</span>
+                }
+<span class="nc" id="L1574">                result.done();</span>
+<span class="nc bnc" id="L1575" title="All 4 branches missed.">            } else if (error == Errors.NOT_COORDINATOR || error == Errors.COORDINATOR_NOT_AVAILABLE) {</span>
+<span class="nc" id="L1576">                lookupCoordinator(FindCoordinatorRequest.CoordinatorType.TRANSACTION, transactionalId);</span>
+<span class="nc" id="L1577">                reenqueue();</span>
+<span class="nc bnc" id="L1578" title="All 2 branches missed.">            } else if (error.exception() instanceof RetriableException) {</span>
+<span class="nc" id="L1579">                reenqueue();</span>
+<span class="nc bnc" id="L1580" title="All 4 branches missed.">            } else if (error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED ||</span>
+                    error == Errors.CLUSTER_AUTHORIZATION_FAILED) {
+<span class="nc" id="L1582">                log.info(&quot;Abortable authorization error: {}.  Transition the producer state to {}&quot;, error.message(), State.ABORTABLE_ERROR);</span>
+<span class="nc" id="L1583">                lastError = error.exception();</span>
+<span class="nc" id="L1584">                abortableError(error.exception());</span>
+<span class="nc bnc" id="L1585" title="All 4 branches missed.">            } else if (error == Errors.INVALID_PRODUCER_EPOCH || error == Errors.PRODUCER_FENCED) {</span>
+                // We could still receive INVALID_PRODUCER_EPOCH from old versioned transaction coordinator,
+                // just treat it the same as PRODUCE_FENCED.
+<span class="nc" id="L1588">                fatalError(Errors.PRODUCER_FENCED.exception());</span>
+<span class="nc bnc" id="L1589" title="All 2 branches missed.">            } else if (error == Errors.TRANSACTION_ABORTABLE) {</span>
+<span class="nc" id="L1590">                abortableError(error.exception());</span>
+            } else {
+<span class="nc" id="L1592">                fatalError(new KafkaException(&quot;Unexpected error in InitProducerIdResponse; &quot; + error.message()));</span>
+            }
+<span class="nc" id="L1594">        }</span>
+    }
+
+    private class AddPartitionsToTxnHandler extends TxnRequestHandler {
+        private final AddPartitionsToTxnRequest.Builder builder;
+        private long retryBackoffMs;
+
+<span class="nc" id="L1601">        private AddPartitionsToTxnHandler(AddPartitionsToTxnRequest.Builder builder) {</span>
+<span class="nc" id="L1602">            super(&quot;AddPartitionsToTxn&quot;);</span>
+<span class="nc" id="L1603">            this.builder = builder;</span>
+<span class="nc" id="L1604">            this.retryBackoffMs = TransactionManager.this.retryBackoffMs;</span>
+<span class="nc" id="L1605">        }</span>
+
+        @Override
+        AddPartitionsToTxnRequest.Builder requestBuilder() {
+<span class="nc" id="L1609">            return builder;</span>
+        }
+
+        @Override
+        Priority priority() {
+<span class="nc" id="L1614">            return Priority.ADD_PARTITIONS_OR_OFFSETS;</span>
+        }
+
+        @Override
+        public void handleResponse(AbstractResponse response) {
+<span class="nc" id="L1619">            AddPartitionsToTxnResponse addPartitionsToTxnResponse = (AddPartitionsToTxnResponse) response;</span>
+<span class="nc" id="L1620">            Map&lt;TopicPartition, Errors&gt; errors = addPartitionsToTxnResponse.errors().get(AddPartitionsToTxnResponse.V3_AND_BELOW_TXN_ID);</span>
+<span class="nc" id="L1621">            boolean hasPartitionErrors = false;</span>
+<span class="nc" id="L1622">            Set&lt;String&gt; unauthorizedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1623">            retryBackoffMs = TransactionManager.this.retryBackoffMs;</span>
+
+<span class="nc bnc" id="L1625" title="All 2 branches missed.">            for (Map.Entry&lt;TopicPartition, Errors&gt; topicPartitionErrorEntry : errors.entrySet()) {</span>
+<span class="nc" id="L1626">                TopicPartition topicPartition = topicPartitionErrorEntry.getKey();</span>
+<span class="nc" id="L1627">                Errors error = topicPartitionErrorEntry.getValue();</span>
+
+<span class="nc bnc" id="L1629" title="All 2 branches missed.">                if (error == Errors.NONE) {</span>
+<span class="nc" id="L1630">                    continue;</span>
+<span class="nc bnc" id="L1631" title="All 4 branches missed.">                } else if (error == Errors.COORDINATOR_NOT_AVAILABLE || error == Errors.NOT_COORDINATOR) {</span>
+<span class="nc" id="L1632">                    lookupCoordinator(FindCoordinatorRequest.CoordinatorType.TRANSACTION, transactionalId);</span>
+<span class="nc" id="L1633">                    reenqueue();</span>
+<span class="nc" id="L1634">                    return;</span>
+<span class="nc bnc" id="L1635" title="All 2 branches missed.">                } else if (error == Errors.CONCURRENT_TRANSACTIONS) {</span>
+<span class="nc" id="L1636">                    maybeOverrideRetryBackoffMs();</span>
+<span class="nc" id="L1637">                    reenqueue();</span>
+<span class="nc" id="L1638">                    return;</span>
+<span class="nc bnc" id="L1639" title="All 2 branches missed.">                } else if (error.exception() instanceof RetriableException) {</span>
+<span class="nc" id="L1640">                    reenqueue();</span>
+<span class="nc" id="L1641">                    return;</span>
+<span class="nc bnc" id="L1642" title="All 4 branches missed.">                } else if (error == Errors.INVALID_PRODUCER_EPOCH || error == Errors.PRODUCER_FENCED) {</span>
+                    // We could still receive INVALID_PRODUCER_EPOCH from old versioned transaction coordinator,
+                    // just treat it the same as PRODUCE_FENCED.
+<span class="nc" id="L1645">                    fatalError(Errors.PRODUCER_FENCED.exception());</span>
+<span class="nc" id="L1646">                    return;</span>
+<span class="nc bnc" id="L1647" title="All 6 branches missed.">                } else if (error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED ||</span>
+                        error == Errors.INVALID_TXN_STATE || error == Errors.INVALID_PRODUCER_ID_MAPPING) {
+<span class="nc" id="L1649">                    fatalError(error.exception());</span>
+<span class="nc" id="L1650">                    return;</span>
+<span class="nc bnc" id="L1651" title="All 2 branches missed.">                } else if (error == Errors.TOPIC_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1652">                    unauthorizedTopics.add(topicPartition.topic());</span>
+<span class="nc bnc" id="L1653" title="All 2 branches missed.">                } else if (error == Errors.OPERATION_NOT_ATTEMPTED) {</span>
+<span class="nc" id="L1654">                    log.debug(&quot;Did not attempt to add partition {} to transaction because other partitions in the &quot; +</span>
+                            &quot;batch had errors.&quot;, topicPartition);
+<span class="nc" id="L1656">                    hasPartitionErrors = true;</span>
+<span class="nc bnc" id="L1657" title="All 2 branches missed.">                } else if (error == Errors.UNKNOWN_PRODUCER_ID) {</span>
+<span class="nc" id="L1658">                    abortableErrorIfPossible(error.exception());</span>
+<span class="nc" id="L1659">                    return;</span>
+<span class="nc bnc" id="L1660" title="All 2 branches missed.">                } else if (error == Errors.TRANSACTION_ABORTABLE) {</span>
+<span class="nc" id="L1661">                    abortableError(error.exception());</span>
+<span class="nc" id="L1662">                    return;</span>
+                } else {
+<span class="nc" id="L1664">                    log.error(&quot;Could not add partition {} due to unexpected error {}&quot;, topicPartition, error);</span>
+<span class="nc" id="L1665">                    hasPartitionErrors = true;</span>
+                }
+<span class="nc" id="L1667">            }</span>
+
+<span class="nc" id="L1669">            Set&lt;TopicPartition&gt; partitions = errors.keySet();</span>
+
+            // Remove the partitions from the pending set regardless of the result. We use the presence
+            // of partitions in the pending set to know when it is not safe to send batches. However, if
+            // the partitions failed to be added and we enter an error state, we expect the batches to be
+            // aborted anyway. In this case, we must be able to continue sending the batches which are in
+            // retry for partitions that were successfully added.
+<span class="nc" id="L1676">            pendingPartitionsInTransaction.removeAll(partitions);</span>
+
+<span class="nc bnc" id="L1678" title="All 2 branches missed.">            if (!unauthorizedTopics.isEmpty()) {</span>
+<span class="nc" id="L1679">                abortableError(new TopicAuthorizationException(unauthorizedTopics));</span>
+<span class="nc bnc" id="L1680" title="All 2 branches missed.">            } else if (hasPartitionErrors) {</span>
+<span class="nc" id="L1681">                abortableError(new KafkaException(&quot;Could not add partitions to transaction due to errors: &quot; + errors));</span>
+            } else {
+<span class="nc" id="L1683">                log.debug(&quot;Successfully added partitions {} to transaction&quot;, partitions);</span>
+<span class="nc" id="L1684">                partitionsInTransaction.addAll(partitions);</span>
+<span class="nc" id="L1685">                transactionStarted = true;</span>
+<span class="nc" id="L1686">                result.done();</span>
+            }
+<span class="nc" id="L1688">        }</span>
+
+        @Override
+        public long retryBackoffMs() {
+<span class="nc" id="L1692">            return Math.min(TransactionManager.this.retryBackoffMs, this.retryBackoffMs);</span>
+        }
+
+        private void maybeOverrideRetryBackoffMs() {
+            // We only want to reduce the backoff when retrying the first AddPartition which errored out due to a
+            // CONCURRENT_TRANSACTIONS error since this means that the previous transaction is still completing and
+            // we don't want to wait too long before trying to start the new one.
+            //
+            // This is only a temporary fix, the long term solution is being tracked in
+            // https://issues.apache.org/jira/browse/KAFKA-5482
+<span class="nc bnc" id="L1702" title="All 2 branches missed.">            if (partitionsInTransaction.isEmpty())</span>
+<span class="nc" id="L1703">                this.retryBackoffMs = ADD_PARTITIONS_RETRY_BACKOFF_MS;</span>
+<span class="nc" id="L1704">        }</span>
+    }
+
+    private class FindCoordinatorHandler extends TxnRequestHandler {
+        private final FindCoordinatorRequest.Builder builder;
+
+<span class="nc" id="L1710">        private FindCoordinatorHandler(FindCoordinatorRequest.Builder builder) {</span>
+<span class="nc" id="L1711">            super(&quot;FindCoordinator&quot;);</span>
+<span class="nc" id="L1712">            this.builder = builder;</span>
+<span class="nc" id="L1713">        }</span>
+
+        @Override
+        FindCoordinatorRequest.Builder requestBuilder() {
+<span class="nc" id="L1717">            return builder;</span>
+        }
+
+        @Override
+        Priority priority() {
+<span class="nc" id="L1722">            return Priority.FIND_COORDINATOR;</span>
+        }
+
+        @Override
+        FindCoordinatorRequest.CoordinatorType coordinatorType() {
+<span class="nc" id="L1727">            return null;</span>
+        }
+
+        @Override
+        String coordinatorKey() {
+<span class="nc" id="L1732">            return null;</span>
+        }
+
+        @Override
+        public void handleResponse(AbstractResponse response) {
+<span class="nc" id="L1737">            CoordinatorType coordinatorType = CoordinatorType.forId(builder.data().keyType());</span>
+
+<span class="nc" id="L1739">            List&lt;Coordinator&gt; coordinators = ((FindCoordinatorResponse) response).coordinators();</span>
+<span class="nc bnc" id="L1740" title="All 2 branches missed.">            if (coordinators.size() != 1) {</span>
+<span class="nc" id="L1741">                log.error(&quot;Group coordinator lookup failed: Invalid response containing more than a single coordinator&quot;);</span>
+<span class="nc" id="L1742">                fatalError(new IllegalStateException(&quot;Group coordinator lookup failed: Invalid response containing more than a single coordinator&quot;));</span>
+            }
+<span class="nc" id="L1744">            Coordinator coordinatorData = coordinators.get(0);</span>
+            // For older versions without batching, obtain key from request data since it is not included in response
+<span class="nc bnc" id="L1746" title="All 2 branches missed.">            String key = coordinatorData.key() == null ? builder.data().key() : coordinatorData.key();</span>
+<span class="nc" id="L1747">            Errors error = Errors.forCode(coordinatorData.errorCode());</span>
+<span class="nc bnc" id="L1748" title="All 2 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc" id="L1749">                Node node = new Node(coordinatorData.nodeId(), coordinatorData.host(), coordinatorData.port());</span>
+<span class="nc bnc" id="L1750" title="All 3 branches missed.">                switch (coordinatorType) {</span>
+                    case GROUP:
+<span class="nc" id="L1752">                        consumerGroupCoordinator = node;</span>
+<span class="nc" id="L1753">                        break;</span>
+                    case TRANSACTION:
+<span class="nc" id="L1755">                        transactionCoordinator = node;</span>
+<span class="nc" id="L1756">                        break;</span>
+                    default:
+<span class="nc" id="L1758">                        log.error(&quot;Group coordinator lookup failed: Unexpected coordinator type in response&quot;);</span>
+<span class="nc" id="L1759">                        fatalError(new IllegalStateException(&quot;Group coordinator lookup failed: Unexpected coordinator type in response&quot;));</span>
+                }
+<span class="nc" id="L1761">                result.done();</span>
+<span class="nc" id="L1762">                log.info(&quot;Discovered {} coordinator {}&quot;, coordinatorType.toString().toLowerCase(Locale.ROOT), node);</span>
+<span class="nc bnc" id="L1763" title="All 2 branches missed.">            } else if (error.exception() instanceof RetriableException) {</span>
+<span class="nc" id="L1764">                reenqueue();</span>
+<span class="nc bnc" id="L1765" title="All 2 branches missed.">            } else if (error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1766">                fatalError(error.exception());</span>
+<span class="nc bnc" id="L1767" title="All 2 branches missed.">            } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1768">                abortableError(GroupAuthorizationException.forGroupId(key));</span>
+<span class="nc bnc" id="L1769" title="All 2 branches missed.">            } else if (error == Errors.TRANSACTION_ABORTABLE) {</span>
+<span class="nc" id="L1770">                abortableError(error.exception());</span>
+            } else {
+<span class="nc" id="L1772">                fatalError(new KafkaException(String.format(&quot;Could not find a coordinator with type %s with key %s due to &quot; +</span>
+                        &quot;unexpected error: %s&quot;, coordinatorType, key,
+<span class="nc" id="L1774">                        coordinatorData.errorMessage())));</span>
+            }
+<span class="nc" id="L1776">        }</span>
+    }
+
+    private class EndTxnHandler extends TxnRequestHandler {
+        private final EndTxnRequest.Builder builder;
+
+<span class="nc" id="L1782">        private EndTxnHandler(EndTxnRequest.Builder builder) {</span>
+<span class="nc" id="L1783">            super(&quot;EndTxn(&quot; + builder.data.committed() + &quot;)&quot;);</span>
+<span class="nc" id="L1784">            this.builder = builder;</span>
+<span class="nc" id="L1785">        }</span>
+
+        @Override
+        EndTxnRequest.Builder requestBuilder() {
+<span class="nc" id="L1789">            return builder;</span>
+        }
+
+        @Override
+        Priority priority() {
+<span class="nc" id="L1794">            return Priority.END_TXN;</span>
+        }
+
+        @Override
+        boolean isEndTxn() {
+<span class="nc" id="L1799">            return true;</span>
+        }
+
+        @Override
+        public void handleResponse(AbstractResponse response) {
+<span class="nc" id="L1804">            EndTxnResponse endTxnResponse = (EndTxnResponse) response;</span>
+<span class="nc" id="L1805">            Errors error = endTxnResponse.error();</span>
+<span class="nc bnc" id="L1806" title="All 2 branches missed.">            boolean isAbort = !builder.data.committed();</span>
+<span class="nc bnc" id="L1807" title="All 2 branches missed.">            if (error == Errors.NONE) {</span>
+                // For End Txn version 5+, the broker includes the producerId and producerEpoch in the EndTxnResponse.
+                // For versions lower than 5, the producer Id and epoch are set to -1 by default.
+                // When Transaction Version 2 is enabled, the end txn request 5+ is used,
+                // it mandates bumping the epoch after every transaction.
+                // If the epoch overflows, a new producerId is returned with epoch set to 0.
+                // Note, we still may see EndTxn TV1 (&lt; 5) responses when the producer has upgraded to TV2 due to the upgrade
+                // occurring at the end of beginCompletingTransaction. The next transaction started should be TV2.
+<span class="nc bnc" id="L1815" title="All 2 branches missed.">                if (endTxnResponse.data().producerId() != -1) {</span>
+<span class="nc" id="L1816">                    ProducerIdAndEpoch producerIdAndEpoch = new ProducerIdAndEpoch(</span>
+<span class="nc" id="L1817">                        endTxnResponse.data().producerId(),</span>
+<span class="nc" id="L1818">                        endTxnResponse.data().producerEpoch()</span>
+                    );
+<span class="nc" id="L1820">                    setProducerIdAndEpoch(producerIdAndEpoch);</span>
+<span class="nc" id="L1821">                    resetSequenceNumbers();</span>
+                }
+<span class="nc" id="L1823">                resetTransactionState();</span>
+<span class="nc" id="L1824">                result.done();</span>
+<span class="nc bnc" id="L1825" title="All 4 branches missed.">            } else if (error == Errors.COORDINATOR_NOT_AVAILABLE || error == Errors.NOT_COORDINATOR) {</span>
+<span class="nc" id="L1826">                lookupCoordinator(FindCoordinatorRequest.CoordinatorType.TRANSACTION, transactionalId);</span>
+<span class="nc" id="L1827">                reenqueue();</span>
+<span class="nc bnc" id="L1828" title="All 2 branches missed.">            } else if (error.exception() instanceof RetriableException) {</span>
+<span class="nc" id="L1829">                reenqueue();</span>
+<span class="nc bnc" id="L1830" title="All 4 branches missed.">            } else if (error == Errors.INVALID_PRODUCER_EPOCH || error == Errors.PRODUCER_FENCED) {</span>
+                // We could still receive INVALID_PRODUCER_EPOCH from old versioned transaction coordinator,
+                // just treat it the same as PRODUCE_FENCED.
+<span class="nc" id="L1833">                fatalError(Errors.PRODUCER_FENCED.exception());</span>
+<span class="nc bnc" id="L1834" title="All 6 branches missed.">            } else if (error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED ||</span>
+                    error == Errors.INVALID_TXN_STATE || error == Errors.INVALID_PRODUCER_ID_MAPPING) {
+<span class="nc" id="L1836">                fatalError(error.exception());</span>
+<span class="nc bnc" id="L1837" title="All 2 branches missed.">            } else if (error == Errors.UNKNOWN_PRODUCER_ID) {</span>
+<span class="nc" id="L1838">                abortableErrorIfPossible(error.exception());</span>
+<span class="nc bnc" id="L1839" title="All 4 branches missed.">            } else if (isAbort &amp;&amp; error.exception() instanceof TransactionAbortableException) {</span>
+                // When aborting a transaction, we must convert TRANSACTION_ABORTABLE errors to KafkaException
+                // because if an abort operation itself encounters an abortable error, retrying the abort would create a cycle.
+                // Instead, we treat this as fatal error at the application layer to ensure the transaction can be cleanly terminated.
+<span class="nc" id="L1843">                fatalError(new KafkaException(&quot;Failed to abort transaction&quot;, error.exception()));</span>
+<span class="nc bnc" id="L1844" title="All 2 branches missed.">            } else if (error == Errors.TRANSACTION_ABORTABLE) {</span>
+<span class="nc" id="L1845">                abortableError(error.exception());</span>
+            } else {
+<span class="nc" id="L1847">                fatalError(new KafkaException(&quot;Unhandled error in EndTxnResponse: &quot; + error.message()));</span>
+            }
+<span class="nc" id="L1849">        }</span>
+    }
+
+    private class AddOffsetsToTxnHandler extends TxnRequestHandler {
+        private final AddOffsetsToTxnRequest.Builder builder;
+        private final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets;
+        private final ConsumerGroupMetadata groupMetadata;
+
+        private AddOffsetsToTxnHandler(AddOffsetsToTxnRequest.Builder builder,
+                                       Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets,
+<span class="nc" id="L1859">                                       ConsumerGroupMetadata groupMetadata) {</span>
+<span class="nc" id="L1860">            super(&quot;AddOffsetsToTxn&quot;);</span>
+<span class="nc" id="L1861">            this.builder = builder;</span>
+<span class="nc" id="L1862">            this.offsets = offsets;</span>
+<span class="nc" id="L1863">            this.groupMetadata = groupMetadata;</span>
+<span class="nc" id="L1864">        }</span>
+
+        @Override
+        AddOffsetsToTxnRequest.Builder requestBuilder() {
+<span class="nc" id="L1868">            return builder;</span>
+        }
+
+        @Override
+        Priority priority() {
+<span class="nc" id="L1873">            return Priority.ADD_PARTITIONS_OR_OFFSETS;</span>
+        }
+
+        @Override
+        public void handleResponse(AbstractResponse response) {
+<span class="nc" id="L1878">            AddOffsetsToTxnResponse addOffsetsToTxnResponse = (AddOffsetsToTxnResponse) response;</span>
+<span class="nc" id="L1879">            Errors error = Errors.forCode(addOffsetsToTxnResponse.data().errorCode());</span>
+
+<span class="nc bnc" id="L1881" title="All 2 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc" id="L1882">                log.debug(&quot;Successfully added partition for consumer group {} to transaction&quot;, builder.data.groupId());</span>
+
+                // note the result is not completed until the TxnOffsetCommit returns
+<span class="nc" id="L1885">                pendingRequests.add(txnOffsetCommitHandler(result, offsets, groupMetadata));</span>
+
+<span class="nc" id="L1887">                transactionStarted = true;</span>
+<span class="nc bnc" id="L1888" title="All 4 branches missed.">            } else if (error == Errors.COORDINATOR_NOT_AVAILABLE || error == Errors.NOT_COORDINATOR) {</span>
+<span class="nc" id="L1889">                lookupCoordinator(FindCoordinatorRequest.CoordinatorType.TRANSACTION, transactionalId);</span>
+<span class="nc" id="L1890">                reenqueue();</span>
+<span class="nc bnc" id="L1891" title="All 2 branches missed.">            } else if (error.exception() instanceof RetriableException) {</span>
+<span class="nc" id="L1892">                reenqueue();</span>
+<span class="nc bnc" id="L1893" title="All 2 branches missed.">            } else if (error == Errors.UNKNOWN_PRODUCER_ID) {</span>
+<span class="nc" id="L1894">                abortableErrorIfPossible(error.exception());</span>
+<span class="nc bnc" id="L1895" title="All 4 branches missed.">            } else if (error == Errors.INVALID_PRODUCER_EPOCH || error == Errors.PRODUCER_FENCED) {</span>
+                // We could still receive INVALID_PRODUCER_EPOCH from old versioned transaction coordinator,
+                // just treat it the same as PRODUCE_FENCED.
+<span class="nc" id="L1898">                fatalError(Errors.PRODUCER_FENCED.exception());</span>
+<span class="nc bnc" id="L1899" title="All 6 branches missed.">            } else if (error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED ||</span>
+                    error == Errors.INVALID_TXN_STATE || error == Errors.INVALID_PRODUCER_ID_MAPPING) {
+<span class="nc" id="L1901">                fatalError(error.exception());</span>
+<span class="nc bnc" id="L1902" title="All 2 branches missed.">            } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1903">                abortableError(GroupAuthorizationException.forGroupId(builder.data.groupId()));</span>
+<span class="nc bnc" id="L1904" title="All 2 branches missed.">            } else if (error == Errors.TRANSACTION_ABORTABLE) {</span>
+<span class="nc" id="L1905">                abortableError(error.exception());</span>
+            } else {
+<span class="nc" id="L1907">                fatalError(new KafkaException(&quot;Unexpected error in AddOffsetsToTxnResponse: &quot; + error.message()));</span>
+            }
+<span class="nc" id="L1909">        }</span>
+    }
+
+    private class TxnOffsetCommitHandler extends TxnRequestHandler {
+        private final TxnOffsetCommitRequest.Builder builder;
+        // Snapshot of the topic-id -&gt; name map captured when the request was
+        // built. v6+ responses omit the topic name on the wire, so we resolve
+        // it via this snapshot rather than the live metadata cache (which may
+        // have changed by the time the response arrives).
+        private final Map&lt;Uuid, String&gt; topicNamesByIds;
+
+        private TxnOffsetCommitHandler(TransactionalRequestResult result,
+                                       TxnOffsetCommitRequest.Builder builder,
+<span class="nc" id="L1922">                                       Map&lt;Uuid, String&gt; topicNamesByIds) {</span>
+<span class="nc" id="L1923">            super(result);</span>
+<span class="nc" id="L1924">            this.builder = builder;</span>
+<span class="nc" id="L1925">            this.topicNamesByIds = topicNamesByIds;</span>
+<span class="nc" id="L1926">        }</span>
+
+        private TxnOffsetCommitHandler(TxnOffsetCommitRequest.Builder builder,
+<span class="nc" id="L1929">                                       Map&lt;Uuid, String&gt; topicNamesByIds) {</span>
+<span class="nc" id="L1930">            super(&quot;TxnOffsetCommitHandler&quot;);</span>
+<span class="nc" id="L1931">            this.builder = builder;</span>
+<span class="nc" id="L1932">            this.topicNamesByIds = topicNamesByIds;</span>
+<span class="nc" id="L1933">        }</span>
+
+        @Override
+        TxnOffsetCommitRequest.Builder requestBuilder() {
+<span class="nc" id="L1937">            return builder;</span>
+        }
+
+        @Override
+        Priority priority() {
+<span class="nc" id="L1942">            return Priority.ADD_PARTITIONS_OR_OFFSETS;</span>
+        }
+
+        @Override
+        FindCoordinatorRequest.CoordinatorType coordinatorType() {
+<span class="nc" id="L1947">            return FindCoordinatorRequest.CoordinatorType.GROUP;</span>
+        }
+
+        @Override
+        String coordinatorKey() {
+<span class="nc" id="L1952">            return builder.data.groupId();</span>
+        }
+
+        @SuppressWarnings({&quot;checkstyle:NPathComplexity&quot;})
+        @Override
+        public void handleResponse(AbstractResponse response) {
+<span class="nc" id="L1958">            TxnOffsetCommitResponse txnOffsetCommitResponse = (TxnOffsetCommitResponse) response;</span>
+<span class="nc" id="L1959">            boolean coordinatorReloaded = false;</span>
+
+<span class="nc" id="L1961">            log.debug(&quot;Received TxnOffsetCommit response for consumer group {}: {}&quot;,</span>
+<span class="nc" id="L1962">                builder.data.groupId(), txnOffsetCommitResponse.data().topics());</span>
+
+<span class="nc bnc" id="L1964" title="All 2 branches missed.">            for (TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic responseTopic : txnOffsetCommitResponse.data().topics()) {</span>
+                // v6+ responses omit the topic name on the wire; fall back to
+                // the snapshot taken at request build time.
+<span class="nc bnc" id="L1967" title="All 4 branches missed.">                String topicName = responseTopic.name() != null &amp;&amp; !responseTopic.name().isEmpty()</span>
+<span class="nc" id="L1968">                    ? responseTopic.name()</span>
+<span class="nc" id="L1969">                    : topicNamesByIds.get(responseTopic.topicId());</span>
+<span class="nc bnc" id="L1970" title="All 2 branches missed.">                if (topicName == null) {</span>
+<span class="nc" id="L1971">                    log.warn(&quot;Received TxnOffsetCommit response for consumer group {} with an unknown topic id {}&quot;,</span>
+<span class="nc" id="L1972">                        builder.data.groupId(), responseTopic.topicId());</span>
+<span class="nc" id="L1973">                    continue;</span>
+                }
+<span class="nc bnc" id="L1975" title="All 2 branches missed.">                for (TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition responsePartition : responseTopic.partitions()) {</span>
+<span class="nc" id="L1976">                    TopicPartition topicPartition = new TopicPartition(topicName, responsePartition.partitionIndex());</span>
+<span class="nc" id="L1977">                    Errors error = Errors.forCode(responsePartition.errorCode());</span>
+<span class="nc bnc" id="L1978" title="All 2 branches missed.">                    if (error == Errors.NONE) {</span>
+<span class="nc" id="L1979">                        pendingTxnOffsetCommits.remove(topicPartition);</span>
+<span class="nc bnc" id="L1980" title="All 6 branches missed.">                    } else if (error == Errors.COORDINATOR_NOT_AVAILABLE</span>
+                            || error == Errors.NOT_COORDINATOR
+                            || error == Errors.REQUEST_TIMED_OUT) {
+<span class="nc bnc" id="L1983" title="All 2 branches missed.">                        if (!coordinatorReloaded) {</span>
+<span class="nc" id="L1984">                            coordinatorReloaded = true;</span>
+<span class="nc" id="L1985">                            lookupCoordinator(FindCoordinatorRequest.CoordinatorType.GROUP, builder.data.groupId());</span>
+                        }
+<span class="nc bnc" id="L1987" title="All 2 branches missed.">                    } else if (error.exception() instanceof RetriableException) {</span>
+                        // The topic is unknown, the coordinator is loading, or it is another retriable error;
+                        // retry with the current coordinator.
+<span class="nc bnc" id="L1990" title="All 2 branches missed.">                    } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {</span>
+<span class="nc" id="L1991">                        abortableError(GroupAuthorizationException.forGroupId(builder.data.groupId()));</span>
+<span class="nc" id="L1992">                        break;</span>
+<span class="nc bnc" id="L1993" title="All 4 branches missed.">                    } else if (error == Errors.FENCED_INSTANCE_ID ||</span>
+                            error == Errors.TRANSACTION_ABORTABLE) {
+<span class="nc" id="L1995">                        abortableError(error.exception());</span>
+<span class="nc" id="L1996">                        break;</span>
+<span class="nc bnc" id="L1997" title="All 8 branches missed.">                    } else if (error == Errors.UNKNOWN_MEMBER_ID</span>
+                            || error == Errors.ILLEGAL_GENERATION
+                            || error == Errors.GROUP_ID_NOT_FOUND
+                            || error == Errors.STALE_MEMBER_EPOCH) {
+                        // GROUP_ID_NOT_FOUND and STALE_MEMBER_EPOCH are returned by
+                        // TxnOffsetCommit v6+. Older versions map them to
+                        // ILLEGAL_GENERATION. All four indicate a consumer group
+                        // metadata mismatch and must abort the transaction.
+<span class="nc" id="L2005">                        abortableError(new CommitFailedException(&quot;Transaction offset Commit failed &quot; +</span>
+<span class="nc" id="L2006">                            &quot;due to consumer group metadata mismatch: &quot; + error.exception().getMessage()));</span>
+<span class="nc" id="L2007">                        break;</span>
+<span class="nc bnc" id="L2008" title="All 4 branches missed.">                    } else if (error == Errors.INVALID_PRODUCER_EPOCH</span>
+                            || error == Errors.PRODUCER_FENCED) {
+                        // We could still receive INVALID_PRODUCER_EPOCH from old versioned transaction coordinator,
+                        // just treat it the same as PRODUCE_FENCED.
+<span class="nc" id="L2012">                        fatalError(Errors.PRODUCER_FENCED.exception());</span>
+<span class="nc" id="L2013">                        break;</span>
+<span class="nc bnc" id="L2014" title="All 4 branches missed.">                    } else if (error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED</span>
+                            || error == Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT) {
+<span class="nc" id="L2016">                        fatalError(error.exception());</span>
+<span class="nc" id="L2017">                        break;</span>
+                    } else {
+<span class="nc" id="L2019">                        fatalError(new KafkaException(&quot;Unexpected error in TxnOffsetCommitResponse: &quot; + error.message()));</span>
+<span class="nc" id="L2020">                        break;</span>
+                    }
+<span class="nc" id="L2022">                }</span>
+                // Stop processing further topics once the transaction has reached a terminal state.
+<span class="nc bnc" id="L2024" title="All 2 branches missed.">                if (result.isCompleted()) break;</span>
+<span class="nc" id="L2025">            }</span>
+
+<span class="nc bnc" id="L2027" title="All 2 branches missed.">            if (result.isCompleted()) {</span>
+<span class="nc" id="L2028">                pendingTxnOffsetCommits.clear();</span>
+<span class="nc bnc" id="L2029" title="All 2 branches missed.">            } else if (pendingTxnOffsetCommits.isEmpty()) {</span>
+<span class="nc" id="L2030">                result.done();</span>
+            } else {
+                // Retry the commits which failed with a retriable error
+<span class="nc" id="L2033">                reenqueue();</span>
+            }
+<span class="nc" id="L2035">        }</span>
+    }
+
+    private static final class PendingStateTransition {
+        private final TransactionalRequestResult result;
+        private final State state;
+        private final String operation;
+
+        private PendingStateTransition(
+            TransactionalRequestResult result,
+            State state,
+            String operation
+<span class="nc" id="L2047">        ) {</span>
+<span class="nc" id="L2048">            this.result = result;</span>
+<span class="nc" id="L2049">            this.state = state;</span>
+<span class="nc" id="L2050">            this.operation = operation;</span>
+<span class="nc" id="L2051">        }</span>
+    }
+
+    /**
+     * Returns a ProducerIdAndEpoch object containing the producer ID and epoch
+     * of the ongoing transaction.
+     * This is used when preparing a transaction for a two-phase commit.
+     *
+     * @return a ProducerIdAndEpoch with the current producer ID and epoch.
+     */
+    public ProducerIdAndEpoch preparedTransactionState() {
+<span class="nc" id="L2062">        return this.preparedTxnState;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

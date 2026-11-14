@@ -1,0 +1,398 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KerberosLogin.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.security.kerberos</a> &gt; <span class="el_source">KerberosLogin.java</span></div><h1>KerberosLogin.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.security.kerberos;
+
+import org.apache.kafka.common.config.SaslConfigs;
+import org.apache.kafka.common.security.JaasContext;
+import org.apache.kafka.common.security.JaasUtils;
+import org.apache.kafka.common.security.auth.AuthenticateCallbackHandler;
+import org.apache.kafka.common.security.authenticator.AbstractLogin;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.KafkaThread;
+import org.apache.kafka.common.utils.internals.Shell;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Arrays;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+
+import javax.security.auth.Subject;
+import javax.security.auth.kerberos.KerberosPrincipal;
+import javax.security.auth.kerberos.KerberosTicket;
+import javax.security.auth.login.AppConfigurationEntry;
+import javax.security.auth.login.Configuration;
+import javax.security.auth.login.LoginContext;
+import javax.security.auth.login.LoginException;
+
+/**
+ * This class is responsible for refreshing Kerberos credentials for
+ * logins for both Kafka client and server.
+ */
+<span class="nc" id="L50">public class KerberosLogin extends AbstractLogin {</span>
+<span class="nc" id="L51">    private static final Logger log = LoggerFactory.getLogger(KerberosLogin.class);</span>
+
+<span class="nc" id="L53">    private static final Random RNG = new Random();</span>
+
+<span class="nc" id="L55">    private final Time time = Time.SYSTEM;</span>
+    private Thread t;
+    private boolean isKrbTicket;
+    private boolean isUsingTicketCache;
+
+    private String principal;
+
+    // LoginThread will sleep until 80% of time from last refresh to
+    // ticket's expiry has been reached, at which time it will wake
+    // and try to renew the ticket.
+    private double ticketRenewWindowFactor;
+
+    /**
+     * Percentage of random jitter added to the renewal time
+     */
+    private double ticketRenewJitter;
+
+    // Regardless of ticketRenewWindowFactor setting above and the ticket expiry time,
+    // thread will not sleep between refresh attempts any less than 1 minute (60*1000 milliseconds = 1 minute).
+    // Change the '1' to e.g. 5, to change this to 5 minutes.
+    private long minTimeBeforeRelogin;
+
+    private String kinitCmd;
+
+    private volatile Subject subject;
+
+    private LoginContext loginContext;
+    private String serviceName;
+    private long lastLogin;
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs, String contextName, Configuration configuration,
+                          AuthenticateCallbackHandler callbackHandler) {
+<span class="nc" id="L88">        super.configure(configs, contextName, configuration, callbackHandler);</span>
+<span class="nc" id="L89">        this.ticketRenewWindowFactor = (Double) configs.get(SaslConfigs.SASL_KERBEROS_TICKET_RENEW_WINDOW_FACTOR);</span>
+<span class="nc" id="L90">        this.ticketRenewJitter = (Double) configs.get(SaslConfigs.SASL_KERBEROS_TICKET_RENEW_JITTER);</span>
+<span class="nc" id="L91">        this.minTimeBeforeRelogin = (Long) configs.get(SaslConfigs.SASL_KERBEROS_MIN_TIME_BEFORE_RELOGIN);</span>
+<span class="nc" id="L92">        this.kinitCmd = (String) configs.get(SaslConfigs.SASL_KERBEROS_KINIT_CMD);</span>
+<span class="nc" id="L93">        this.serviceName = getServiceName(configs, contextName, configuration);</span>
+<span class="nc" id="L94">    }</span>
+
+    /**
+     * Performs login for each login module specified for the login context of this instance and starts the thread used
+     * to periodically re-login to the Kerberos Ticket Granting Server.
+     */
+    @Override
+    public LoginContext login() throws LoginException {
+
+<span class="nc" id="L103">        this.lastLogin = currentElapsedTime();</span>
+<span class="nc" id="L104">        loginContext = super.login();</span>
+<span class="nc" id="L105">        subject = loginContext.getSubject();</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        isKrbTicket = !subject.getPrivateCredentials(KerberosTicket.class).isEmpty();</span>
+
+<span class="nc" id="L108">        AppConfigurationEntry[] entries = configuration().getAppConfigurationEntry(contextName());</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        if (entries.length == 0) {</span>
+<span class="nc" id="L110">            isUsingTicketCache = false;</span>
+<span class="nc" id="L111">            principal = null;</span>
+        } else {
+            // there will only be a single entry
+<span class="nc" id="L114">            AppConfigurationEntry entry = entries[0];</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">            if (entry.getOptions().get(&quot;useTicketCache&quot;) != null) {</span>
+<span class="nc" id="L116">                String val = (String) entry.getOptions().get(&quot;useTicketCache&quot;);</span>
+<span class="nc" id="L117">                isUsingTicketCache = val.equals(&quot;true&quot;);</span>
+<span class="nc" id="L118">            } else</span>
+<span class="nc" id="L119">                isUsingTicketCache = false;</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">            if (entry.getOptions().get(&quot;principal&quot;) != null)</span>
+<span class="nc" id="L121">                principal = (String) entry.getOptions().get(&quot;principal&quot;);</span>
+            else
+<span class="nc" id="L123">                principal = null;</span>
+        }
+
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        if (!isKrbTicket) {</span>
+<span class="nc" id="L127">            log.debug(&quot;[Principal={}]: It is not a Kerberos ticket&quot;, principal);</span>
+<span class="nc" id="L128">            t = null;</span>
+            // if no TGT, do not bother with ticket management.
+<span class="nc" id="L130">            return loginContext;</span>
+        }
+<span class="nc" id="L132">        log.debug(&quot;[Principal={}]: It is a Kerberos ticket&quot;, principal);</span>
+
+        // Refresh the Ticket Granting Ticket (TGT) periodically. How often to refresh is determined by the
+        // TGT's existing expiry date and the configured minTimeBeforeRelogin. For testing and development,
+        // you can decrease the interval of expiration of tickets (for example, to 3 minutes) by running:
+        //  &quot;modprinc -maxlife 3mins &lt;principal&gt;&quot; in kadmin.
+<span class="nc" id="L138">        t = KafkaThread.daemon(String.format(&quot;kafka-kerberos-refresh-thread-%s&quot;, principal), () -&gt; {</span>
+<span class="nc" id="L139">            log.info(&quot;[Principal={}]: TGT refresh thread started.&quot;, principal);</span>
+            while (true) {  // renewal thread's main loop. if it exits from here, thread will exit.
+<span class="nc" id="L141">                KerberosTicket tgt = getTGT();</span>
+<span class="nc" id="L142">                long now = currentWallTime();</span>
+                long nextRefresh;
+                Date nextRefreshDate;
+<span class="nc bnc" id="L145" title="All 2 branches missed.">                if (tgt == null) {</span>
+<span class="nc" id="L146">                    nextRefresh = now + minTimeBeforeRelogin;</span>
+<span class="nc" id="L147">                    nextRefreshDate = new Date(nextRefresh);</span>
+<span class="nc" id="L148">                    log.warn(&quot;[Principal={}]: No TGT found: will try again at {}&quot;, principal, nextRefreshDate);</span>
+                } else {
+<span class="nc" id="L150">                    nextRefresh = getRefreshTime(tgt);</span>
+<span class="nc" id="L151">                    long expiry = tgt.getEndTime().getTime();</span>
+<span class="nc" id="L152">                    Date expiryDate = new Date(expiry);</span>
+<span class="nc bnc" id="L153" title="All 6 branches missed.">                    if (isUsingTicketCache &amp;&amp; tgt.getRenewTill() != null &amp;&amp; tgt.getRenewTill().getTime() &lt; expiry) {</span>
+<span class="nc" id="L154">                        log.warn(&quot;The TGT cannot be renewed beyond the next expiry date: {}.&quot; +</span>
+                            &quot;This process will not be able to authenticate new SASL connections after that &quot; +
+                            &quot;time (for example, it will not be able to authenticate a new connection with a Kafka &quot; +
+                            &quot;Broker).  Ask your system administrator to either increase the &quot; +
+                            &quot;'renew until' time by doing : 'modprinc -maxrenewlife {} ' within &quot; +
+                            &quot;kadmin, or instead, to generate a keytab for {}. Because the TGT's &quot; +
+                            &quot;expiry cannot be further extended by refreshing, exiting refresh thread now.&quot;,
+                            expiryDate, principal, principal);
+<span class="nc" id="L162">                        return;</span>
+                    }
+                    // determine how long to sleep from looking at ticket's expiry.
+                    // We should not allow the ticket to expire, but we should take into consideration
+                    // minTimeBeforeRelogin. Will not sleep less than minTimeBeforeRelogin, unless doing so
+                    // would cause ticket expiration.
+<span class="nc bnc" id="L168" title="All 4 branches missed.">                    if ((nextRefresh &gt; expiry) || (minTimeBeforeRelogin &gt; expiry - now)) {</span>
+                        // expiry is before next scheduled refresh.
+<span class="nc" id="L170">                        log.info(&quot;[Principal={}]: Refreshing now because expiry is before next scheduled refresh time.&quot;, principal);</span>
+<span class="nc" id="L171">                        nextRefresh = now;</span>
+                    } else {
+<span class="nc bnc" id="L173" title="All 2 branches missed.">                        if (nextRefresh - now &lt; minTimeBeforeRelogin) {</span>
+                            // next scheduled refresh is sooner than (now + MIN_TIME_BEFORE_LOGIN).
+<span class="nc" id="L175">                            Date until = new Date(nextRefresh);</span>
+<span class="nc" id="L176">                            Date newUntil = new Date(now + minTimeBeforeRelogin);</span>
+<span class="nc" id="L177">                            log.warn(&quot;[Principal={}]: TGT refresh thread time adjusted from {} to {} since the former is sooner &quot; +</span>
+                                &quot;than the minimum refresh interval ({} seconds) from now.&quot;,
+<span class="nc" id="L179">                                principal, until, newUntil, minTimeBeforeRelogin / 1000);</span>
+                        }
+<span class="nc" id="L181">                        nextRefresh = Math.max(nextRefresh, now + minTimeBeforeRelogin);</span>
+                    }
+<span class="nc" id="L183">                    nextRefreshDate = new Date(nextRefresh);</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">                    if (nextRefresh &gt; expiry) {</span>
+<span class="nc" id="L185">                        log.error(&quot;[Principal={}]: Next refresh: {} is later than expiry {}. This may indicate a clock skew problem.&quot; +</span>
+                            &quot;Check that this host and the KDC hosts' clocks are in sync. Exiting refresh thread.&quot;,
+                            principal, nextRefreshDate, expiryDate);
+<span class="nc" id="L188">                        return;</span>
+                    }
+                }
+<span class="nc bnc" id="L191" title="All 2 branches missed.">                if (now &lt; nextRefresh) {</span>
+<span class="nc" id="L192">                    Date until = new Date(nextRefresh);</span>
+<span class="nc" id="L193">                    log.info(&quot;[Principal={}]: TGT refresh sleeping until: {}&quot;, principal, until);</span>
+                    try {
+<span class="nc" id="L195">                        Thread.sleep(nextRefresh - now);</span>
+<span class="nc" id="L196">                    } catch (InterruptedException ie) {</span>
+<span class="nc" id="L197">                        log.warn(&quot;[Principal={}]: TGT renewal thread has been interrupted and will exit.&quot;, principal);</span>
+<span class="nc" id="L198">                        return;</span>
+<span class="nc" id="L199">                    }</span>
+<span class="nc" id="L200">                } else {</span>
+<span class="nc" id="L201">                    log.error(&quot;[Principal={}]: NextRefresh: {} is in the past: exiting refresh thread. Check&quot;</span>
+                        + &quot; clock sync between this host and KDC - (KDC's clock is likely ahead of this host).&quot;
+                        + &quot; Manual intervention will be required for this client to successfully authenticate.&quot;
+                        + &quot; Exiting refresh thread.&quot;, principal, nextRefreshDate);
+<span class="nc" id="L205">                    return;</span>
+                }
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                if (isUsingTicketCache) {</span>
+<span class="nc" id="L208">                    String kinitArgs = &quot;-R&quot;;</span>
+<span class="nc" id="L209">                    int retry = 1;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                    while (retry &gt;= 0) {</span>
+                        try {
+<span class="nc" id="L212">                            log.debug(&quot;[Principal={}]: Running ticket cache refresh command: {} {}&quot;, principal, kinitCmd, kinitArgs);</span>
+<span class="nc" id="L213">                            Shell.execCommand(kinitCmd, kinitArgs);</span>
+<span class="nc" id="L214">                            break;</span>
+<span class="nc" id="L215">                        } catch (Exception e) {</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">                            if (retry &gt; 0) {</span>
+<span class="nc" id="L217">                                log.warn(&quot;[Principal={}]: Error when trying to renew with TicketCache, but will retry &quot;, principal, e);</span>
+<span class="nc" id="L218">                                --retry;</span>
+                                // sleep for 10 seconds
+                                try {
+<span class="nc" id="L221">                                    Thread.sleep(10 * 1000);</span>
+<span class="nc" id="L222">                                } catch (InterruptedException ie) {</span>
+<span class="nc" id="L223">                                    log.error(&quot;[Principal={}]: Interrupted while renewing TGT, exiting Login thread&quot;, principal);</span>
+<span class="nc" id="L224">                                    return;</span>
+<span class="nc" id="L225">                                }</span>
+                            } else {
+<span class="nc" id="L227">                                log.warn(&quot;[Principal={}]: Could not renew TGT due to problem running shell command: '{} {}'. &quot; +</span>
+                                    &quot;Exiting refresh thread.&quot;, principal, kinitCmd, kinitArgs, e);
+<span class="nc" id="L229">                                return;</span>
+                            }
+<span class="nc" id="L231">                        }</span>
+                    }
+                }
+                try {
+<span class="nc" id="L235">                    int retry = 1;</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">                    while (retry &gt;= 0) {</span>
+                        try {
+<span class="nc" id="L238">                            reLogin();</span>
+<span class="nc" id="L239">                            break;</span>
+<span class="nc" id="L240">                        } catch (LoginException le) {</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                            if (retry &gt; 0) {</span>
+<span class="nc" id="L242">                                log.warn(&quot;[Principal={}]: Error when trying to re-Login, but will retry &quot;, principal, le);</span>
+<span class="nc" id="L243">                                --retry;</span>
+                                // sleep for 10 seconds.
+                                try {
+<span class="nc" id="L246">                                    Thread.sleep(10 * 1000);</span>
+<span class="nc" id="L247">                                } catch (InterruptedException e) {</span>
+<span class="nc" id="L248">                                    log.error(&quot;[Principal={}]: Interrupted during login retry after LoginException:&quot;, principal, le);</span>
+<span class="nc" id="L249">                                    throw le;</span>
+<span class="nc" id="L250">                                }</span>
+                            } else {
+<span class="nc" id="L252">                                log.error(&quot;[Principal={}]: Could not refresh TGT.&quot;, principal, le);</span>
+                            }
+<span class="nc" id="L254">                        }</span>
+                    }
+<span class="nc" id="L256">                } catch (LoginException le) {</span>
+<span class="nc" id="L257">                    log.error(&quot;[Principal={}]: Failed to refresh TGT: refresh thread exiting now.&quot;, principal, le);</span>
+<span class="nc" id="L258">                    return;</span>
+<span class="nc" id="L259">                }</span>
+<span class="nc" id="L260">            }</span>
+        });
+<span class="nc" id="L262">        t.start();</span>
+<span class="nc" id="L263">        return loginContext;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc bnc" id="L268" title="All 4 branches missed.">        if ((t != null) &amp;&amp; (t.isAlive())) {</span>
+<span class="nc" id="L269">            t.interrupt();</span>
+            try {
+<span class="nc" id="L271">                t.join();</span>
+<span class="nc" id="L272">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L273">                log.warn(&quot;[Principal={}]: Error while waiting for Login thread to shutdown.&quot;, principal, e);</span>
+<span class="nc" id="L274">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L275">            }</span>
+        }
+<span class="nc" id="L277">    }</span>
+
+    @Override
+    public Subject subject() {
+<span class="nc" id="L281">        return subject;</span>
+    }
+
+    @Override
+    public String serviceName() {
+<span class="nc" id="L286">        return serviceName;</span>
+    }
+
+    private static String getServiceName(Map&lt;String, ?&gt; configs, String contextName, Configuration configuration) {
+<span class="nc" id="L290">        List&lt;AppConfigurationEntry&gt; configEntries = Arrays.asList(configuration.getAppConfigurationEntry(contextName));</span>
+<span class="nc" id="L291">        String jaasServiceName = JaasContext.configEntryOption(configEntries, JaasUtils.SERVICE_NAME, null);</span>
+<span class="nc" id="L292">        String configServiceName = (String) configs.get(SaslConfigs.SASL_KERBEROS_SERVICE_NAME);</span>
+<span class="nc bnc" id="L293" title="All 6 branches missed.">        if (jaasServiceName != null &amp;&amp; configServiceName != null &amp;&amp; !jaasServiceName.equals(configServiceName)) {</span>
+<span class="nc" id="L294">            String message = String.format(&quot;Conflicting serviceName values found in JAAS and Kafka configs &quot; +</span>
+                &quot;value in JAAS file %s, value in Kafka config %s&quot;, jaasServiceName, configServiceName);
+<span class="nc" id="L296">            throw new IllegalArgumentException(message);</span>
+        }
+
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if (jaasServiceName != null)</span>
+<span class="nc" id="L300">            return jaasServiceName;</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        if (configServiceName != null)</span>
+<span class="nc" id="L302">            return configServiceName;</span>
+
+<span class="nc" id="L304">        throw new IllegalArgumentException(&quot;No serviceName defined in either JAAS or Kafka config&quot;);</span>
+    }
+
+
+    private long getRefreshTime(KerberosTicket tgt) {
+<span class="nc" id="L309">        long start = tgt.getStartTime().getTime();</span>
+<span class="nc" id="L310">        long expires = tgt.getEndTime().getTime();</span>
+<span class="nc" id="L311">        log.info(&quot;[Principal={}]: TGT valid starting at: {}&quot;, principal, tgt.getStartTime());</span>
+<span class="nc" id="L312">        log.info(&quot;[Principal={}]: TGT expires: {}&quot;, principal, tgt.getEndTime());</span>
+<span class="nc" id="L313">        long proposedRefresh = start + (long) ((expires - start) *</span>
+<span class="nc" id="L314">                (ticketRenewWindowFactor + (ticketRenewJitter * RNG.nextDouble())));</span>
+
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        if (proposedRefresh &gt; expires)</span>
+            // proposedRefresh is too far in the future: it's after ticket expires: simply return now.
+<span class="nc" id="L318">            return currentWallTime();</span>
+        else
+<span class="nc" id="L320">            return proposedRefresh;</span>
+    }
+
+    private KerberosTicket getTGT() {
+<span class="nc" id="L324">        Set&lt;KerberosTicket&gt; tickets = subject.getPrivateCredentials(KerberosTicket.class);</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        for (KerberosTicket ticket : tickets) {</span>
+<span class="nc" id="L326">            KerberosPrincipal server = ticket.getServer();</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            if (server.getName().equals(&quot;krbtgt/&quot; + server.getRealm() + &quot;@&quot; + server.getRealm())) {</span>
+<span class="nc" id="L328">                log.debug(&quot;Found TGT with client principal '{}' and server principal '{}'.&quot;, ticket.getClient().getName(),</span>
+<span class="nc" id="L329">                        ticket.getServer().getName());</span>
+<span class="nc" id="L330">                return ticket;</span>
+            }
+<span class="nc" id="L332">        }</span>
+<span class="nc" id="L333">        return null;</span>
+    }
+
+    private boolean hasSufficientTimeElapsed() {
+<span class="nc" id="L337">        long now = currentElapsedTime();</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if (now - lastLogin &lt; minTimeBeforeRelogin) {</span>
+<span class="nc" id="L339">            log.warn(&quot;[Principal={}]: Not attempting to re-login since the last re-login was attempted less than {} seconds before.&quot;,</span>
+<span class="nc" id="L340">                    principal, minTimeBeforeRelogin / 1000);</span>
+<span class="nc" id="L341">            return false;</span>
+        }
+<span class="nc" id="L343">        return true;</span>
+    }
+
+    /**
+     * Re-login a principal. This method assumes that {@link #login()} has happened already.
+     * @throws javax.security.auth.login.LoginException on a failure
+     */
+    protected void reLogin() throws LoginException {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (!isKrbTicket) {</span>
+<span class="nc" id="L352">            return;</span>
+        }
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        if (loginContext == null) {</span>
+<span class="nc" id="L355">            throw new LoginException(&quot;Login must be done first&quot;);</span>
+        }
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        if (!hasSufficientTimeElapsed()) {</span>
+<span class="nc" id="L358">            return;</span>
+        }
+<span class="nc" id="L360">        synchronized (KerberosLogin.class) {</span>
+<span class="nc" id="L361">            log.info(&quot;Initiating logout for {}&quot;, principal);</span>
+            // register most recent relogin attempt
+<span class="nc" id="L363">            lastLogin = currentElapsedTime();</span>
+            //clear up the kerberos state. But the tokens are not cleared! As per
+            //the Java kerberos login module code, only the kerberos credentials
+            //are cleared. If previous logout succeeded but login failed, we shouldn't
+            //logout again since duplicate logout causes NPE from Java 9 onwards.
+<span class="nc bnc" id="L368" title="All 4 branches missed.">            if (subject != null &amp;&amp; !subject.getPrincipals().isEmpty()) {</span>
+<span class="nc" id="L369">                logout();</span>
+            }
+            //login and also update the subject field of this instance to
+            //have the new credentials (pass it to the LoginContext constructor)
+<span class="nc" id="L373">            loginContext = new LoginContext(contextName(), subject, null, configuration());</span>
+<span class="nc" id="L374">            log.info(&quot;Initiating re-login for {}&quot;, principal);</span>
+<span class="nc" id="L375">            login(loginContext);</span>
+<span class="nc" id="L376">        }</span>
+<span class="nc" id="L377">    }</span>
+
+    // Visibility to override for testing
+    protected void login(LoginContext loginContext) throws LoginException {
+<span class="nc" id="L381">        loginContext.login();</span>
+<span class="nc" id="L382">    }</span>
+
+    // Visibility to override for testing
+    protected void logout() throws LoginException {
+<span class="nc" id="L386">        loginContext.logout();</span>
+<span class="nc" id="L387">    }</span>
+
+    private long currentElapsedTime() {
+<span class="nc" id="L390">        return time.hiResClockMs();</span>
+    }
+
+    private long currentWallTime() {
+<span class="nc" id="L394">        return time.milliseconds();</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

@@ -1,0 +1,586 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BufferPool.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.producer.internals</a> &gt; <span class="el_source">BufferPool.java</span></div><h1>BufferPool.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.producer.internals;
+
+import org.apache.kafka.clients.producer.BufferExhaustedException;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Meter;
+import org.apache.kafka.common.utils.Time;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
+
+
+/**
+ * A pool of ByteBuffers kept under a given memory limit. This class is fairly specific to the needs of the producer. In
+ * particular it has the following properties:
+ * &lt;ol&gt;
+ * &lt;li&gt;There is a special &quot;poolable size&quot; and buffers of this size are kept in a free list and recycled
+ * &lt;li&gt;It is fair. That is all memory is given to the longest waiting thread until it has sufficient memory. This
+ * prevents starvation or deadlock when a thread asks for a large chunk of memory and needs to block until multiple
+ * buffers are deallocated.
+ * &lt;/ol&gt;
+ */
+public class BufferPool {
+
+    static final String WAIT_TIME_SENSOR_NAME = &quot;bufferpool-wait-time&quot;;
+
+    /**
+     * Which allocation method a pool serves: {@link #FULL} accepts only {@link #allocate} (the full
+     * strategy), {@link #INCREMENTAL} only {@link #allocateChunks} (the incremental strategy). Fixed at
+     * construction so the two are never mixed on the same pool.
+     */
+<span class="nc" id="L57">    public enum AllocationMode { FULL, INCREMENTAL }</span>
+
+    private final long totalMemory;
+    private final int poolableSize;
+    /** Lock held for any read or write of {@link #free}, {@link #waiters}, {@link #nonPooledAvailableMemory}, or {@link #closed}. */
+    private final ReentrantLock lock;
+    /** Pooled buffers of capacity {@link #poolableSize}, available for reuse. Guarded by {@link #lock}. */
+    private final Deque&lt;ByteBuffer&gt; free;
+    /** FIFO queue of pending allocation requests; the longest-waiting thread is woken first. Guarded by {@link #lock}. */
+    private final Deque&lt;Condition&gt; waiters;
+    /** Total available memory is the sum of nonPooledAvailableMemory and the number of byte buffers in free * poolableSize. Guarded by {@link #lock}. */
+    private long nonPooledAvailableMemory;
+    private final Metrics metrics;
+    private final Time time;
+    private final Sensor waitTime;
+    private boolean closed;
+    private final AllocationMode allocationMode;
+
+    /**
+     * Create a new buffer pool
+     *
+     * @param memory The maximum amount of memory that this buffer pool can allocate
+     * @param poolableSize The buffer size to cache in the free list rather than deallocating
+     * @param metrics instance of Metrics
+     * @param time time instance
+     * @param metricGrpName logical group name for metrics
+     */
+    public BufferPool(long memory, int poolableSize, Metrics metrics, Time time, String metricGrpName) {
+<span class="nc" id="L85">        this(memory, poolableSize, metrics, time, metricGrpName, AllocationMode.FULL);</span>
+<span class="nc" id="L86">    }</span>
+
+    /**
+     * Create a new buffer pool that serves the given {@link AllocationMode}.
+     *
+     * @param memory The maximum amount of memory that this buffer pool can allocate
+     * @param poolableSize The buffer size to cache in the free list rather than deallocating
+     * @param metrics instance of Metrics
+     * @param time time instance
+     * @param metricGrpName logical group name for metrics
+     * @param allocationMode which allocation method this pool serves ({@link #allocate} vs {@link #allocateChunks})
+     */
+<span class="nc" id="L98">    public BufferPool(long memory, int poolableSize, Metrics metrics, Time time, String metricGrpName, AllocationMode allocationMode) {</span>
+<span class="nc" id="L99">        this.allocationMode = allocationMode;</span>
+<span class="nc" id="L100">        this.poolableSize = poolableSize;</span>
+<span class="nc" id="L101">        this.lock = new ReentrantLock();</span>
+<span class="nc" id="L102">        this.free = new ArrayDeque&lt;&gt;();</span>
+<span class="nc" id="L103">        this.waiters = new ArrayDeque&lt;&gt;();</span>
+<span class="nc" id="L104">        this.totalMemory = memory;</span>
+<span class="nc" id="L105">        this.nonPooledAvailableMemory = memory;</span>
+<span class="nc" id="L106">        this.metrics = metrics;</span>
+<span class="nc" id="L107">        this.time = time;</span>
+<span class="nc" id="L108">        this.waitTime = this.metrics.sensor(WAIT_TIME_SENSOR_NAME);</span>
+<span class="nc" id="L109">        MetricName rateMetricName = metrics.metricName(&quot;bufferpool-wait-ratio&quot;,</span>
+                                                   metricGrpName,
+                                                   &quot;The fraction of time an appender waits for space allocation.&quot;);
+<span class="nc" id="L112">        MetricName totalNsMetricName = metrics.metricName(&quot;bufferpool-wait-time-ns-total&quot;,</span>
+                                                    metricGrpName,
+                                                    &quot;The total time in nanoseconds an appender waits for space allocation.&quot;);
+
+<span class="nc" id="L116">        Sensor bufferExhaustedRecordSensor = metrics.sensor(&quot;buffer-exhausted-records&quot;);</span>
+<span class="nc" id="L117">        MetricName bufferExhaustedRateMetricName = metrics.metricName(&quot;buffer-exhausted-rate&quot;, metricGrpName, &quot;The average per-second number of record sends that are dropped due to buffer exhaustion&quot;);</span>
+<span class="nc" id="L118">        MetricName bufferExhaustedTotalMetricName = metrics.metricName(&quot;buffer-exhausted-total&quot;, metricGrpName, &quot;The total number of record sends that are dropped due to buffer exhaustion&quot;);</span>
+<span class="nc" id="L119">        bufferExhaustedRecordSensor.add(new Meter(bufferExhaustedRateMetricName, bufferExhaustedTotalMetricName));</span>
+
+<span class="nc" id="L121">        this.waitTime.add(new Meter(TimeUnit.NANOSECONDS, rateMetricName, totalNsMetricName));</span>
+<span class="nc" id="L122">        this.closed = false;</span>
+<span class="nc" id="L123">    }</span>
+
+    /**
+     * Allocate a buffer of the given size. This method blocks if there is not enough memory and the buffer pool
+     * is configured with blocking mode.
+     *
+     * @param size The buffer size to allocate in bytes
+     * @param maxTimeToBlockMs The maximum time in milliseconds to block for buffer memory to be available
+     * @return The buffer
+     * @throws InterruptedException If the thread is interrupted while blocked
+     * @throws IllegalArgumentException if size is larger than the total memory controlled by the pool (and hence we would block
+     *         forever)
+     */
+    public ByteBuffer allocate(int size, long maxTimeToBlockMs) throws InterruptedException {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        if (allocationMode != AllocationMode.FULL)</span>
+<span class="nc" id="L138">            throw new IllegalStateException(&quot;allocate() is not supported in &quot; + allocationMode</span>
+                + &quot; allocation mode; use allocateChunks()&quot;);
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (size &gt; this.totalMemory)</span>
+<span class="nc" id="L141">            throw new IllegalArgumentException(&quot;Attempt to allocate &quot; + size</span>
+                                               + &quot; bytes, but there is a hard limit of &quot;
+                                               + this.totalMemory
+                                               + &quot; on memory allocations.&quot;);
+
+<span class="nc" id="L146">        ByteBuffer buffer = null;</span>
+<span class="nc" id="L147">        this.lock.lock();</span>
+
+<span class="nc bnc" id="L149" title="All 2 branches missed.">        if (this.closed) {</span>
+<span class="nc" id="L150">            this.lock.unlock();</span>
+<span class="nc" id="L151">            throw new KafkaException(&quot;Producer closed while allocating memory&quot;);</span>
+        }
+
+        try {
+            // check if we have a free buffer of the right size pooled
+<span class="nc bnc" id="L156" title="All 4 branches missed.">            if (size == poolableSize &amp;&amp; !this.free.isEmpty())</span>
+<span class="nc" id="L157">                return this.free.pollFirst();</span>
+
+            // now check if the request is immediately satisfiable with the
+            // memory on hand or if we need to block
+<span class="nc" id="L161">            int freeListSize = freeSize() * this.poolableSize;</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (this.nonPooledAvailableMemory + freeListSize &gt;= size) {</span>
+                // we have enough unallocated or pooled memory to immediately
+                // satisfy the request, but need to allocate the buffer
+<span class="nc" id="L165">                freeUp(size);</span>
+<span class="nc" id="L166">                this.nonPooledAvailableMemory -= size;</span>
+            } else {
+                // we are out of memory and will have to block
+<span class="nc" id="L169">                int accumulated = 0;</span>
+<span class="nc" id="L170">                Condition moreMemory = this.lock.newCondition();</span>
+                try {
+<span class="nc" id="L172">                    long remainingTimeToBlockNs = TimeUnit.MILLISECONDS.toNanos(maxTimeToBlockMs);</span>
+<span class="nc" id="L173">                    this.waiters.addLast(moreMemory);</span>
+                    // loop over and over until we have a buffer or have reserved
+                    // enough memory to allocate one
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                    while (accumulated &lt; size) {</span>
+<span class="nc" id="L177">                        remainingTimeToBlockNs -= awaitMemory(moreMemory, remainingTimeToBlockNs, true,</span>
+<span class="nc" id="L178">                            () -&gt; &quot;Failed to allocate &quot; + size + &quot; bytes within the configured max blocking time &quot;</span>
+<span class="nc" id="L179">                                + maxTimeToBlockMs + &quot; ms. Total memory: &quot; + totalMemory() + &quot; bytes. Available memory: &quot; + availableMemory()</span>
+<span class="nc" id="L180">                                + &quot; bytes. Poolable size: &quot; + poolableSize() + &quot; bytes&quot;);</span>
+
+                        // check if we can satisfy this request from the free list,
+                        // otherwise allocate memory
+<span class="nc bnc" id="L184" title="All 6 branches missed.">                        if (accumulated == 0 &amp;&amp; size == this.poolableSize &amp;&amp; !this.free.isEmpty()) {</span>
+                            // just grab a buffer from the free list
+<span class="nc" id="L186">                            buffer = this.free.pollFirst();</span>
+<span class="nc" id="L187">                            accumulated = size;</span>
+                        } else {
+                            // we'll need to allocate memory, but we may only get
+                            // part of what we need on this iteration
+<span class="nc" id="L191">                            freeUp(size - accumulated);</span>
+<span class="nc" id="L192">                            int got = (int) Math.min(size - accumulated, this.nonPooledAvailableMemory);</span>
+<span class="nc" id="L193">                            this.nonPooledAvailableMemory -= got;</span>
+<span class="nc" id="L194">                            accumulated += got;</span>
+<span class="nc" id="L195">                        }</span>
+                    }
+                    // Don't reclaim memory on throwable since nothing was thrown
+<span class="nc" id="L198">                    accumulated = 0;</span>
+                } finally {
+                    // When this loop was not able to successfully terminate don't loose available memory
+<span class="nc" id="L201">                    this.nonPooledAvailableMemory += accumulated;</span>
+<span class="nc" id="L202">                    this.waiters.remove(moreMemory);</span>
+                }
+            }
+        } finally {
+            // signal any additional waiters if there is more memory left
+            // over for them
+            try {
+<span class="nc" id="L209">                signalNextWaiterIfMemoryAvailable();</span>
+            } finally {
+                // Another finally... otherwise find bugs complains
+<span class="nc" id="L212">                lock.unlock();</span>
+            }
+        }
+
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if (buffer == null)</span>
+<span class="nc" id="L217">            return safeAllocateByteBuffer(size);</span>
+        else
+<span class="nc" id="L219">            return buffer;</span>
+    }
+
+    /**
+     * Block once on {@code moreMemory} for up to {@code remainingTimeToBlockNs}, recording the wait
+     * time. Shared by {@link #allocate} and {@link #allocateChunks}.
+     *
+     * @return the nanos actually waited, for the caller to deduct from its blocking budget
+     * @throws KafkaException           if the pool was closed during the wait
+     * @throws BufferExhaustedException if the wait timed out; the buffer-exhausted metric is recorded
+     *         only when {@code recordExhaustedOnTimeout} is true (the incremental extension path
+     *         recovers without dropping the record, so it records the drop itself if needed)
+     */
+    private long awaitMemory(Condition moreMemory, long remainingTimeToBlockNs,
+                             boolean recordExhaustedOnTimeout, Supplier&lt;String&gt; exhaustedMessage) throws InterruptedException {
+<span class="nc" id="L234">        long startWaitNs = time.nanoseconds();</span>
+        long timeNs;
+        boolean waitingTimeElapsed;
+        try {
+<span class="nc bnc" id="L238" title="All 2 branches missed.">            waitingTimeElapsed = !moreMemory.await(remainingTimeToBlockNs, TimeUnit.NANOSECONDS);</span>
+        } finally {
+<span class="nc" id="L240">            long endWaitNs = time.nanoseconds();</span>
+<span class="nc" id="L241">            timeNs = Math.max(0L, endWaitNs - startWaitNs);</span>
+<span class="nc" id="L242">            recordWaitTime(timeNs);</span>
+        }
+
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if (this.closed)</span>
+<span class="nc" id="L246">            throw new KafkaException(&quot;Producer closed while allocating memory&quot;);</span>
+
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        if (waitingTimeElapsed) {</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">            if (recordExhaustedOnTimeout)</span>
+<span class="nc" id="L250">                recordBufferExhausted();</span>
+<span class="nc" id="L251">            throw new BufferExhaustedException(exhaustedMessage.get());</span>
+        }
+
+<span class="nc" id="L254">        return timeNs;</span>
+    }
+
+    /**
+     * Allocate {@code ceil(totalSize / poolableSize)} poolable-sized buffers atomically, mirroring
+     * {@link #allocate}: satisfied immediately if memory is available, else blocks up to
+     * {@code maxTimeToBlockMs} for the whole request (FIFO on {@link #waiters}). The reservation is
+     * tracked as bytes against {@link #nonPooledAvailableMemory} plus chunks polled from {@link #free}.
+     * Any failure refunds the whole reservation and signals the next waiter before the exception
+     * propagates, so a failed request leaves nothing reserved.
+     * &lt;p&gt;
+     * Used by the incremental buffer.memory allocation strategy; the poolable size is the chunk size.
+     *
+     * @param totalSize        minimum total bytes of capacity required across the returned chunks
+     * @param maxTimeToBlockMs maximum time in milliseconds to block waiting for memory
+     * @return list of {@code ceil(totalSize / poolableSize())} {@code ByteBuffer}s, each of capacity
+     *         {@code poolableSize()}
+     * @throws InterruptedException     if interrupted while waiting
+     * @throws IllegalArgumentException if {@code totalSize &lt;= 0}, or if the request rounded up to
+     *         whole chunks exceeds {@code totalMemory()}
+     * @throws BufferExhaustedException if the request can't be satisfied within {@code maxTimeToBlockMs}
+     * @throws KafkaException           if the pool is closed during the wait
+     */
+    public List&lt;ByteBuffer&gt; allocateChunks(int totalSize, long maxTimeToBlockMs) throws InterruptedException {
+<span class="nc bnc" id="L278" title="All 2 branches missed.">        if (allocationMode != AllocationMode.INCREMENTAL)</span>
+<span class="nc" id="L279">            throw new IllegalStateException(&quot;allocateChunks() is not supported in &quot; + allocationMode</span>
+                + &quot; allocation mode; use allocate()&quot;);
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        if (totalSize &lt;= 0)</span>
+<span class="nc" id="L282">            throw new IllegalArgumentException(&quot;totalSize must be positive: &quot; + totalSize);</span>
+
+<span class="nc" id="L284">        int chunkSize = poolableSize();</span>
+<span class="nc" id="L285">        int numChunks = (int) (((long) totalSize + chunkSize - 1L) / chunkSize);</span>
+<span class="nc" id="L286">        long memoryRequired = (long) numChunks * chunkSize;</span>
+<span class="nc" id="L287">        throwIfChunksNeededExceedsPool(totalSize, numChunks, chunkSize, memoryRequired);</span>
+
+        // Chunks taken from the free list. The remaining bytes are reserved against
+        // nonPooledAvailableMemory and materialized as raw allocations after the lock is released.
+<span class="nc" id="L291">        List&lt;ByteBuffer&gt; pooled = new ArrayList&lt;&gt;(numChunks);</span>
+
+<span class="nc" id="L293">        lock.lock();</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if (this.closed) {</span>
+<span class="nc" id="L295">            lock.unlock();</span>
+<span class="nc" id="L296">            throw new KafkaException(&quot;Producer closed while allocating memory&quot;);</span>
+        }
+        try {
+<span class="nc" id="L299">            long freeListBytes = (long) free.size() * chunkSize;</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            if (this.nonPooledAvailableMemory + freeListBytes &gt;= memoryRequired) {</span>
+                // Enough memory available to allocate the chunks needed
+<span class="nc bnc" id="L302" title="All 4 branches missed.">                while (pooled.size() &lt; numChunks &amp;&amp; !free.isEmpty())</span>
+<span class="nc" id="L303">                    pooled.add(free.pollFirst());</span>
+<span class="nc" id="L304">                long remainingBytes = memoryRequired - (long) pooled.size() * chunkSize;</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                if (remainingBytes &gt; 0) {</span>
+                    // remainingBytes &gt; 0 means the free list was fully drained into `pooled`, so the
+                    // remainder comes entirely from non-pooled memory (sufficient per the check above).
+<span class="nc" id="L308">                    this.nonPooledAvailableMemory -= remainingBytes;</span>
+                }
+<span class="nc" id="L310">            } else {</span>
+                // Not enough memory available, so we wait to acquire the memory needed for all the chunks.
+                // Same as allocate, but for the whole multi-chunk request. A single Condition is added to
+                // the waiter's list to ensure FIFO fairness at the request level.
+                //
+                // `nonPoolAccumulated` tracks bytes drawn from nonPooledAvailableMemory only (pool chunks
+                // already taken live in `pooled`), and is always a whole-chunk multiple. If the wait
+                // does not complete (timeout / close / interrupt), the finally refunds the whole
+                // reservation: `nonPoolAccumulated` back to non-pooled memory, `pooled` back to the free chunks list.
+<span class="nc" id="L319">                long nonPoolAccumulated = 0;</span>
+<span class="nc" id="L320">                boolean allocationCompleted = false;</span>
+<span class="nc" id="L321">                Condition moreMemory = lock.newCondition();</span>
+                try {
+<span class="nc" id="L323">                    long remainingTimeToBlockNs = TimeUnit.MILLISECONDS.toNanos(maxTimeToBlockMs);</span>
+<span class="nc" id="L324">                    waiters.addLast(moreMemory);</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                    while ((long) pooled.size() * chunkSize + nonPoolAccumulated &lt; memoryRequired) {</span>
+                        // Not recording the buffer-exhausted metric on timeout (recordExhaustedOnTimeout=false):
+                        // this may be the extension path, which recovers without dropping the record, so the
+                        // caller records the drop if needed.
+<span class="nc" id="L329">                        remainingTimeToBlockNs -= awaitMemory(moreMemory, remainingTimeToBlockNs, false,</span>
+<span class="nc" id="L330">                            () -&gt; &quot;Failed to allocate &quot; + memoryRequired + &quot; bytes (&quot; + numChunks + &quot; chunks of &quot;</span>
+                                + chunkSize + &quot;) within the configured max blocking time &quot; + maxTimeToBlockMs
+<span class="nc" id="L332">                                + &quot; ms. Total memory: &quot; + totalMemory() + &quot; bytes. Available memory: &quot;</span>
+<span class="nc" id="L333">                                + availableMemory() + &quot; bytes.&quot;);</span>
+
+                        // Reuse free-list chunks first, preferring them over raw reservations: if a
+                        // taken chunk covers a slot already reserved as raw bytes in an earlier
+                        // iteration, hand that raw reservation back to the pool.
+<span class="nc bnc" id="L338" title="All 4 branches missed.">                        while (pooled.size() &lt; numChunks &amp;&amp; !free.isEmpty()) {</span>
+<span class="nc" id="L339">                            pooled.add(free.pollFirst());</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">                            if (nonPoolAccumulated &gt;= chunkSize) { // nonPoolAccumulated is always chunk-aligned</span>
+<span class="nc" id="L341">                                nonPoolAccumulated -= chunkSize;</span>
+<span class="nc" id="L342">                                this.nonPooledAvailableMemory += chunkSize;</span>
+                            }
+                        }
+                        // Reserve non-pooled memory for the still-uncovered chunks, in whole chunks
+                        // (the buffers themselves are allocated after the lock is released).
+<span class="nc bnc" id="L347" title="All 4 branches missed.">                        while (pooled.size() + (int) (nonPoolAccumulated / chunkSize) &lt; numChunks</span>
+                                &amp;&amp; this.nonPooledAvailableMemory &gt;= chunkSize) {
+<span class="nc" id="L349">                            this.nonPooledAvailableMemory -= chunkSize;</span>
+<span class="nc" id="L350">                            nonPoolAccumulated += chunkSize;</span>
+                        }
+                    }
+<span class="nc" id="L353">                    allocationCompleted = true;</span>
+                } finally {
+<span class="nc bnc" id="L355" title="All 2 branches missed.">                    if (!allocationCompleted) {</span>
+                        // Refund all that was reserved (pooled chunks and non-pooled bytes)
+<span class="nc" id="L357">                        this.nonPooledAvailableMemory += nonPoolAccumulated;</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                        for (ByteBuffer chunk : pooled)</span>
+<span class="nc" id="L359">                            free.addFirst(chunk);</span>
+<span class="nc" id="L360">                        pooled.clear();</span>
+                    }
+<span class="nc" id="L362">                    waiters.remove(moreMemory);</span>
+                }
+            }
+        } finally {
+            try {
+<span class="nc" id="L367">                signalNextWaiterIfMemoryAvailable();</span>
+            } finally {
+<span class="nc" id="L369">                lock.unlock();</span>
+            }
+        }
+
+        // Allocate raw chunks for the reserved non-pooled portion outside the lock. On error,
+        // refund all reserved bytes (memoryRequired) and let the next waiter try.
+<span class="nc" id="L375">        int chunksStillNeeded = numChunks - pooled.size();</span>
+<span class="nc" id="L376">        List&lt;ByteBuffer&gt; result = new ArrayList&lt;&gt;(numChunks);</span>
+<span class="nc" id="L377">        result.addAll(pooled);</span>
+<span class="nc" id="L378">        boolean error = true;</span>
+        try {
+<span class="nc bnc" id="L380" title="All 2 branches missed.">            for (int i = 0; i &lt; chunksStillNeeded; i++)</span>
+<span class="nc" id="L381">                result.add(allocateByteBuffer(chunkSize));</span>
+<span class="nc" id="L382">            error = false;</span>
+<span class="nc" id="L383">            return result;</span>
+        } finally {
+<span class="nc bnc" id="L385" title="All 2 branches missed.">            if (error) {</span>
+                // The pooled buffers we already drained are also lost on this path; mirror
+                // safeAllocateByteBuffer's behaviour (the bytes return, the ByteBuffer
+                // instances become garbage).
+<span class="nc" id="L389">                releaseReservedBytes(memoryRequired);</span>
+            }
+        }
+    }
+
+    /**
+     * Throw if the request memory rounded up to whole chunks would exceed the pool.
+     */
+    private void throwIfChunksNeededExceedsPool(int totalSize, int numChunks, int chunkSize, long memoryRequired) {
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (memoryRequired &gt; totalMemory())</span>
+<span class="nc" id="L399">            throw new IllegalArgumentException(&quot;Attempt to allocate &quot; + totalSize + &quot; bytes (&quot;</span>
+                + numChunks + &quot; chunks of &quot; + chunkSize + &quot; = &quot; + memoryRequired + &quot; bytes), but the &quot;
+<span class="nc" id="L401">                + &quot;hard limit on memory allocations is &quot; + totalMemory() + &quot;.&quot;);</span>
+<span class="nc" id="L402">    }</span>
+
+    // Protected for testing
+    protected void recordWaitTime(long timeNs) {
+<span class="nc" id="L406">        this.waitTime.record(timeNs, time.milliseconds());</span>
+<span class="nc" id="L407">    }</span>
+
+    /**
+     * Record that a record send was dropped because the buffer pool was exhausted. Shared by the
+     * full strategy (allocate) and the incremental strategy ({@link ChunkedRecordAccumulator}),
+     * so both update the same buffer-exhausted metrics.
+     */
+    void recordBufferExhausted() {
+<span class="nc" id="L415">        this.metrics.sensor(&quot;buffer-exhausted-records&quot;).record();</span>
+<span class="nc" id="L416">    }</span>
+
+    /**
+     * Wake the longest-waiting thread if any memory (pooled or non-pooled) is available.
+     * Must be called with {@link #lock} held. No-op if no waiters or no memory is free.
+     */
+    private void signalNextWaiterIfMemoryAvailable() {
+<span class="nc bnc" id="L423" title="All 6 branches missed.">        if (!(this.nonPooledAvailableMemory == 0 &amp;&amp; this.free.isEmpty()) &amp;&amp; !this.waiters.isEmpty())</span>
+<span class="nc" id="L424">            this.waiters.peekFirst().signal();</span>
+<span class="nc" id="L425">    }</span>
+
+    /**
+     * Allocate a buffer.  If buffer allocation fails (e.g. because of OOM) then return the size count back to
+     * available memory and signal the next waiter if it exists.
+     */
+    private ByteBuffer safeAllocateByteBuffer(int size) {
+<span class="nc" id="L432">        boolean error = true;</span>
+        try {
+<span class="nc" id="L434">            ByteBuffer buffer = allocateByteBuffer(size);</span>
+<span class="nc" id="L435">            error = false;</span>
+<span class="nc" id="L436">            return buffer;</span>
+        } finally {
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            if (error)</span>
+<span class="nc" id="L439">                releaseReservedBytes(size);</span>
+        }
+    }
+
+    /**
+     * Return previously-reserved non-pooled bytes to the pool and signal the next
+     * waiter. Acquires {@link #lock} internally. Used by callers
+     * that reserve memory and then need to roll back the reservation (e.g., upon errors).
+     */
+    private void releaseReservedBytes(long bytes) {
+<span class="nc" id="L449">        this.lock.lock();</span>
+        try {
+<span class="nc" id="L451">            this.nonPooledAvailableMemory += bytes;</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">            if (!this.waiters.isEmpty())</span>
+<span class="nc" id="L453">                this.waiters.peekFirst().signal();</span>
+        } finally {
+<span class="nc" id="L455">            this.lock.unlock();</span>
+        }
+<span class="nc" id="L457">    }</span>
+
+    // Protected for testing.
+    protected ByteBuffer allocateByteBuffer(int size) {
+<span class="nc" id="L461">        return ByteBuffer.allocate(size);</span>
+    }
+
+    /**
+     * Attempt to ensure we have at least the requested number of bytes of memory for allocation by deallocating pooled
+     * buffers (if needed). Must be called with {@link #lock} held.
+     */
+    private void freeUp(int size) {
+<span class="nc bnc" id="L469" title="All 4 branches missed.">        while (!this.free.isEmpty() &amp;&amp; this.nonPooledAvailableMemory &lt; size)</span>
+<span class="nc" id="L470">            this.nonPooledAvailableMemory += this.free.pollLast().capacity();</span>
+<span class="nc" id="L471">    }</span>
+
+    /**
+     * Return buffers to the pool. If they are of the poolable size add them to the free list, otherwise just mark the
+     * memory as free.
+     *
+     * @param buffer The buffer to return
+     * @param size The size of the buffer to mark as deallocated, note that this may be smaller than buffer.capacity
+     *             since the buffer may re-allocate itself during in-place compression
+     */
+    public void deallocate(ByteBuffer buffer, int size) {
+<span class="nc" id="L482">        lock.lock();</span>
+        try {
+<span class="nc bnc" id="L484" title="All 4 branches missed.">            if (size == this.poolableSize &amp;&amp; size == buffer.capacity()) {</span>
+<span class="nc" id="L485">                buffer.clear();</span>
+<span class="nc" id="L486">                this.free.add(buffer);</span>
+            } else {
+<span class="nc" id="L488">                this.nonPooledAvailableMemory += size;</span>
+            }
+<span class="nc" id="L490">            Condition moreMem = this.waiters.peekFirst();</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">            if (moreMem != null)</span>
+<span class="nc" id="L492">                moreMem.signal();</span>
+        } finally {
+<span class="nc" id="L494">            lock.unlock();</span>
+        }
+<span class="nc" id="L496">    }</span>
+
+    public void deallocate(ByteBuffer buffer) {
+<span class="nc bnc" id="L499" title="All 2 branches missed.">        if (buffer != null)</span>
+<span class="nc" id="L500">            deallocate(buffer, buffer.capacity());</span>
+<span class="nc" id="L501">    }</span>
+
+    /**
+     * the total free memory both unallocated and in the free list
+     */
+    public long availableMemory() {
+<span class="nc" id="L507">        lock.lock();</span>
+        try {
+<span class="nc" id="L509">            return this.nonPooledAvailableMemory + freeSize() * (long) this.poolableSize;</span>
+        } finally {
+<span class="nc" id="L511">            lock.unlock();</span>
+        }
+    }
+
+    // Protected for testing.
+    protected int freeSize() {
+<span class="nc" id="L517">        return this.free.size();</span>
+    }
+
+    /**
+     * Get the unallocated memory (not in the free list or in use)
+     */
+    public long unallocatedMemory() {
+<span class="nc" id="L524">        lock.lock();</span>
+        try {
+<span class="nc" id="L526">            return this.nonPooledAvailableMemory;</span>
+        } finally {
+<span class="nc" id="L528">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * The number of threads blocked waiting on memory
+     */
+    public int queued() {
+<span class="nc" id="L536">        lock.lock();</span>
+        try {
+<span class="nc" id="L538">            return this.waiters.size();</span>
+        } finally {
+<span class="nc" id="L540">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * The buffer size that will be retained in the free list after use
+     */
+    public int poolableSize() {
+<span class="nc" id="L548">        return this.poolableSize;</span>
+    }
+
+    /**
+     * The total memory managed by this pool
+     */
+    public long totalMemory() {
+<span class="nc" id="L555">        return this.totalMemory;</span>
+    }
+
+    /**
+     * Which allocation method this pool serves, so callers that only use one of them can validate
+     * the pool they were given up front.
+     */
+    AllocationMode allocationMode() {
+<span class="nc" id="L563">        return this.allocationMode;</span>
+    }
+
+    // package-private method used only for testing
+    Deque&lt;Condition&gt; waiters() {
+<span class="nc" id="L568">        return this.waiters;</span>
+    }
+
+    /**
+     * Closes the buffer pool. Memory will be prevented from being allocated, but may be deallocated. All allocations
+     * awaiting available memory will be notified to abort.
+     */
+    public void close() {
+<span class="nc" id="L576">        this.lock.lock();</span>
+<span class="nc" id="L577">        this.closed = true;</span>
+        try {
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            for (Condition waiter : this.waiters)</span>
+<span class="nc" id="L580">                waiter.signal();</span>
+        } finally {
+<span class="nc" id="L582">            this.lock.unlock();</span>
+        }
+<span class="nc" id="L584">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

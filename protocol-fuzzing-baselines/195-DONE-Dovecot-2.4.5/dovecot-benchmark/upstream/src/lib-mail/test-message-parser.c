@@ -1,0 +1,2286 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "str.h"
+#include "istream.h"
+#include "message-parser.h"
+#include "message-part-data.h"
+#include "message-size.h"
+#include "test-common.h"
+
+static const char test_msg[] =
+"Return-Path: <test@example.org>\n"
+"Subject: Hello world\n"
+"From: Test User <test@example.org>\n"
+"To: Another User <test2@example.org>\n"
+"Message-Id: <1.2.3.4@example>\n"
+"Mime-Version: 1.0\n"
+"Date: Sun, 23 May 2007 04:58:08 +0300\n"
+"Content-Type: multipart/signed; micalg=pgp-sha1;\n"
+"	protocol=\"application/pgp-signature\";\n"
+"	boundary=\"=-GNQXLhuj24Pl1aCkk4/d\"\n"
+"\n"
+"--=-GNQXLhuj24Pl1aCkk4/d\n"
+"Content-Type: text/plain\n"
+"Content-Transfer-Encoding: quoted-printable\n"
+"\n"
+"There was a day=20\n"
+"a happy=20day\n"
+"\n"
+"--=-GNQXLhuj24Pl1aCkk4/d\n"
+"Content-Type: application/pgp-signature; name=signature.asc\n"
+"\n"
+"-----BEGIN PGP SIGNATURE-----\n"
+"Version: GnuPG v1.2.4 (GNU/Linux)\n"
+"\n"
+"invalid\n"
+"-----END PGP SIGNATURE-----\n"
+"\n"
+"--=-GNQXLhuj24Pl1aCkk4/d--\n"
+"\n"
+"\n";
+#define TEST_MSG_LEN (sizeof(test_msg)-1)
+
+static const struct message_parser_settings set_empty = { .flags = 0 };
+
+static int message_parse_stream(pool_t pool, struct istream *input,
+				const struct message_parser_settings *set,
+				bool parse_data, struct message_part **parts_r)
+{
+	int ret;
+	struct message_parser_ctx *parser;
+	struct message_block block;
+
+	struct message_part_data_limits limits = MESSAGE_PART_DATA_LIMITS_INIT;
+	i_zero(&block);
+	parser = message_parser_init(pool, input, set);
+	while ((ret = message_parser_parse_next_block(parser, &block)) > 0)
+		if (parse_data)
+			message_part_data_parse_from_header(pool, block.part,
+							    &limits, block.hdr);
+	message_parser_deinit(&parser, parts_r);
+	test_assert(input->stream_errno == 0);
+	return ret;
+}
+
+static void test_parsed_parts(struct istream *input, struct message_part *parts)
+{
+	const struct message_parser_settings parser_set = {
+		.flags = MESSAGE_PARSER_FLAG_SKIP_BODY_BLOCK,
+	};
+	struct message_parser_ctx *parser;
+	struct message_block block;
+	struct message_part *parts2;
+	uoff_t i, input_size;
+	const char *error;
+
+	i_stream_seek(input, 0);
+	if (i_stream_get_size(input, TRUE, &input_size) < 0)
+		i_unreached();
+
+	parser = message_parser_init_from_parts(parts, input, &parser_set);
+	for (i = 1; i <= input_size*2+1; i++) {
+		test_istream_set_size(input, i/2);
+		if (i > TEST_MSG_LEN*2)
+			test_istream_set_allow_eof(input, TRUE);
+		while (message_parser_parse_next_block(parser, &block) > 0) ;
+	}
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) == 0);
+	test_assert(message_part_is_equal(parts, parts2));
+}
+
+static void test_message_parser_small_blocks(void)
+{
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2;
+	struct message_block block;
+	unsigned int i, end_of_headers_idx;
+	string_t *output;
+	pool_t pool;
+	const char *error;
+	int ret;
+
+	test_begin("message parser in small blocks");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(test_msg);
+	output = t_str_new(128);
+
+	/* full parsing */
+	const struct message_parser_settings full_parser_set = {
+		.flags = MESSAGE_PARSER_FLAG_INCLUDE_MULTIPART_BLOCKS |
+			MESSAGE_PARSER_FLAG_INCLUDE_BOUNDARIES,
+	};
+	parser = message_parser_init(pool, input, &full_parser_set);
+	while ((ret = message_parser_parse_next_block(parser, &block)) > 0) {
+		if (block.hdr != NULL)
+			message_header_line_write(output, block.hdr);
+		else if (block.size > 0)
+			str_append_data(output, block.data, block.size);
+	}
+
+	test_assert(ret < 0);
+	message_parser_deinit(&parser, &parts);
+	test_assert(input->stream_errno == 0);
+	test_assert(strcmp(test_msg, str_c(output)) == 0);
+
+	/* parsing in small blocks */
+	i_stream_seek(input, 0);
+	test_istream_set_allow_eof(input, FALSE);
+
+	parser = message_parser_init(pool, input, &set_empty);
+	for (i = 1; i <= TEST_MSG_LEN*2+1; i++) {
+		test_istream_set_size(input, i/2);
+		if (i > TEST_MSG_LEN*2)
+			test_istream_set_allow_eof(input, TRUE);
+		while ((ret = message_parser_parse_next_block(parser,
+							      &block)) > 0) ;
+		test_assert((ret == 0 && i <= TEST_MSG_LEN*2) ||
+			    (ret < 0 && i > TEST_MSG_LEN*2));
+	}
+	message_parser_deinit(&parser, &parts2);
+	test_assert(input->stream_errno == 0);
+	test_assert(message_part_is_equal(parts, parts2));
+
+	/* parsing in small blocks from preparsed parts */
+	i_stream_seek(input, 0);
+	test_istream_set_allow_eof(input, FALSE);
+
+	end_of_headers_idx = (strstr(test_msg, "\n-----") - test_msg);
+	const struct message_parser_settings preparsed_parser_set = {
+		.flags = MESSAGE_PARSER_FLAG_SKIP_BODY_BLOCK,
+	};
+	parser = message_parser_init_from_parts(parts, input,
+						&preparsed_parser_set);
+	for (i = 1; i <= TEST_MSG_LEN*2+1; i++) {
+		test_istream_set_size(input, i/2);
+		if (i > TEST_MSG_LEN*2)
+			test_istream_set_allow_eof(input, TRUE);
+		while ((ret = message_parser_parse_next_block(parser,
+							      &block)) > 0) ;
+		test_assert((ret == 0 && i/2 <= end_of_headers_idx) ||
+			    (ret < 0 && i/2 > end_of_headers_idx));
+	}
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) == 0);
+	test_assert(message_part_is_equal(parts, parts2));
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_stop_early(void)
+{
+	struct istream *input, *input2;
+	struct message_part *parts;
+	unsigned int i;
+	pool_t pool;
+
+	test_begin("message parser in stop early");
+	pool = pool_alloconly_create("message parser", 524288);
+	input = test_istream_create(test_msg);
+
+	test_istream_set_allow_eof(input, FALSE);
+	for (i = 1; i <= TEST_MSG_LEN+1; i++) {
+		i_stream_seek(input, 0);
+		test_istream_set_size(input, i);
+
+		test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) == 0);
+
+		/* test preparsed - first re-parse everything with a stream
+		   that sees EOF at this position */
+		input2 = i_stream_create_from_data(test_msg, i);
+		test_assert(message_parse_stream(pool, input2, &set_empty, FALSE, &parts) == -1);
+
+		/* now parse from the parts */
+		i_stream_seek(input2, 0);
+		test_assert(message_parse_stream(pool, input2, &set_empty, FALSE, &parts) == -1);
+
+		i_stream_unref(&input2);
+	}
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_get_sizes(struct istream *input,
+					  struct message_size *body_size_r,
+					  struct message_size *header_size_r,
+					  bool expect_has_nuls)
+{
+	bool has_nuls;
+	i_zero(body_size_r);
+	i_zero(header_size_r);
+
+	message_get_header_size(input, header_size_r, &has_nuls);
+	test_assert(has_nuls == expect_has_nuls);
+	message_get_body_size(input, body_size_r, &has_nuls);
+	test_assert(has_nuls == expect_has_nuls);
+}
+
+static void test_message_parser_assert_sizes(const struct message_part *part,
+					     const struct message_size *body_size,
+					     const struct message_size *header_size)
+{
+	test_assert(part->header_size.lines == header_size->lines);
+	test_assert(part->header_size.physical_size == header_size->physical_size);
+	test_assert(part->header_size.virtual_size == header_size->virtual_size);
+	test_assert(part->body_size.lines == body_size->lines);
+	test_assert(part->body_size.physical_size == body_size->physical_size);
+	test_assert(part->body_size.virtual_size == body_size->virtual_size);
+}
+
+static void test_message_parser_truncated_mime_headers(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\":foo\"\n"
+"\n"
+"--:foo\n"
+"--:foo\n"
+"Content-Type: text/plain\n"
+"--:foo\n"
+"Content-Type: text/plain\r\n"
+"--:foo\n"
+"Content-Type: text/html\n"
+"--:foo--\n";
+	struct istream *input;
+	struct message_part *parts, *part;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser truncated mime headers");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	test_assert((parts->flags & MESSAGE_PART_FLAG_MULTIPART) != 0);
+	test_assert(parts->children_count == 4);
+	test_assert(parts->header_size.lines == 2);
+	test_assert(parts->header_size.physical_size == 48);
+	test_assert(parts->header_size.virtual_size == 48+2);
+	test_assert(parts->body_size.lines == 8);
+	test_assert(parts->body_size.physical_size == 112);
+	test_assert(parts->body_size.virtual_size == 112+7);
+	test_message_parser_assert_sizes(parts, &body_size, &header_size);
+
+	test_assert(parts->children->physical_pos == 55);
+	test_assert(parts->children->header_size.physical_size == 0);
+	test_assert(parts->children->body_size.physical_size == 0);
+	test_assert(parts->children->body_size.lines == 0);
+	test_assert(parts->children->next->physical_pos == 62);
+	test_assert(parts->children->next->header_size.physical_size == 24);
+	test_assert(parts->children->next->header_size.virtual_size == 24);
+	test_assert(parts->children->next->header_size.lines == 0);
+	test_assert(parts->children->next->next->physical_pos == 94);
+	test_assert(parts->children->next->next->header_size.physical_size == 24);
+	test_assert(parts->children->next->next->header_size.virtual_size == 24);
+	test_assert(parts->children->next->next->header_size.lines == 0);
+	test_assert(parts->children->next->next->next->physical_pos == 127);
+	test_assert(parts->children->next->next->next->header_size.physical_size == 23);
+	test_assert(parts->children->next->next->next->header_size.virtual_size == 23);
+	test_assert(parts->children->next->next->next->header_size.lines == 0);
+	for (part = parts->children; part != NULL; part = part->next) {
+		test_assert(part->children_count == 0);
+		test_assert(part->body_size.physical_size == 0);
+		test_assert(part->body_size.virtual_size == 0);
+	}
+	test_assert(parts->children->next->next->next->next == NULL);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_truncated_mime_headers2(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"ab\"\n"
+"\n"
+"--ab\n"
+"Content-Type: multipart/mixed; boundary=\"a\"\n"
+"\n"
+"--ab\n"
+"Content-Type: text/plain\n"
+"\n"
+"--a\n\n";
+	struct istream *input;
+	struct message_part *parts;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser truncated mime headers 2");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	test_assert(parts->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children_count == 2);
+	test_assert(parts->header_size.lines == 2);
+	test_assert(parts->header_size.physical_size == 46);
+	test_assert(parts->header_size.virtual_size == 46+2);
+	test_assert(parts->body_size.lines == 8);
+	test_assert(parts->body_size.physical_size == 86);
+	test_assert(parts->body_size.virtual_size == 86+8);
+	test_message_parser_assert_sizes(parts, &body_size, &header_size);
+
+	test_assert(parts->children->children_count == 0);
+	test_assert(parts->children->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->physical_pos == 51);
+	test_assert(parts->children->header_size.lines == 1);
+	test_assert(parts->children->header_size.physical_size == 44);
+	test_assert(parts->children->header_size.virtual_size == 44+1);
+	test_assert(parts->children->body_size.lines == 0);
+	test_assert(parts->children->body_size.physical_size == 0);
+	test_assert(parts->children->children == NULL);
+
+	test_assert(parts->children->next->children_count == 0);
+	test_assert(parts->children->next->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->next->physical_pos == 101);
+	test_assert(parts->children->next->header_size.lines == 2);
+	test_assert(parts->children->next->header_size.physical_size == 26);
+	test_assert(parts->children->next->header_size.virtual_size == 26+2);
+	test_assert(parts->children->next->body_size.lines == 2);
+	test_assert(parts->children->next->body_size.physical_size == 5);
+	test_assert(parts->children->next->body_size.virtual_size == 5+2);
+	test_assert(parts->children->next->children == NULL);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_truncated_mime_headers3(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"ab\"\n";
+	struct istream *input;
+	struct message_part *parts;
+	pool_t pool;
+
+	test_begin("message parser truncated mime headers 3");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	test_assert(parts->children_count == 0);
+	test_assert(parts->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->header_size.lines == 1);
+	test_assert(parts->header_size.physical_size == 45);
+	test_assert(parts->header_size.virtual_size == 45+1);
+	test_assert(parts->body_size.lines == 0);
+	test_assert(parts->body_size.physical_size == 0);
+
+	test_assert(parts->children == NULL);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_empty_multipart(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"ab\"\n"
+"\n"
+"body\n";
+	struct istream *input;
+	struct message_part *parts;
+	pool_t pool;
+
+	test_begin("message parser empty multipart");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	test_assert(parts->children_count == 0);
+	test_assert(parts->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->header_size.lines == 2);
+	test_assert(parts->header_size.physical_size == 46);
+	test_assert(parts->header_size.virtual_size == 46+2);
+	test_assert(parts->body_size.lines == 1);
+	test_assert(parts->body_size.physical_size == 5);
+	test_assert(parts->body_size.virtual_size == 5+1);
+
+	test_assert(parts->children == NULL);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_duplicate_mime_boundary(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"a\"\n"
+"\n"
+"--a\n"
+"Content-Type: multipart/mixed; boundary=\"a\"\n"
+"\n"
+"--a\n"
+"Content-Type: text/plain\n"
+"\n"
+"body\n";
+	struct istream *input;
+	struct message_part *parts;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser duplicate mime boundary");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	test_assert(parts->children_count == 2);
+	test_assert(parts->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->header_size.lines == 2);
+	test_assert(parts->header_size.physical_size == 45);
+	test_assert(parts->header_size.virtual_size == 45+2);
+	test_assert(parts->body_size.lines == 7);
+	test_assert(parts->body_size.physical_size == 84);
+	test_assert(parts->body_size.virtual_size == 84+7);
+	test_message_parser_assert_sizes(parts, &body_size, &header_size);
+
+	test_assert(parts->children->children_count == 1);
+	test_assert(parts->children->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->physical_pos == 49);
+	test_assert(parts->children->header_size.lines == 2);
+	test_assert(parts->children->header_size.physical_size == 45);
+	test_assert(parts->children->header_size.virtual_size == 45+2);
+	test_assert(parts->children->body_size.lines == 4);
+	test_assert(parts->children->body_size.physical_size == 35);
+	test_assert(parts->children->body_size.virtual_size == 35+4);
+	test_assert(parts->children->children->children_count == 0);
+	test_assert(parts->children->children->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->children->physical_pos == 98);
+	test_assert(parts->children->children->header_size.lines == 2);
+	test_assert(parts->children->children->header_size.physical_size == 26);
+	test_assert(parts->children->children->header_size.virtual_size == 26+2);
+	test_assert(parts->children->children->body_size.lines == 1);
+	test_assert(parts->children->children->body_size.physical_size == 5);
+	test_assert(parts->children->children->body_size.virtual_size == 5+1);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_garbage_suffix_mime_boundary(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"a\"\n"
+"\n"
+"--ab\n"
+"Content-Type: multipart/mixed; boundary=\"a\"\n"
+"\n"
+"--ac\n"
+"Content-Type: text/plain\n"
+"\n"
+"body\n";
+	struct istream *input;
+	struct message_part *parts;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser garbage suffix mime boundary");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	test_assert(parts->children_count == 2);
+	test_assert(parts->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->header_size.lines == 2);
+	test_assert(parts->header_size.physical_size == 45);
+	test_assert(parts->header_size.virtual_size == 45+2);
+	test_assert(parts->body_size.lines == 7);
+	test_assert(parts->body_size.physical_size == 86);
+	test_assert(parts->body_size.virtual_size == 86+7);
+	test_message_parser_assert_sizes(parts, &body_size, &header_size);
+
+	test_assert(parts->children->children_count == 1);
+	test_assert(parts->children->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->physical_pos == 50);
+	test_assert(parts->children->header_size.lines == 2);
+	test_assert(parts->children->header_size.physical_size == 45);
+	test_assert(parts->children->header_size.virtual_size == 45+2);
+	test_assert(parts->children->body_size.lines == 4);
+	test_assert(parts->children->body_size.physical_size == 36);
+	test_assert(parts->children->body_size.virtual_size == 36+4);
+	test_assert(parts->children->children->children_count == 0);
+	test_assert(parts->children->children->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->children->physical_pos == 100);
+	test_assert(parts->children->children->header_size.lines == 2);
+	test_assert(parts->children->children->header_size.physical_size == 26);
+	test_assert(parts->children->children->header_size.virtual_size == 26+2);
+	test_assert(parts->children->children->body_size.lines == 1);
+	test_assert(parts->children->children->body_size.physical_size == 5);
+	test_assert(parts->children->children->body_size.virtual_size == 5+1);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_trailing_dashes(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"a--\"\n"
+"\n"
+"--a--\n"
+"Content-Type: multipart/mixed; boundary=\"a----\"\n"
+"\n"
+"--a----\n"
+"Content-Type: text/plain\n"
+"\n"
+"body\n"
+"--a------\n"
+"Content-Type: text/html\n"
+"\n"
+"body2\n"
+"--a----";
+	struct istream *input;
+	struct message_part *parts;
+	pool_t pool;
+
+	test_begin("message parser trailing dashes");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	test_assert(parts->children_count == 2);
+	test_assert(parts->children->next == NULL);
+	test_assert(parts->children->children_count == 1);
+	test_assert(parts->children->children->next == NULL);
+	test_assert(parts->children->children->children_count == 0);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_continuing_mime_boundary(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"a\"\n"
+"\n"
+"--a\n"
+"Content-Type: multipart/mixed; boundary=\"ab\"\n"
+"\n"
+"--ab\n"
+"Content-Type: text/plain\n"
+"\n"
+"body\n";
+	struct istream *input;
+	struct message_part *parts;
+	pool_t pool;
+
+	test_begin("message parser continuing mime boundary");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+
+	test_assert(parts->children_count == 2);
+	test_assert(parts->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->header_size.lines == 2);
+	test_assert(parts->header_size.physical_size == 45);
+	test_assert(parts->header_size.virtual_size == 45+2);
+	test_assert(parts->body_size.lines == 7);
+	test_assert(parts->body_size.physical_size == 86);
+	test_assert(parts->body_size.virtual_size == 86+7);
+	test_assert(parts->children->children_count == 1);
+	test_assert(parts->children->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->physical_pos == 49);
+	test_assert(parts->children->header_size.lines == 2);
+	test_assert(parts->children->header_size.physical_size == 46);
+	test_assert(parts->children->header_size.virtual_size == 46+2);
+	test_assert(parts->children->body_size.lines == 4);
+	test_assert(parts->children->body_size.physical_size == 36);
+	test_assert(parts->children->body_size.virtual_size == 36+4);
+	test_assert(parts->children->children->children_count == 0);
+	test_assert(parts->children->children->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->children->physical_pos == 100);
+	test_assert(parts->children->children->header_size.lines == 2);
+	test_assert(parts->children->children->header_size.physical_size == 26);
+	test_assert(parts->children->children->header_size.virtual_size == 26+2);
+	test_assert(parts->children->children->body_size.lines == 1);
+	test_assert(parts->children->children->body_size.physical_size == 5);
+	test_assert(parts->children->children->body_size.virtual_size == 5+1);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_continuing_truncated_mime_boundary(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"a\"\n"
+"\n"
+"--a\n"
+"Content-Type: multipart/mixed; boundary=\"ab\"\n"
+"MIME-Version: 1.0\n"
+"--ab\n"
+"Content-Type: text/plain\n"
+"\n"
+"--ab--\n"
+"--a--\n\n";
+	struct istream *input;
+	struct message_part *parts, *part;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser continuing truncated mime boundary");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	part = parts;
+	test_assert(part->children_count == 3);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 45);
+	test_assert(part->header_size.virtual_size == 45+2);
+	test_assert(part->body_size.lines == 9);
+	test_assert(part->body_size.physical_size == 112);
+	test_assert(part->body_size.virtual_size == 112+9);
+	test_message_parser_assert_sizes(part, &body_size, &header_size);
+
+	part = parts->children;
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->physical_pos == 49);
+	test_assert(part->header_size.lines == 1);
+	test_assert(part->header_size.physical_size == 45+17);
+	test_assert(part->header_size.virtual_size == 45+17+1);
+	test_assert(part->body_size.lines == 0);
+	test_assert(part->body_size.physical_size == 0);
+	test_assert(part->children == NULL);
+
+	/* this will not be a child, since the header was truncated. I guess
+	   we could make it, but it would complicate the message-parser even
+	   more. */
+	part = parts->children->next;
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->physical_pos == 117);
+	test_assert(part->header_size.lines == 1);
+	test_assert(part->header_size.physical_size == 25);
+	test_assert(part->header_size.virtual_size == 25+1);
+	test_assert(part->body_size.lines == 0);
+	test_assert(part->body_size.physical_size == 0);
+	test_assert(part->children == NULL);
+
+	part = parts->children->next->next;
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 0);
+	test_assert(part->header_size.physical_size == 0);
+	test_assert(part->body_size.lines == 0);
+	test_assert(part->body_size.physical_size == 0);
+	test_assert(part->children == NULL);
+	test_assert(part->next == NULL);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_continuing_mime_boundary_reverse(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"ab\"\n"
+"\n"
+"--ab\n"
+"Content-Type: multipart/mixed; boundary=\"a\"\n"
+"\n"
+"--a\n"
+"Content-Type: text/plain\n"
+"\n"
+"body\n"
+"--ab\n"
+"Content-Type: text/html\n"
+"\n"
+"body2\n";
+	struct istream *input;
+	struct message_part *parts;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser continuing mime boundary reverse");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	test_assert(parts->children_count == 3);
+	test_assert(parts->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->header_size.lines == 2);
+	test_assert(parts->header_size.physical_size == 46);
+	test_assert(parts->header_size.virtual_size == 46+2);
+	test_assert(parts->body_size.lines == 11);
+	test_assert(parts->body_size.physical_size == 121);
+	test_assert(parts->body_size.virtual_size == 121+11);
+	test_message_parser_assert_sizes(parts, &body_size, &header_size);
+
+	test_assert(parts->children->children_count == 1);
+	test_assert(parts->children->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->physical_pos == 51);
+	test_assert(parts->children->header_size.lines == 2);
+	test_assert(parts->children->header_size.physical_size == 45);
+	test_assert(parts->children->header_size.virtual_size == 45+2);
+	test_assert(parts->children->body_size.lines == 3);
+	test_assert(parts->children->body_size.physical_size == 34);
+	test_assert(parts->children->body_size.virtual_size == 34+3);
+	test_assert(parts->children->children->children_count == 0);
+	test_assert(parts->children->children->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->children->physical_pos == 100);
+	test_assert(parts->children->children->header_size.lines == 2);
+	test_assert(parts->children->children->header_size.physical_size == 26);
+	test_assert(parts->children->children->header_size.virtual_size == 26+2);
+	test_assert(parts->children->children->body_size.lines == 0);
+	test_assert(parts->children->children->body_size.physical_size == 4);
+	test_assert(parts->children->children->body_size.virtual_size == 4);
+	test_assert(parts->children->next->children_count == 0);
+	test_assert(parts->children->next->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(parts->children->next->physical_pos == 136);
+	test_assert(parts->children->next->header_size.lines == 2);
+	test_assert(parts->children->next->header_size.physical_size == 25);
+	test_assert(parts->children->next->header_size.virtual_size == 25+2);
+	test_assert(parts->children->next->body_size.lines == 1);
+	test_assert(parts->children->next->body_size.physical_size == 6);
+	test_assert(parts->children->next->body_size.virtual_size == 6+1);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_no_eoh(void)
+{
+	static const char input_msg[] = "a:b\n";
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts;
+	struct message_block block;
+	pool_t pool;
+
+	test_begin("message parser no EOH");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	parser = message_parser_init(pool, input, &set_empty);
+	test_assert(message_parser_parse_next_block(parser, &block) > 0 &&
+		    block.hdr != NULL && strcmp(block.hdr->name, "a") == 0 &&
+		    block.hdr->value_len == 1 && block.hdr->value[0] == 'b');
+	test_assert(message_parser_parse_next_block(parser, &block) > 0 &&
+		    block.hdr == NULL && block.size == 0);
+	test_assert(message_parser_parse_next_block(parser, &block) < 0);
+	message_parser_deinit(&parser, &parts);
+	test_assert(input->stream_errno == 0);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_long_mime_boundary(void)
+{
+	/* Close the boundaries in wrong reverse order. But because all
+	   boundaries are actually truncated to the same size (..890) it
+	   works the same as if all of them were duplicate boundaries. */
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"1234567890123456789012345678901234567890123456789012345678901234567890123456789012\"\n"
+"\n"
+"--1234567890123456789012345678901234567890123456789012345678901234567890123456789012\n"
+"Content-Type: multipart/mixed; boundary=\"123456789012345678901234567890123456789012345678901234567890123456789012345678901\"\n"
+"\n"
+"--123456789012345678901234567890123456789012345678901234567890123456789012345678901\n"
+"Content-Type: multipart/mixed; boundary=\"12345678901234567890123456789012345678901234567890123456789012345678901234567890\"\n"
+"\n"
+"--12345678901234567890123456789012345678901234567890123456789012345678901234567890\n"
+"Content-Type: text/plain\n"
+"\n"
+"1\n"
+"--1234567890123456789012345678901234567890123456789012345678901234567890123456789012\n"
+"Content-Type: text/plain\n"
+"\n"
+"22\n"
+"--123456789012345678901234567890123456789012345678901234567890123456789012345678901\n"
+"Content-Type: text/plain\n"
+"\n"
+"333\n"
+"--12345678901234567890123456789012345678901234567890123456789012345678901234567890\n"
+"Content-Type: text/plain\n"
+"\n"
+"4444\n";
+	struct istream *input;
+	struct message_part *parts, *part;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser long mime boundary");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	part = parts;
+	test_assert(part->children_count == 6);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 126);
+	test_assert(part->header_size.virtual_size == 126+2);
+	test_assert(part->body_size.lines == 22);
+	test_assert(part->body_size.physical_size == 871);
+	test_assert(part->body_size.virtual_size == 871+22);
+	test_message_parser_assert_sizes(part, &body_size, &header_size);
+
+	part = parts->children;
+	test_assert(part->children_count == 5);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 125);
+	test_assert(part->header_size.virtual_size == 125+2);
+	test_assert(part->body_size.lines == 19);
+	test_assert(part->body_size.physical_size == 661);
+	test_assert(part->body_size.virtual_size == 661+19);
+
+	part = parts->children->children;
+	test_assert(part->children_count == 4);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 124);
+	test_assert(part->header_size.virtual_size == 124+2);
+	test_assert(part->body_size.lines == 16);
+	test_assert(part->body_size.physical_size == 453);
+	test_assert(part->body_size.virtual_size == 453+16);
+
+	part = parts->children->children->children;
+	for (unsigned int i = 1; i <= 3; i++, part = part->next) {
+		test_assert(part->children_count == 0);
+		test_assert(part->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+		test_assert(part->header_size.lines == 2);
+		test_assert(part->header_size.physical_size == 26);
+		test_assert(part->header_size.virtual_size == 26+2);
+		test_assert(part->body_size.lines == 0);
+		test_assert(part->body_size.physical_size == i);
+		test_assert(part->body_size.virtual_size == i);
+	}
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_mime_part_nested_limit(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"1\"\n"
+"\n"
+"--1\n"
+"Content-Type: multipart/mixed; boundary=\"2\"\n"
+"\n"
+"--2\n"
+"Content-Type: text/plain\n"
+"\n"
+"1\n"
+"--2\n"
+"Content-Type: text/plain\n"
+"\n"
+"22\n"
+"--1\n"
+"Content-Type: text/plain\n"
+"\n"
+"333\n";
+	const struct message_parser_settings parser_set = {
+		.max_nested_mime_parts = 2,
+	};
+	struct istream *input;
+	struct message_part *parts, *part;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser mime part nested limit");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &parser_set, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	part = parts;
+	test_assert(part->children_count == 2);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 45);
+	test_assert(part->header_size.virtual_size == 45+2);
+	test_assert(part->body_size.lines == 15);
+	test_assert(part->body_size.physical_size == 148);
+	test_assert(part->body_size.virtual_size == 148+15);
+	test_message_parser_assert_sizes(part, &body_size, &header_size);
+
+	part = parts->children;
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_IS_MIME |
+				    MESSAGE_PART_FLAG_OVERFLOW));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 45);
+	test_assert(part->header_size.virtual_size == 45+2);
+	test_assert(part->body_size.lines == 7);
+	test_assert(part->body_size.physical_size == 64);
+	test_assert(part->body_size.virtual_size == 64+7);
+
+	part = parts->children->next;
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 26);
+	test_assert(part->header_size.virtual_size == 26+2);
+	test_assert(part->body_size.lines == 1);
+	test_assert(part->body_size.physical_size == 4);
+	test_assert(part->body_size.virtual_size == 4+1);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_mime_part_nested_limit_rfc822(void)
+{
+static const char input_msg[] =
+"Content-Type: message/rfc822\n"
+"\n"
+"Content-Type: message/rfc822\n"
+"\n"
+"Content-Type: text/plain\n"
+"\n"
+"1\n";
+	const struct message_parser_settings parser_set = {
+		.max_nested_mime_parts = 2,
+	};
+	struct istream *input;
+	struct message_part *parts, *part;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser mime part nested limit rfc822");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &parser_set, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	part = parts;
+	test_assert(part->children_count == 1);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MESSAGE_RFC822 | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 30);
+	test_assert(part->header_size.virtual_size == 30+2);
+	test_assert(part->body_size.lines == 5);
+	test_assert(part->body_size.physical_size == 58);
+	test_assert(part->body_size.virtual_size == 58+5);
+	test_message_parser_assert_sizes(part, &body_size, &header_size);
+
+	part = parts->children;
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_IS_MIME |
+				    MESSAGE_PART_FLAG_OVERFLOW));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 30);
+	test_assert(part->header_size.virtual_size == 30+2);
+	test_assert(part->body_size.lines == 3);
+	test_assert(part->body_size.physical_size == 28);
+	test_assert(part->body_size.virtual_size == 28+3);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_mime_part_limit(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"1\"\n"
+"\n"
+"--1\n"
+"Content-Type: multipart/mixed; boundary=\"2\"\n"
+"\n"
+"--2\n"
+"Content-Type: text/plain\n"
+"\n"
+"1\n"
+"--2\n"
+"Content-Type: text/plain\n"
+"\n"
+"22\n"
+"--1\n"
+"Content-Type: text/plain\n"
+"\n"
+"333\n";
+	const struct message_parser_settings parser_set = {
+		.max_total_mime_parts = 4,
+	};
+	struct istream *input;
+	struct message_part *parts, *part;
+	struct message_size body_size, header_size;
+	pool_t pool;
+
+	test_begin("message parser mime part limit");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &parser_set, FALSE, &parts) < 0);
+
+	i_stream_seek(input, 0);
+	test_message_parser_get_sizes(input, &body_size, &header_size, FALSE);
+
+	part = parts;
+	test_assert(part->children_count == 3);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 45);
+	test_assert(part->header_size.virtual_size == 45+2);
+	test_assert(part->body_size.lines == 15);
+	test_assert(part->body_size.physical_size == 148);
+	test_assert(part->body_size.virtual_size == 148+15);
+	test_message_parser_assert_sizes(part, &body_size, &header_size);
+
+	part = parts->children;
+	test_assert(part->children_count == 2);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 45);
+	test_assert(part->header_size.virtual_size == 45+2);
+	test_assert(part->body_size.lines == 12);
+	test_assert(part->body_size.physical_size == 99);
+	test_assert(part->body_size.virtual_size == 99+12);
+
+	part = parts->children->children;
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_TEXT | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 26);
+	test_assert(part->header_size.virtual_size == 26+2);
+	test_assert(part->body_size.lines == 0);
+	test_assert(part->body_size.physical_size == 1);
+	test_assert(part->body_size.virtual_size == 1);
+
+	part = parts->children->children->next;
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_TEXT |
+				    MESSAGE_PART_FLAG_IS_MIME |
+				    MESSAGE_PART_FLAG_OVERFLOW));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 26);
+	test_assert(part->header_size.virtual_size == 26+2);
+	test_assert(part->body_size.lines == 5);
+	test_assert(part->body_size.physical_size == 37);
+	test_assert(part->body_size.virtual_size == 37+5);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_mime_part_limit_rfc822(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"1\"\n"
+"\n"
+"--1\n"
+"Content-Type: multipart/mixed; boundary=\"2\"\n"
+"\n"
+"--2\n"
+"Content-Type: message/rfc822\n"
+"\n"
+"Content-Type: text/plain\n"
+"\n"
+"1\n"
+"--2\n"
+"Content-Type: message/rfc822\n"
+"\n"
+"Content-Type: text/plain\n"
+"\n"
+"22\n"
+"--1\n"
+"Content-Type: message/rfc822\n"
+"\n"
+"Content-Type: text/plain\n"
+"\n"
+"333\n";
+	const struct message_parser_settings parser_set = {
+		.max_total_mime_parts = 3,
+	};
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *part;
+	struct message_block block;
+	pool_t pool;
+	int ret;
+
+	test_begin("message parser mime part limit rfc822");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	parser = message_parser_init(pool, input, &parser_set);
+	while ((ret = message_parser_parse_next_block(parser, &block)) > 0) ;
+	test_assert(ret < 0);
+	message_parser_deinit(&parser, &parts);
+
+	part = parts;
+	test_assert(part->children_count == 2);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 45);
+	test_assert(part->header_size.virtual_size == 45+2);
+	test_assert(part->body_size.lines == 21);
+	test_assert(part->body_size.physical_size == 238);
+	test_assert(part->body_size.virtual_size == 238+21);
+
+	part = parts->children;
+	test_assert(part->children_count == 1);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 45);
+	test_assert(part->header_size.virtual_size == 45+2);
+	test_assert(part->body_size.lines == 18);
+	test_assert(part->body_size.physical_size == 189);
+	test_assert(part->body_size.virtual_size == 189+18);
+
+	part = parts->children->children;
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == (MESSAGE_PART_FLAG_IS_MIME |
+				    MESSAGE_PART_FLAG_OVERFLOW));
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 30);
+	test_assert(part->header_size.virtual_size == 30+2);
+	test_assert(part->body_size.lines == 15);
+	test_assert(part->body_size.physical_size == 155);
+	test_assert(part->body_size.virtual_size == 155+15);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_mime_version(void)
+{
+	test_begin("message parser mime version");
+
+	/* Check that MIME version is accepted. */
+static const char *const input_msgs[] = {
+	/* valid mime header */
+"Content-Type: multipart/mixed; boundary=\"1\"\n"
+"MIME-Version: 1.0\n\n"
+"--1\n"
+"Content-Type: text/plain\n"
+"\n"
+"hello, world\n"
+"--1\n",
+	/* future mime header */
+"Content-Type: multipart/mixed; boundary=\"1\"\n"
+"MIME-Version: 2.0\n\n"
+"--1\n"
+"Content-Type: text/plain\n"
+"\n"
+"hello, world\n"
+"--1\n",
+	/* invalid value in mime header */
+"Content-Type: multipart/mixed; boundary=\"1\"\n"
+"MIME-Version: abc\n\n"
+"--1\n"
+"Content-Type: text/plain\n"
+"\n"
+"hello, world\n"
+"--1\n",
+	/* missing value in mime header */
+"Content-Type: multipart/mixed; boundary=\"1\"\n"
+"MIME-Version:\n\n"
+"--1\n"
+"Content-Type: text/plain\n"
+"\n"
+"hello, world\n"
+"--1\n"
+	};
+
+	const struct message_parser_settings parser_set = {
+		.max_total_mime_parts = 2,
+		.flags = MESSAGE_PARSER_FLAG_MIME_VERSION_STRICT,
+	};
+	struct istream *input;
+	struct message_part *parts, *part;
+	pool_t pool;
+
+	for (size_t i = 0; i < N_ELEMENTS(input_msgs); i++) {
+		ssize_t variance = (ssize_t)strlen(input_msgs[i]) - (ssize_t)strlen(input_msgs[0]);
+		pool = pool_alloconly_create("message parser", 10240);
+		input = test_istream_create(input_msgs[i]);
+
+		test_assert(message_parse_stream(pool, input, &parser_set, TRUE, &parts) < 0);
+		part = parts;
+
+		test_assert_idx(part->children_count == 1, i);
+		test_assert_idx(part->flags == (MESSAGE_PART_FLAG_MULTIPART | MESSAGE_PART_FLAG_IS_MIME), i);
+		test_assert_idx(part->header_size.lines == 3, i);
+		test_assert_idx(part->header_size.physical_size == (size_t)(63 + variance), i);
+		test_assert_idx(part->header_size.virtual_size == (size_t)(66 + variance), i);
+		test_assert_idx(part->body_size.lines == 5, i);
+		test_assert_idx(part->body_size.physical_size == 47, i);
+		test_assert_idx(part->body_size.virtual_size == 52, i);
+		test_assert_strcmp_idx(part->data->content_type, "multipart", i);
+		test_assert_strcmp_idx(part->data->content_subtype, "mixed", i);
+		part = part->children;
+
+		test_assert_idx(part->children_count == 0, i);
+		test_assert_idx(part->flags == (MESSAGE_PART_FLAG_TEXT |
+						MESSAGE_PART_FLAG_IS_MIME |
+						MESSAGE_PART_FLAG_OVERFLOW), i);
+		test_assert_idx(part->header_size.lines == 2, i);
+		test_assert_idx(part->header_size.physical_size == 26, i);
+		test_assert_idx(part->header_size.virtual_size == 28, i);
+		test_assert_idx(part->body_size.lines == 2, i);
+		test_assert_idx(part->body_size.physical_size == 17, i);
+		test_assert_strcmp_idx(part->data->content_type, "text", i);
+		test_assert_strcmp_idx(part->data->content_subtype, "plain", i);
+
+		test_parsed_parts(input, parts);
+		i_stream_unref(&input);
+		pool_unref(&pool);
+	};
+
+	/* test for +10MB header */
+	const size_t test_hdr_size = 10*1024*1024UL;
+	const size_t test_msg_size = test_hdr_size + 1024UL;
+	/* add space for parser */
+	pool = pool_alloconly_create("10mb header", test_msg_size + 10240UL);
+	string_t *buffer = str_new(pool, test_msg_size + 1);
+
+	str_append(buffer, "MIME-Version: ");
+
+	/* @UNSAFE */
+	char *tmp = buffer_append_space_unsafe(buffer, test_hdr_size);
+	memset(tmp, 'a', test_hdr_size);
+
+	str_append_c(buffer, '\n');
+	str_append(buffer, "Content-Type: multipart/mixed; boundary=1\n\n--1--");
+
+	input = test_istream_create_data(buffer->data, buffer->used);
+	test_assert(message_parse_stream(pool, input, &parser_set, TRUE, &parts) < 0);
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_mime_version_missing(void)
+{
+	test_begin("message parser mime version missing");
+
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"1\"\n\n"
+"--1\n"
+"Content-Type: text/plain\n"
+"\n"
+"hello, world\n"
+"--1\n";
+
+	const struct message_parser_settings parser_set = {
+		.max_total_mime_parts = 2,
+		.flags = MESSAGE_PARSER_FLAG_MIME_VERSION_STRICT,
+	};
+	struct istream *input;
+	struct message_part *parts, *part;
+	pool_t pool;
+
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	test_assert(message_parse_stream(pool, input, &parser_set, TRUE, &parts) < 0);
+	part = parts;
+
+	/* non-MIME message should end up as plain text mail */
+
+	test_assert(part->children_count == 0);
+	test_assert(part->flags == MESSAGE_PART_FLAG_TEXT);
+	test_assert(part->header_size.lines == 2);
+	test_assert(part->header_size.physical_size == 45);
+	test_assert(part->header_size.virtual_size == 47);
+	test_assert(part->body_size.lines == 5);
+	test_assert(part->body_size.physical_size == 47);
+	test_assert(part->body_size.virtual_size == 52);
+	test_assert(part->children == NULL);
+	test_assert(part->data->content_type == NULL);
+	test_assert(part->data->content_subtype == NULL);
+
+	test_parsed_parts(input, parts);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+
+	test_end();
+}
+
+#define test_assert_virtual_size(part) \
+	test_assert((part).virtual_size == (part).lines + (part).physical_size)
+
+#define test_assert_part(part, flags_, children, h_lines, h_size, b_lines, b_size ) \
+STMT_START {								\
+	test_assert((part)->flags == (flags_));			\
+	test_assert((part)->children_count == children);		\
+	test_assert((part)->header_size.lines == h_lines);		\
+	test_assert((part)->header_size.physical_size == h_size);	\
+	test_assert((part)->body_size.lines == b_lines);		\
+	test_assert((part)->body_size.physical_size == b_size);	\
+	test_assert_virtual_size((part)->header_size);			\
+	test_assert_virtual_size((part)->body_size);			\
+} STMT_END
+
+static const enum message_part_flags FLAGS_MULTIPART =
+	MESSAGE_PART_FLAG_IS_MIME | MESSAGE_PART_FLAG_MULTIPART;
+static const enum message_part_flags FLAGS_RFC822 =
+	MESSAGE_PART_FLAG_IS_MIME | MESSAGE_PART_FLAG_MESSAGE_RFC822;
+static const enum message_part_flags FLAGS_TEXT =
+	MESSAGE_PART_FLAG_IS_MIME | MESSAGE_PART_FLAG_TEXT;
+
+static const char too_many_header_bytes_input_msg[] =
+	"Content-Type: multipart/mixed; boundary=\"1\"\n\n"
+		"--1\n"
+		"Content-Type: multipart/mixed; boundary=\"2\"\n\n"
+			"--2\n"
+			"Content-Type: message/rfc822\n\n"
+				"Content-Type: text/plain\n\n1-rfc822\n"
+			"--2\n"
+			"Content-Type: message/rfc822\n\n"
+				"Content-Type: text/plain\n\n2-rfc822\n"
+		"--1\n"
+			"Content-Type: message/rfc822\n\n"
+				"Content-Type: text/plain\n\n3-rfc822\n";
+
+static void test_message_parser_too_many_header_bytes_run(
+	const struct message_parser_settings *parser_set,
+	pool_t *pool_r, struct istream **input_r,
+	struct message_part **parts_r)
+{
+	*pool_r = pool_alloconly_create("message parser", 10240);
+	*input_r = test_istream_create(too_many_header_bytes_input_msg);
+	struct message_parser_ctx *parser = message_parser_init(*pool_r, *input_r, parser_set);
+
+	int ret;
+	struct message_block block ATTR_UNUSED;
+	while ((ret = message_parser_parse_next_block(parser, &block)) > 0);
+	test_assert(ret < 0);
+
+	message_parser_deinit(&parser, parts_r);
+}
+
+static void test_message_parser_too_many_header_bytes_default(void)
+{
+	test_begin("message parser too many header bytes default");
+
+	pool_t pool;
+	struct istream *input;
+	struct message_part *part_root;
+	const struct message_parser_settings parser_set = { .all_headers_max_size = 0 };
+
+	test_message_parser_too_many_header_bytes_run(&parser_set, &pool, &input, &part_root);
+
+	// test_assert_part(part, flags_, children, h_lines, h_size, b_lines, b_size )
+
+	test_assert_part(part_root, FLAGS_MULTIPART, 7, 2, 45, 21, 256);
+	test_assert(part_root->parent == NULL);
+
+		struct message_part *part_1 = part_root->children;
+		test_assert_part(part_1, FLAGS_MULTIPART, 4, 2, 45, 11, 137);
+
+			struct message_part *part_1_1 = part_1->children;
+			test_assert_part(part_1_1, FLAGS_RFC822, 1, 2, 30, 2, 34);
+
+				struct message_part *part_1_1_1 = part_1_1->children;
+				test_assert_part(part_1_1_1, FLAGS_TEXT, 0, 2, 26, 0, 8);
+
+				test_assert(part_1_1_1->next == NULL);
+
+			struct message_part *part_1_2 = part_1_1->next;
+			test_assert_part(part_1_2, FLAGS_RFC822, 1, 2, 30, 2, 34);
+
+				struct message_part *part_1_2_1 = part_1_2->children;
+				test_assert_part(part_1_2_1, FLAGS_TEXT, 0, 2, 26, 0, 8);
+
+				test_assert(part_1_2_1->next == NULL);
+
+			test_assert(part_1_2->next == NULL);
+
+		struct message_part *part_2 = part_1->next;
+		test_assert_part(part_2, FLAGS_RFC822, 1, 2, 30, 3, 35);
+
+			struct message_part *part_2_1 = part_2->children;
+			test_assert_part(part_2_1, FLAGS_TEXT, 0, 2, 26, 1, 9);
+			test_assert(part_2_1->next == NULL);
+
+		test_assert(part_2->next == NULL);
+
+	test_assert(part_root->next == NULL);
+
+	test_parsed_parts(input, part_root);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_too_many_header_bytes_100(void)
+{
+	test_begin("message parser too many header bytes 100");
+
+	pool_t pool;
+	struct istream *input;
+	struct message_part *part_root;
+	const struct message_parser_settings parser_set = { .all_headers_max_size = 100 };
+
+	test_message_parser_too_many_header_bytes_run(&parser_set, &pool, &input, &part_root);
+
+	// test_assert_part(part, flags_, children, h_lines, h_size, b_lines, b_size )
+
+	test_assert_part(part_root, FLAGS_MULTIPART, 5, 2, 45, 21, 256);
+	test_assert(part_root->parent == NULL);
+
+		struct message_part *part_1 = part_root->children;
+		test_assert_part(part_1, FLAGS_MULTIPART, 3, 2, 45, 11, 137);
+
+			struct message_part *part_1_1 = part_1->children;
+			test_assert_part(part_1_1, FLAGS_RFC822, 1, 2, 30, 2, 34);
+
+				struct message_part *part_1_1_1 = part_1_1->children;
+				test_assert_part(part_1_1_1, MESSAGE_PART_FLAG_IS_MIME, 0, 2, 26, 0, 8);
+
+				test_assert(part_1_1_1->next == NULL);
+
+			struct message_part *part_1_2 = part_1_1->next;
+			test_assert_part(part_1_2, MESSAGE_PART_FLAG_IS_MIME, 0, 2, 30, 2, 34);
+
+			test_assert(part_1_2->next == NULL);
+
+		struct message_part *part_2 = part_1->next;
+		test_assert_part(part_2, MESSAGE_PART_FLAG_IS_MIME, 0, 2, 30, 3, 35);
+
+		test_assert(part_2->next == NULL);
+
+	test_assert(part_root->next == NULL);
+
+	test_parsed_parts(input, part_root);
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_preparsed_empty_preamble(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+"\r\n"
+"--b\r\n"
+"Content-Type: text/plain\r\n"
+"\r\n"
+"hello\r\n"
+"--b--\r\n";
+	const struct message_parser_settings preparsed_set = {
+		.flags = MESSAGE_PARSER_FLAG_INCLUDE_MULTIPART_BLOCKS,
+	};
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2;
+	struct message_block block;
+	const char *error;
+	pool_t pool;
+
+	test_begin("message parser preparsed empty preamble");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+	test_istream_set_allow_eof(input, TRUE);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	/* Re-parse from the cached parts, requesting multipart blocks so the
+	   prologue is returned. The prologue region here is exactly the
+	   boundary line ("--b\r\n") with no preamble before it. Before the fix
+	   the backward newline scan walked past block start and clipped the
+	   block to a (size_t)-underflowed length. */
+	i_stream_seek(input, 0);
+	parser = message_parser_init_from_parts(parts, input, &preparsed_set);
+	while (message_parser_parse_next_block(parser, &block) > 0)
+		test_assert(block.size <= sizeof(input_msg));
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) == 0);
+	test_assert(message_part_is_equal(parts, parts2));
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_preparsed_empty_preamble_lf(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"bb\"\n"
+"\n"
+"--bb\n"
+"Content-Type: text/plain\n"
+"\n"
+"hello\n"
+"--bb--\n";
+	const struct message_parser_settings preparsed_set = {
+		.flags = MESSAGE_PARSER_FLAG_INCLUDE_MULTIPART_BLOCKS,
+	};
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2;
+	struct message_block block;
+	const char *error;
+	pool_t pool;
+
+	test_begin("message parser preparsed empty preamble lf");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+	test_istream_set_allow_eof(input, TRUE);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	/* Same as test_message_parser_preparsed_empty_preamble(), but with
+	   LF-only newlines so the boundary line has no CR before its LF. */
+	i_stream_seek(input, 0);
+	parser = message_parser_init_from_parts(parts, input, &preparsed_set);
+	while (message_parser_parse_next_block(parser, &block) > 0)
+		test_assert(block.size <= sizeof(input_msg));
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) == 0);
+	test_assert(message_part_is_equal(parts, parts2));
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_preparsed_epilogue_no_newline(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+"\r\n"
+"--b\r\n"
+"Content-Type: text/plain\r\n"
+"\r\n"
+"hello\r\n"
+"--b--";
+	const struct message_parser_settings preparsed_set = {
+		.flags = MESSAGE_PARSER_FLAG_INCLUDE_MULTIPART_BLOCKS,
+	};
+	const size_t msg_len = sizeof(input_msg)-1;
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2;
+	struct message_block block;
+	const char *error;
+	pool_t pool;
+
+	test_begin("message parser preparsed epilogue without newline");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+	test_istream_set_allow_eof(input, TRUE);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+
+	/* The close delimiter line has no trailing newline and ends exactly at
+	   the multipart's end, so preparsed_parse_epilogue_boundary() finds no
+	   LF and cannot ask for more data either. It must skip the boundary
+	   line it has, not compute a skip from the NULL memchr() result. */
+	i_stream_seek(input, 0);
+	parser = message_parser_init_from_parts(parts, input, &preparsed_set);
+	while (message_parser_parse_next_block(parser, &block) > 0)
+		test_assert(block.size <= msg_len);
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) == 0);
+	test_assert(message_part_is_equal(parts, parts2));
+	test_assert(input->v_offset == msg_len);
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_preparsed_epilogue_truncated(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+"\r\n"
+"--b\r\n"
+"Content-Type: text/plain\r\n"
+"\r\n"
+"hello\r\n"
+"--b--\r\n"
+"epilogue\r\n";
+	const struct message_parser_settings preparsed_set = {
+		.flags = MESSAGE_PARSER_FLAG_INCLUDE_MULTIPART_BLOCKS,
+	};
+	/* cut off "\r\nepilogue\r\n", leaving the boundary line without its
+	   newline as the last bytes of the stream */
+	const size_t trunc_len = sizeof(input_msg)-1 - 12;
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2;
+	struct message_block block;
+	const char *error;
+	pool_t pool;
+
+	test_begin("message parser preparsed epilogue truncated");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+	test_istream_set_allow_eof(input, TRUE);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+	i_stream_unref(&input);
+
+	/* Replay against a stream that ends before the cached sizes say it
+	   should. preparsed_parse_epilogue_boundary() again finds no LF, and
+	   must not turn that into a huge skip. */
+	input = test_istream_create_data(input_msg, trunc_len);
+	test_istream_set_allow_eof(input, TRUE);
+	parser = message_parser_init_from_parts(parts, input, &preparsed_set);
+	while (message_parser_parse_next_block(parser, &block) > 0)
+		test_assert(block.size <= trunc_len);
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) == 0);
+	test_assert_ucmp(input->v_offset, ==, trunc_len);
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_preparsed_epilogue_boundary_dashes(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+"\r\n"
+"--b\r\n"
+"Content-Type: text/plain\r\n"
+"\r\n"
+"hello\r\n"
+"--b--\r\n";
+/* Identical to input_msg, except the epilogue boundary line's second
+   dash is replaced: "--b--" -> "-xb--". Same length, so the cached part
+   offsets still point at the same places. */
+static const char bad_msg[] =
+"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+"\r\n"
+"--b\r\n"
+"Content-Type: text/plain\r\n"
+"\r\n"
+"hello\r\n"
+"-xb--\r\n";
+	const struct message_parser_settings preparsed_set = {
+		.flags = MESSAGE_PARSER_FLAG_INCLUDE_MULTIPART_BLOCKS,
+	};
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2;
+	struct message_block block;
+	const char *error;
+	pool_t pool;
+
+	test_begin("message parser preparsed epilogue boundary dashes");
+	test_assert(sizeof(input_msg) == sizeof(bad_msg));
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+	test_istream_set_allow_eof(input, TRUE);
+
+	test_assert(message_parse_stream(pool, input, &set_empty, FALSE, &parts) < 0);
+	i_stream_unref(&input);
+
+	/* The cached tree says a close delimiter starts here, but the stream
+	   has "\r\n-x" instead of "\r\n--". Both dashes must be checked. */
+	input = test_istream_create(bad_msg);
+	test_istream_set_allow_eof(input, TRUE);
+	parser = message_parser_init_from_parts(parts, input, &preparsed_set);
+	while (message_parser_parse_next_block(parser, &block) > 0) ;
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) < 0);
+	test_assert_strcmp(error,
+		"Epilogue boundary start not at expected position");
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_parser_preparsed_epilogue_boundary_long_line(void)
+{
+static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+"\r\n"
+"--b\r\n"
+"Content-Type: text/plain\r\n"
+"\r\n"
+"hello\r\n"
+/* close delimiter followed by 100 bytes of transport padding, so its
+   newline is further away than BOUNDARY_END_MAX_LEN */
+"--b--"
+"                                                  "
+"                                                  "
+"\r\n"
+"epilogue\r\n";
+	const struct message_parser_settings preparsed_set = {
+		.flags = MESSAGE_PARSER_FLAG_INCLUDE_MULTIPART_BLOCKS,
+	};
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2;
+	struct message_block block;
+	string_t *forward, *replayed;
+	const char *error;
+	pool_t pool;
+
+	test_begin("message parser preparsed epilogue boundary long line");
+	pool = pool_alloconly_create("message parser", 10240);
+	forward = str_new(pool, 256);
+	replayed = str_new(pool, 256);
+
+	/* forward parse, collecting the blocks it returns */
+	input = test_istream_create(input_msg);
+	test_istream_set_allow_eof(input, TRUE);
+	parser = message_parser_init(pool, input, &preparsed_set);
+	while (message_parser_parse_next_block(parser, &block) > 0)
+		str_append_data(forward, block.data, block.size);
+	message_parser_deinit(&parser, &parts);
+	i_stream_unref(&input);
+
+	/* Replay the cached tree with a buffer too small to ever hold the
+	   whole boundary line, so its newline stays out of reach and the
+	   parser has to keep skipping until it finds the end of the line.
+	   The result must match the forward parse of the same input. */
+	input = test_istream_create(input_msg);
+	test_istream_set_allow_eof(input, TRUE);
+	test_istream_set_max_buffer_size(input, 96);
+	parser = message_parser_init_from_parts(parts, input, &preparsed_set);
+	while (message_parser_parse_next_block(parser, &block) > 0)
+		str_append_data(replayed, block.data, block.size);
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) == 0);
+	test_assert(message_part_is_equal(parts, parts2));
+	test_assert_strcmp(str_c(replayed), str_c(forward));
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static bool part_offsets_consistent(const struct message_part *part)
+{
+	/* Verify the from-parts invariant on a cached message_part tree:
+	   Within each container siblings must not overlap, and children must
+	   start at/after the container's header end. A violation is exactly
+	   what makes preparsed_parse_*_init() see v_offset past physical_pos. */
+	for (; part != NULL; part = part->next) {
+		uoff_t part_end = part->physical_pos +
+			part->header_size.physical_size +
+			part->body_size.physical_size;
+
+		if (part->children != NULL) {
+			uoff_t body_start = part->physical_pos +
+				part->header_size.physical_size;
+			if (part->children->physical_pos < body_start)
+				return FALSE;
+			if (!part_offsets_consistent(part->children))
+				return FALSE;
+		}
+		if (part->next != NULL &&
+		    part->next->physical_pos < part_end)
+			return FALSE;
+	}
+	return TRUE;
+}
+
+static bool
+test_message_parser_preparsed_buffer_size_msg(const char *msg, size_t bufsize)
+{
+	const struct message_parser_settings preparsed_set = {
+		.flags = MESSAGE_PARSER_FLAG_SKIP_BODY_BLOCK,
+	};
+	struct message_block block;
+	const char *error;
+
+	pool_t pool = pool_alloconly_create("preparsed", 10240);
+	struct istream *input = test_istream_create(msg);
+	struct message_part *parts, *parts2;
+	struct message_parser_ctx *parser;
+
+	test_istream_set_max_buffer_size(input, bufsize);
+	test_istream_set_allow_eof(input, TRUE);
+
+	/* forward parse (variable buffer fills) -> cached tree,
+	   which must never have overlapping part offsets */
+	parser = message_parser_init(pool, input, &set_empty);
+	while (message_parser_parse_next_block(parser, &block) > 0) ;
+	message_parser_deinit(&parser, &parts);
+	test_assert(part_offsets_consistent(parts));
+
+	/* re-parsing from the cached tree must not break */
+	i_stream_seek(input, 0);
+	parser = message_parser_init_from_parts(parts, input, &preparsed_set);
+	while (message_parser_parse_next_block(parser, &block) > 0) ;
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) == 0);
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	return !test_has_failed();
+}
+
+static void test_message_parser_preparsed_buffer_sizes(void)
+{
+	static const char *const msgs[] = {
+		/* transport padding + close delimiter padding */
+		"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+		"\r\n"
+		"preamble\r\n"
+		"--b  \r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"body one\r\n"
+		"--b\t\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"body two\r\n"
+		"--b--  \r\n"
+		"epilogue\r\n",
+		/* long body lines (no LF within buffer) -> forces the
+		   full-buffer (-2) path in body/boundary scanning */
+		"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+		"\r\n"
+		"--b\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n"
+		"--b\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+		"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\r\n"
+		"--b--\r\n",
+		/* nested multipart */
+		"Content-Type: multipart/mixed; boundary=\"o\"\r\n"
+		"\r\n"
+		"--o\r\n"
+		"Content-Type: multipart/alternative; boundary=\"i\"\r\n"
+		"\r\n"
+		"--i\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"inner a\r\n"
+		"--i\r\n"
+		"Content-Type: text/html\r\n"
+		"\r\n"
+		"inner b\r\n"
+		"--i--\r\n"
+		"--o\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"outer tail\r\n"
+		"--o--\r\n",
+		/* embedded message/rfc822 */
+		"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+		"\r\n"
+		"--b\r\n"
+		"Content-Type: message/rfc822\r\n"
+		"\r\n"
+		"Subject: inner\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"embedded body\r\n"
+		"--b--\r\n",
+		/* body without trailing CRLF before boundary line */
+		"Content-Type: multipart/mixed; boundary=\"bnd\"\r\n"
+		"\r\n"
+		"--bnd\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"no-newline-body"
+		"\r\n--bnd--\r\n",
+		/* empty preamble, empty part body */
+		"Content-Type: multipart/mixed; boundary=\"x\"\r\n"
+		"\r\n"
+		"--x\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"--x--\r\n",
+		/* boundary that is a prefix of a longer used boundary */
+		"Content-Type: multipart/mixed; boundary=\"a\"\r\n"
+		"\r\n"
+		"--a\r\n"
+		"Content-Type: multipart/mixed; boundary=\"ab\"\r\n"
+		"\r\n"
+		"--ab\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"deep\r\n"
+		"--ab--\r\n"
+		"--a\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"tail\r\n"
+		"--a--\r\n",
+		/* multipart/digest (implicit message/rfc822 children) */
+		"Content-Type: multipart/digest; boundary=\"d\"\r\n"
+		"\r\n"
+		"--d\r\n"
+		"\r\n"
+		"Subject: one\r\n"
+		"\r\n"
+		"first digest body\r\n"
+		"--d\r\n"
+		"\r\n"
+		"Subject: two\r\n"
+		"\r\n"
+		"second digest body\r\n"
+		"--d--\r\n",
+		/* missing final close delimiter (truncated) */
+		"Content-Type: multipart/mixed; boundary=\"m\"\r\n"
+		"\r\n"
+		"--m\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"unterminated body with no closing boundary\r\n",
+		/* header with no blank line before boundary (empty part) +
+		   trailing-dashes-inside-body */
+		"Content-Type: multipart/mixed; boundary=\"z\"\r\n"
+		"\r\n"
+		"--z\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"line ending with dashes--\r\n"
+		"--zzz not a boundary\r\n"
+		"still body\r\n"
+		"--z--\r\n",
+		/* LF-only (no CR) variant of the padded case */
+		"Content-Type: multipart/mixed; boundary=\"b\"\n"
+		"\n"
+		"preamble\n"
+		"--b  \n"
+		"Content-Type: text/plain\n"
+		"\n"
+		"body one\n"
+		"--b\n"
+		"Content-Type: text/plain\n"
+		"\n"
+		"body two\n"
+		"--b--\n",
+		NULL
+	};
+	/* match the production from-parts callers (index-mail-headers,
+	   message-search): body is skipped, parts walked by cached offsets */
+	test_begin("message parser preparsed buffer sizes");
+	for (unsigned int m = 0; msgs[m] != NULL; m++) {
+		size_t len = strlen(msgs[m]);
+		/* start above the longest lookahead the parser may want
+		   (header line / BOUNDARY_END_MAX_LEN); smaller buffers can't
+		   occur with real streams and would livelock the lookahead. */
+		for (size_t bufsize = 96; bufsize <= len; bufsize++)
+			test_assert_idx(test_message_parser_preparsed_buffer_size_msg(msgs[m], bufsize), bufsize);
+	}
+	test_end();
+}
+
+static void test_message_parser_preparsed_sibling_overlap(void)
+{
+	/* Last line of defence for the imap panic in
+	   preparsed_parse_next_header_init(): if a cached message_part tree
+	   whose sibling leaf parts overlap ever reaches the SKIP_BODY_BLOCK
+	   from-parts walk, it must fail gracefully (broken_reason) rather than
+	   i_assert-panic. (message_part_serialize() now asserts such trees
+	   can't be produced, and message_part_deserialize() rejects them if
+	   read from disk.) */
+	static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+"\r\n"
+"--b\r\n"
+"Content-Type: text/plain\r\n"
+"\r\n"
+"first body\r\n"
+"--b\r\n"
+"Content-Type: text/plain\r\n"
+"\r\n"
+"second body\r\n"
+"--b--\r\n";
+	const struct message_parser_settings preparsed_set = {
+		.flags = MESSAGE_PARSER_FLAG_SKIP_BODY_BLOCK,
+	};
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2;
+	struct message_block block;
+	const char *error;
+	pool_t pool;
+
+	test_begin("message parser preparsed sibling overlap");
+	pool = pool_alloconly_create("overlap", 10240);
+	input = test_istream_create(input_msg);
+	test_istream_set_allow_eof(input, TRUE);
+
+	/* forward parse -> consistent two-leaf tree */
+	test_assert(message_parse_stream(pool, input, &set_empty,
+					 FALSE, &parts) < 0);
+	test_assert(parts->children != NULL &&
+		    parts->children->next != NULL);
+	test_assert(part_offsets_consistent(parts));
+
+	/* Simulate a cache that recorded the 2nd child as starting before the
+	   1st child's body ends (here at the same position) -- the in-cache
+	   footprint of a boundary-size miscount. Feed it straight to the
+	   from-parts walk (bypassing serialize, which would assert). */
+	parts->children->next->physical_pos = parts->children->physical_pos;
+	test_assert(!part_offsets_consistent(parts));
+
+	i_stream_seek(input, 0);
+	parser = message_parser_init_from_parts(parts, input, &preparsed_set);
+	while (message_parser_parse_next_block(parser, &block) > 0) ;
+	test_assert(message_parser_deinit_from_parts(
+		&parser, &parts2, &error) != 0);
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+static unsigned int test_part_count(struct message_part *part)
+{
+	unsigned int count = 0;
+
+	for (; part != NULL; part = part->next)
+		count += 1 + test_part_count(part->children);
+	return count;
+}
+
+static void test_message_parser_preparsed_tree_unchanged(void)
+{
+static const char input_msg[] =
+"Content-Type:multipart/d;boundary=\n"
+"\n"
+"--\n";
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2;
+	struct message_block block;
+	uoff_t body_size;
+	unsigned int children_count;
+	const char *error;
+	pool_t pool;
+
+	test_begin("message parser preparsed tree unchanged");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	parser = message_parser_init(pool, input, &set_empty);
+	while (message_parser_parse_next_block(parser, &block) > 0) ;
+	message_parser_deinit(&parser, &parts);
+
+	body_size = parts->body_size.physical_size;
+	children_count = parts->children_count;
+	test_assert(children_count == test_part_count(parts->children));
+
+	/* Parsing again with the tree must not change the tree. */
+	i_stream_seek(input, 0);
+	parser = message_parser_init_from_parts(parts, input, &set_empty);
+	while (message_parser_parse_next_block(parser, &block) > 0) ;
+	test_assert(message_parser_deinit_from_parts(&parser, &parts2, &error) == 0);
+
+	test_assert(parts->body_size.physical_size == body_size);
+	test_assert(parts->children_count == children_count);
+	test_assert(parts->children_count == test_part_count(parts->children));
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+struct test_part_snapshot {
+	uoff_t header_physical_size, header_virtual_size, header_lines;
+	uoff_t body_physical_size, body_virtual_size, body_lines;
+	unsigned int children_count;
+};
+
+static void
+test_part_snapshot(struct message_part *part, struct test_part_snapshot *snaps,
+		   unsigned int *count)
+{
+	for (; part != NULL; part = part->next) {
+		struct test_part_snapshot *snap = &snaps[(*count)++];
+
+		snap->header_physical_size = part->header_size.physical_size;
+		snap->header_virtual_size = part->header_size.virtual_size;
+		snap->header_lines = part->header_size.lines;
+		snap->body_physical_size = part->body_size.physical_size;
+		snap->body_virtual_size = part->body_size.virtual_size;
+		snap->body_lines = part->body_size.lines;
+		snap->children_count = part->children_count;
+		test_part_snapshot(part->children, snaps, count);
+	}
+}
+
+static void test_message_parser_preparsed_stop_early(void)
+{
+	static const char input_msg[] =
+"Content-Type: multipart/mixed; boundary=\"b\"\n"
+"\n"
+"--b\n"
+"Content-Type: text/plain\n"
+"\n"
+"first\n"
+"--b\n"
+"Content-Type: multipart/alternative; boundary=\"a\"\n"
+"\n"
+"--a\n"
+"Content-Type: text/plain\n"
+"\n"
+"plain\n"
+"--a\n"
+"Content-Type: text/html\n"
+"\n"
+"<p>html</p>\n"
+"--a--\n"
+"--b\n"
+"Content-Type: text/plain\n"
+"\n"
+"last\n"
+"--b--\n";
+	struct test_part_snapshot before[16] = {}, after[16] = {};
+	struct message_parser_ctx *parser;
+	struct istream *input;
+	struct message_part *parts, *parts2, *stop_part;
+	struct message_block block;
+	unsigned int before_count = 0, after_count;
+	const char *error;
+	pool_t pool;
+
+	test_begin("message parser preparsed stop early");
+	pool = pool_alloconly_create("message parser", 10240);
+	input = test_istream_create(input_msg);
+
+	parser = message_parser_init(pool, input, &set_empty);
+	while (message_parser_parse_next_block(parser, &block) > 0) ;
+	message_parser_deinit(&parser, &parts);
+
+	/* the text/html part inside multipart/alternative */
+	stop_part = parts->children->next->children->next;
+	test_assert(stop_part->children == NULL && stop_part->parent != parts);
+	test_part_snapshot(parts, before, &before_count);
+	test_assert(before_count == 6);
+
+	/* Stopping a preparsed parse inside a nested part must not change the
+	   tree, no matter how many times it is done. */
+	for (unsigned int i = 0; i < 3; i++) {
+		i_stream_seek(input, 0);
+		parser = message_parser_init_from_parts(parts, input, &set_empty);
+		while (message_parser_parse_next_block(parser, &block) > 0) {
+			if (block.part == stop_part && block.hdr == NULL &&
+			    block.size > 0)
+				break;
+		}
+		test_assert_idx(block.part == stop_part, i);
+		test_assert_idx(message_parser_deinit_from_parts(
+			&parser, &parts2, &error) == 0, i);
+
+		after_count = 0;
+		memset(after, 0, sizeof(after));
+		test_part_snapshot(parts, after, &after_count);
+		test_assert_idx(after_count == before_count, i);
+		test_assert_idx(memcmp(before, after,
+				       sizeof(before[0]) * before_count) == 0, i);
+	}
+
+	i_stream_unref(&input);
+	pool_unref(&pool);
+	test_end();
+}
+
+int main(void)
+{
+	static void (*const test_functions[])(void) = {
+		test_message_parser_preparsed_buffer_sizes,
+		test_message_parser_preparsed_sibling_overlap,
+		test_message_parser_small_blocks,
+		test_message_parser_stop_early,
+		test_message_parser_truncated_mime_headers,
+		test_message_parser_truncated_mime_headers2,
+		test_message_parser_truncated_mime_headers3,
+		test_message_parser_empty_multipart,
+		test_message_parser_duplicate_mime_boundary,
+		test_message_parser_garbage_suffix_mime_boundary,
+		test_message_parser_trailing_dashes,
+		test_message_parser_continuing_mime_boundary,
+		test_message_parser_continuing_truncated_mime_boundary,
+		test_message_parser_continuing_mime_boundary_reverse,
+		test_message_parser_long_mime_boundary,
+		test_message_parser_no_eoh,
+		test_message_parser_mime_part_nested_limit,
+		test_message_parser_mime_part_nested_limit_rfc822,
+		test_message_parser_mime_part_limit,
+		test_message_parser_mime_part_limit_rfc822,
+		test_message_parser_mime_version,
+		test_message_parser_mime_version_missing,
+		test_message_parser_too_many_header_bytes_default,
+		test_message_parser_too_many_header_bytes_100,
+		test_message_parser_preparsed_empty_preamble,
+		test_message_parser_preparsed_empty_preamble_lf,
+		test_message_parser_preparsed_epilogue_no_newline,
+		test_message_parser_preparsed_epilogue_truncated,
+		test_message_parser_preparsed_epilogue_boundary_dashes,
+		test_message_parser_preparsed_epilogue_boundary_long_line,
+		test_message_parser_preparsed_tree_unchanged,
+		test_message_parser_preparsed_stop_early,
+		NULL
+	};
+	return test_run(test_functions);
+}

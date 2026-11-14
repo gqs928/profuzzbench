@@ -1,0 +1,714 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ProducerStateManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.storage.internals.log</a> &gt; <span class="el_source">ProducerStateManager.java</span></div><h1>ProducerStateManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.storage.internals.log;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.protocol.ByteBufferAccessor;
+import org.apache.kafka.common.protocol.MessageUtil;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.ByteUtils;
+import org.apache.kafka.common.utils.internals.Crc32C;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.server.log.remote.metadata.storage.generated.ProducerSnapshot;
+
+import org.slf4j.Logger;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.stream.Stream;
+
+/**
+ * Maintains a mapping from ProducerIds to metadata about the last appended entries (e.g.
+ * epoch, sequence number, last offset, etc.)
+ * &lt;p&gt;
+ * The sequence number is the last number successfully appended to the partition for the given identifier.
+ * The epoch is used for fencing against zombie writers. The offset is the one of the last successful message
+ * appended to the partition.
+ * &lt;p&gt;
+ * As long as a producer id is contained in the map, the corresponding producer can continue to write data.
+ * However, producer ids can be expired due to lack of recent use or if the last written entry has been deleted from
+ * the log (e.g. if the retention policy is &quot;delete&quot;). For compacted topics, the log cleaner will ensure
+ * that the most recent entry from a given producer id is retained in the log provided it hasn't expired due to
+ * age. This ensures that producer ids will not be expired until either the max expiration time has been reached,
+ * or if the topic also is configured for deletion, the segment containing the last written offset has
+ * been deleted.
+ */
+public class ProducerStateManager {
+
+    public static final long LATE_TRANSACTION_BUFFER_MS = 5 * 60 * 1000;
+
+    private static final int VERSION_OFFSET = 0;
+    private static final int CRC_OFFSET = VERSION_OFFSET + 2;
+    private static final int PRODUCER_ENTRIES_OFFSET = CRC_OFFSET + 4;
+
+    private final Logger log;
+
+    private final TopicPartition topicPartition;
+    private final int maxTransactionTimeoutMs;
+    private final ProducerStateManagerConfig producerStateManagerConfig;
+    private final Time time;
+
+<span class="nc" id="L85">    private final Map&lt;Long, ProducerStateEntry&gt; producers = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L87">    private final Map&lt;Long, VerificationStateEntry&gt; verificationStates = new HashMap&lt;&gt;();</span>
+
+    // ongoing transactions sorted by the first offset of the transaction
+<span class="nc" id="L90">    private final TreeMap&lt;Long, TxnMetadata&gt; ongoingTxns = new TreeMap&lt;&gt;();</span>
+
+    // completed transactions whose markers are at offsets above the high watermark
+<span class="nc" id="L93">    private final TreeMap&lt;Long, TxnMetadata&gt; unreplicatedTxns = new TreeMap&lt;&gt;();</span>
+
+    private volatile File logDir;
+
+    // The same as producers.size, but for lock-free access.
+<span class="nc" id="L98">    private volatile int producerIdCount = 0;</span>
+
+    // Keep track of the last timestamp from the oldest transaction. This is used
+    // to detect (approximately) when a transaction has been left hanging on a partition.
+    // We make the field volatile so that it can be safely accessed without a lock.
+<span class="nc" id="L103">    private volatile long oldestTxnLastTimestamp = -1L;</span>
+
+    private ConcurrentSkipListMap&lt;Long, SnapshotFile&gt; snapshots;
+<span class="nc" id="L106">    private long lastMapOffset = 0L;</span>
+<span class="nc" id="L107">    private long lastSnapOffset = 0L;</span>
+
+<span class="nc" id="L109">    public ProducerStateManager(TopicPartition topicPartition, File logDir, int maxTransactionTimeoutMs, ProducerStateManagerConfig producerStateManagerConfig, Time time) throws IOException {</span>
+<span class="nc" id="L110">        this.topicPartition = topicPartition;</span>
+<span class="nc" id="L111">        this.logDir = logDir;</span>
+<span class="nc" id="L112">        this.maxTransactionTimeoutMs = maxTransactionTimeoutMs;</span>
+<span class="nc" id="L113">        this.producerStateManagerConfig = producerStateManagerConfig;</span>
+<span class="nc" id="L114">        this.time = time;</span>
+<span class="nc" id="L115">        log = new LogContext(&quot;[ProducerStateManager partition=&quot; + topicPartition + &quot;] &quot;).logger(ProducerStateManager.class);</span>
+<span class="nc" id="L116">        snapshots = loadSnapshots();</span>
+<span class="nc" id="L117">    }</span>
+
+    public int maxTransactionTimeoutMs() {
+<span class="nc" id="L120">        return maxTransactionTimeoutMs;</span>
+    }
+
+    public ProducerStateManagerConfig producerStateManagerConfig() {
+<span class="nc" id="L124">        return producerStateManagerConfig;</span>
+    }
+
+    /**
+     * This method checks whether there is a late transaction in a thread safe manner.
+     */
+    public boolean hasLateTransaction(long currentTimeMs) {
+<span class="nc" id="L131">        long lastTimestamp = oldestTxnLastTimestamp;</span>
+<span class="nc bnc" id="L132" title="All 4 branches missed.">        return lastTimestamp &gt; 0 &amp;&amp; (currentTimeMs - lastTimestamp) &gt; maxTransactionTimeoutMs + ProducerStateManager.LATE_TRANSACTION_BUFFER_MS;</span>
+    }
+
+    public void truncateFullyAndReloadSnapshots() throws IOException {
+<span class="nc" id="L136">        log.info(&quot;Reloading the producer state snapshots&quot;);</span>
+<span class="nc" id="L137">        truncateFullyAndStartAt(0L);</span>
+<span class="nc" id="L138">        snapshots = loadSnapshots();</span>
+<span class="nc" id="L139">    }</span>
+
+    public int producerIdCount() {
+<span class="nc" id="L142">        return producerIdCount;</span>
+    }
+
+    private void addProducerId(long producerId, ProducerStateEntry entry) {
+<span class="nc" id="L146">        producers.put(producerId, entry);</span>
+<span class="nc" id="L147">        producerIdCount = producers.size();</span>
+<span class="nc" id="L148">    }</span>
+
+    private void clearProducerIds() {
+<span class="nc" id="L151">        producers.clear();</span>
+<span class="nc" id="L152">        producerIdCount = 0;</span>
+<span class="nc" id="L153">    }</span>
+
+    /**
+     * Maybe create the VerificationStateEntry for a given producer ID and return it.
+     * This method also updates the sequence and epoch accordingly.
+     */
+    public VerificationStateEntry maybeCreateVerificationStateEntry(long producerId, int sequence, short epoch, boolean supportsEpochBump) {
+<span class="nc" id="L160">        VerificationStateEntry entry = verificationStates.computeIfAbsent(producerId, pid -&gt;</span>
+<span class="nc" id="L161">            new VerificationStateEntry(time.milliseconds(), sequence, epoch, supportsEpochBump)</span>
+        );
+<span class="nc" id="L163">        entry.maybeUpdateLowestSequenceAndEpoch(sequence, epoch);</span>
+<span class="nc" id="L164">        return entry;</span>
+    }
+
+    /**
+     * Return the VerificationStateEntry for the producer ID if it exists, otherwise return null.
+     */
+    public VerificationStateEntry verificationStateEntry(long producerId) {
+<span class="nc" id="L171">        return verificationStates.get(producerId);</span>
+    }
+
+    /**
+     * Clear the verificationStateEntry for the given producer ID.
+     */
+    public void clearVerificationStateEntry(long producerId) {
+<span class="nc" id="L178">        verificationStates.remove(producerId);</span>
+<span class="nc" id="L179">    }</span>
+
+    /**
+     * Load producer state snapshots by scanning the logDir.
+     */
+    private ConcurrentSkipListMap&lt;Long, SnapshotFile&gt; loadSnapshots() throws IOException {
+<span class="nc" id="L185">        ConcurrentSkipListMap&lt;Long, SnapshotFile&gt; offsetToSnapshots = new ConcurrentSkipListMap&lt;&gt;();</span>
+<span class="nc" id="L186">        List&lt;SnapshotFile&gt; snapshotFiles = listSnapshotFiles(logDir);</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        for (SnapshotFile snapshotFile : snapshotFiles) {</span>
+<span class="nc" id="L188">            offsetToSnapshots.put(snapshotFile.offset, snapshotFile);</span>
+<span class="nc" id="L189">        }</span>
+<span class="nc" id="L190">        return offsetToSnapshots;</span>
+    }
+
+    /**
+     * Scans the log directory, gathering all producer state snapshot files. Snapshot files which do not have an offset
+     * corresponding to one of the provided offsets in segmentBaseOffsets will be removed, except in the case that there
+     * is a snapshot file at a higher offset than any offset in segmentBaseOffsets.
+     * &lt;p&gt;
+     * The goal here is to remove any snapshot files which do not have an associated segment file, but not to remove the
+     * largest stray snapshot file which was emitted during clean shutdown.
+     */
+    public void removeStraySnapshots(Collection&lt;Long&gt; segmentBaseOffsets) throws IOException {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        OptionalLong maxSegmentBaseOffset = segmentBaseOffsets.isEmpty() ? OptionalLong.empty() : OptionalLong.of(segmentBaseOffsets.stream().max(Long::compare).get());</span>
+
+<span class="nc" id="L204">        HashSet&lt;Long&gt; baseOffsets = new HashSet&lt;&gt;(segmentBaseOffsets);</span>
+<span class="nc" id="L205">        Optional&lt;SnapshotFile&gt; latestStraySnapshot = Optional.empty();</span>
+
+<span class="nc" id="L207">        ConcurrentSkipListMap&lt;Long, SnapshotFile&gt; snapshots = loadSnapshots();</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        for (SnapshotFile snapshot : snapshots.values()) {</span>
+<span class="nc" id="L209">            long key = snapshot.offset;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (latestStraySnapshot.isPresent()) {</span>
+<span class="nc" id="L211">                SnapshotFile prev = latestStraySnapshot.get();</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">                if (!baseOffsets.contains(key)) {</span>
+                    // this snapshot is now the largest stray snapshot.
+<span class="nc" id="L214">                    prev.deleteIfExists();</span>
+<span class="nc" id="L215">                    snapshots.remove(prev.offset);</span>
+<span class="nc" id="L216">                    latestStraySnapshot = Optional.of(snapshot);</span>
+                }
+<span class="nc" id="L218">            } else {</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">                if (!baseOffsets.contains(key)) {</span>
+<span class="nc" id="L220">                    latestStraySnapshot = Optional.of(snapshot);</span>
+                }
+            }
+<span class="nc" id="L223">        }</span>
+
+        // Check to see if the latestStraySnapshot is larger than the largest segment base offset, if it is not,
+        // delete the largestStraySnapshot.
+<span class="nc bnc" id="L227" title="All 4 branches missed.">        if (latestStraySnapshot.isPresent() &amp;&amp; maxSegmentBaseOffset.isPresent()) {</span>
+<span class="nc" id="L228">            long strayOffset = latestStraySnapshot.get().offset;</span>
+<span class="nc" id="L229">            long maxOffset = maxSegmentBaseOffset.getAsLong();</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            if (strayOffset &lt; maxOffset) {</span>
+<span class="nc" id="L231">                SnapshotFile removedSnapshot = snapshots.remove(strayOffset);</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">                if (removedSnapshot != null) {</span>
+<span class="nc" id="L233">                    removedSnapshot.deleteIfExists();</span>
+                }
+            }
+        }
+
+<span class="nc" id="L238">        this.snapshots = snapshots;</span>
+<span class="nc" id="L239">    }</span>
+
+    /**
+     * An unstable offset is one which is either undecided (i.e. its ultimate outcome is not yet known),
+     * or one that is decided, but may not have been replicated (i.e. any transaction which has a COMMIT/ABORT
+     * marker written at a higher offset than the current high watermark).
+     */
+    public Optional&lt;LogOffsetMetadata&gt; firstUnstableOffset() {
+<span class="nc" id="L247">        Optional&lt;LogOffsetMetadata&gt; unreplicatedFirstOffset = Optional.ofNullable(unreplicatedTxns.firstEntry()).map(e -&gt; e.getValue().firstOffset);</span>
+<span class="nc" id="L248">        Optional&lt;LogOffsetMetadata&gt; undecidedFirstOffset = Optional.ofNullable(ongoingTxns.firstEntry()).map(e -&gt; e.getValue().firstOffset);</span>
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (unreplicatedFirstOffset.isEmpty())</span>
+<span class="nc" id="L251">            return undecidedFirstOffset;</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        else if (undecidedFirstOffset.isEmpty())</span>
+<span class="nc" id="L253">            return unreplicatedFirstOffset;</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        else if (undecidedFirstOffset.get().messageOffset &lt; unreplicatedFirstOffset.get().messageOffset)</span>
+<span class="nc" id="L255">            return undecidedFirstOffset;</span>
+        else
+<span class="nc" id="L257">            return unreplicatedFirstOffset;</span>
+    }
+
+    /**
+     * Acknowledge all transactions which have been completed before a given offset. This allows the LSO
+     * to advance to the next unstable offset.
+     */
+    public void onHighWatermarkUpdated(long highWatermark) {
+<span class="nc" id="L265">        removeUnreplicatedTransactions(highWatermark);</span>
+<span class="nc" id="L266">    }</span>
+
+    /**
+     * The first undecided offset is the earliest transactional message which has not yet been committed
+     * or aborted. Unlike [[firstUnstableOffset]], this does not reflect the state of replication (i.e.
+     * whether a completed transaction marker is beyond the high watermark).
+     */
+    public OptionalLong firstUndecidedOffset() {
+<span class="nc" id="L274">        Map.Entry&lt;Long, TxnMetadata&gt; firstEntry = ongoingTxns.firstEntry();</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        return firstEntry != null ? OptionalLong.of(firstEntry.getValue().firstOffset.messageOffset) : OptionalLong.empty();</span>
+    }
+
+    /**
+     * Returns the last offset of this map
+     */
+    public long mapEndOffset() {
+<span class="nc" id="L282">        return lastMapOffset;</span>
+    }
+
+    /**
+     * Get an unmodifiable map of active producers.
+     */
+    public Map&lt;Long, ProducerStateEntry&gt; activeProducers() {
+<span class="nc" id="L289">        return Collections.unmodifiableMap(producers);</span>
+    }
+
+    public boolean isEmpty() {
+<span class="nc bnc" id="L293" title="All 4 branches missed.">        return producers.isEmpty() &amp;&amp; unreplicatedTxns.isEmpty();</span>
+    }
+
+    private void loadFromSnapshot(long logStartOffset, long currentTime) throws IOException {
+        while (true) {
+<span class="nc" id="L298">            Optional&lt;SnapshotFile&gt; latestSnapshotFileOptional = latestSnapshotFile();</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (latestSnapshotFileOptional.isPresent()) {</span>
+<span class="nc" id="L300">                SnapshotFile snapshot = latestSnapshotFileOptional.get();</span>
+                try {
+<span class="nc" id="L302">                    log.info(&quot;Loading producer state from snapshot file '{}'&quot;, snapshot);</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                    Stream&lt;ProducerStateEntry&gt; loadedProducers = readSnapshot(snapshot.file()).stream().filter(producerEntry -&gt; !isProducerExpired(currentTime, producerEntry));</span>
+<span class="nc" id="L304">                    loadedProducers.forEach(this::loadProducerEntry);</span>
+<span class="nc" id="L305">                    lastSnapOffset = snapshot.offset;</span>
+<span class="nc" id="L306">                    lastMapOffset = lastSnapOffset;</span>
+<span class="nc" id="L307">                    updateOldestTxnTimestamp();</span>
+<span class="nc" id="L308">                    return;</span>
+<span class="nc" id="L309">                } catch (CorruptSnapshotException e) {</span>
+<span class="nc" id="L310">                    log.warn(&quot;Failed to load producer snapshot from '{}': {}&quot;, snapshot.file(), e.getMessage());</span>
+<span class="nc" id="L311">                    removeAndDeleteSnapshot(snapshot.offset);</span>
+                }
+<span class="nc" id="L313">            } else {</span>
+<span class="nc" id="L314">                lastSnapOffset = logStartOffset;</span>
+<span class="nc" id="L315">                lastMapOffset = logStartOffset;</span>
+<span class="nc" id="L316">                return;</span>
+
+            }
+<span class="nc" id="L319">        }</span>
+    }
+
+    // Visible for testing
+    public void loadProducerEntry(ProducerStateEntry entry) {
+<span class="nc" id="L324">        long producerId = entry.producerId();</span>
+<span class="nc" id="L325">        addProducerId(producerId, entry);</span>
+<span class="nc" id="L326">        entry.currentTxnFirstOffset().ifPresent(offset -&gt; ongoingTxns.put(offset, new TxnMetadata(producerId, offset)));</span>
+<span class="nc" id="L327">    }</span>
+
+    private boolean isProducerExpired(long currentTimeMs, ProducerStateEntry producerState) {
+<span class="nc bnc" id="L330" title="All 4 branches missed.">        return producerState.currentTxnFirstOffset().isEmpty() &amp;&amp; currentTimeMs - producerState.lastTimestamp() &gt;= producerStateManagerConfig.producerIdExpirationMs();</span>
+    }
+
+    /**
+     * Expire any producer ids which have been idle longer than the configured maximum expiration timeout.
+     * Also expire any verification state entries that are lingering as unverified.
+     */
+    public void removeExpiredProducers(long currentTimeMs) {
+<span class="nc" id="L338">        producers.entrySet().removeIf(entry -&gt; isProducerExpired(currentTimeMs, entry.getValue()));</span>
+<span class="nc" id="L339">        producerIdCount = producers.size();</span>
+
+<span class="nc" id="L341">        verificationStates.entrySet().removeIf(entry -&gt;</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            (currentTimeMs - entry.getValue().timestamp()) &gt;= producerStateManagerConfig.producerIdExpirationMs()</span>
+        );
+<span class="nc" id="L344">    }</span>
+
+    /**
+     * Truncate the producer id mapping to the given offset range and reload the entries from the most recent
+     * snapshot in range (if there is one). We delete snapshot files prior to the logStartOffset but do not remove
+     * producer state from the map. This means that in-memory and on-disk state can diverge, and in the case of
+     * broker failover or unclean shutdown, any in-memory state not persisted in the snapshots will be lost, which
+     * would lead to UNKNOWN_PRODUCER_ID errors. Note that the log end offset is assumed to be less than or equal
+     * to the high watermark.
+     */
+    public void truncateAndReload(long logStartOffset, long logEndOffset, long currentTimeMs) throws IOException {
+        // remove all out of range snapshots
+<span class="nc bnc" id="L356" title="All 2 branches missed.">        for (SnapshotFile snapshot : snapshots.values()) {</span>
+<span class="nc bnc" id="L357" title="All 4 branches missed.">            if (snapshot.offset &gt; logEndOffset || snapshot.offset &lt;= logStartOffset) {</span>
+<span class="nc" id="L358">                removeAndDeleteSnapshot(snapshot.offset);</span>
+            }
+<span class="nc" id="L360">        }</span>
+
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        if (logEndOffset != mapEndOffset()) {</span>
+<span class="nc" id="L363">            clearProducerIds();</span>
+<span class="nc" id="L364">            ongoingTxns.clear();</span>
+<span class="nc" id="L365">            updateOldestTxnTimestamp();</span>
+
+            // since we assume that the offset is less than or equal to the high watermark, it is
+            // safe to clear the unreplicated transactions
+<span class="nc" id="L369">            unreplicatedTxns.clear();</span>
+<span class="nc" id="L370">            loadFromSnapshot(logStartOffset, currentTimeMs);</span>
+        } else {
+<span class="nc" id="L372">            onLogStartOffsetIncremented(logStartOffset);</span>
+        }
+<span class="nc" id="L374">    }</span>
+
+    public ProducerAppendInfo prepareUpdate(long producerId, AppendOrigin origin) {
+<span class="nc" id="L377">        ProducerStateEntry currentEntry = lastEntry(producerId).orElse(ProducerStateEntry.empty(producerId));</span>
+<span class="nc" id="L378">        return new ProducerAppendInfo(topicPartition, producerId, currentEntry, origin, verificationStateEntry(producerId));</span>
+    }
+
+    /**
+     * Update the mapping with the given append information
+     */
+    public void update(ProducerAppendInfo appendInfo) {
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (appendInfo.producerId() == RecordBatch.NO_PRODUCER_ID)</span>
+<span class="nc" id="L386">            throw new IllegalArgumentException(&quot;Invalid producer id &quot; + appendInfo.producerId() + &quot; passed to update &quot;</span>
+                    + &quot;for partition&quot; + topicPartition);
+
+<span class="nc" id="L389">        log.trace(&quot;Updated producer {} state to {}&quot;, appendInfo.producerId(), appendInfo);</span>
+<span class="nc" id="L390">        ProducerStateEntry updatedEntry = appendInfo.toEntry();</span>
+<span class="nc" id="L391">        ProducerStateEntry currentEntry = producers.get(appendInfo.producerId());</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        if (currentEntry != null) {</span>
+<span class="nc" id="L393">            currentEntry.update(updatedEntry);</span>
+        } else {
+<span class="nc" id="L395">            addProducerId(appendInfo.producerId(), updatedEntry);</span>
+        }
+
+<span class="nc" id="L398">        appendInfo.startedTransactions().forEach(txn -&gt; ongoingTxns.put(txn.firstOffset.messageOffset, txn));</span>
+
+<span class="nc" id="L400">        updateOldestTxnTimestamp();</span>
+<span class="nc" id="L401">    }</span>
+
+    private void updateOldestTxnTimestamp() {
+<span class="nc" id="L404">        Map.Entry&lt;Long, TxnMetadata&gt; firstEntry = ongoingTxns.firstEntry();</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        if (firstEntry == null) {</span>
+<span class="nc" id="L406">            oldestTxnLastTimestamp = -1;</span>
+        } else {
+<span class="nc" id="L408">            TxnMetadata oldestTxnMetadata = firstEntry.getValue();</span>
+<span class="nc" id="L409">            ProducerStateEntry entry = producers.get(oldestTxnMetadata.producerId);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            oldestTxnLastTimestamp = entry != null ? entry.lastTimestamp() : -1L;</span>
+        }
+<span class="nc" id="L412">    }</span>
+
+    public void updateMapEndOffset(long lastOffset) {
+<span class="nc" id="L415">        lastMapOffset = lastOffset;</span>
+<span class="nc" id="L416">    }</span>
+
+    /**
+     * Get the last written entry for the given producer id.
+     */
+    public Optional&lt;ProducerStateEntry&gt; lastEntry(long producerId) {
+<span class="nc" id="L422">        return Optional.ofNullable(producers.get(producerId));</span>
+    }
+
+    /**
+     * Take a snapshot at the current end offset if one does not already exist with syncing the change to the device
+     */
+    public void takeSnapshot() throws IOException {
+<span class="nc" id="L429">        takeSnapshot(true);</span>
+<span class="nc" id="L430">    }</span>
+
+    /**
+     * Take a snapshot at the current end offset if one does not already exist, then return the snapshot file if taken.
+     */
+    public Optional&lt;File&gt; takeSnapshot(boolean sync) throws IOException {
+        // If not a new offset, then it is not worth taking another snapshot
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        if (lastMapOffset &gt; lastSnapOffset) {</span>
+<span class="nc" id="L438">            SnapshotFile snapshotFile = new SnapshotFile(LogFileUtils.producerSnapshotFile(logDir, lastMapOffset));</span>
+<span class="nc" id="L439">            long start = time.hiResClockMs();</span>
+<span class="nc" id="L440">            writeSnapshot(snapshotFile.file(), producers, sync);</span>
+<span class="nc" id="L441">            log.info(&quot;Wrote producer snapshot at offset {} with {} producer ids in {} ms.&quot;, lastMapOffset,</span>
+<span class="nc" id="L442">                    producers.size(), time.hiResClockMs() - start);</span>
+
+<span class="nc" id="L444">            snapshots.put(snapshotFile.offset, snapshotFile);</span>
+
+            // Update the last snap offset according to the serialized map
+<span class="nc" id="L447">            lastSnapOffset = lastMapOffset;</span>
+
+<span class="nc" id="L449">            return Optional.of(snapshotFile.file());</span>
+        }
+<span class="nc" id="L451">        return Optional.empty();</span>
+    }
+
+    /**
+     * Update the parentDir for this ProducerStateManager and all of the snapshot files which it manages.
+     */
+    public void updateParentDir(File parentDir) {
+<span class="nc" id="L458">        logDir = parentDir;</span>
+<span class="nc" id="L459">        snapshots.forEach((k, v) -&gt; v.updateParentDir(parentDir));</span>
+<span class="nc" id="L460">    }</span>
+
+    /**
+     * Get the last offset (exclusive) of the latest snapshot file.
+     */
+    public OptionalLong latestSnapshotOffset() {
+<span class="nc" id="L466">        Optional&lt;SnapshotFile&gt; snapshotFileOptional = latestSnapshotFile();</span>
+<span class="nc" id="L467">        return snapshotFileOptional.map(snapshotFile -&gt; OptionalLong.of(snapshotFile.offset)).orElseGet(OptionalLong::empty);</span>
+    }
+
+    /**
+     * Get the last offset (exclusive) of the oldest snapshot file.
+     */
+    public OptionalLong oldestSnapshotOffset() {
+<span class="nc" id="L474">        Optional&lt;SnapshotFile&gt; snapshotFileOptional = oldestSnapshotFile();</span>
+<span class="nc" id="L475">        return snapshotFileOptional.map(snapshotFile -&gt; OptionalLong.of(snapshotFile.offset)).orElseGet(OptionalLong::empty);</span>
+    }
+
+    /**
+     * Visible for testing
+     */
+    public Optional&lt;SnapshotFile&gt; snapshotFileForOffset(long offset) {
+<span class="nc" id="L482">        return Optional.ofNullable(snapshots.get(offset));</span>
+    }
+
+    /**
+     * Remove any unreplicated transactions lower than the provided logStartOffset and bring the lastMapOffset forward
+     * if necessary.
+     */
+    public void onLogStartOffsetIncremented(long logStartOffset) {
+<span class="nc" id="L490">        removeUnreplicatedTransactions(logStartOffset);</span>
+
+<span class="nc bnc" id="L492" title="All 2 branches missed.">        if (lastMapOffset &lt; logStartOffset) lastMapOffset = logStartOffset;</span>
+
+<span class="nc" id="L494">        lastSnapOffset = latestSnapshotOffset().orElse(logStartOffset);</span>
+<span class="nc" id="L495">    }</span>
+
+    private void removeUnreplicatedTransactions(long offset) {
+<span class="nc" id="L498">        Iterator&lt;Map.Entry&lt;Long, TxnMetadata&gt;&gt; iterator = unreplicatedTxns.entrySet().iterator();</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">        while (iterator.hasNext()) {</span>
+<span class="nc" id="L500">            Map.Entry&lt;Long, TxnMetadata&gt; txnEntry = iterator.next();</span>
+<span class="nc" id="L501">            OptionalLong lastOffset = txnEntry.getValue().lastOffset;</span>
+<span class="nc bnc" id="L502" title="All 4 branches missed.">            if (lastOffset.isPresent() &amp;&amp; lastOffset.getAsLong() &lt; offset) iterator.remove();</span>
+<span class="nc" id="L503">        }</span>
+<span class="nc" id="L504">    }</span>
+
+    /**
+     * Truncate the producer id mapping and remove all snapshots. This resets the state of the mapping.
+     */
+    public void truncateFullyAndStartAt(long offset) throws IOException {
+<span class="nc" id="L510">        clearProducerIds();</span>
+<span class="nc" id="L511">        ongoingTxns.clear();</span>
+<span class="nc" id="L512">        unreplicatedTxns.clear();</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        for (SnapshotFile snapshotFile : snapshots.values()) {</span>
+<span class="nc" id="L514">            removeAndDeleteSnapshot(snapshotFile.offset);</span>
+<span class="nc" id="L515">        }</span>
+<span class="nc" id="L516">        lastSnapOffset = 0L;</span>
+<span class="nc" id="L517">        lastMapOffset = offset;</span>
+<span class="nc" id="L518">        updateOldestTxnTimestamp();</span>
+<span class="nc" id="L519">    }</span>
+
+    /**
+     * Compute the last stable offset of a completed transaction, but do not yet mark the transaction complete.
+     * That will be done in `completeTxn` below. This is used to compute the LSO that will be appended to the
+     * transaction index, but the completion must be done only after successfully appending to the index.
+     */
+    public long lastStableOffset(CompletedTxn completedTxn) {
+<span class="nc" id="L527">        return findNextIncompleteTxn(completedTxn.producerId())</span>
+<span class="nc" id="L528">                .map(x -&gt; x.firstOffset.messageOffset)</span>
+<span class="nc" id="L529">                .orElse(completedTxn.lastOffset() + 1);</span>
+    }
+
+    private Optional&lt;TxnMetadata&gt; findNextIncompleteTxn(long producerId) {
+<span class="nc bnc" id="L533" title="All 2 branches missed.">        for (TxnMetadata txnMetadata : ongoingTxns.values()) {</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">            if (txnMetadata.producerId != producerId) {</span>
+<span class="nc" id="L535">                return Optional.of(txnMetadata);</span>
+            }
+<span class="nc" id="L537">        }</span>
+<span class="nc" id="L538">        return Optional.empty();</span>
+    }
+
+    /**
+     * Mark a transaction as completed. We will still await advancement of the high watermark before
+     * advancing the first unstable offset.
+     */
+    public void completeTxn(CompletedTxn completedTxn) {
+<span class="nc" id="L546">        TxnMetadata txnMetadata = ongoingTxns.remove(completedTxn.firstOffset());</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">        if (txnMetadata == null)</span>
+<span class="nc" id="L548">            throw new IllegalArgumentException(&quot;Attempted to complete transaction &quot; + completedTxn + &quot; on partition &quot;</span>
+                    + topicPartition + &quot; which was not started&quot;);
+
+<span class="nc" id="L551">        txnMetadata.lastOffset = OptionalLong.of(completedTxn.lastOffset());</span>
+<span class="nc" id="L552">        unreplicatedTxns.put(completedTxn.firstOffset(), txnMetadata);</span>
+<span class="nc" id="L553">        updateOldestTxnTimestamp();</span>
+<span class="nc" id="L554">    }</span>
+
+    /**
+     * Deletes the producer snapshot files until the given offset (exclusive) in a thread safe manner.
+     *
+     * @param offset offset number
+     * @throws IOException if any IOException occurs while deleting the files.
+     */
+    public void deleteSnapshotsBefore(long offset) throws IOException {
+<span class="nc bnc" id="L563" title="All 2 branches missed.">        for (SnapshotFile snapshot : snapshots.subMap(0L, offset).values()) {</span>
+<span class="nc" id="L564">            removeAndDeleteSnapshot(snapshot.offset);</span>
+<span class="nc" id="L565">        }</span>
+<span class="nc" id="L566">    }</span>
+
+    public Optional&lt;File&gt; fetchSnapshot(long offset) {
+<span class="nc" id="L569">        return Optional.ofNullable(snapshots.get(offset)).map(SnapshotFile::file);</span>
+    }
+
+    private Optional&lt;SnapshotFile&gt; oldestSnapshotFile() {
+<span class="nc" id="L573">        return Optional.ofNullable(snapshots.firstEntry()).map(Map.Entry::getValue);</span>
+    }
+
+    private Optional&lt;SnapshotFile&gt; latestSnapshotFile() {
+<span class="nc" id="L577">        return Optional.ofNullable(snapshots.lastEntry()).map(Map.Entry::getValue);</span>
+    }
+
+    /**
+     * Removes the producer state snapshot file metadata corresponding to the provided offset if it exists from this
+     * ProducerStateManager, and deletes the backing snapshot file.
+     */
+    private void removeAndDeleteSnapshot(long snapshotOffset) throws IOException {
+<span class="nc" id="L585">        SnapshotFile snapshotFile = snapshots.remove(snapshotOffset);</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        if (snapshotFile != null) snapshotFile.deleteIfExists();</span>
+<span class="nc" id="L587">    }</span>
+
+    /**
+     * Removes the producer state snapshot file metadata corresponding to the provided offset if it exists from this
+     * ProducerStateManager, and renames the backing snapshot file to have the Log.DeletionSuffix.
+     * &lt;p&gt;
+     * Note: This method is safe to use with async deletes. If a race occurs and the snapshot file
+     * is deleted without this ProducerStateManager instance knowing, the resulting exception on
+     * SnapshotFile rename will be ignored and {@link Optional#empty()} will be returned.
+     */
+    public Optional&lt;SnapshotFile&gt; removeAndMarkSnapshotForDeletion(long snapshotOffset) throws IOException {
+<span class="nc" id="L598">        SnapshotFile snapshotFile = snapshots.remove(snapshotOffset);</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">        if (snapshotFile != null) {</span>
+            // If the file cannot be renamed, it likely means that the file was deleted already.
+            // This can happen due to the way we construct an intermediate producer state manager
+            // during log recovery, and use it to issue deletions prior to creating the &quot;real&quot;
+            // producer state manager.
+            //
+            // In any case, removeAndMarkSnapshotForDeletion is intended to be used for snapshot file
+            // deletion, so ignoring the exception here just means that the intended operation was
+            // already completed.
+            try {
+<span class="nc" id="L609">                snapshotFile.renameToDelete();</span>
+<span class="nc" id="L610">                return Optional.of(snapshotFile);</span>
+<span class="nc" id="L611">            } catch (NoSuchFileException ex) {</span>
+<span class="nc" id="L612">                log.info(&quot;Failed to rename producer state snapshot {} with deletion suffix because it was already deleted&quot;, snapshotFile.file().getAbsoluteFile());</span>
+            }
+        }
+<span class="nc" id="L615">        return Optional.empty();</span>
+    }
+
+    public static List&lt;ProducerStateEntry&gt; readSnapshot(File file) throws IOException {
+<span class="nc" id="L619">        byte[] buffer = Files.readAllBytes(file.toPath());</span>
+
+<span class="nc" id="L621">        ByteBuffer byteBuffer = ByteBuffer.wrap(buffer);</span>
+        short version;
+        ProducerSnapshot producerSnapshot;
+        try {
+<span class="nc" id="L625">            version = byteBuffer.getShort();</span>
+<span class="nc bnc" id="L626" title="All 4 branches missed.">            if (version &lt; ProducerSnapshot.LOWEST_SUPPORTED_VERSION || version &gt; ProducerSnapshot.HIGHEST_SUPPORTED_VERSION)</span>
+<span class="nc" id="L627">                throw new CorruptSnapshotException(&quot;Snapshot contained an unknown file version &quot; + version);</span>
+<span class="nc" id="L628">            producerSnapshot = new ProducerSnapshot(new ByteBufferAccessor(byteBuffer), version);</span>
+<span class="nc" id="L629">        } catch (Exception e) {</span>
+<span class="nc" id="L630">            throw new CorruptSnapshotException(&quot;Snapshot failed schema validation: &quot; + e.getMessage());</span>
+<span class="nc" id="L631">        }</span>
+
+<span class="nc" id="L633">        long crc = producerSnapshot.crc();</span>
+<span class="nc" id="L634">        long computedCrc = Crc32C.compute(buffer, PRODUCER_ENTRIES_OFFSET, buffer.length - PRODUCER_ENTRIES_OFFSET);</span>
+<span class="nc bnc" id="L635" title="All 2 branches missed.">        if (crc != computedCrc)</span>
+<span class="nc" id="L636">            throw new CorruptSnapshotException(&quot;Snapshot is corrupt (CRC is no longer valid). Stored crc: &quot; + crc</span>
+                    + &quot;. Computed crc: &quot; + computedCrc);
+
+<span class="nc" id="L639">        List&lt;ProducerSnapshot.ProducerEntry&gt; producerEntries = producerSnapshot.producerEntries();</span>
+<span class="nc" id="L640">        List&lt;ProducerStateEntry&gt; entries = new ArrayList&lt;&gt;(producerEntries.size());</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">        for (ProducerSnapshot.ProducerEntry producerEntry : producerEntries) {</span>
+<span class="nc" id="L642">            long producerId = producerEntry.producerId();</span>
+<span class="nc" id="L643">            short producerEpoch = producerEntry.epoch();</span>
+<span class="nc" id="L644">            int lastSequence = producerEntry.lastSequence();</span>
+<span class="nc" id="L645">            long lastOffset = producerEntry.lastOffset();</span>
+<span class="nc" id="L646">            long timestamp = producerEntry.timestamp();</span>
+<span class="nc" id="L647">            int offsetDelta = producerEntry.offsetDelta();</span>
+<span class="nc" id="L648">            int coordinatorEpoch = producerEntry.coordinatorEpoch();</span>
+<span class="nc" id="L649">            long currentTxnFirstOffset = producerEntry.currentTxnFirstOffset();</span>
+
+<span class="nc bnc" id="L651" title="All 2 branches missed.">            OptionalLong currentTxnFirstOffsetVal = currentTxnFirstOffset &gt;= 0 ? OptionalLong.of(currentTxnFirstOffset) : OptionalLong.empty();</span>
+<span class="nc" id="L652">            ProducerStateEntry stateEntry = new ProducerStateEntry(producerId, producerEpoch, coordinatorEpoch, timestamp, currentTxnFirstOffsetVal);</span>
+
+<span class="nc bnc" id="L654" title="All 2 branches missed.">            if (lastOffset &gt;= 0)</span>
+<span class="nc" id="L655">                stateEntry.addBatch(producerEpoch, lastSequence, lastOffset, offsetDelta, timestamp);</span>
+
+<span class="nc" id="L657">            entries.add(stateEntry);</span>
+<span class="nc" id="L658">        }</span>
+
+<span class="nc" id="L660">        return entries;</span>
+    }
+
+    // visible for testing
+    public static void writeSnapshot(File file, Map&lt;Long, ProducerStateEntry&gt; entries, boolean sync) throws IOException {
+<span class="nc" id="L665">        ProducerSnapshot producerSnapshot = new ProducerSnapshot();</span>
+<span class="nc" id="L666">        List&lt;ProducerSnapshot.ProducerEntry&gt; producerEntries = new ArrayList&lt;&gt;(entries.size());</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">        for (Map.Entry&lt;Long, ProducerStateEntry&gt; producerIdEntry : entries.entrySet()) {</span>
+<span class="nc" id="L668">            Long producerId = producerIdEntry.getKey();</span>
+<span class="nc" id="L669">            ProducerStateEntry entry = producerIdEntry.getValue();</span>
+<span class="nc" id="L670">            ProducerSnapshot.ProducerEntry producerEntry = new ProducerSnapshot.ProducerEntry()</span>
+<span class="nc" id="L671">                    .setProducerId(producerId)</span>
+<span class="nc" id="L672">                    .setEpoch(entry.producerEpoch())</span>
+<span class="nc" id="L673">                    .setLastSequence(entry.lastSeq())</span>
+<span class="nc" id="L674">                    .setLastOffset(entry.lastDataOffset())</span>
+<span class="nc" id="L675">                    .setOffsetDelta(entry.lastOffsetDelta())</span>
+<span class="nc" id="L676">                    .setTimestamp(entry.lastTimestamp())</span>
+<span class="nc" id="L677">                    .setCoordinatorEpoch(entry.coordinatorEpoch())</span>
+<span class="nc" id="L678">                    .setCurrentTxnFirstOffset(entry.currentTxnFirstOffset().orElse(-1L));</span>
+<span class="nc" id="L679">            producerEntries.add(producerEntry);</span>
+<span class="nc" id="L680">        }</span>
+
+<span class="nc" id="L682">        producerSnapshot.setProducerEntries(producerEntries);</span>
+<span class="nc" id="L683">        ByteBuffer buffer = MessageUtil.toVersionPrefixedByteBuffer(ProducerSnapshot.HIGHEST_SUPPORTED_VERSION, producerSnapshot);</span>
+
+        // now fill in the CRC
+<span class="nc" id="L686">        long crc = Crc32C.compute(buffer, PRODUCER_ENTRIES_OFFSET, buffer.limit() - PRODUCER_ENTRIES_OFFSET);</span>
+<span class="nc" id="L687">        ByteUtils.writeUnsignedInt(buffer, CRC_OFFSET, crc);</span>
+
+<span class="nc" id="L689">        try (FileChannel fileChannel = FileChannel.open(file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {</span>
+<span class="nc" id="L690">            Utils.writeFully(fileChannel, buffer);</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">            if (sync) {</span>
+<span class="nc" id="L692">                fileChannel.force(true);</span>
+            }
+        }
+<span class="nc" id="L695">    }</span>
+
+    private static boolean isSnapshotFile(Path path) {
+<span class="nc bnc" id="L698" title="All 4 branches missed.">        return Files.isRegularFile(path) &amp;&amp; path.getFileName().toString().endsWith(LogFileUtils.PRODUCER_SNAPSHOT_FILE_SUFFIX);</span>
+    }
+
+    // visible for testing
+    public static List&lt;SnapshotFile&gt; listSnapshotFiles(File dir) throws IOException {
+<span class="nc bnc" id="L703" title="All 4 branches missed.">        if (dir.exists() &amp;&amp; dir.isDirectory()) {</span>
+<span class="nc" id="L704">            try (Stream&lt;Path&gt; paths = Files.list(dir.toPath())) {</span>
+<span class="nc" id="L705">                return paths.filter(ProducerStateManager::isSnapshotFile)</span>
+<span class="nc" id="L706">                        .map(path -&gt; new SnapshotFile(path.toFile())).toList();</span>
+            }
+        } else {
+<span class="nc" id="L709">            return List.of();</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

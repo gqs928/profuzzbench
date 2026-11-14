@@ -1,0 +1,495 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "test-lib.h"
+#include "buffer.h"
+#include "str.h"
+#include "strfuncs.h"
+#include "str-sanitize.h"
+#include "istream.h"
+#include "ostream.h"
+#include "test-common.h"
+#include "http-transfer.h"
+
+#include <time.h>
+
+struct http_transfer_chunked_input_test {
+	const char *in;
+	const char *out;
+};
+
+/* Valid transfer_chunked input tests */
+static struct http_transfer_chunked_input_test
+valid_transfer_chunked_input_tests[] = {
+	{	.in = "1E\r\n"
+			"This is a simple test payload."
+			"\r\n"
+			"0\r\n"
+			"\r\n",
+		.out =
+			"This is a simple test payload."
+	},
+	{	.in = "20\r\n"
+			"This is a longer test payload..."
+			"\r\n"
+			"23\r\n"
+			"...spread over two separate chunks."
+			"\r\n"
+			"0\r\n"
+			"\r\n",
+		.out =
+			"This is a longer test payload..."
+			"...spread over two separate chunks."
+	},
+	{	.in = "26\r\n"
+			"This is an even longer test payload..."
+			"\r\n"
+			"27\r\n"
+			"...spread over three separate chunks..."
+			"\r\n"
+			"1F\r\n"
+			"...and also includes a trailer."
+			"\r\n"
+			"0\r\n"
+			"Checksum: adgfef3fdaf3daf3dfaf3ff3fdag\r\n"
+			"X-Dovecot: Whatever\r\n"
+			"\r\n",
+		.out =
+			"This is an even longer test payload..."
+			"...spread over three separate chunks..."
+			"...and also includes a trailer."
+	},
+	{	.in = "26\n"
+			"This is an even longer test payload..."
+			"\n"
+			"27\n"
+			"...spread over three separate chunks..."
+			"\n"
+			"1F\n"
+			"...and also includes a trailer."
+			"\n"
+			"0\n"
+			"Checksum: adgfef3fdaf3daf3dfaf3ff3fdag\n"
+			"X-Dovecot: Whatever\n"
+			"\n",
+		.out =
+			"This is an even longer test payload..."
+			"...spread over three separate chunks..."
+			"...and also includes a trailer."
+	}
+};
+
+static unsigned int valid_transfer_chunked_input_test_count =
+	N_ELEMENTS(valid_transfer_chunked_input_tests);
+
+static void test_http_transfer_chunked_input_valid(void)
+{
+	struct istream *input, *chunked;
+	struct ostream *output;
+	buffer_t *payload_buffer;
+	unsigned int i;
+
+	payload_buffer = buffer_create_dynamic(default_pool, 1024);
+
+	for (i = 0; i < valid_transfer_chunked_input_test_count; i++) T_BEGIN {
+		const char *in, *out, *stream_out;
+
+		in = valid_transfer_chunked_input_tests[i].in;
+		out = valid_transfer_chunked_input_tests[i].out;
+
+		test_begin(t_strdup_printf("http transfer_chunked input valid [%d]", i));
+
+		input = i_stream_create_from_data(in, strlen(in));
+		chunked = http_transfer_chunked_istream_create(input, 0, NULL, FALSE);
+		i_stream_unref(&input);
+
+		buffer_set_used_size(payload_buffer, 0);
+		output = o_stream_create_buffer(payload_buffer);
+		test_out("payload read", o_stream_send_istream(output, chunked) == OSTREAM_SEND_ISTREAM_RESULT_FINISHED
+			&& chunked->stream_errno == 0);
+		o_stream_destroy(&output);
+		i_stream_unref(&chunked);
+		stream_out = str_c(payload_buffer);
+
+		test_assert(strcmp(stream_out, out) == 0);
+		test_end();
+	} T_END;
+
+	buffer_free(&payload_buffer);
+}
+
+/* Invalid transfer_chunked input tests */
+static const char *
+invalid_transfer_chunked_input_tests[] = {
+	// invalid size
+	"1X\r\n"
+	"This is a simple test payload."
+	"\r\n"
+	"0\r\n"
+	"\r\n",
+	// invalid end
+	"1E\r\n"
+	"This is a simple test payload."
+	"\r\n"
+	"0\r\n"
+	"ah\r\n",
+	// invalid size
+	"20\r\n"
+	"This is a longer test payload..."
+	"\r\n"
+	"2q\r\n"
+	"...spread over two separate chunks."
+	"\r\n"
+	"0\r\n"
+	"\r\n",
+	// invalid end
+	"20\r\n"
+	"This is a longer test payload..."
+	"\r\n"
+	"23\r\n"
+	"...spread over two separate chunks."
+	"\r\n"
+	"0\r\n",
+	// invalid last chunk
+	"20\r\n"
+	"This is a longer test payload..."
+	"\r\n"
+	"23\r\n"
+	"...spread over two separate chunks."
+	"\r\n"
+	"4\r\n"
+	"\r\n",
+	// invalid trailer
+	"26\r\n"
+	"This is an even longer test payload..."
+	"\r\n"
+	"27\r\n"
+	"...spread over three separate chunks..."
+	"\r\n"
+	"1F\r\n"
+	"...and also includes a trailer."
+	"\r\n"
+	"0\r\n"
+	"Checksum adgfef3fdaf3daf3dfaf3ff3fdag\r\n"
+	"\r\n",
+	// chunk size overflow
+	"FFFFFFFFFFFFFFFFF\r\n"
+	"\r\n"
+	"0\r\n"
+	"\r\n"
+};
+
+static unsigned int invalid_transfer_chunked_input_test_count =
+	N_ELEMENTS(invalid_transfer_chunked_input_tests);
+
+static void test_http_transfer_chunked_input_invalid(void)
+{
+	struct istream *input, *chunked;
+	struct ostream *output;
+	buffer_t *payload_buffer;
+	unsigned int i;
+
+	payload_buffer = buffer_create_dynamic(default_pool, 1024);
+
+	for (i = 0; i < invalid_transfer_chunked_input_test_count; i++) T_BEGIN {
+		const char *in;
+
+		in = invalid_transfer_chunked_input_tests[i];
+
+		test_begin(t_strdup_printf("http transfer_chunked input invalid [%d]", i));
+
+		input = i_stream_create_from_data(in, strlen(in));
+		chunked = http_transfer_chunked_istream_create(input, 0, NULL, FALSE);
+		i_stream_unref(&input);
+
+		buffer_set_used_size(payload_buffer, 0);
+		output = o_stream_create_buffer(payload_buffer);
+		o_stream_nsend_istream(output, chunked);
+		test_assert(chunked->stream_errno != 0);
+		i_stream_unref(&chunked);
+		o_stream_destroy(&output);
+
+		test_end();
+	} T_END;
+
+	buffer_free(&payload_buffer);
+}
+
+/* Strict-mode transfer_chunked input tests: bare LF must be rejected */
+static const char *strict_transfer_chunked_input_tests[] = {
+	/* bare LF after chunk size */
+	"1E\n"
+	"This is a simple test payload."
+	"\r\n"
+	"0\r\n"
+	"\r\n",
+	/* bare LF after chunk data */
+	"1E\r\n"
+	"This is a simple test payload."
+	"\n"
+	"0\r\n"
+	"\r\n",
+};
+
+static unsigned int strict_transfer_chunked_input_test_count =
+	N_ELEMENTS(strict_transfer_chunked_input_tests);
+
+static void test_http_transfer_chunked_input_strict(void)
+{
+	struct istream *input, *chunked;
+	struct ostream *output;
+	buffer_t *payload_buffer;
+	unsigned int i;
+
+	payload_buffer = buffer_create_dynamic(default_pool, 1024);
+
+	for (i = 0; i < strict_transfer_chunked_input_test_count; i++) T_BEGIN {
+		const char *in;
+
+		in = strict_transfer_chunked_input_tests[i];
+
+		test_begin(t_strdup_printf(
+			"http transfer_chunked input strict [%d]", i));
+
+		input = i_stream_create_from_data(in, strlen(in));
+		chunked = http_transfer_chunked_istream_create(input, 0, NULL, TRUE);
+		i_stream_unref(&input);
+
+		buffer_set_used_size(payload_buffer, 0);
+		output = o_stream_create_buffer(payload_buffer);
+		o_stream_nsend_istream(output, chunked);
+		test_assert(chunked->stream_errno != 0);
+		i_stream_unref(&chunked);
+		o_stream_destroy(&output);
+
+		test_end();
+	} T_END;
+
+	buffer_free(&payload_buffer);
+}
+
+/* Valid transfer_chunked output tests */
+static const char *valid_transfer_chunked_output_tests[] = {
+	/* The maximum chunk size is set to 16. These tests are tuned to some border
+	   cases
+	*/
+	"A small payload",  // 15 bytes
+	"A longer payload", // 16 bytes
+	"A lengthy payload", // 17 bytes
+	/* Others */
+	"This is a test payload with lots of nonsense.",
+	"Yet another payload.",
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+	"This a very long repetitive payload. This a very long repetitive payload. "
+};
+
+static unsigned int valid_transfer_chunked_output_test_count =
+	N_ELEMENTS(valid_transfer_chunked_output_tests);
+
+static void test_http_transfer_chunked_output_valid(void)
+{
+	struct istream *input, *ichunked;
+	struct ostream *output, *ochunked;
+	buffer_t *chunked_buffer, *plain_buffer;
+	unsigned int i;
+
+	chunked_buffer = buffer_create_dynamic(default_pool, 1024);
+	plain_buffer = buffer_create_dynamic(default_pool, 1024);
+
+	for (i = 0; i < valid_transfer_chunked_output_test_count; i++) T_BEGIN {
+		const char *data, *stream_out;
+		const unsigned char *rdata;
+		size_t rsize;
+		ssize_t ret;
+
+		data = valid_transfer_chunked_output_tests[i];
+
+		test_begin(t_strdup_printf("http transfer_chunked output valid [%d]", i));
+
+		/* create input stream */
+		input = i_stream_create_from_data(data, strlen(data));
+
+		/* create buffer output stream */
+		buffer_set_used_size(chunked_buffer, 0);
+		output = o_stream_create_buffer(chunked_buffer);
+
+		/* create chunked output stream */
+		ochunked = http_transfer_chunked_ostream_create(output);
+
+		/* send input through chunked stream; chunk size is limited */
+		for (;;) {
+			ret = i_stream_read_more(input, &rdata, &rsize);
+			if (ret < 0) {
+				if (input->eof)
+					ret = 1;
+				break;
+			}
+			if (rsize == 0)
+				break;
+			if (rsize > 16)
+				rsize = 16;
+
+			ret = o_stream_send(ochunked, rdata, rsize);
+			if (ret < 0)
+				break;
+
+			if ((size_t)ret != rsize) {
+				ret = -1;
+				break;
+			}
+
+			i_stream_skip(input, ret);
+		}
+
+		/* cleanup streams */
+		test_out("payload chunk", ret > 0);
+		test_assert(o_stream_finish(ochunked) > 0);
+		o_stream_destroy(&ochunked);
+		o_stream_destroy(&output);
+		i_stream_destroy(&input);
+
+		/* create chunked input stream */
+		input = i_stream_create_from_data
+			(chunked_buffer->data, chunked_buffer->used);
+		ichunked = http_transfer_chunked_istream_create(input, 0, NULL, FALSE);
+
+		/* read back chunk */
+		buffer_set_used_size(plain_buffer, 0);
+		output = o_stream_create_buffer(plain_buffer);
+		test_out("payload unchunk",
+			o_stream_send_istream(output, ichunked) == OSTREAM_SEND_ISTREAM_RESULT_FINISHED
+			&& ichunked->stream_errno == 0);
+		o_stream_destroy(&output);
+		i_stream_destroy(&ichunked);
+		i_stream_destroy(&input);
+
+		/* test output */
+		stream_out = str_c(plain_buffer);
+		test_assert(strcmp(stream_out, data) == 0);
+		test_end();
+	} T_END;
+
+	buffer_free(&chunked_buffer);
+	buffer_free(&plain_buffer);
+}
+
+static void test_http_transfer_chunked_input_trailer_limit(void)
+{
+	struct istream *input, *chunked;
+	struct ostream *output;
+	buffer_t *payload_buffer;
+	struct http_header_limits limits;
+	const char *in = "4\r\n"
+			 "test\r\n"
+			 "0\r\n"
+			 "X-Very-Long-Trailer: "
+			 "12345678901234567890123456789012345678901234567890"
+			 "\r\n"
+			 "\r\n";
+
+	test_begin("http transfer_chunked input trailer limit");
+
+	payload_buffer = buffer_create_dynamic(default_pool, 1024);
+
+	/* 1. Test that default limit (256KB) is applied when NULL is passed. */
+	size_t trailer_size = HTTP_TRANSFER_CHUNKED_DEFAULT_MAX_TRAILER_SIZE + 1024;
+	char *trailer = i_malloc(trailer_size + 1);
+	memset(trailer, 'a', trailer_size);
+	trailer[trailer_size] = '\0';
+
+	const char *header = "4\r\n"
+	                     "test\r\n"
+	                     "0\r\n"
+	                     "X-Large-Trailer: ";
+	const char *footer = "\r\n\r\n";
+
+	buffer_set_used_size(payload_buffer, 0);
+	buffer_append(payload_buffer, header, strlen(header));
+	buffer_append(payload_buffer, trailer, trailer_size);
+	buffer_append(payload_buffer, footer, strlen(footer));
+
+	input = i_stream_create_from_data(payload_buffer->data, payload_buffer->used);
+	chunked = http_transfer_chunked_istream_create(input, 0, NULL, FALSE);
+	i_stream_unref(&input);
+
+	output = o_stream_create_buffer(payload_buffer);
+	o_stream_nsend_istream(output, chunked);
+	/* payload read failure due to default trailer limit */
+	test_assert(chunked->stream_errno != 0);
+
+	o_stream_destroy(&output);
+	i_stream_unref(&chunked);
+	i_free(trailer);
+
+	/* 2. Test explicit small limit (30) to trigger failure on smaller trailer */
+	i_zero(&limits);
+	limits.max_size = 30;
+
+	input = i_stream_create_from_data(in, strlen(in));
+	chunked = http_transfer_chunked_istream_create(input, 0, &limits, FALSE);
+	i_stream_unref(&input);
+
+	buffer_set_used_size(payload_buffer, 0);
+	output = o_stream_create_buffer(payload_buffer);
+
+	/* The payload should be read successfully, but the trailer should cause failure */
+	o_stream_nsend_istream(output, chunked);
+
+	/* payload read failure due to explicit trailer limit */
+	test_assert(chunked->stream_errno != 0);
+
+	o_stream_destroy(&output);
+	i_stream_unref(&chunked);
+
+	/* 3. Now raise the limit and try again. */
+	limits.max_size = 100;
+
+	input = i_stream_create_from_data(in, strlen(in));
+	chunked = http_transfer_chunked_istream_create(input, 0, &limits, FALSE);
+	i_stream_unref(&input);
+
+	buffer_set_used_size(payload_buffer, 0);
+	output = o_stream_create_buffer(payload_buffer);
+
+	/* The payload should be read successfully, and the trailer size is ok. */
+	o_stream_nsend_istream(output, chunked);
+
+	/* payload read success due to higher trailer limit */
+	test_assert(chunked->stream_errno == 0);
+
+	o_stream_destroy(&output);
+	i_stream_unref(&chunked);
+
+	buffer_free(&payload_buffer);
+
+	test_end();
+}
+
+int main(void)
+{
+	static void (*const test_functions[])(void) = {
+		test_http_transfer_chunked_input_valid,
+		test_http_transfer_chunked_input_invalid,
+		test_http_transfer_chunked_input_strict,
+		test_http_transfer_chunked_output_valid,
+		test_http_transfer_chunked_input_trailer_limit,
+		NULL
+	};
+	return test_run(test_functions);
+}

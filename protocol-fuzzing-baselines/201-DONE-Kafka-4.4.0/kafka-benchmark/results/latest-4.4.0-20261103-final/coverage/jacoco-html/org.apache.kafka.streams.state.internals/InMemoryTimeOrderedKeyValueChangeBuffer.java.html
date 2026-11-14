@@ -1,0 +1,810 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>InMemoryTimeOrderedKeyValueChangeBuffer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">InMemoryTimeOrderedKeyValueChangeBuffer.java</span></div><h1>InMemoryTimeOrderedKeyValueChangeBuffer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.apache.kafka.common.serialization.BytesSerializer;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.kstream.internals.Change;
+import org.apache.kafka.streams.kstream.internals.FullChangeSerde;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.api.Record;
+import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
+import org.apache.kafka.streams.processor.internals.ProcessorContextUtils;
+import org.apache.kafka.streams.processor.internals.ProcessorRecordContext;
+import org.apache.kafka.streams.processor.internals.RecordBatchingStateRestoreCallback;
+import org.apache.kafka.streams.processor.internals.RecordCollector;
+import org.apache.kafka.streams.processor.internals.RecordQueue;
+import org.apache.kafka.streams.processor.internals.SerdeGetter;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.state.StoreBuilder;
+import org.apache.kafka.streams.state.ValueTimestampHeaders;
+import org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.DeserializationResult;
+import org.apache.kafka.streams.state.internals.metrics.StateStoreMetrics;
+
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+import static java.util.Objects.requireNonNull;
+import static org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.deserializeV0;
+import static org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.deserializeV1;
+import static org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.deserializeV3;
+import static org.apache.kafka.streams.state.internals.TimeOrderedKeyValueBufferChangelogDeserializationHelper.duckTypeV2;
+
+public final class InMemoryTimeOrderedKeyValueChangeBuffer&lt;K, V, T&gt; implements TimeOrderedKeyValueBuffer&lt;K, V, Change&lt;V&gt;&gt; {
+<span class="nc" id="L71">    private static final BytesSerializer KEY_SERIALIZER = new BytesSerializer();</span>
+<span class="nc" id="L72">    private static final ByteArraySerializer VALUE_SERIALIZER = new ByteArraySerializer();</span>
+<span class="nc" id="L73">    private static final byte[] V_1_CHANGELOG_HEADER_VALUE = {(byte) 1};</span>
+<span class="nc" id="L74">    private static final byte[] V_2_CHANGELOG_HEADER_VALUE = {(byte) 2};</span>
+<span class="nc" id="L75">    private static final byte[] V_3_CHANGELOG_HEADER_VALUE = {(byte) 3};</span>
+<span class="nc" id="L76">    static final RecordHeaders CHANGELOG_HEADERS =</span>
+        new RecordHeaders(new Header[] {new RecordHeader(&quot;v&quot;, V_3_CHANGELOG_HEADER_VALUE)});
+    // The prior and old value parts' headers/timestamp travel in the changelog record's own Kafka headers -- one per
+    // part, holding that part's [headersSize][headers][timestamp] prefix -- so the value bytes stay V3 and remain
+    // restorable by older versions, which simply ignore these headers. The new value part needs no such header: the
+    // record context encoded in the V3 value already describes it, because put() captures the context of the very
+    // record the new value came from.
+    static final String PRIOR_VALUE_HEADERS_KEY = &quot;vh.prior&quot;;
+    static final String OLD_VALUE_HEADERS_KEY = &quot;vh.old&quot;;
+    private static final String METRIC_SCOPE = &quot;in-memory-suppression&quot;;
+
+<span class="nc" id="L87">    private final Map&lt;Bytes, BufferKey&gt; index = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L88">    private final TreeMap&lt;BufferKey, BufferValue&gt; sortedMap = new TreeMap&lt;&gt;();</span>
+
+<span class="nc" id="L90">    private final Set&lt;Bytes&gt; dirtyKeys = new HashSet&lt;&gt;();</span>
+    private final String storeName;
+    private final boolean loggingEnabled;
+
+    private Serde&lt;K&gt; keySerde;
+    private FullChangeSerde&lt;V&gt; valueSerde;
+
+    // When headers-aware stores are enabled (dsl.store.format=HEADERS) each buffered value part is
+    // stored as a ValueTimestampHeaders blob so that the old and new value can carry their own
+    // headers and timestamp independently. Otherwise plain values are stored (the pre-existing V3
+    // behavior) to avoid inflating memory/changelog size for users who do not use header stores.
+    private boolean storeHeaders;
+    private ValueTimestampHeadersSerializer&lt;V&gt; valueTimestampHeadersSerializer;
+    private ValueTimestampHeadersDeserializer&lt;V&gt; valueTimestampHeadersDeserializer;
+
+<span class="nc" id="L105">    private long memBufferSize = 0L;</span>
+<span class="nc" id="L106">    private long minTimestamp = Long.MAX_VALUE;</span>
+    private InternalProcessorContext&lt;?, ?&gt; context;
+    private String changelogTopic;
+    private Sensor bufferSizeSensor;
+    private Sensor bufferCountSensor;
+    private StreamsMetricsImpl streamsMetrics;
+    private String taskId;
+
+    private volatile boolean open;
+
+    private int partition;
+
+    public static class Builder&lt;K, V&gt; implements StoreBuilder&lt;InMemoryTimeOrderedKeyValueChangeBuffer&lt;K, V, Change&lt;V&gt;&gt;&gt; {
+
+        private final String storeName;
+        private final Serde&lt;K&gt; keySerde;
+        private final Serde&lt;V&gt; valueSerde;
+<span class="nc" id="L123">        private boolean loggingEnabled = true;</span>
+<span class="nc" id="L124">        private Map&lt;String, String&gt; logConfig = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L126">        public Builder(final String storeName, final Serde&lt;K&gt; keySerde, final Serde&lt;V&gt; valueSerde) {</span>
+<span class="nc" id="L127">            this.storeName = storeName;</span>
+<span class="nc" id="L128">            this.keySerde = keySerde;</span>
+<span class="nc" id="L129">            this.valueSerde = valueSerde;</span>
+<span class="nc" id="L130">        }</span>
+
+        /**
+         * As of 2.1, there's no way for users to directly interact with the buffer,
+         * so this method is implemented solely to be called by Streams (which
+         * it will do based on the {@code cache.max.bytes.buffering} config.
+         * &lt;p&gt;
+         * It's currently a no-op.
+         */
+        @Override
+        public StoreBuilder&lt;InMemoryTimeOrderedKeyValueChangeBuffer&lt;K, V, Change&lt;V&gt;&gt;&gt; withCachingEnabled() {
+<span class="nc" id="L141">            return this;</span>
+        }
+
+        /**
+         * As of 2.1, there's no way for users to directly interact with the buffer,
+         * so this method is implemented solely to be called by Streams (which
+         * it will do based on the {@code cache.max.bytes.buffering} config.
+         * &lt;p&gt;
+         * It's currently a no-op.
+         */
+        @Override
+        public StoreBuilder&lt;InMemoryTimeOrderedKeyValueChangeBuffer&lt;K, V, Change&lt;V&gt;&gt;&gt; withCachingDisabled() {
+<span class="nc" id="L153">            return this;</span>
+        }
+
+        @Override
+        public StoreBuilder&lt;InMemoryTimeOrderedKeyValueChangeBuffer&lt;K, V, Change&lt;V&gt;&gt;&gt; withLoggingEnabled(final Map&lt;String, String&gt; config) {
+<span class="nc" id="L158">            logConfig = config;</span>
+<span class="nc" id="L159">            return this;</span>
+        }
+
+        @Override
+        public StoreBuilder&lt;InMemoryTimeOrderedKeyValueChangeBuffer&lt;K, V, Change&lt;V&gt;&gt;&gt; withLoggingDisabled() {
+<span class="nc" id="L164">            loggingEnabled = false;</span>
+<span class="nc" id="L165">            return this;</span>
+        }
+
+        @Override
+        public InMemoryTimeOrderedKeyValueChangeBuffer&lt;K, V, Change&lt;V&gt;&gt; build() {
+<span class="nc" id="L170">            return new InMemoryTimeOrderedKeyValueChangeBuffer&lt;&gt;(storeName, loggingEnabled, keySerde, valueSerde);</span>
+        }
+
+        @Override
+        public Map&lt;String, String&gt; logConfig() {
+<span class="nc bnc" id="L175" title="All 2 branches missed.">            return loggingEnabled() ? Collections.unmodifiableMap(logConfig) : Collections.emptyMap();</span>
+        }
+
+        @Override
+        public boolean loggingEnabled() {
+<span class="nc" id="L180">            return loggingEnabled;</span>
+        }
+
+        @Override
+        public String name() {
+<span class="nc" id="L185">            return storeName;</span>
+        }
+    }
+
+    private InMemoryTimeOrderedKeyValueChangeBuffer(final String storeName,
+                                                    final boolean loggingEnabled,
+                                                    final Serde&lt;K&gt; keySerde,
+<span class="nc" id="L192">                                                    final Serde&lt;V&gt; valueSerde) {</span>
+<span class="nc" id="L193">        this.storeName = storeName;</span>
+<span class="nc" id="L194">        this.loggingEnabled = loggingEnabled;</span>
+<span class="nc" id="L195">        this.keySerde = keySerde;</span>
+<span class="nc" id="L196">        this.valueSerde = FullChangeSerde.wrap(valueSerde);</span>
+<span class="nc" id="L197">    }</span>
+
+    @Override
+    public String name() {
+<span class="nc" id="L201">        return storeName;</span>
+    }
+
+
+    @Override
+    public boolean persistent() {
+<span class="nc" id="L207">        return false;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public void setSerdesIfNull(final SerdeGetter getter) {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        keySerde = keySerde == null ? (Serde&lt;K&gt;) getter.keySerde() : keySerde;</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        valueSerde = valueSerde == null ? FullChangeSerde.wrap((Serde&lt;V&gt;) getter.valueSerde()) : valueSerde;</span>
+<span class="nc" id="L215">    }</span>
+    @Override
+    public void init(final StateStoreContext stateStoreContext, final StateStore root) {
+<span class="nc" id="L218">        this.context = ProcessorContextUtils.asInternalProcessorContext(stateStoreContext);</span>
+<span class="nc" id="L219">        changelogTopic = ProcessorContextUtils.changelogFor(stateStoreContext, name(), Boolean.TRUE);</span>
+<span class="nc" id="L220">        taskId = context.taskId().toString();</span>
+<span class="nc" id="L221">        streamsMetrics = context.metrics();</span>
+
+<span class="nc" id="L223">        final Object dslStoreFormat = stateStoreContext.appConfigs().get(StreamsConfig.DSL_STORE_FORMAT_CONFIG);</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        storeHeaders = dslStoreFormat != null</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">            &amp;&amp; StreamsConfig.DSL_STORE_FORMAT_HEADERS.equalsIgnoreCase(dslStoreFormat.toString());</span>
+
+<span class="nc" id="L227">        bufferSizeSensor = StateStoreMetrics.suppressionBufferSizeSensor(</span>
+            taskId,
+            METRIC_SCOPE,
+            storeName,
+            streamsMetrics
+        );
+<span class="nc" id="L233">        bufferCountSensor = StateStoreMetrics.suppressionBufferCountSensor(</span>
+            taskId,
+            METRIC_SCOPE,
+            storeName,
+            streamsMetrics
+        );
+
+<span class="nc" id="L240">        this.context.register(root, (RecordBatchingStateRestoreCallback) this::restoreBatch);</span>
+<span class="nc" id="L241">        updateBufferMetrics();</span>
+<span class="nc" id="L242">        open = true;</span>
+<span class="nc" id="L243">        partition = context.taskId().partition();</span>
+<span class="nc" id="L244">    }</span>
+
+    @Override
+    public boolean isOpen() {
+<span class="nc" id="L248">        return open;</span>
+    }
+
+    @Override
+    public Position getPosition() {
+<span class="nc" id="L253">        throw new UnsupportedOperationException(&quot;This store does not keep track of the position.&quot;);</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L258">        open = false;</span>
+<span class="nc" id="L259">        index.clear();</span>
+<span class="nc" id="L260">        sortedMap.clear();</span>
+<span class="nc" id="L261">        dirtyKeys.clear();</span>
+<span class="nc" id="L262">        memBufferSize = 0;</span>
+<span class="nc" id="L263">        minTimestamp = Long.MAX_VALUE;</span>
+<span class="nc" id="L264">        updateBufferMetrics();</span>
+<span class="nc" id="L265">        streamsMetrics.removeAllStoreLevelSensorsAndMetrics(taskId, storeName);</span>
+<span class="nc" id="L266">    }</span>
+
+    @Override
+    public void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        if (loggingEnabled) {</span>
+            // counting on this getting called before the record collector's flush
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            for (final Bytes key : dirtyKeys) {</span>
+
+<span class="nc" id="L274">                final BufferKey bufferKey = index.get(key);</span>
+
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                if (bufferKey == null) {</span>
+                    // The record was evicted from the buffer. Send a tombstone.
+<span class="nc" id="L278">                    logTombstone(key);</span>
+                } else {
+<span class="nc" id="L280">                    final BufferValue value = sortedMap.get(bufferKey);</span>
+
+<span class="nc" id="L282">                    logValue(key, bufferKey, value);</span>
+                }
+<span class="nc" id="L284">            }</span>
+<span class="nc" id="L285">            dirtyKeys.clear();</span>
+        }
+<span class="nc" id="L287">    }</span>
+
+    private void logValue(final Bytes key, final BufferKey bufferKey, final BufferValue value) {
+
+<span class="nc" id="L291">        final int sizeOfBufferTime = Long.BYTES;</span>
+        // The logged value is always in the V3 format: in headers mode the in-memory value parts are
+        // ValueTimestampHeaders blobs, so split each one and log only its plain value bytes, sending
+        // the headers/timestamp prefixes alongside in the record's Kafka headers.
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        final ByteBuffer buffer = (storeHeaders ? plainEncoded(value) : value).serialize(sizeOfBufferTime);</span>
+<span class="nc" id="L296">        buffer.putLong(bufferKey.time());</span>
+<span class="nc" id="L297">        final byte[] array = buffer.array();</span>
+<span class="nc" id="L298">        ((RecordCollector.Supplier) context).recordCollector().send(</span>
+            changelogTopic,
+            key,
+            array,
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            storeHeaders ? changelogHeadersWithValuePartHeaders(value) : CHANGELOG_HEADERS,</span>
+<span class="nc" id="L303">            partition,</span>
+            null,
+            KEY_SERIALIZER,
+            VALUE_SERIALIZER,
+            null,
+            null);
+<span class="nc" id="L309">    }</span>
+
+    private static BufferValue plainEncoded(final BufferValue value) {
+<span class="nc" id="L312">        return new BufferValue(</span>
+<span class="nc" id="L313">            Utils.rawPlainValue(value.priorValue()),</span>
+<span class="nc" id="L314">            Utils.rawPlainValue(value.oldValue()),</span>
+<span class="nc" id="L315">            Utils.rawPlainValue(value.newValue()),</span>
+<span class="nc" id="L316">            value.context()</span>
+        );
+    }
+
+    private static RecordHeaders changelogHeadersWithValuePartHeaders(final BufferValue value) {
+<span class="nc" id="L321">        final RecordHeaders headers = new RecordHeaders(new Header[] {new RecordHeader(&quot;v&quot;, V_3_CHANGELOG_HEADER_VALUE)});</span>
+        // BufferValue collapses the prior and old values onto one array whenever they are equal -- the
+        // common case, since on the first buffering of a key the prior value IS the old value -- and
+        // serialize() then writes those bytes only once. Skip the duplicate prefix as well; restoring
+        // recovers the prior part from vh.old whenever vh.prior is absent.
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        if (value.priorValue() != value.oldValue()) {</span>
+<span class="nc" id="L327">            addValuePartHeader(headers, PRIOR_VALUE_HEADERS_KEY, value.priorValue());</span>
+        }
+<span class="nc" id="L329">        addValuePartHeader(headers, OLD_VALUE_HEADERS_KEY, value.oldValue());</span>
+<span class="nc" id="L330">        return headers;</span>
+    }
+
+    private static void addValuePartHeader(final RecordHeaders headers,
+                                           final String headerKey,
+                                           final byte[] rawValueTimestampHeaders) {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        if (rawValueTimestampHeaders != null) {</span>
+<span class="nc" id="L337">            headers.add(new RecordHeader(headerKey, Utils.rawHeadersTimestampPrefix(rawValueTimestampHeaders)));</span>
+        }
+<span class="nc" id="L339">    }</span>
+
+    private void logTombstone(final Bytes key) {
+<span class="nc" id="L342">        ((RecordCollector.Supplier) context).recordCollector().send(</span>
+            changelogTopic,
+            key,
+            null,
+            null,
+<span class="nc" id="L347">            partition,</span>
+            null,
+            KEY_SERIALIZER,
+            VALUE_SERIALIZER,
+            null,
+            null);
+<span class="nc" id="L353">    }</span>
+
+    private void restoreBatch(final Collection&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; batch) {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">        for (final ConsumerRecord&lt;byte[], byte[]&gt; record : batch) {</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            if (record.partition() != partition) {</span>
+<span class="nc" id="L358">                throw new IllegalStateException(</span>
+<span class="nc" id="L359">                    String.format(</span>
+                        &quot;record partition [%d] is being restored by the wrong suppress partition [%d]&quot;,
+<span class="nc" id="L361">                        record.partition(),</span>
+<span class="nc" id="L362">                        partition</span>
+                    )
+                );
+            }
+<span class="nc" id="L366">            final Bytes key = Bytes.wrap(record.key());</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">            if (record.value() == null) {</span>
+                // This was a tombstone. Delete the record.
+<span class="nc" id="L369">                final BufferKey bufferKey = index.remove(key);</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">                if (bufferKey != null) {</span>
+<span class="nc" id="L371">                    final BufferValue removed = sortedMap.remove(bufferKey);</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                    if (removed != null) {</span>
+<span class="nc" id="L373">                        memBufferSize -= computeRecordSize(bufferKey.key(), removed);</span>
+                    }
+<span class="nc bnc" id="L375" title="All 2 branches missed.">                    if (bufferKey.time() == minTimestamp) {</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">                        minTimestamp = sortedMap.isEmpty() ? Long.MAX_VALUE : sortedMap.firstKey().time();</span>
+                    }
+                }
+<span class="nc" id="L379">            } else {</span>
+<span class="nc" id="L380">                final Header versionHeader = record.headers().lastHeader(&quot;v&quot;);</span>
+                final DeserializationResult deserializationResult;
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                if (versionHeader == null) {</span>
+                    // Version 0:
+                    // value:
+                    //  - buffer time
+                    //  - old value
+                    //  - new value
+<span class="nc bnc" id="L388" title="All 2 branches missed.">                    final byte[] previousBufferedValue = index.containsKey(key)</span>
+<span class="nc" id="L389">                        ? plainPriorValueForBuffered(key)</span>
+<span class="nc" id="L390">                        : null;</span>
+<span class="nc" id="L391">                    deserializationResult = deserializeV0(record, key, previousBufferedValue);</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">                } else if (Arrays.equals(versionHeader.value(), V_3_CHANGELOG_HEADER_VALUE)) {</span>
+                    // Version 3:
+                    // value:
+                    //  - record context
+                    //  - prior value
+                    //  - old value
+                    //  - new value
+                    //  - buffer time
+<span class="nc" id="L400">                    deserializationResult = deserializeV3(record, key);</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">                } else if (Arrays.equals(versionHeader.value(), V_2_CHANGELOG_HEADER_VALUE)) {</span>
+                    // Version 2:
+                    // value:
+                    //  - record context
+                    //  - old value
+                    //  - new value
+                    //  - prior value
+                    //  - buffer time
+                    // NOTE: 2.4.0, 2.4.1, and 2.5.0 actually encode Version 3 formatted data,
+                    // but still set the Version 2 flag, so to deserialize, we have to duck type.
+<span class="nc" id="L411">                    deserializationResult = duckTypeV2(record, key);</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">                } else if (Arrays.equals(versionHeader.value(), V_1_CHANGELOG_HEADER_VALUE)) {</span>
+                    // Version 1:
+                    // value:
+                    //  - buffer time
+                    //  - record context
+                    //  - old value
+                    //  - new value
+<span class="nc bnc" id="L419" title="All 2 branches missed.">                    final byte[] previousBufferedValue = index.containsKey(key)</span>
+<span class="nc" id="L420">                        ? plainPriorValueForBuffered(key)</span>
+<span class="nc" id="L421">                        : null;</span>
+<span class="nc" id="L422">                    deserializationResult = deserializeV1(record, key, previousBufferedValue);</span>
+<span class="nc" id="L423">                } else {</span>
+                    // NOTE: the streams_application_upgrade_test.py system test greps the logs for
+                    // this message to assert that no suppress-changelog record is rejected while
+                    // restoring across the HEADERS format boundary (KAFKA-20850). Do not change this
+                    // string without updating that test.
+<span class="nc" id="L428">                    throw new IllegalArgumentException(&quot;Restoring apparently invalid changelog record: &quot; + record);</span>
+                }
+<span class="nc" id="L430">                cleanPut(</span>
+<span class="nc" id="L431">                    deserializationResult.time(),</span>
+<span class="nc" id="L432">                    deserializationResult.key(),</span>
+<span class="nc" id="L433">                    toInMemoryEncoding(deserializationResult.bufferValue(), record.headers())</span>
+                );
+            }
+<span class="nc" id="L436">        }</span>
+<span class="nc" id="L437">        updateBufferMetrics();</span>
+<span class="nc" id="L438">    }</span>
+
+
+    @Override
+    public void evictWhile(final Supplier&lt;Boolean&gt; predicate,
+                           final Consumer&lt;Eviction&lt;K, Change&lt;V&gt;&gt;&gt; callback) {
+<span class="nc" id="L444">        final Iterator&lt;Map.Entry&lt;BufferKey, BufferValue&gt;&gt; delegate = sortedMap.entrySet().iterator();</span>
+<span class="nc" id="L445">        int evictions = 0;</span>
+
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        if (predicate.get()) {</span>
+<span class="nc" id="L448">            Map.Entry&lt;BufferKey, BufferValue&gt; next = null;</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">            if (delegate.hasNext()) {</span>
+<span class="nc" id="L450">                next = delegate.next();</span>
+            }
+
+            // predicate being true means we read one record, call the callback, and then remove it
+<span class="nc bnc" id="L454" title="All 4 branches missed.">            while (next != null &amp;&amp; predicate.get()) {</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">                if (next.getKey().time() != minTimestamp) {</span>
+<span class="nc" id="L456">                    throw new IllegalStateException(</span>
+                        &quot;minTimestamp [&quot; + minTimestamp + &quot;] did not match the actual min timestamp [&quot; +
+<span class="nc" id="L458">                            next.getKey().time() + &quot;]&quot;</span>
+                    );
+                }
+<span class="nc" id="L461">                final BufferValue bufferValue = next.getValue();</span>
+<span class="nc" id="L462">                final ProcessorRecordContext bufferedContext = bufferValue.context();</span>
+
+                final K key;
+                final Change&lt;V&gt; value;
+                final ProcessorRecordContext evictionContext;
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                if (storeHeaders) {</span>
+                    // Each value part was stored as a ValueTimestampHeaders blob carrying the headers of
+                    // the record it originated from, so take them from the value rather than from the
+                    // buffered context: the old value came from an earlier record than the new one, and
+                    // deserializing it with the new record's headers would hand the serde the wrong ones.
+                    // (ValueTimestampHeadersDeserializer feeds each part's own headers to the inner
+                    // value deserializer.)
+<span class="nc" id="L474">                    final ValueTimestampHeaders&lt;V&gt; newPart = deserializeValueTimestampHeaders(bufferValue.newValue());</span>
+<span class="nc" id="L475">                    final ValueTimestampHeaders&lt;V&gt; oldPart = deserializeValueTimestampHeaders(bufferValue.oldValue());</span>
+                    // A tombstone has no new value to take headers from; fall back to the buffered context.
+                    // That fallback is not a second-best guess: the buffered context and the new value's
+                    // embedded headers always agree. put() hands the very same record.headers() instance to
+                    // both, and ValueTimestampHeadersSerializer snapshots the headers only AFTER running the
+                    // inner value serializer, so even a serde that writes into the headers it is given (a
+                    // Schema Registry serde recording the schema id, say) is reflected in both. Restoring
+                    // preserves the equality, because toInMemoryEncoding rebuilds the new part from that
+                    // same context. Only the old and prior parts can differ from the context, which is why
+                    // they are the ones read from the value here.
+<span class="nc bnc" id="L485" title="All 2 branches missed.">                    final Headers newHeaders = newPart == null ? bufferedContext.headers() : newPart.headers();</span>
+<span class="nc" id="L486">                    key = keySerde.deserializer().deserialize(changelogTopic, newHeaders, next.getKey().key().get());</span>
+<span class="nc" id="L487">                    value = new Change&lt;&gt;(</span>
+<span class="nc" id="L488">                        ValueTimestampHeaders.getValueOrNull(newPart),</span>
+<span class="nc" id="L489">                        ValueTimestampHeaders.getValueOrNull(oldPart)</span>
+                    );
+                    // The emitted record carries the new value's headers, so hand them to the callback
+                    // via the eviction's context (which is what the suppress processor forwards).
+<span class="nc" id="L493">                    evictionContext = withHeaders(bufferedContext, newHeaders);</span>
+<span class="nc" id="L494">                } else {</span>
+                    // Plain values store no headers of their own; the buffered context is the only
+                    // carrier, exactly as before.
+<span class="nc" id="L497">                    final Headers headers = bufferedContext.headers();</span>
+<span class="nc" id="L498">                    key = keySerde.deserializer().deserialize(changelogTopic, headers, next.getKey().key().get());</span>
+<span class="nc" id="L499">                    value = new Change&lt;&gt;(</span>
+<span class="nc" id="L500">                        deserializeValue(bufferValue.newValue(), headers),</span>
+<span class="nc" id="L501">                        deserializeValue(bufferValue.oldValue(), headers)</span>
+                    );
+<span class="nc" id="L503">                    evictionContext = bufferedContext;</span>
+                }
+<span class="nc" id="L505">                callback.accept(new Eviction&lt;K, Change&lt;V&gt;&gt;(key, value, evictionContext));</span>
+
+<span class="nc" id="L507">                delegate.remove();</span>
+<span class="nc" id="L508">                index.remove(next.getKey().key());</span>
+
+<span class="nc bnc" id="L510" title="All 2 branches missed.">                if (loggingEnabled) {</span>
+<span class="nc" id="L511">                    dirtyKeys.add(next.getKey().key());</span>
+                }
+
+<span class="nc" id="L514">                memBufferSize -= computeRecordSize(next.getKey().key(), bufferValue);</span>
+
+                // peek at the next record so we can update the minTimestamp
+<span class="nc bnc" id="L517" title="All 2 branches missed.">                if (delegate.hasNext()) {</span>
+<span class="nc" id="L518">                    next = delegate.next();</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">                    minTimestamp = next == null ? Long.MAX_VALUE : next.getKey().time();</span>
+                } else {
+<span class="nc" id="L521">                    next = null;</span>
+<span class="nc" id="L522">                    minTimestamp = Long.MAX_VALUE;</span>
+                }
+
+<span class="nc" id="L525">                evictions++;</span>
+<span class="nc" id="L526">            }</span>
+        }
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        if (evictions &gt; 0) {</span>
+<span class="nc" id="L529">            updateBufferMetrics();</span>
+        }
+<span class="nc" id="L531">    }</span>
+
+    // Copy of the given context with different headers, preserving everything else -- including
+    // sourceRawKey/sourceRawValue, which the shorter ProcessorRecordContext constructor drops.
+    private static ProcessorRecordContext withHeaders(final ProcessorRecordContext context, final Headers headers) {
+<span class="nc bnc" id="L536" title="All 2 branches missed.">        if (context.headers() == headers) {</span>
+<span class="nc" id="L537">            return context;</span>
+        }
+<span class="nc" id="L539">        return new ProcessorRecordContext(</span>
+<span class="nc" id="L540">            context.timestamp(),</span>
+<span class="nc" id="L541">            context.offset(),</span>
+<span class="nc" id="L542">            context.partition(),</span>
+<span class="nc" id="L543">            context.topic(),</span>
+            headers,
+<span class="nc" id="L545">            context.sourceRawKey(),</span>
+<span class="nc" id="L546">            context.sourceRawValue()</span>
+        );
+    }
+
+    @Override
+    public Maybe&lt;ValueTimestampHeaders&lt;V&gt;&gt; priorValueForBuffered(final K key) {
+<span class="nc" id="L552">        final Bytes serializedKey = Bytes.wrap(keySerde.serializer().serialize(changelogTopic, context.headers(), key));</span>
+<span class="nc" id="L553">        final BufferKey bufferKey = index.get(serializedKey);</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">        if (bufferKey != null) {</span>
+<span class="nc" id="L555">            final BufferValue bufferValue = sortedMap.get(bufferKey);</span>
+<span class="nc" id="L556">            final byte[] serializedValue = bufferValue.priorValue();</span>
+
+<span class="nc bnc" id="L558" title="All 2 branches missed.">            if (storeHeaders) {</span>
+                // The prior value is stored as a ValueTimestampHeaders blob, so we can recover its
+                // timestamp and headers directly (they are unknown/empty when the key was first
+                // buffered, but preserved across restarts via the changelog).
+<span class="nc" id="L562">                return Maybe.defined(deserializeValueTimestampHeaders(serializedValue));</span>
+            }
+
+<span class="nc" id="L565">            final V deserializedValue = valueSerde.innerSerde().deserializer().deserialize(</span>
+                changelogTopic,
+<span class="nc" id="L567">                bufferValue.context().headers(),</span>
+                serializedValue
+            );
+
+            // it's unfortunately not possible to know this, unless we materialize the suppressed result, since our only
+            // knowledge of the prior value is what the upstream processor sends us as the &quot;old value&quot; when we first
+            // buffer something.
+<span class="nc" id="L574">            return Maybe.defined(ValueTimestampHeaders.make(deserializedValue, RecordQueue.UNKNOWN, new RecordHeaders()));</span>
+        } else {
+<span class="nc" id="L576">            return Maybe.undefined();</span>
+        }
+    }
+
+    private byte[] internalPriorValueForBuffered(final Bytes key) {
+<span class="nc" id="L581">        final BufferKey bufferKey = index.get(key);</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">        if (bufferKey == null) {</span>
+<span class="nc" id="L583">            throw new NoSuchElementException(&quot;Key [&quot; + key + &quot;] is not in the buffer.&quot;);</span>
+        } else {
+<span class="nc" id="L585">            final BufferValue bufferValue = sortedMap.get(bufferKey);</span>
+<span class="nc" id="L586">            return bufferValue.priorValue();</span>
+        }
+    }
+
+    // The legacy V0/V1 restore paths feed the currently-buffered prior value back in as plain value
+    // bytes, so unwrap it when the in-memory encoding is the headers-aware format.
+    private byte[] plainPriorValueForBuffered(final Bytes key) {
+<span class="nc" id="L593">        final byte[] priorValue = internalPriorValueForBuffered(key);</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">        return storeHeaders ? Utils.rawPlainValue(priorValue) : priorValue;</span>
+    }
+
+    // The changelog value format is plain for every version, so a restored buffer value always has
+    // plain value parts. When header stores are enabled the in-memory encoding is
+    // ValueTimestampHeaders, so re-attach each part's headers and timestamp. The new value gets them
+    // from the restored record context, which describes exactly that part (see put()); the prior and
+    // old values get them from the changelog record's own Kafka headers. Records written before this
+    // feature -- or by a run configured without header stores -- carry no such Kafka headers, in
+    // which case the prior/old originals are genuinely unknown and we fall back to empty headers with
+    // the record-context timestamp.
+    private BufferValue toInMemoryEncoding(final BufferValue value, final Headers recordHeaders) {
+<span class="nc bnc" id="L606" title="All 2 branches missed.">        if (!storeHeaders) {</span>
+<span class="nc" id="L607">            return value;</span>
+        }
+<span class="nc" id="L609">        final ProcessorRecordContext context = value.context();</span>
+<span class="nc" id="L610">        final byte[] oldValue = valuePartWithHeaders(value.oldValue(), recordHeaders, OLD_VALUE_HEADERS_KEY, context.timestamp());</span>
+        // A missing vh.prior on a row whose prior and old values share an array means the writer
+        // skipped the duplicate prefix, so the old part IS the prior part. The two conditions have to
+        // be checked together: the changelog value dedups on the PLAIN bytes, so a row can come back
+        // sharing an array even though the parts carried different headers and were written with a
+        // vh.prior of their own. In that case the header wins.
+<span class="nc bnc" id="L616" title="All 2 branches missed.">        final byte[] priorValue = value.priorValue() == value.oldValue()</span>
+<span class="nc bnc" id="L617" title="All 2 branches missed.">            &amp;&amp; recordHeaders.lastHeader(PRIOR_VALUE_HEADERS_KEY) == null</span>
+<span class="nc" id="L618">            ? oldValue</span>
+<span class="nc" id="L619">            : valuePartWithHeaders(value.priorValue(), recordHeaders, PRIOR_VALUE_HEADERS_KEY, context.timestamp());</span>
+<span class="nc" id="L620">        return new BufferValue(</span>
+            priorValue,
+            oldValue,
+<span class="nc" id="L623">            Utils.rawValueTimestampHeaders(value.newValue(), context.timestamp(), context.headers()),</span>
+            context
+        );
+    }
+
+    private static byte[] valuePartWithHeaders(final byte[] rawPlainValue,
+                                               final Headers recordHeaders,
+                                               final String headerKey,
+                                               final long fallbackTimestamp) {
+<span class="nc bnc" id="L632" title="All 2 branches missed.">        if (rawPlainValue == null) {</span>
+<span class="nc" id="L633">            return null;</span>
+        }
+<span class="nc" id="L635">        final Header headersAndTimestamp = recordHeaders.lastHeader(headerKey);</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">        return headersAndTimestamp == null</span>
+<span class="nc" id="L637">            ? Utils.rawValueTimestampHeaders(rawPlainValue, fallbackTimestamp)</span>
+<span class="nc" id="L638">            : Utils.rawValueTimestampHeaders(headersAndTimestamp.value(), rawPlainValue);</span>
+    }
+
+    private ValueTimestampHeadersSerializer&lt;V&gt; valueTimestampHeadersSerializer() {
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        if (valueTimestampHeadersSerializer == null) {</span>
+<span class="nc" id="L643">            valueTimestampHeadersSerializer = new ValueTimestampHeadersSerializer&lt;&gt;(valueSerde.innerSerde().serializer());</span>
+        }
+<span class="nc" id="L645">        return valueTimestampHeadersSerializer;</span>
+    }
+
+    private ValueTimestampHeadersDeserializer&lt;V&gt; valueTimestampHeadersDeserializer() {
+<span class="nc bnc" id="L649" title="All 2 branches missed.">        if (valueTimestampHeadersDeserializer == null) {</span>
+<span class="nc" id="L650">            valueTimestampHeadersDeserializer = new ValueTimestampHeadersDeserializer&lt;&gt;(valueSerde.innerSerde().deserializer());</span>
+        }
+<span class="nc" id="L652">        return valueTimestampHeadersDeserializer;</span>
+    }
+
+    // Serialize a single value part. When storeHeaders is set, the value is wrapped as a
+    // ValueTimestampHeaders blob carrying the given timestamp and headers; otherwise the plain
+    // value bytes are stored (the pre-existing V3 behavior). Returns null for a null value.
+    private byte[] serializeValuePart(final V value, final long timestamp, final Headers headers) {
+<span class="nc bnc" id="L659" title="All 2 branches missed.">        if (value == null) {</span>
+<span class="nc" id="L660">            return null;</span>
+        }
+<span class="nc bnc" id="L662" title="All 2 branches missed.">        if (storeHeaders) {</span>
+<span class="nc" id="L663">            return valueTimestampHeadersSerializer().serialize(changelogTopic, ValueTimestampHeaders.make(value, timestamp, headers));</span>
+        }
+<span class="nc" id="L665">        return valueSerde.innerSerde().serializer().serialize(changelogTopic, headers, value);</span>
+    }
+
+    // Deserialize a single stored value part into a ValueTimestampHeaders. Only valid when
+    // storeHeaders is set (i.e. the part bytes are a ValueTimestampHeaders blob).
+    private ValueTimestampHeaders&lt;V&gt; deserializeValueTimestampHeaders(final byte[] bytes) {
+<span class="nc bnc" id="L671" title="All 2 branches missed.">        return bytes == null ? null : valueTimestampHeadersDeserializer().deserialize(changelogTopic, bytes);</span>
+    }
+
+    // Deserialize a single stored value part into the plain value, handling both the headers-aware
+    // (ValueTimestampHeaders) and plain encodings.
+    private V deserializeValue(final byte[] bytes, final Headers fallbackHeaders) {
+<span class="nc bnc" id="L677" title="All 2 branches missed.">        if (bytes == null) {</span>
+<span class="nc" id="L678">            return null;</span>
+        }
+<span class="nc bnc" id="L680" title="All 2 branches missed.">        if (storeHeaders) {</span>
+<span class="nc" id="L681">            return ValueTimestampHeaders.getValueOrNull(deserializeValueTimestampHeaders(bytes));</span>
+        }
+<span class="nc" id="L683">        return valueSerde.innerSerde().deserializer().deserialize(changelogTopic, fallbackHeaders, bytes);</span>
+    }
+
+    @Override
+    public boolean put(final long time,
+                       final Record&lt;K, Change&lt;V&gt;&gt; record,
+                       final ProcessorRecordContext recordContext) {
+<span class="nc" id="L690">        requireNonNull(record.value(), &quot;value cannot be null&quot;);</span>
+<span class="nc" id="L691">        requireNonNull(recordContext, &quot;recordContext cannot be null&quot;);</span>
+
+        // The headers of the record being processed. These describe the new value: the old value came
+        // from an earlier record and gets its own headers below. The framework keeps recordContext in
+        // sync with the record (see StreamTask#doProcess and ProcessorContextImpl#forward), so this is
+        // the same object as recordContext.headers(); we read it off the record because that is where
+        // it conceptually belongs.
+<span class="nc" id="L698">        final Headers headers = record.headers();</span>
+<span class="nc" id="L699">        final long timestamp = record.timestamp();</span>
+<span class="nc" id="L700">        final Bytes serializedKey = Bytes.wrap(keySerde.serializer().serialize(changelogTopic, headers, record.key()));</span>
+<span class="nc" id="L701">        final BufferValue buffered = getBuffered(serializedKey);</span>
+
+        // The old value's original headers/timestamp are not carried by the incoming record. On an
+        // in-place update we recover them from the entry's previous new value (whose value is exactly
+        // this update's old value); on the first insert for a key they are genuinely unknown.
+<span class="nc" id="L706">        Headers oldHeaders = new RecordHeaders();</span>
+<span class="nc" id="L707">        long oldTimestamp = RecordQueue.UNKNOWN;</span>
+<span class="nc bnc" id="L708" title="All 4 branches missed.">        if (storeHeaders &amp;&amp; buffered != null) {</span>
+<span class="nc" id="L709">            final ValueTimestampHeaders&lt;V&gt; previousNewValue = deserializeValueTimestampHeaders(buffered.newValue());</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">            if (previousNewValue != null) {</span>
+<span class="nc" id="L711">                oldHeaders = previousNewValue.headers();</span>
+<span class="nc" id="L712">                oldTimestamp = previousNewValue.timestamp();</span>
+            }
+        }
+
+<span class="nc" id="L716">        final Change&lt;V&gt; change = record.value();</span>
+        // Order matters, and must stay old-then-new as in FullChangeSerde#serializeParts: a serializer
+        // may write into the headers it is handed (Schema Registry serdes record the schema id there),
+        // and in plain mode both parts are serialized against the same live record headers, so
+        // whichever is serialized last determines what the emitted record carries. That has to be the
+        // new value. In plain mode the old value is therefore serialized with the current record's headers
+        // exactly as before, leaving the stored bytes unchanged for non-header stores.
+<span class="nc bnc" id="L723" title="All 2 branches missed.">        final byte[] oldValue = serializeValuePart(change.oldValue, oldTimestamp, storeHeaders ? oldHeaders : headers);</span>
+<span class="nc" id="L724">        final byte[] newValue = serializeValuePart(change.newValue, timestamp, headers);</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">        final byte[] serializedPriorValue = buffered == null ? oldValue : buffered.priorValue();</span>
+
+<span class="nc" id="L727">        cleanPut(</span>
+            time,
+            serializedKey,
+            new BufferValue(serializedPriorValue, oldValue, newValue, recordContext)
+        );
+<span class="nc bnc" id="L732" title="All 2 branches missed.">        if (loggingEnabled) {</span>
+<span class="nc" id="L733">            dirtyKeys.add(serializedKey);</span>
+        }
+<span class="nc" id="L735">        updateBufferMetrics();</span>
+<span class="nc" id="L736">        return true;</span>
+    }
+
+    private BufferValue getBuffered(final Bytes key) {
+<span class="nc" id="L740">        final BufferKey bufferKey = index.get(key);</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">        return bufferKey == null ? null : sortedMap.get(bufferKey);</span>
+    }
+
+    private void cleanPut(final long time, final Bytes key, final BufferValue value) {
+        // non-resetting semantics:
+        // if there was a previous version of the same record,
+        // then insert the new record in the same place in the priority queue
+
+<span class="nc" id="L749">        final BufferKey previousKey = index.get(key);</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">        if (previousKey == null) {</span>
+<span class="nc" id="L751">            final BufferKey nextKey = new BufferKey(time, key);</span>
+<span class="nc" id="L752">            index.put(key, nextKey);</span>
+<span class="nc" id="L753">            sortedMap.put(nextKey, value);</span>
+<span class="nc" id="L754">            minTimestamp = Math.min(minTimestamp, time);</span>
+<span class="nc" id="L755">            memBufferSize += computeRecordSize(key, value);</span>
+<span class="nc" id="L756">        } else {</span>
+<span class="nc" id="L757">            final BufferValue removedValue = sortedMap.put(previousKey, value);</span>
+<span class="nc" id="L758">            memBufferSize =</span>
+                memBufferSize
+<span class="nc" id="L760">                    + computeRecordSize(key, value)</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">                    - (removedValue == null ? 0 : computeRecordSize(key, removedValue));</span>
+        }
+<span class="nc" id="L763">    }</span>
+
+    @Override
+    public int numRecords() {
+<span class="nc" id="L767">        return index.size();</span>
+    }
+
+    @Override
+    public long bufferSize() {
+<span class="nc" id="L772">        return memBufferSize;</span>
+    }
+
+    @Override
+    public long minTimestamp() {
+<span class="nc" id="L777">        return minTimestamp;</span>
+    }
+
+    private static long computeRecordSize(final Bytes key, final BufferValue value) {
+<span class="nc" id="L781">        long size = 0L;</span>
+<span class="nc" id="L782">        size += 8; // buffer time</span>
+<span class="nc" id="L783">        size += key.get().length;</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">        if (value != null) {</span>
+<span class="nc" id="L785">            size += value.residentMemorySizeEstimate();</span>
+        }
+<span class="nc" id="L787">        return size;</span>
+    }
+
+    private void updateBufferMetrics() {
+<span class="nc" id="L791">        bufferSizeSensor.record(memBufferSize, context.currentSystemTimeMs());</span>
+<span class="nc" id="L792">        bufferCountSensor.record(index.size(), context.currentSystemTimeMs());</span>
+<span class="nc" id="L793">    }</span>
+
+    @Override
+    public String toString() {
+<span class="nc" id="L797">        return &quot;InMemoryTimeOrderedKeyValueChangeBuffer{&quot; +</span>
+            &quot;storeName='&quot; + storeName + '\'' +
+            &quot;, changelogTopic='&quot; + changelogTopic + '\'' +
+            &quot;, open=&quot; + open +
+            &quot;, loggingEnabled=&quot; + loggingEnabled +
+            &quot;, minTimestamp=&quot; + minTimestamp +
+            &quot;, memBufferSize=&quot; + memBufferSize +
+            &quot;, \n\tdirtyKeys=&quot; + dirtyKeys +
+            &quot;, \n\tindex=&quot; + index +
+            &quot;, \n\tsortedMap=&quot; + sortedMap +
+            '}';
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

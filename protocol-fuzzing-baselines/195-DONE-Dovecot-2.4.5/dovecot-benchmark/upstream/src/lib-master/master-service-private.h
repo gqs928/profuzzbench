@@ -1,0 +1,164 @@
+#ifndef MASTER_SERVICE_PRIVATE_H
+#define MASTER_SERVICE_PRIVATE_H
+
+#include "master-interface.h"
+#include "master-service.h"
+
+#include <signal.h>
+
+struct master_service_haproxy_conn;
+
+struct master_service_listener {
+	struct master_service *service;
+	char *name;
+	char *type;
+
+	/* settings */
+	bool ssl;
+	bool haproxy;
+
+	/* state */
+	bool closed;
+	int fd;
+	struct io *io;
+};
+
+struct master_service {
+	struct ioloop *ioloop;
+	struct event *event;
+
+	char *name;
+	char *configured_name;
+	char *getopt_str;
+	const struct option *longopts;
+	enum master_service_flags flags;
+
+	int argc;
+	char **argv;
+
+	const char *version_string;
+	char *config_path;
+	ARRAY_TYPE(const_string) config_overrides;
+	struct settings_root *settings_root;
+	int syslog_facility;
+	data_stack_frame_t datastack_frame_id;
+
+	int accepted_listener_fd;
+	struct master_service_listener *listeners;
+	unsigned int socket_count;
+
+	struct io *io_status_write;
+	/* Set when the master told this process to stop accepting new
+	   connections (MASTER_STOP_FD). */
+	struct io *io_master_stop;
+	/* Set when the master process died (MASTER_ALIVE_FD). Unlike
+	   io_master_stop this isn't triggered by a configuration reload. */
+	struct io *io_master_alive;
+	/* Number of requests left before process is stopped. */
+	unsigned int restart_request_count_left;
+	/* Starts as service's client_limit, but never more than
+	   restart_request_count_left. */
+	unsigned int total_available_count;
+	unsigned int process_limit;
+	unsigned int process_min_avail;
+	unsigned int idle_kill_interval_secs;
+
+	struct master_status master_status;
+	unsigned int last_sent_status_avail_count;
+	time_t last_sent_status_time;
+	struct timeout *to_status;
+
+	bool (*idle_die_callback)(void);
+	void (*die_callback)(void);
+	master_service_killed_callback_t *killed_callback;
+	void *killed_context;
+
+	struct timeout *to_die;
+	/* Time when the master told this process to stop accepting new
+	   connections, or 0 if it hasn't. shutdown_clients_timeout is counted
+	   from this. */
+	time_t stop_time;
+	unsigned int die_timeout_msecs;
+	/* service_shutdown_clients_timeout for this process's own service, as
+	   the master passed it in the environment. */
+	unsigned int shutdown_clients_timeout_secs;
+
+	master_service_avail_overflow_callback_t *avail_overflow_callback;
+	struct timeout *to_overflow_state, *to_overflow_call;
+
+	void (*stop_new_connections_callback)(void *context);
+	void *stop_new_connections_context;
+
+	master_service_connection_callback_t *callback;
+
+	const struct master_service_settings *set;
+
+	struct ssl_iostream_context *ssl_ctx;
+	time_t ssl_params_last_refresh;
+
+	char *current_user;
+	char *last_kick_signal_user;
+	siginfo_t killed_signal_info;
+	volatile sig_atomic_t last_kick_signal_user_accessed;
+	volatile sig_atomic_t last_kick_signal_user_matched;
+	volatile sig_atomic_t killed_signal;
+	/* The killed_signal was sent by the master process. It can't be a
+	   user kick, so there is no point in waiting for a kick command. */
+	volatile sig_atomic_t killed_by_master;
+	volatile struct timeval killed_time;
+
+	struct stats_client *stats_client;
+	struct master_service_haproxy_conn *haproxy_conns;
+	struct event_filter *process_shutdown_filter;
+
+	bool lib_initialized_externally:1;
+	bool stopping:1;
+	bool keep_environment:1;
+	bool options_parsed:1;
+	bool log_directly:1;
+	bool initial_status_sent:1;
+	/* die_with_master overrides shutdown_clients_timeout */
+	bool die_with_master_set:1;
+	bool die_with_master:1;
+	/* master_service_die_now() was already called */
+	bool die_started:1;
+	bool call_avail_overflow:1;
+	bool config_path_changed_with_param:1;
+	bool have_admin_sockets:1;
+	bool reuse_port:1;
+	bool want_ssl_server:1;
+	bool config_path_from_master:1;
+	bool log_initialized:1;
+	bool init_finished:1;
+	bool killed_signal_logged:1;
+	bool io_status_waiting:1;
+};
+
+void master_service_io_listeners_add(struct master_service *service);
+void master_status_update(struct master_service *service);
+
+void master_service_io_listeners_remove(struct master_service *service);
+void master_service_ssl_io_listeners_remove(struct master_service *service);
+
+void master_service_client_connection_handled(struct master_service *service,
+					      struct master_service_connection *conn);
+void master_service_client_connection_callback(struct master_service *service,
+					       struct master_service_connection *conn);
+
+void master_service_add_stop_new_connections_callback(
+	struct master_service *service,
+	void (*callback)(void *context), void *context);
+void master_service_remove_stop_new_connections_callback(
+	struct master_service *service,
+	void (*callback)(void *context), void *context);
+
+void master_service_haproxy_new(struct master_service *service,
+				struct master_service_connection *conn);
+void master_service_haproxy_abort(struct master_service *service);
+
+void master_admin_clients_deinit(void);
+/* Wait for a while for master-admin connections that haven't sent their
+   command yet. */
+void master_admin_clients_wait_commands(void);
+
+#endif

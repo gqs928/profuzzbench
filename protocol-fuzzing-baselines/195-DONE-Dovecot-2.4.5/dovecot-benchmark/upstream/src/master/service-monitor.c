@@ -1,0 +1,1059 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "common.h"
+#include "array.h"
+#include "ioloop.h"
+#include "hash.h"
+#include "llist.h"
+#include "str.h"
+#include "safe-mkstemp.h"
+#include "time-util.h"
+#include "sleep.h"
+#include "master-client.h"
+#include "service.h"
+#include "service-process.h"
+#include "service-process-notify.h"
+#include "service-anvil.h"
+#include "service-log.h"
+#include "service-monitor.h"
+
+#include <unistd.h>
+#include <sys/wait.h>
+#include <syslog.h>
+#include <signal.h>
+
+#define SERVICE_DROP_WARN_INTERVAL_SECS 1
+#define SERVICE_DROP_TIMEOUT_MSECS (10*1000)
+#define SERVICE_LOG_DROP_WARNING_DELAY_MSECS 500
+#define MAX_DIE_WAIT_MSECS 5000
+#define SERVICE_MAX_EXIT_FAILURES_IN_SEC 10
+#define SERVICE_MIN_SUCCESSFUL_AGE_SECS 10
+#define SERVICE_PREFORK_MAX_AT_ONCE 10
+
+static void service_monitor_start_extra_avail(struct service *service);
+static void service_status_more(struct service_process *process,
+				unsigned int status_available_count);
+static void service_monitor_listen_start_force(struct service *service);
+
+static void service_process_idle_kill_timeout(struct service_process *process)
+{
+	e_error(process->service->event, "Process %s is ignoring idle SIGINT",
+		dec2str(process->pid));
+
+	timeout_remove(&process->to_idle_kill);
+
+	/* assume this process is busy */
+	service_status_more(process, 0);
+	process->available_count = 0;
+}
+
+static void service_kill_idle(struct service *service)
+{
+	/* Kill extra idling processes to reduce their number. The idea here is
+	   that if the load stays the same, by killing the lowwater number of
+	   processes there won't be any extra idling processes left. */
+	unsigned int processes_to_kill =
+		service->process_idling_lowwater_since_kills;
+	service->process_idling_lowwater_since_kills = service->process_idling;
+
+	/* Always try to leave process_min_avail processes */
+	i_assert(processes_to_kill <= service->process_avail);
+	if (processes_to_kill <= service->set->process_min_avail) {
+		if (service->process_idling == 0)
+			timeout_remove(&service->to_idle);
+		return;
+	}
+	processes_to_kill -= service->set->process_min_avail;
+
+	/* Now, kill the processes with the oldest idle_start time.
+
+	   (It's actually not important which processes get killed. A better
+	   way could be to kill the oldest processes since they might have to
+	   be restarted anyway soon due to reaching restart_request_count, but
+	   we'd have to use priority queue for tracking that, which is more
+	   expensive and probably not worth it.) */
+	for (; processes_to_kill > 0; processes_to_kill--) {
+		struct service_process *process = service->idle_processes_head;
+
+		i_assert(process != NULL);
+		if (process->to_idle_kill != NULL) {
+			/* already tried to kill all the idle processes */
+			break;
+		}
+
+		i_assert(process->available_count == service->client_limit);
+		if (kill(process->pid, SIGINT) < 0 && errno != ESRCH) {
+			e_error(service->event, "kill(%s, SIGINT) failed: %m",
+				dec2str(process->pid));
+		}
+		process->last_kill_sent = ioloop_time;
+		process->to_idle_kill =
+			timeout_add(service->idle_kill_interval * 1000,
+				    service_process_idle_kill_timeout, process);
+
+		/* Move it to the end of the list, so it's not tried to be
+		   killed again. */
+		DLLIST2_REMOVE(&service->idle_processes_head,
+			       &service->idle_processes_tail, process);
+		DLLIST2_APPEND(&service->idle_processes_head,
+			       &service->idle_processes_tail, process);
+	}
+}
+
+static void service_status_more(struct service_process *process,
+				unsigned int status_available_count)
+{
+	struct service *service = process->service;
+
+	if (process->idle_start != 0) {
+		/* idling process became busy */
+		DLLIST2_REMOVE(&service->idle_processes_head,
+			       &service->idle_processes_tail, process);
+		DLLIST_PREPEND(&service->busy_processes, process);
+		process->idle_start = 0;
+
+		i_assert(service->process_idling > 0);
+		i_assert(service->process_idling <= service->process_avail);
+		service->process_idling--;
+		service->process_idling_lowwater_since_kills =
+			I_MIN(service->process_idling_lowwater_since_kills,
+			      service->process_idling);
+	}
+	process->total_count +=
+		process->available_count - status_available_count;
+
+	if (status_available_count != 0)
+		return;
+
+	/* process used up all of its clients */
+	i_assert(service->process_avail > 0);
+	service->process_avail--;
+	i_assert(service->process_idling <= service->process_avail);
+
+	if (service->type == SERVICE_TYPE_LOGIN &&
+	    service->process_avail == 0 &&
+	    service_active_process_count(service) >= service->process_limit)
+		service_login_notify(service, TRUE);
+
+	if (service->set->reuse_port &&
+	    service->last_drop_warning +
+	    SERVICE_DROP_WARN_INTERVAL_SECS <= ioloop_time) {
+		service->last_drop_warning = ioloop_time;
+		e_warning(service->event,
+			  "client_limit (%u) reached, client connections are being dropped (pid=%s, reuse_port=yes)",
+			  service->client_limit, dec2str(process->pid));
+	}
+
+	/* we may need to start more */
+	service_monitor_start_extra_avail(service);
+	service_monitor_listen_start(service);
+}
+
+static void service_check_idle(struct service_process *process)
+{
+	struct service *service = process->service;
+
+	if (process->available_count != service->client_limit)
+		return;
+
+	if (process->idle_start == 0) {
+		/* busy process started idling */
+		DLLIST_REMOVE(&service->busy_processes, process);
+		service->process_idling++;
+		i_assert(service->process_idling <= service->process_avail);
+	} else {
+		/* Idling process updated its status again to be idling. Maybe
+		   it was busy for a little bit? Update its idle_start time. */
+		DLLIST2_REMOVE(&service->idle_processes_head,
+			       &service->idle_processes_tail, process);
+	}
+	DLLIST2_APPEND(&service->idle_processes_head,
+		       &service->idle_processes_tail, process);
+	process->idle_start = ioloop_time;
+
+	if (service->process_avail > service->set->process_min_avail &&
+	    service->to_idle == NULL && !service->monitor_stopped &&
+	    service->idle_kill_interval != UINT_MAX) {
+		/* We have more processes than we really need. Start a timer
+		   to trigger idle_kill_interval. Stopped services are skipped,
+		   because their processes are no longer ours to manage - they
+		   are either waited for to die on their own or killed by
+		   services_kill_timeout(). */
+		service->to_idle =
+			timeout_add(service->idle_kill_interval * 1000,
+				    service_kill_idle, service);
+	}
+}
+
+static void service_status_less(struct service_process *process)
+{
+	struct service *service = process->service;
+
+	/* some process got more connections - remove the delayed warning */
+	timeout_remove(&service->to_drop_warning);
+
+	if (process->available_count == 0) {
+		/* process can accept more clients again */
+		if (service->process_avail++ == 0)
+			service_monitor_listen_stop(service);
+		i_assert(service->process_avail +
+			 service->retired_process_count <= service->process_count);
+	}
+	if (service->type == SERVICE_TYPE_LOGIN)
+		service_login_notify(service, FALSE);
+}
+
+static void
+service_status_input_one(struct service *service,
+			 const struct master_status *status)
+{
+        struct service_process *process;
+
+	process = hash_table_lookup(service_pids, POINTER_CAST(status->pid));
+	if (process == NULL) {
+		/* we've probably wait()ed it away already. ignore */
+		return;
+	}
+
+	if (process->uid != status->uid || process->service != service) {
+		/* a) Process was closed and another process was created with
+		   the same PID, but we're still receiving status update from
+		   the old process.
+
+		   b) Some process is trying to corrupt our internal state by
+		   trying to pretend to be someone else. We could use stronger
+		   randomness here, but the worst they can do is DoS and there
+		   are already more serious problems if someone is able to do
+		   this.. */
+		e_error(service->event, "Ignoring invalid update from child %s "
+			      "(UID=%u)", dec2str(status->pid), status->uid);
+		return;
+	}
+	process->last_status_update = ioloop_time;
+	/* process worked a bit - it may have ignored idle-kill signal */
+	timeout_remove(&process->to_idle_kill);
+
+	/* first status notification */
+	if (process->to_status != NULL) {
+		timeout_remove(&process->to_status);
+		if (service->kill_sigterm_sent) {
+			/* The service was killed while this process was still
+			   uninitialized, so it was skipped and only the next
+			   escalation would have reached it - with a SIGKILL.
+			   Send the SIGTERM now that the process can handle
+			   it. */
+			if (kill(process->pid, SIGTERM) == 0) {
+				e_debug(service->event,
+					"Sent delayed SIGTERM to %s process %s",
+					service->set->name,
+					dec2str(process->pid));
+			} else if (errno != ESRCH) {
+				e_error(service->event,
+					"kill(%s, SIGTERM) failed: %m",
+					dec2str(process->pid));
+			}
+		}
+	}
+
+	if (status->available_count == UINT_MAX) {
+		/* restart_request_count reached. If this is a service with
+		   client_limit > 1, we mark it as retired and stop counting
+		   it towards process_limit. */
+		if (!process->retired && service->client_limit > 1) {
+			process->retired = TRUE;
+			service->retired_process_count++;
+			i_assert(service->retired_process_count <= service->process_count);
+		}
+		if (process->available_count != 0) {
+			process->available_count = 0;
+			service_status_more(process, 0);
+		}
+	} else if (process->available_count != status->available_count) {
+		if (process->available_count > status->available_count) {
+			/* process started servicing some more clients */
+			service_status_more(process, status->available_count);
+		} else {
+			/* process finished servicing some clients */
+			service_status_less(process);
+		}
+		process->available_count = status->available_count;
+	}
+	service_check_idle(process);
+}
+
+static void service_status_input(struct service *service)
+{
+	struct master_status status[1024/sizeof(struct master_status)];
+	unsigned int i, count;
+	ssize_t ret;
+
+	ret = read(service->status_fd[0], &status, sizeof(status));
+	if (ret <= 0) {
+		if (ret == 0)
+			e_error(service->event, "read(status) failed: EOF");
+		else if (errno != EAGAIN)
+			e_error(service->event, "read(status) failed: %m");
+		else
+			return;
+		/* Close the status fd explicitly. service_monitor_stop()
+		   wouldn't do it while there are still processes running,
+		   which would cause this callback to be called in a loop. */
+		service_monitor_close_status_fd(service);
+		service_monitor_stop(service, TRUE);
+		return;
+	}
+
+	if ((ret % sizeof(struct master_status)) != 0) {
+		e_error(service->event, "service sent partial status update "
+			      "(%d bytes)", (int)ret);
+		return;
+	}
+
+	count = ret / sizeof(struct master_status);
+	for (i = 0; i < count; i++)
+		service_status_input_one(service, &status[i]);
+	/* If ret==sizeof(status) there may be more input available, but do it
+	   in the next ioloop run. This way a single service can't flood the
+	   master process and cause it to hang entirely. */
+}
+
+static void service_log_drop_warning(struct service *service)
+{
+	const char *limit_name;
+	unsigned int limit;
+
+	if (service->last_drop_warning +
+	    SERVICE_DROP_WARN_INTERVAL_SECS <= ioloop_time) {
+		service->last_drop_warning = ioloop_time;
+		if (service->process_limit > 1) {
+			limit_name = "process_limit";
+			limit = service->process_limit;
+		} else if (service->set->restart_request_count == 1) {
+			i_assert(service->client_limit == 1);
+			limit_name = "client_limit/restart_request_count";
+			limit = 1;
+		} else {
+			limit_name = "client_limit";
+			limit = service->client_limit;
+		}
+		e_warning(service->event,
+			  "%s (%u) reached, client connections are being dropped",
+			  limit_name, limit);
+	}
+}
+
+static void service_drop_warning_timeout(struct service *service)
+{
+	/* The warning is cancelled when a process reports that it became
+	   available again. The ioloop runs timeouts before I/Os, so such a
+	   status update may already be waiting to be read - especially if the
+	   ioloop was delayed past this timeout's deadline. Read the pending
+	   status updates first, so a client that just reconnects to a busy
+	   service doesn't cause a warning about a limit that isn't really
+	   being reached. */
+	if (service->status_fd[0] != -1)
+		service_status_input(service);
+	if (service->to_drop_warning == NULL) {
+		/* a process became available - this was a false alarm */
+		return;
+	}
+	timeout_remove(&service->to_drop_warning);
+	service_log_drop_warning(service);
+}
+
+static void service_monitor_throttle(struct service *service)
+{
+	if (service->to_throttle != NULL || service->list->destroying)
+		return;
+
+	i_assert(service->throttle_msecs > 0);
+
+	e_error(service->event,
+		      "command startup failed, throttling for %u.%03u secs",
+		      service->throttle_msecs / 1000,
+		      service->throttle_msecs % 1000);
+	service_throttle(service, service->throttle_msecs);
+	service->throttle_msecs *= 2;
+	if (service->throttle_msecs >
+	    SERVICE_STARTUP_FAILURE_THROTTLE_MAX_MSECS) {
+		service->throttle_msecs =
+			SERVICE_STARTUP_FAILURE_THROTTLE_MAX_MSECS;
+	}
+}
+
+static void service_drop_timeout(struct service *service)
+{
+	struct service_listener *lp;
+	int fd;
+
+	i_assert(service->process_avail == 0);
+
+	/* drop all pending connections */
+	array_foreach_elem(&service->listeners, lp) {
+		while ((fd = net_accept(lp->fd, NULL, NULL)) > 0)
+			net_disconnect(fd);
+	}
+
+	service_monitor_listen_start_force(service);
+	service->listen_pending = TRUE;
+}
+
+static void service_monitor_listen_pending(struct service *service)
+{
+	i_assert(service->process_avail == 0);
+
+	service_monitor_listen_stop(service);
+	service->listen_pending = TRUE;
+
+	service->to_drop = timeout_add(SERVICE_DROP_TIMEOUT_MSECS,
+				       service_drop_timeout, service);
+}
+
+/* A new connection arrived to a listener, but process_limit is reached and
+   none of the processes can accept more clients. This is handled in two
+   stages:
+
+   1. Master stops listening and waits up to SERVICE_DROP_TIMEOUT_MSECS for
+      a process to become available. Meanwhile the new connections wait in
+      the listener's queue. This way temporary peaks don't cause connections
+      to be dropped.
+
+   2. If no process became available, the pending connections are dropped
+      and master starts listening again. Each new connection is now
+      immediately accepted and closed.
+
+   Once a process becomes available or exits, the limit is no longer reached
+   and the connections are handled normally again. If the limit is reached
+   again later, it starts from stage 1.
+
+   The "limit reached, client connections are being dropped" warning is
+   logged at most once per SERVICE_DROP_WARN_INTERVAL_SECS:
+
+   - In stage 1 it's logged SERVICE_LOG_DROP_WARNING_DELAY_MSECS after the
+     stage started, unless a process became available or exited in the
+     meantime. A process may already be available without master knowing
+     it yet, e.g. when a client disconnects and immediately reconnects.
+   - In stage 2 it's logged whenever a connection is dropped.
+
+   Login services are different: they log the warning immediately and notify
+   the login processes to start killing their existing connections when they
+   reach client_limit. Their pending connections are also dropped after
+   SERVICE_DROP_TIMEOUT_MSECS, but they never do stage 2's accept-and-close.
+   A new connection arriving after that starts stage 1 again. */
+static void service_drop_connections(struct service_listener *l)
+{
+	struct service *service = l->service;
+	int fd;
+
+	if (service->type == SERVICE_TYPE_LOGIN) {
+		service_log_drop_warning(service);
+		service_login_notify(service, TRUE);
+		service_monitor_listen_pending(service);
+	} else if (!service->listen_pending) {
+		/* stage 1 */
+		service_monitor_listen_pending(service);
+		i_assert(service->to_drop_warning == NULL);
+		service->to_drop_warning =
+			timeout_add_short(SERVICE_LOG_DROP_WARNING_DELAY_MSECS,
+					  service_drop_warning_timeout, service);
+	} else {
+		/* stage 2: accept and close the connection, so it's clear
+		   that this is happening because of the limit, rather than
+		   because the service processes aren't answering fast
+		   enough */
+		service_log_drop_warning(service);
+		fd = net_accept(l->fd, NULL, NULL);
+		if (fd > 0)
+			net_disconnect(fd);
+	}
+}
+
+static void service_accept(struct service_listener *l)
+{
+	struct service *service = l->service;
+	int fd = -1;
+
+	i_assert(service->process_avail == 0);
+
+	if (service_active_process_count(service) >= service->process_limit) {
+		/* we've reached our limits, new clients will have to
+		   wait until there are more processes available */
+		service_drop_connections(l);
+		return;
+	}
+
+	if (service->client_limit == 1 &&
+	    (l->type == SERVICE_LISTENER_INET ||
+	     (l->type == SERVICE_LISTENER_UNIX &&
+	      !l->set.fileset.pid_listener))) {
+		/* pre-accept() a client fd for services with client_limit=1,
+		   so we can rapidly create new processes as needed. */
+		fd = net_accept(l->fd, NULL, NULL);
+		if (fd == -1) {
+			if (!NET_ACCEPT_ENOCONN(errno))
+				e_error(service->event, "net_accept() failed: %m");
+			return;
+		}
+		fd_close_on_exec(fd, TRUE);
+	} else {
+		/* the created child process will accept() the connection */
+	}
+
+	if (service_process_create(service, fd, l) == NULL) {
+		/* failed to create the process */
+		service_monitor_throttle(service);
+	} else if (fd == -1) {
+		service_monitor_listen_stop(service);
+	}
+	if (fd != -1)
+		net_disconnect(fd);
+}
+
+static bool
+service_monitor_start_count(struct service *service, unsigned int limit)
+{
+	unsigned int i, count;
+
+	i_assert(service->set->process_min_avail >= service->process_avail);
+
+	unsigned int active_process_count =
+		service_active_process_count(service);
+	count = service->set->process_min_avail - service->process_avail;
+	if (active_process_count + count > service->process_limit)
+		count = service->process_limit - active_process_count;
+	if (count > limit)
+		count = limit;
+
+	for (i = 0; i < count; i++) {
+		if (service_process_create(service, -1, NULL) == NULL) {
+			service_monitor_throttle(service);
+			break;
+		}
+	}
+	if (i > 0) {
+		/* we created some processes, they'll do the listening now */
+		service_monitor_listen_stop(service);
+	}
+	return i >= limit;
+}
+
+static void service_monitor_prefork_timeout(struct service *service)
+{
+	/* don't prefork more processes if other more important processes had
+	   been forked while we were waiting for this timeout (= master seems
+	   busy) */
+	if (service->list->fork_counter != service->prefork_counter) {
+		service->prefork_counter = service->list->fork_counter;
+		return;
+	}
+	if (service->process_avail < service->set->process_min_avail) {
+		if (service_monitor_start_count(service, SERVICE_PREFORK_MAX_AT_ONCE) &&
+		    service->process_avail < service->set->process_min_avail) {
+			/* All SERVICE_PREFORK_MAX_AT_ONCE were created, but
+			   it still wasn't enough. Launch more in the next
+			   timeout. */
+			return;
+		}
+	}
+	timeout_remove(&service->to_prefork);
+}
+
+static void service_monitor_start_extra_avail(struct service *service)
+{
+	if (service->process_avail >= service->set->process_min_avail ||
+	    service_active_process_count(service) >= service->process_limit ||
+	    service->list->destroying || service->monitor_stopped)
+		return;
+
+	if (service->process_avail == 0) {
+		/* quickly start one process now */
+		if (!service_monitor_start_count(service, 1))
+			return;
+		if (service->process_avail >= service->set->process_min_avail)
+			return;
+	}
+	if (service->to_prefork == NULL) {
+		/* ioloop handles timeouts before fds (= SIGCHLD callback),
+		   so let the first timeout handler call simply update the fork
+		   counter and the second one check if we're busy or not. */
+		service->to_prefork =
+			timeout_add_short(0, service_monitor_prefork_timeout, service);
+	}
+}
+
+static void service_monitor_listen_start_force(struct service *service)
+{
+	struct service_listener *l;
+
+	service->listening = TRUE;
+	service->listen_pending = FALSE;
+	timeout_remove(&service->to_drop);
+	timeout_remove(&service->to_drop_warning);
+
+	array_foreach_elem(&service->listeners, l) {
+		if (l->io == NULL && l->fd != -1 && !service->set->reuse_port)
+			l->io = io_add(l->fd, IO_READ, service_accept, l);
+	}
+}
+
+void service_monitor_listen_start(struct service *service)
+{
+	if (service->monitor_stopped ||
+	    service->process_avail > 0 || service->to_throttle != NULL ||
+	    (service_active_process_count(service) >= service->process_limit &&
+	     service->listen_pending))
+		return;
+
+	service_monitor_listen_start_force(service);
+}
+
+void service_monitor_listen_stop(struct service *service)
+{
+	struct service_listener *l;
+
+	array_foreach_elem(&service->listeners, l)
+		io_remove(&l->io);
+	service->listening = FALSE;
+	service->listen_pending = FALSE;
+	timeout_remove(&service->to_drop);
+	timeout_remove(&service->to_drop_warning);
+}
+
+static int service_login_create_notify_fd(struct service *service)
+{
+	int fd, ret;
+
+	if (service->login_notify_fd != -1)
+		return 0;
+
+	T_BEGIN {
+		string_t *prefix = t_str_new(128);
+		const char *path;
+
+		str_append(prefix, service->list->set->base_dir);
+		str_append(prefix, "/login-master-notify");
+
+		fd = safe_mkstemp(prefix, 0600, (uid_t)-1, (gid_t)-1);
+		path = str_c(prefix);
+
+		if (fd == -1) {
+			e_error(service->event, "safe_mkstemp(%s) failed: %m",
+				      path);
+		} else if (unlink(path) < 0) {
+			e_error(service->event, "unlink(%s) failed: %m", path);
+		} else {
+			fd_close_on_exec(fd, TRUE);
+			service->login_notify_fd = fd;
+		}
+	} T_END;
+
+	ret = fd == -1 ? -1 : 0;
+	if (fd != service->login_notify_fd)
+		i_close_fd(&fd);
+	return ret;
+}
+
+void services_monitor_start(struct service_list *service_list)
+{
+	ARRAY(struct service *) listener_services;
+	struct service *service;
+
+	if (services_log_init(service_list) < 0)
+		return;
+	service_anvil_monitor_start(service_list);
+
+	if (service_list->io_master == NULL &&
+	    service_list->master_fd != -1) {
+		service_list->io_master =
+			io_add(service_list->master_fd, IO_READ,
+			       master_client_connected, service_list);
+	}
+
+	t_array_init(&listener_services, array_count(&service_list->services));
+	array_foreach_elem(&service_list->services, service) {
+		if (service->type == SERVICE_TYPE_LOGIN) {
+			if (service_login_create_notify_fd(service) < 0)
+				continue;
+		}
+		if (service->stop_pipe_fd[0] == -1) {
+			if (pipe(service->stop_pipe_fd) < 0) {
+				e_error(service->event, "pipe() failed: %m");
+				continue;
+			}
+			fd_close_on_exec(service->stop_pipe_fd[0], TRUE);
+			fd_close_on_exec(service->stop_pipe_fd[1], TRUE);
+		}
+		if (service->status_fd[0] == -1) {
+			/* we haven't yet created status pipe */
+			if (pipe(service->status_fd) < 0) {
+				e_error(service->event, "pipe() failed: %m");
+				continue;
+			}
+
+			net_set_nonblock(service->status_fd[0], TRUE);
+			fd_close_on_exec(service->status_fd[0], TRUE);
+			net_set_nonblock(service->status_fd[1], TRUE);
+			fd_close_on_exec(service->status_fd[1], TRUE);
+		}
+		if (service->io_status == NULL) {
+			service->io_status =
+				io_add(service->status_fd[0], IO_READ,
+				       service_status_input, service);
+		}
+		service->monitor_stopped = FALSE;
+		service_monitor_listen_start(service);
+		array_push_back(&listener_services, &service);
+	}
+
+	/* create processes only after adding all listeners */
+	array_foreach_elem(&listener_services, service)
+		service_monitor_start_extra_avail(service);
+
+	if (service_list->log->status_fd[0] != -1) {
+		if (service_process_create(service_list->log, -1, NULL) != NULL)
+			service_monitor_listen_stop(service_list->log);
+	}
+
+	/* start up a process for startup-services */
+	array_foreach_elem(&service_list->services, service) {
+		if (service->type == SERVICE_TYPE_STARTUP &&
+		    service->status_fd[0] != -1) {
+			if (service_process_create(service, -1, NULL) != NULL)
+				service_monitor_listen_stop(service);
+		}
+	}
+}
+
+static void service_monitor_close_stop_pipe(struct service *service)
+{
+	if (service->stop_pipe_fd[0] != -1) {
+		i_close_fd(&service->stop_pipe_fd[0]);
+		i_close_fd(&service->stop_pipe_fd[1]);
+	}
+}
+
+void service_monitor_close_status_fd(struct service *service)
+{
+	int i;
+
+	io_remove(&service->io_status);
+
+	if (service->status_fd[0] != -1 &&
+	    service->type != SERVICE_TYPE_ANVIL) {
+		for (i = 0; i < 2; i++) {
+			if (close(service->status_fd[i]) < 0) {
+				e_error(service->event,
+					      "close(status fd) failed: %m");
+			}
+			service->status_fd[i] = -1;
+		}
+	}
+}
+
+void service_monitor_stop(struct service *service, bool close_stop_pipe)
+{
+	service->monitor_stopped = TRUE;
+
+	/* Keep the status fd open as long as there are processes running.
+	   Otherwise a process that hasn't yet sent its initial status
+	   notification could never send it, and it would be killed by the
+	   status timeout. The fd is closed once the last process is
+	   destroyed. */
+	if (service->process_count == 0)
+		service_monitor_close_status_fd(service);
+
+	if (close_stop_pipe)
+		service_monitor_close_stop_pipe(service);
+	if (service->login_notify_fd != -1) {
+		if (close(service->login_notify_fd) < 0) {
+			e_error(service->event,
+				      "close(login notify fd) failed: %m");
+		}
+		service->login_notify_fd = -1;
+	}
+	timeout_remove(&service->to_login_notify);
+	service_monitor_listen_stop(service);
+
+	timeout_remove(&service->to_throttle);
+	timeout_remove(&service->to_prefork);
+	timeout_remove(&service->to_idle);
+}
+
+void service_monitor_stop_close(struct service *service)
+{
+	struct service_listener *l;
+
+	service_monitor_stop(service, TRUE);
+
+	array_foreach_elem(&service->listeners, l)
+		i_close_fd(&l->fd);
+}
+
+static void services_monitor_wait(struct service_list *service_list)
+{
+	struct service *service;
+	struct timeval tv_start;
+	bool finished;
+
+	io_loop_time_refresh();
+	tv_start = ioloop_timeval;
+
+	for (;;) {
+		finished = TRUE;
+		services_monitor_reap_children();
+		array_foreach_elem(&service_list->services, service) {
+			if (service->status_fd[0] != -1)
+				service_status_input(service);
+			if (service->stop_pipe_fd[0] != -1) {
+				/* Not told to stop yet, so don't wait for it
+				   either - see services_monitor_stop(). */
+				continue;
+			}
+			if (service->process_avail > 0)
+				finished = FALSE;
+		}
+		io_loop_time_refresh();
+		if (finished ||
+		    timeval_diff_msecs(&ioloop_timeval, &tv_start) > MAX_DIE_WAIT_MSECS)
+			break;
+		i_sleep_msecs(10);
+	}
+}
+
+static bool
+service_processes_list_close_listeners(struct service *service,
+				       struct service_process *processes)
+{
+	struct service_process *process = processes;
+	bool ret = FALSE;
+
+	for (; process != NULL; process = process->next) {
+		if (kill(process->pid, SIGQUIT) == 0)
+			ret = TRUE;
+		else if (errno != ESRCH) {
+			e_error(service->event, "kill(%s, SIGQUIT) failed: %m",
+				      dec2str(process->pid));
+		}
+	}
+	return ret;
+}
+
+static bool service_processes_close_listeners(struct service *service)
+{
+	bool ret = FALSE;
+
+	if (service_processes_list_close_listeners(service,
+						   service->busy_processes))
+		ret = TRUE;
+	if (service_processes_list_close_listeners(service,
+						   service->idle_processes_head))
+		ret = TRUE;
+	return ret;
+}
+
+static bool
+service_list_processes_close_listeners(struct service_list *service_list)
+{
+	struct service *service;
+	bool ret = FALSE;
+
+	array_foreach_elem(&service_list->services, service) {
+		if (service_processes_close_listeners(service)) {
+			if (service->type != SERVICE_TYPE_LOG)
+				ret = TRUE;
+			else {
+				/* The log process won't stop until we close its
+				   fds later on. Send a SIGQUIT to it anyway
+				   just in case it's stuck for some reason, but
+				   don't wait for it to be processed. This way
+				   there is no unnecessary 1sec wait. */
+			}
+		}
+	}
+	return ret;
+}
+
+static void services_monitor_kill_listeners(struct service_list *service_list)
+{
+	/* Even if the waiting stopped early because all the process_avail==0,
+	   it can mean that there are processes that have the listener socket
+	   open (just not actively being listened to). We'll need to make sure
+	   that those sockets are closed before we exit, so that a restart
+	   won't fail. Do this by sending SIGQUIT to all the child processes
+	   that are left, which are handled by lib-master to immediately close
+	   the listener in the signal handler itself. */
+	if (service_list_processes_close_listeners(service_list)) {
+		/* SIGQUITs were sent. wait a little bit to make sure they're
+		   also processed before quitting. */
+		i_sleep_msecs(1000);
+	}
+}
+
+/* Tells the stats process to stop. This is done separately from the rest of
+   the generation, because its clients switch over to a new stats process as
+   soon as they are told to: the new generation's stats-writer listener has to
+   exist before that happens. */
+void services_monitor_stop_stats(struct service_list *service_list)
+{
+	if (service_list->stats != NULL)
+		service_monitor_close_stop_pipe(service_list->stats);
+}
+
+void services_monitor_stop(struct service_list *service_list, bool wait)
+{
+	struct service *service;
+
+	array_foreach_elem(&service_list->services, service) {
+		if (service == service_list->stats) {
+			/* Stopped separately - see
+			   services_monitor_stop_stats(). */
+			continue;
+		}
+		service_monitor_close_stop_pipe(service);
+	}
+
+	if (wait) {
+		/* Wait for the children to either die or to tell that they're
+		   no longer listening for new connections. */
+		services_monitor_wait(service_list);
+		/* The master itself is stopping, so this generation isn't
+		   being replaced by another one: there is no new stats process
+		   for the other processes to switch to, like a configuration
+		   reload gives them. They log events while they are
+		   deinitializing, so the stats process is told to stop only
+		   now that they are gone. It stops on its own once its clients
+		   have disconnected, so don't wait for it - that would just
+		   delay the shutdown. The log process keeps running even
+		   longer, until its fds are closed, so their last log messages
+		   are written out as well. */
+		services_monitor_stop_stats(service_list);
+		services_monitor_kill_listeners(service_list);
+	}
+
+	io_remove(&service_list->io_master);
+
+	array_foreach_elem(&service_list->services, service) {
+		service_monitor_stop(service,
+				     service != service_list->stats);
+	}
+
+	services_log_deinit(service_list);
+}
+
+static bool
+service_has_successful_processes_in_list(struct service *service,
+					 struct service_process *processes)
+{
+	/* See if there is a process that has existed for a while and has
+	   received the initial status notification. The oldest processes are
+	   last in the list, so just scan through all of them. */
+	struct service_process *process = processes;
+	for (; process != NULL; process = process->next) {
+		time_t age_secs = ioloop_time - process->create_time;
+		if (age_secs >= SERVICE_MIN_SUCCESSFUL_AGE_SECS &&
+		    process->to_status == NULL) {
+			/* Remember this so this list doesn't have to be
+			   scanned again. */
+			service->have_successful_exits = TRUE;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static bool service_has_successful_processes(struct service *service)
+{
+	if (service->have_successful_exits)
+		return TRUE;
+
+	return service_has_successful_processes_in_list(service,
+			service->busy_processes) ||
+		service_has_successful_processes_in_list(service,
+			service->idle_processes_head);
+}
+
+static bool
+service_process_failure(struct service_process *process, int status)
+{
+	struct service *service = process->service;
+	bool throttle;
+
+	service_process_log_status_error(process, status);
+	throttle = process->to_status != NULL;
+	if (!throttle && !service_has_successful_processes(service)) {
+		/* This service has seen no successful exits yet and no
+		   processes that were already running for a while.
+		   Try to avoid failure storms at Dovecot startup by throttling
+		   the service if it only keeps failing rapidly. This is no
+		   longer done after the service looks to be generally working,
+		   in case an attacker finds a way to quickly crash their own
+		   session. */
+		if (service->exit_failure_last != ioloop_time) {
+			service->exit_failure_last = ioloop_time;
+			service->exit_failures_in_sec = 0;
+		}
+		if (++service->exit_failures_in_sec > SERVICE_MAX_EXIT_FAILURES_IN_SEC)
+			throttle = TRUE;
+	}
+	service_process_notify_add(service_anvil_global->kills, process);
+	return throttle;
+}
+
+void services_monitor_reap_children(void)
+{
+	struct service_process *process;
+	struct service *service;
+	pid_t pid;
+	int status;
+	bool service_stopped, throttle;
+
+	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+		process = hash_table_lookup(service_pids, POINTER_CAST(pid));
+		if (process == NULL) {
+			i_error("waitpid() returned unknown PID %s",
+				dec2str(pid));
+			continue;
+		}
+
+		service = process->service;
+		if (status == 0) {
+			/* success - one success resets all failures */
+			service->have_successful_exits = TRUE;
+			service->exit_failures_in_sec = 0;
+			service->throttle_msecs =
+				SERVICE_STARTUP_FAILURE_THROTTLE_MIN_MSECS;
+			throttle = FALSE;
+		} else {
+			throttle = service_process_failure(process, status);
+		}
+		if (service->type == SERVICE_TYPE_ANVIL)
+			service_anvil_process_destroyed(process);
+
+		/* if we're reloading, we may get here with a service list
+		   that's going to be destroyed after this process is
+		   destroyed. keep the list referenced until we're done. */
+		service_list_ref(service->list);
+		service_process_destroy(process);
+
+		if (throttle)
+			service_monitor_throttle(service);
+		service_stopped = service->monitor_stopped ||
+			service->status_fd[0] == -1;
+		if (!service_stopped && !service->list->destroying) {
+			service_monitor_start_extra_avail(service);
+			/* if there are no longer listening processes,
+			   start listening for more */
+			if (service->to_throttle != NULL) {
+				/* throttling */
+			} else if (service == service->list->log &&
+				   service->process_count == 0) {
+				/* log service must always be running */
+				if (service_process_create(service, -1, NULL) == NULL)
+					service_monitor_throttle(service);
+			} else {
+				service_monitor_listen_start(service);
+			}
+		}
+		service_list_unref(service->list);
+	}
+}

@@ -1,0 +1,339 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "imap-common.h"
+#include "array.h"
+#include "str.h"
+#include "ostream.h"
+#include "imap-base-subject.h"
+#include "imap-commands.h"
+#include "imap-search-args.h"
+#include "mail-thread.h"
+
+struct imap_thread_frame {
+	struct mail_thread_iterate_context *iter;
+
+	/* iter must be deinitialized when the frame is popped. The root
+	   iterator is owned by the caller, so it isn't. */
+	bool own_iter:1;
+	/* ')' must be written when the frame is popped */
+	bool close_paren:1;
+	/* this is the root frame */
+	bool root:1;
+	/* the iterator has only a single child, which is written without the
+	   surrounding parenthesis */
+	bool single:1;
+	/* the frame has already been initialized */
+	bool started:1;
+};
+
+/* Write the thread tree using an explicit stack of iterators. The tree depth
+   is derived from client-controlled References/In-Reply-To chains, so it's
+   unbounded and recursing here could exhaust the C stack. */
+static int imap_thread_write(struct mail_thread_iterate_context *root_iter,
+			     string_t *str)
+{
+	ARRAY(struct imap_thread_frame) frames;
+	struct imap_thread_frame *frame;
+	const struct mail_thread_child_node *node;
+	struct mail_thread_iterate_context *child_iter;
+	bool close_paren;
+	int ret = 0;
+
+	i_array_init(&frames, 16);
+	frame = array_append_space(&frames);
+	frame->iter = root_iter;
+	frame->root = TRUE;
+
+	while (array_count(&frames) > 0) {
+		frame = array_back_modifiable(&frames);
+		if (!frame->started) {
+			frame->started = TRUE;
+			frame->single = !frame->root &&
+				mail_thread_iterate_count(frame->iter) == 1;
+		}
+
+		node = mail_thread_iterate_next(frame->iter, &child_iter);
+		if (node == NULL) {
+			/* this level is finished */
+			if (frame->own_iter &&
+			    mail_thread_iterate_deinit(&frame->iter) < 0)
+				ret = -1;
+			if (frame->close_paren)
+				str_append_c(str, ')');
+			array_pop_back(&frames);
+			if (ret < 0)
+				break;
+			continue;
+		}
+
+		if (frame->single) {
+			/* only one child - special case to avoid extra
+			   parenthesis */
+			str_printfa(str, "%u", node->uid);
+			if (child_iter == NULL)
+				continue;
+			str_append_c(str, ' ');
+			close_paren = FALSE;
+		} else if (child_iter == NULL) {
+			/* no children */
+			str_printfa(str, "(%u)", node->uid);
+			continue;
+		} else {
+			/* node with children */
+			str_append_c(str, '(');
+			if (node->uid != 0)
+				str_printfa(str, "%u ", node->uid);
+			close_paren = TRUE;
+		}
+
+		frame = array_append_space(&frames);
+		frame->iter = child_iter;
+		frame->own_iter = TRUE;
+		frame->close_paren = close_paren;
+	}
+
+	/* on failure the frames below the failed one are still open */
+	array_foreach_modifiable(&frames, frame) {
+		if (frame->own_iter)
+			(void)mail_thread_iterate_deinit(&frame->iter);
+	}
+	array_free(&frames);
+	return ret;
+}
+
+static int
+imap_thread_write_reply(struct mail_thread_context *ctx, string_t *str,
+			enum mail_thread_type thread_type, bool write_seqs)
+{
+	struct mail_thread_iterate_context *iter;
+	int ret;
+
+	iter = mail_thread_iterate_init(ctx, thread_type, write_seqs);
+	str_append(str, "* THREAD ");
+	T_BEGIN {
+		ret = imap_thread_write(iter, str);
+	} T_END;
+	if (mail_thread_iterate_deinit(&iter) < 0)
+		ret = -1;
+
+	str_append(str, "\r\n");
+	return ret;
+}
+
+static int imap_thread(struct client_command_context *cmd,
+		       struct mail_search_args *search_args,
+		       enum mail_thread_type thread_type)
+{
+	struct mail_thread_context *ctx;
+	string_t *str;
+	int ret;
+
+	i_assert(thread_type == MAIL_THREAD_REFERENCES ||
+		 thread_type == MAIL_THREAD_REFS);
+
+	str = str_new(default_pool, 1024);
+	ret = mail_thread_init(cmd->client->mailbox,
+			       search_args, &ctx);
+	if (ret == 0) {
+		ret = imap_thread_write_reply(ctx, str, thread_type,
+					      !cmd->uid);
+		mail_thread_deinit(&ctx);
+	}
+
+	if (ret == 0)
+		o_stream_nsend(cmd->client->output, str_data(str), str_len(str));
+	str_free(&str);
+	return ret;
+}
+
+struct orderedsubject_thread {
+	time_t timestamp;
+	ARRAY_TYPE(uint32_t) msgs;
+};
+
+static int orderedsubject_thread_cmp(const struct orderedsubject_thread *t1,
+				     const struct orderedsubject_thread *t2)
+{
+	const uint32_t *m1, *m2;
+
+	if (t1->timestamp < t2->timestamp)
+		return -1;
+	if (t1->timestamp > t2->timestamp)
+		return 1;
+
+	m1 = array_front(&t1->msgs);
+	m2 = array_front(&t2->msgs);
+	if (*m1 < *m2)
+		return -1;
+	if (*m1 > *m2)
+		return 1;
+	i_unreached();
+}
+
+static void
+imap_orderedsubject_thread_write(struct ostream *output, string_t *reply,
+				 const struct orderedsubject_thread *thread)
+{
+	const uint32_t *msgs;
+	unsigned int i, count;
+
+	if (str_len(reply) > 128-10) {
+		o_stream_nsend(output, str_data(reply), str_len(reply));
+		str_truncate(reply, 0);
+	}
+
+	msgs = array_get(&thread->msgs, &count);
+	switch (count) {
+	case 1:
+		str_printfa(reply, "(%u)", msgs[0]);
+		break;
+	case 2:
+		str_printfa(reply, "(%u %u)", msgs[0], msgs[1]);
+		break;
+	default:
+		/* (1 (2)(3)) */
+		str_printfa(reply, "(%u ", msgs[0]);
+		for (i = 1; i < count; i++) {
+			if (str_len(reply) > 128-10) {
+				o_stream_nsend(output, str_data(reply),
+					       str_len(reply));
+				str_truncate(reply, 0);
+			}
+			str_printfa(reply, "(%u)", msgs[i]);
+		}
+		str_append_c(reply, ')');
+	}
+}
+
+static int imap_thread_orderedsubject(struct client_command_context *cmd,
+				      struct mail_search_args *search_args)
+{
+	static const enum mail_sort_type sort_program[] = {
+		MAIL_SORT_SUBJECT,
+		MAIL_SORT_DATE,
+		0
+	};
+	struct mailbox_transaction_context *trans;
+	struct mail_search_context *search_ctx;
+	struct mail *mail;
+	string_t *prev_subject, *reply;
+	const char *subject, *base_subject;
+	pool_t pool;
+	ARRAY(struct orderedsubject_thread) threads;
+	const struct orderedsubject_thread *thread;
+	struct orderedsubject_thread *cur_thread = NULL;
+	uint32_t num;
+	bool reply_or_fw;
+	int ret, tz;
+
+	prev_subject = str_new(default_pool, 128);
+
+	/* first read all of the threads into memory */
+	pool = pool_alloconly_create("orderedsubject thread", 1024);
+	i_array_init(&threads, 128);
+	trans = mailbox_transaction_begin(cmd->client->mailbox, 0,
+					  imap_client_command_get_reason(cmd));
+	search_ctx = mailbox_search_init(trans, search_args, sort_program,
+					 0, NULL);
+	while (mailbox_search_next(search_ctx, &mail)) {
+		if (mail_get_first_header(mail, "Subject", &subject) <= 0)
+			subject = "";
+		T_BEGIN {
+			base_subject = imap_get_base_subject_cased(
+					pool_datastack_create(), subject,
+					&reply_or_fw);
+			if (strcmp(str_c(prev_subject), base_subject) != 0) {
+				/* thread changed */
+				cur_thread = NULL;
+			}
+			str_truncate(prev_subject, 0);
+			str_append(prev_subject, base_subject);
+		} T_END;
+
+		if (cur_thread == NULL) {
+			/* starting a new thread. get the first message's
+			   date */
+			cur_thread = array_append_space(&threads);
+			if (mail_get_date(mail, &cur_thread->timestamp,
+					  &tz) == 0 &&
+			    cur_thread->timestamp == 0) {
+				(void)mail_get_received_date(mail,
+					&cur_thread->timestamp);
+			}
+			p_array_init(&cur_thread->msgs, pool, 4);
+		}
+		num = cmd->uid ? mail->uid : mail->seq;
+		array_push_back(&cur_thread->msgs, &num);
+	}
+	str_free(&prev_subject);
+	ret = mailbox_search_deinit(&search_ctx);
+	(void)mailbox_transaction_commit(&trans);
+	if (ret < 0) {
+		array_free(&threads);
+		pool_unref(&pool);
+		return -1;
+	}
+
+	/* sort the threads by their first message's timestamp */
+	array_sort(&threads, orderedsubject_thread_cmp);
+
+	/* write the threads to client */
+	reply = t_str_new(128);
+	str_append(reply, "* THREAD ");
+	array_foreach(&threads, thread) {
+		imap_orderedsubject_thread_write(cmd->client->output,
+						 reply, thread);
+	}
+	str_append(reply, "\r\n");
+	o_stream_nsend(cmd->client->output, str_data(reply), str_len(reply));
+
+	array_free(&threads);
+	pool_unref(&pool);
+	return 0;
+}
+
+bool cmd_thread(struct client_command_context *cmd)
+{
+	struct client *client = cmd->client;
+	enum mail_thread_type thread_type;
+	struct mail_search_args *sargs;
+	const struct imap_arg *args;
+	const char *charset, *str;
+	int ret;
+
+	if (!client_read_args(cmd, 0, 0, &args))
+		return FALSE;
+
+	if (!client_verify_open_mailbox(cmd))
+		return TRUE;
+
+	if (!imap_arg_get_astring(&args[0], &str) ||
+	    !imap_arg_get_astring(&args[1], &charset)) {
+		client_send_command_error(cmd, "Invalid arguments.");
+		return TRUE;
+	}
+	args += 2;
+
+	if (!mail_thread_type_parse(str, &thread_type)) {
+		client_send_command_error(cmd, "Unknown thread algorithm.");
+		return TRUE;
+	}
+
+	ret = imap_search_args_build(cmd, args, charset, &sargs);
+	if (ret <= 0)
+		return ret < 0;
+
+	if (thread_type != MAIL_THREAD_ORDEREDSUBJECT)
+		ret = imap_thread(cmd, sargs, thread_type);
+	else
+		ret = imap_thread_orderedsubject(cmd, sargs);
+	mail_search_args_unref(&sargs);
+	if (ret < 0) {
+		client_send_box_error(cmd, client->mailbox);
+		return TRUE;
+	}
+
+	return cmd_sync(cmd, MAILBOX_SYNC_FLAG_FAST |
+			(cmd->uid ? 0 : MAILBOX_SYNC_FLAG_NO_EXPUNGES),
+			0, "OK Thread completed.");
+}

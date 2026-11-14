@@ -1,0 +1,713 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SaslClientAuthenticator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.security.authenticator</a> &gt; <span class="el_source">SaslClientAuthenticator.java</span></div><h1>SaslClientAuthenticator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.security.authenticator;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.NetworkClient;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.config.SaslConfigs;
+import org.apache.kafka.common.errors.IllegalSaslStateException;
+import org.apache.kafka.common.errors.SaslAuthenticationException;
+import org.apache.kafka.common.errors.UnsupportedSaslMechanismException;
+import org.apache.kafka.common.internals.SecurityManagerCompatibility;
+import org.apache.kafka.common.message.ApiVersionsResponseData.ApiVersion;
+import org.apache.kafka.common.message.RequestHeaderData;
+import org.apache.kafka.common.message.SaslAuthenticateRequestData;
+import org.apache.kafka.common.message.SaslHandshakeRequestData;
+import org.apache.kafka.common.network.Authenticator;
+import org.apache.kafka.common.network.ByteBufferSend;
+import org.apache.kafka.common.network.NetworkReceive;
+import org.apache.kafka.common.network.ReauthenticationContext;
+import org.apache.kafka.common.network.Send;
+import org.apache.kafka.common.network.TransportLayer;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.protocol.types.SchemaException;
+import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.requests.ApiVersionsRequest;
+import org.apache.kafka.common.requests.ApiVersionsResponse;
+import org.apache.kafka.common.requests.RequestHeader;
+import org.apache.kafka.common.requests.SaslAuthenticateRequest;
+import org.apache.kafka.common.requests.SaslAuthenticateResponse;
+import org.apache.kafka.common.requests.SaslHandshakeRequest;
+import org.apache.kafka.common.requests.SaslHandshakeResponse;
+import org.apache.kafka.common.security.auth.AuthenticateCallbackHandler;
+import org.apache.kafka.common.security.auth.KafkaPrincipal;
+import org.apache.kafka.common.security.auth.KafkaPrincipalSerde;
+import org.apache.kafka.common.security.kerberos.KerberosError;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.io.IOException;
+import java.nio.BufferUnderflowException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.security.Principal;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.CompletionException;
+
+import javax.security.auth.Subject;
+import javax.security.sasl.Sasl;
+import javax.security.sasl.SaslClient;
+import javax.security.sasl.SaslException;
+
+public class SaslClientAuthenticator implements Authenticator {
+    /**
+     * The internal state transitions for initial authentication of a channel are
+     * declared in order, starting with {@link #SEND_APIVERSIONS_REQUEST} and ending
+     * in either {@link #COMPLETE} or {@link #FAILED}.
+     * &lt;p&gt;
+     * Re-authentication of a channel starts with the state
+     * {@link #REAUTH_PROCESS_ORIG_APIVERSIONS_RESPONSE} and then flows to
+     * {@link #REAUTH_SEND_HANDSHAKE_REQUEST} followed by
+     * {@link #REAUTH_RECEIVE_HANDSHAKE_OR_OTHER_RESPONSE} and then
+     * {@link #REAUTH_INITIAL}; after that the flow joins the authentication flow
+     * at the {@link #INTERMEDIATE} state and ends at either {@link #COMPLETE} or
+     * {@link #FAILED}.
+     */
+<span class="nc" id="L93">    public enum SaslState {</span>
+<span class="nc" id="L94">        SEND_APIVERSIONS_REQUEST,                   // Initial state for authentication: client sends ApiVersionsRequest in this state when authenticating</span>
+<span class="nc" id="L95">        RECEIVE_APIVERSIONS_RESPONSE,               // Awaiting ApiVersionsResponse from server</span>
+<span class="nc" id="L96">        SEND_HANDSHAKE_REQUEST,                     // Received ApiVersionsResponse, send SaslHandshake request</span>
+<span class="nc" id="L97">        RECEIVE_HANDSHAKE_RESPONSE,                 // Awaiting SaslHandshake response from server when authenticating</span>
+<span class="nc" id="L98">        INITIAL,                                    // Initial authentication state starting SASL token exchange for configured mechanism, send first token</span>
+<span class="nc" id="L99">        INTERMEDIATE,                               // Intermediate state during SASL token exchange, process challenges and send responses</span>
+<span class="nc" id="L100">        CLIENT_COMPLETE,                            // Sent response to last challenge. If using SaslAuthenticate, wait for authentication status from server, else COMPLETE</span>
+<span class="nc" id="L101">        COMPLETE,                                   // Authentication sequence complete. If using SaslAuthenticate, this state implies successful authentication.</span>
+<span class="nc" id="L102">        FAILED,                                     // Failed authentication due to an error at some stage</span>
+<span class="nc" id="L103">        REAUTH_PROCESS_ORIG_APIVERSIONS_RESPONSE,   // Initial state for re-authentication: process ApiVersionsResponse from original authentication</span>
+<span class="nc" id="L104">        REAUTH_SEND_HANDSHAKE_REQUEST,              // Processed original ApiVersionsResponse, send SaslHandshake request as part of re-authentication</span>
+<span class="nc" id="L105">        REAUTH_RECEIVE_HANDSHAKE_OR_OTHER_RESPONSE, // Awaiting SaslHandshake response from server when re-authenticating, and may receive other, in-flight responses sent prior to start of re-authentication as well</span>
+<span class="nc" id="L106">        REAUTH_INITIAL,                             // Initial re-authentication state starting SASL token exchange for configured mechanism, send first token</span>
+    }
+
+    private static final short DISABLE_KAFKA_SASL_AUTHENTICATE_HEADER = -1;
+<span class="nc" id="L110">    private static final Random RNG = new Random();</span>
+
+    /**
+     * the reserved range of correlation id for Sasl requests.
+     *
+     * Noted: there is a story about reserved range. The response of LIST_OFFSET is compatible to response of SASL_HANDSHAKE.
+     * Hence, we could miss the schema error when using schema of SASL_HANDSHAKE to parse response of LIST_OFFSET.
+     * For example: the IllegalStateException caused by mismatched correlation id is thrown if following steps happens.
+     * 1) sent LIST_OFFSET
+     * 2) sent SASL_HANDSHAKE
+     * 3) receive response of LIST_OFFSET
+     * 4) succeed to use schema of SASL_HANDSHAKE to parse response of LIST_OFFSET
+     * 5) throw IllegalStateException due to mismatched correlation id
+     * As a simple approach, we force Sasl requests to use a reserved correlation id which is separated from those
+     * used in NetworkClient for Kafka requests. Hence, we can guarantee that every SASL request will throw
+     * SchemaException due to correlation id mismatch during reauthentication
+     */
+    public static final int MAX_RESERVED_CORRELATION_ID = Integer.MAX_VALUE;
+
+    /**
+     * We only expect one request in-flight a time during authentication so the small range is fine.
+     */
+    public static final int MIN_RESERVED_CORRELATION_ID = MAX_RESERVED_CORRELATION_ID - 7;
+
+    /**
+     * @return true if the correlation id is reserved for SASL request. otherwise, false
+     */
+    public static boolean isReserved(int correlationId) {
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        return correlationId &gt;= MIN_RESERVED_CORRELATION_ID;</span>
+    }
+
+    private final Subject subject;
+    private final String servicePrincipal;
+    private final String host;
+    private final String node;
+    private final String mechanism;
+    private final TransportLayer transportLayer;
+    private final SaslClient saslClient;
+    private final Map&lt;String, ?&gt; configs;
+    private final String clientPrincipalName;
+    private final AuthenticateCallbackHandler callbackHandler;
+    private final Time time;
+    private final Logger log;
+    private final ReauthInfo reauthInfo;
+
+    // buffers used in `authenticate`
+    private NetworkReceive netInBuffer;
+    private Send netOutBuffer;
+
+    // Current SASL state
+    private SaslState saslState;
+    // Next SASL state to be set when outgoing writes associated with the current SASL state complete
+    private SaslState pendingSaslState;
+    // Correlation ID for the next request
+    private int correlationId;
+    // Request header for which response from the server is pending
+    private RequestHeader currentRequestHeader;
+    // Version of SaslAuthenticate request/responses
+    private short saslAuthenticateVersion;
+    // Version of SaslHandshake request/responses
+    private short saslHandshakeVersion;
+
+    @SuppressWarnings(&quot;this-escape&quot;)
+    public SaslClientAuthenticator(Map&lt;String, ?&gt; configs,
+                                   AuthenticateCallbackHandler callbackHandler,
+                                   String node,
+                                   Subject subject,
+                                   String servicePrincipal,
+                                   String host,
+                                   String mechanism,
+                                   TransportLayer transportLayer,
+                                   Time time,
+<span class="nc" id="L182">                                   LogContext logContext) {</span>
+<span class="nc" id="L183">        this.node = node;</span>
+<span class="nc" id="L184">        this.subject = subject;</span>
+<span class="nc" id="L185">        this.callbackHandler = callbackHandler;</span>
+<span class="nc" id="L186">        this.host = host;</span>
+<span class="nc" id="L187">        this.servicePrincipal = servicePrincipal;</span>
+<span class="nc" id="L188">        this.mechanism = mechanism;</span>
+<span class="nc" id="L189">        this.correlationId = 0;</span>
+<span class="nc" id="L190">        this.transportLayer = transportLayer;</span>
+<span class="nc" id="L191">        this.configs = configs;</span>
+<span class="nc" id="L192">        this.saslAuthenticateVersion = DISABLE_KAFKA_SASL_AUTHENTICATE_HEADER;</span>
+<span class="nc" id="L193">        this.time = time;</span>
+<span class="nc" id="L194">        this.log = logContext.logger(getClass());</span>
+<span class="nc" id="L195">        this.reauthInfo = new ReauthInfo();</span>
+
+        try {
+<span class="nc" id="L198">            setSaslState(SaslState.SEND_APIVERSIONS_REQUEST);</span>
+
+            // determine client principal from subject for Kerberos to use as authorization id for the SaslClient.
+            // For other mechanisms, the authenticated principal (username for PLAIN and SCRAM) is used as
+            // authorization id. Hence the principal is not specified for creating the SaslClient.
+<span class="nc bnc" id="L203" title="All 2 branches missed.">            if (mechanism.equals(SaslConfigs.GSSAPI_MECHANISM))</span>
+<span class="nc" id="L204">                this.clientPrincipalName = firstPrincipal(subject);</span>
+            else
+<span class="nc" id="L206">                this.clientPrincipalName = null;</span>
+
+<span class="nc" id="L208">            saslClient = createSaslClient();</span>
+<span class="nc" id="L209">        } catch (Exception e) {</span>
+<span class="nc" id="L210">            throw new SaslAuthenticationException(&quot;Failed to configure SaslClientAuthenticator&quot;, e);</span>
+<span class="nc" id="L211">        }</span>
+<span class="nc" id="L212">    }</span>
+
+    // visible for testing
+    SaslClient createSaslClient() {
+        try {
+<span class="nc" id="L217">            return SecurityManagerCompatibility.get().callAs(subject, () -&gt; {</span>
+<span class="nc" id="L218">                String[] mechs = {mechanism};</span>
+<span class="nc" id="L219">                log.debug(&quot;Creating SaslClient: client={};service={};serviceHostname={};mechs={}&quot;,</span>
+<span class="nc" id="L220">                    clientPrincipalName, servicePrincipal, host, Arrays.toString(mechs));</span>
+<span class="nc" id="L221">                SaslClient retvalSaslClient = Sasl.createSaslClient(mechs, clientPrincipalName, servicePrincipal, host, configs, callbackHandler);</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">                if (retvalSaslClient == null) {</span>
+<span class="nc" id="L223">                    throw new SaslAuthenticationException(&quot;Failed to create SaslClient with mechanism &quot; + mechanism);</span>
+                }
+<span class="nc" id="L225">                return retvalSaslClient;</span>
+            });
+<span class="nc" id="L227">        } catch (CompletionException e) {</span>
+<span class="nc" id="L228">            throw new SaslAuthenticationException(&quot;Failed to create SaslClient with mechanism &quot; + mechanism, e.getCause());</span>
+        }
+    }
+
+    /**
+     * Sends an empty message to the server to initiate the authentication process. It then evaluates server challenges
+     * via `SaslClient.evaluateChallenge` and returns client responses until authentication succeeds or fails.
+     *
+     * The messages are sent and received as size delimited bytes that consists of a 4 byte network-ordered size N
+     * followed by N bytes representing the opaque payload.
+     */
+    @SuppressWarnings(&quot;fallthrough&quot;)
+    public void authenticate() throws IOException {
+<span class="nc bnc" id="L241" title="All 4 branches missed.">        if (netOutBuffer != null &amp;&amp; !flushNetOutBufferAndUpdateInterestOps())</span>
+<span class="nc" id="L242">            return;</span>
+
+<span class="nc bnc" id="L244" title="All 14 branches missed.">        switch (saslState) {</span>
+            case SEND_APIVERSIONS_REQUEST:
+                // Always use version 0 request since brokers treat requests with schema exceptions as GSSAPI tokens
+<span class="nc" id="L247">                ApiVersionsRequest apiVersionsRequest = new ApiVersionsRequest.Builder().build((short) 0);</span>
+<span class="nc" id="L248">                send(apiVersionsRequest.toSend(nextRequestHeader(ApiKeys.API_VERSIONS, apiVersionsRequest.version())));</span>
+<span class="nc" id="L249">                setSaslState(SaslState.RECEIVE_APIVERSIONS_RESPONSE);</span>
+<span class="nc" id="L250">                break;</span>
+            case RECEIVE_APIVERSIONS_RESPONSE:
+<span class="nc" id="L252">                ApiVersionsResponse apiVersionsResponse = (ApiVersionsResponse) receiveKafkaResponse();</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">                if (apiVersionsResponse == null)</span>
+<span class="nc" id="L254">                    break;</span>
+                else {
+<span class="nc" id="L256">                    setSaslAuthenticateAndHandshakeVersions(apiVersionsResponse);</span>
+<span class="nc" id="L257">                    reauthInfo.apiVersionsResponseReceivedFromBroker = apiVersionsResponse;</span>
+<span class="nc" id="L258">                    setSaslState(SaslState.SEND_HANDSHAKE_REQUEST);</span>
+                    // Fall through to send handshake request with the latest supported version
+                }
+            case SEND_HANDSHAKE_REQUEST:
+<span class="nc" id="L262">                sendHandshakeRequest(saslHandshakeVersion);</span>
+<span class="nc" id="L263">                setSaslState(SaslState.RECEIVE_HANDSHAKE_RESPONSE);</span>
+<span class="nc" id="L264">                break;</span>
+            case RECEIVE_HANDSHAKE_RESPONSE:
+<span class="nc" id="L266">                SaslHandshakeResponse handshakeResponse = (SaslHandshakeResponse) receiveKafkaResponse();</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">                if (handshakeResponse == null)</span>
+<span class="nc" id="L268">                    break;</span>
+                else {
+<span class="nc" id="L270">                    handleSaslHandshakeResponse(handshakeResponse);</span>
+<span class="nc" id="L271">                    setSaslState(SaslState.INITIAL);</span>
+                    // Fall through and start SASL authentication using the configured client mechanism
+                }
+            case INITIAL:
+<span class="nc" id="L275">                sendInitialToken();</span>
+<span class="nc" id="L276">                setSaslState(SaslState.INTERMEDIATE);</span>
+<span class="nc" id="L277">                break;</span>
+            case REAUTH_PROCESS_ORIG_APIVERSIONS_RESPONSE:
+<span class="nc" id="L279">                setSaslAuthenticateAndHandshakeVersions(reauthInfo.apiVersionsResponseFromOriginalAuthentication);</span>
+<span class="nc" id="L280">                setSaslState(SaslState.REAUTH_SEND_HANDSHAKE_REQUEST); // Will set immediately</span>
+                // Fall through to send handshake request with the latest supported version
+            case REAUTH_SEND_HANDSHAKE_REQUEST:
+<span class="nc" id="L283">                sendHandshakeRequest(saslHandshakeVersion);</span>
+<span class="nc" id="L284">                setSaslState(SaslState.REAUTH_RECEIVE_HANDSHAKE_OR_OTHER_RESPONSE);</span>
+<span class="nc" id="L285">                break;</span>
+            case REAUTH_RECEIVE_HANDSHAKE_OR_OTHER_RESPONSE:
+<span class="nc" id="L287">                handshakeResponse = (SaslHandshakeResponse) receiveKafkaResponse();</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">                if (handshakeResponse == null)</span>
+<span class="nc" id="L289">                    break;</span>
+<span class="nc" id="L290">                handleSaslHandshakeResponse(handshakeResponse);</span>
+<span class="nc" id="L291">                setSaslState(SaslState.REAUTH_INITIAL); // Will set immediately</span>
+                /*
+                 * Fall through and start SASL authentication using the configured client
+                 * mechanism. Note that we have to either fall through or add a loop to enter
+                 * the switch statement again. We will fall through to avoid adding the loop and
+                 * therefore minimize the changes to authentication-related code due to the
+                 * changes related to re-authentication.
+                 */
+            case REAUTH_INITIAL:
+<span class="nc" id="L300">                sendInitialToken();</span>
+<span class="nc" id="L301">                setSaslState(SaslState.INTERMEDIATE);</span>
+<span class="nc" id="L302">                break;</span>
+            case INTERMEDIATE:
+<span class="nc" id="L304">                byte[] serverToken = receiveToken();</span>
+<span class="nc bnc" id="L305" title="All 4 branches missed.">                boolean noResponsesPending = serverToken != null &amp;&amp; !sendSaslClientToken(serverToken, false);</span>
+                // For versions without SASL_AUTHENTICATE header, SASL exchange may be complete after a token is sent to server.
+                // For versions with SASL_AUTHENTICATE header, server always sends a response to each SASL_AUTHENTICATE request.
+<span class="nc bnc" id="L308" title="All 2 branches missed.">                if (saslClient.isComplete()) {</span>
+<span class="nc bnc" id="L309" title="All 4 branches missed.">                    if (saslAuthenticateVersion == DISABLE_KAFKA_SASL_AUTHENTICATE_HEADER || noResponsesPending)</span>
+<span class="nc" id="L310">                        setSaslState(SaslState.COMPLETE);</span>
+                    else
+<span class="nc" id="L312">                        setSaslState(SaslState.CLIENT_COMPLETE);</span>
+                }
+                break;
+            case CLIENT_COMPLETE:
+<span class="nc" id="L316">                byte[] serverResponse = receiveToken();</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">                if (serverResponse != null)</span>
+<span class="nc" id="L318">                    setSaslState(SaslState.COMPLETE);</span>
+                break;
+            case COMPLETE:
+<span class="nc" id="L321">                break;</span>
+            case FAILED:
+                // Should never get here since exception would have been propagated earlier
+<span class="nc" id="L324">                throw new IllegalStateException(&quot;SASL handshake has already failed&quot;);</span>
+        }
+<span class="nc" id="L326">    }</span>
+
+    private void sendHandshakeRequest(short version) throws IOException {
+<span class="nc" id="L329">        SaslHandshakeRequest handshakeRequest = createSaslHandshakeRequest(version);</span>
+<span class="nc" id="L330">        send(handshakeRequest.toSend(nextRequestHeader(ApiKeys.SASL_HANDSHAKE, handshakeRequest.version())));</span>
+<span class="nc" id="L331">    }</span>
+
+    private void sendInitialToken() throws IOException {
+<span class="nc" id="L334">        sendSaslClientToken(new byte[0], true);</span>
+<span class="nc" id="L335">    }</span>
+
+    @Override
+    public void reauthenticate(ReauthenticationContext reauthenticationContext) throws IOException {
+<span class="nc" id="L339">        SaslClientAuthenticator previousSaslClientAuthenticator = (SaslClientAuthenticator) Objects</span>
+<span class="nc" id="L340">                .requireNonNull(reauthenticationContext).previousAuthenticator();</span>
+<span class="nc" id="L341">        ApiVersionsResponse apiVersionsResponseFromOriginalAuthentication = previousSaslClientAuthenticator.reauthInfo</span>
+<span class="nc" id="L342">                .apiVersionsResponse();</span>
+<span class="nc" id="L343">        previousSaslClientAuthenticator.close();</span>
+<span class="nc" id="L344">        reauthInfo.reauthenticating(apiVersionsResponseFromOriginalAuthentication,</span>
+<span class="nc" id="L345">                reauthenticationContext.reauthenticationBeginNanos());</span>
+<span class="nc" id="L346">        netInBuffer = reauthenticationContext.networkReceive();</span>
+<span class="nc" id="L347">        setSaslState(SaslState.REAUTH_PROCESS_ORIG_APIVERSIONS_RESPONSE); // Will set immediately</span>
+<span class="nc" id="L348">        authenticate();</span>
+<span class="nc" id="L349">    }</span>
+
+    @Override
+    public Optional&lt;NetworkReceive&gt; pollResponseReceivedDuringReauthentication() {
+<span class="nc" id="L353">        return reauthInfo.pollResponseReceivedDuringReauthentication();</span>
+    }
+
+    @Override
+    public Long clientSessionReauthenticationTimeNanos() {
+<span class="nc" id="L358">        return reauthInfo.clientSessionReauthenticationTimeNanos;</span>
+    }
+
+    @Override
+    public Long reauthenticationLatencyMs() {
+<span class="nc" id="L363">        return reauthInfo.reauthenticationLatencyMs();</span>
+    }
+
+    // visible for testing
+    int nextCorrelationId() {
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        if (!isReserved(correlationId))</span>
+<span class="nc" id="L369">            correlationId = MIN_RESERVED_CORRELATION_ID;</span>
+<span class="nc" id="L370">        return correlationId++;</span>
+    }
+
+    private RequestHeader nextRequestHeader(ApiKeys apiKey, short version) {
+<span class="nc" id="L374">        String clientId = (String) configs.get(CommonClientConfigs.CLIENT_ID_CONFIG);</span>
+<span class="nc" id="L375">        short requestApiKey = apiKey.id;</span>
+<span class="nc" id="L376">        currentRequestHeader = new RequestHeader(</span>
+            new RequestHeaderData().
+<span class="nc" id="L378">                setRequestApiKey(requestApiKey).</span>
+<span class="nc" id="L379">                setRequestApiVersion(version).</span>
+<span class="nc" id="L380">                setClientId(clientId).</span>
+<span class="nc" id="L381">                setCorrelationId(nextCorrelationId()),</span>
+<span class="nc" id="L382">            apiKey.requestHeaderVersion(version));</span>
+<span class="nc" id="L383">        return currentRequestHeader;</span>
+    }
+
+    // Visible to override for testing
+    protected SaslHandshakeRequest createSaslHandshakeRequest(short version) {
+<span class="nc" id="L388">        return new SaslHandshakeRequest.Builder(</span>
+<span class="nc" id="L389">                new SaslHandshakeRequestData().setMechanism(mechanism)).build(version);</span>
+    }
+
+    // Visible to override for testing
+    protected void setSaslAuthenticateAndHandshakeVersions(ApiVersionsResponse apiVersionsResponse) {
+<span class="nc" id="L394">        ApiVersion authenticateVersion = apiVersionsResponse.apiVersion(ApiKeys.SASL_AUTHENTICATE.id);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        if (authenticateVersion != null) {</span>
+<span class="nc" id="L396">            this.saslAuthenticateVersion = (short) Math.min(authenticateVersion.maxVersion(),</span>
+<span class="nc" id="L397">                    ApiKeys.SASL_AUTHENTICATE.latestVersion());</span>
+        }
+<span class="nc" id="L399">        ApiVersion handshakeVersion = apiVersionsResponse.apiVersion(ApiKeys.SASL_HANDSHAKE.id);</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (handshakeVersion != null) {</span>
+<span class="nc" id="L401">            this.saslHandshakeVersion = (short) Math.min(handshakeVersion.maxVersion(),</span>
+<span class="nc" id="L402">                    ApiKeys.SASL_HANDSHAKE.latestVersion());</span>
+        }
+<span class="nc" id="L404">    }</span>
+
+    private void setSaslState(SaslState saslState) {
+<span class="nc bnc" id="L407" title="All 4 branches missed.">        if (netOutBuffer != null &amp;&amp; !netOutBuffer.completed())</span>
+<span class="nc" id="L408">            pendingSaslState = saslState;</span>
+        else {
+<span class="nc" id="L410">            this.pendingSaslState = null;</span>
+<span class="nc" id="L411">            this.saslState = saslState;</span>
+<span class="nc" id="L412">            log.debug(&quot;Set SASL client state to {}&quot;, saslState);</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            if (saslState == SaslState.COMPLETE) {</span>
+<span class="nc" id="L414">                reauthInfo.setAuthenticationEndAndSessionReauthenticationTimes(time.nanoseconds());</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">                if (!reauthInfo.reauthenticating())</span>
+<span class="nc" id="L416">                    transportLayer.removeInterestOps(SelectionKey.OP_WRITE);</span>
+                else
+                    /*
+                     * Re-authentication is triggered by a write, so we have to make sure that
+                     * pending write is actually sent.
+                     */
+<span class="nc" id="L422">                    transportLayer.addInterestOps(SelectionKey.OP_WRITE);</span>
+            }
+        }
+<span class="nc" id="L425">    }</span>
+
+    /**
+     * Sends a SASL client token to server if required. This may be an initial token to start
+     * SASL token exchange or response to a challenge from the server.
+     * @return true if a token was sent to the server
+     */
+    private boolean sendSaslClientToken(byte[] serverToken, boolean isInitial) throws IOException {
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        if (!saslClient.isComplete()) {</span>
+<span class="nc" id="L434">            byte[] saslToken = createSaslToken(serverToken, isInitial);</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            if (saslToken != null) {</span>
+<span class="nc" id="L436">                ByteBuffer tokenBuf = ByteBuffer.wrap(saslToken);</span>
+                Send send;
+<span class="nc bnc" id="L438" title="All 2 branches missed.">                if (saslAuthenticateVersion == DISABLE_KAFKA_SASL_AUTHENTICATE_HEADER) {</span>
+<span class="nc" id="L439">                    send = ByteBufferSend.sizePrefixed(tokenBuf);</span>
+                } else {
+<span class="nc" id="L441">                    SaslAuthenticateRequestData data = new SaslAuthenticateRequestData()</span>
+<span class="nc" id="L442">                            .setAuthBytes(tokenBuf.array());</span>
+<span class="nc" id="L443">                    SaslAuthenticateRequest request = new SaslAuthenticateRequest.Builder(data).build(saslAuthenticateVersion);</span>
+<span class="nc" id="L444">                    send = request.toSend(nextRequestHeader(ApiKeys.SASL_AUTHENTICATE, saslAuthenticateVersion));</span>
+                }
+<span class="nc" id="L446">                send(send);</span>
+<span class="nc" id="L447">                return true;</span>
+            }
+        }
+<span class="nc" id="L450">        return false;</span>
+    }
+
+    private void send(Send send) throws IOException {
+        try {
+<span class="nc" id="L455">            netOutBuffer = send;</span>
+<span class="nc" id="L456">            flushNetOutBufferAndUpdateInterestOps();</span>
+<span class="nc" id="L457">        } catch (IOException e) {</span>
+<span class="nc" id="L458">            setSaslState(SaslState.FAILED);</span>
+<span class="nc" id="L459">            throw e;</span>
+<span class="nc" id="L460">        }</span>
+<span class="nc" id="L461">    }</span>
+
+    private boolean flushNetOutBufferAndUpdateInterestOps() throws IOException {
+<span class="nc" id="L464">        boolean flushedCompletely = flushNetOutBuffer();</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">        if (flushedCompletely) {</span>
+<span class="nc" id="L466">            transportLayer.removeInterestOps(SelectionKey.OP_WRITE);</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">            if (pendingSaslState != null)</span>
+<span class="nc" id="L468">                setSaslState(pendingSaslState);</span>
+        } else
+<span class="nc" id="L470">            transportLayer.addInterestOps(SelectionKey.OP_WRITE);</span>
+<span class="nc" id="L471">        return flushedCompletely;</span>
+    }
+
+    private byte[] receiveResponseOrToken() throws IOException {
+<span class="nc bnc" id="L475" title="All 2 branches missed.">        if (netInBuffer == null) netInBuffer = new NetworkReceive(node);</span>
+<span class="nc" id="L476">        netInBuffer.readFrom(transportLayer);</span>
+<span class="nc" id="L477">        byte[] serverPacket = null;</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">        if (netInBuffer.complete()) {</span>
+<span class="nc" id="L479">            netInBuffer.payload().rewind();</span>
+<span class="nc" id="L480">            serverPacket = new byte[netInBuffer.payload().remaining()];</span>
+<span class="nc" id="L481">            netInBuffer.payload().get(serverPacket, 0, serverPacket.length);</span>
+<span class="nc" id="L482">            netInBuffer = null; // reset the networkReceive as we read all the data.</span>
+        }
+<span class="nc" id="L484">        return serverPacket;</span>
+    }
+
+    public KafkaPrincipal principal() {
+<span class="nc" id="L488">        return new KafkaPrincipal(KafkaPrincipal.USER_TYPE, clientPrincipalName);</span>
+    }
+
+    @Override
+    public Optional&lt;KafkaPrincipalSerde&gt; principalSerde() {
+<span class="nc" id="L493">        return Optional.empty();</span>
+    }
+
+    public boolean complete() {
+<span class="nc bnc" id="L497" title="All 2 branches missed.">        return saslState == SaslState.COMPLETE;</span>
+    }
+
+    public void close() throws IOException {
+<span class="nc bnc" id="L501" title="All 2 branches missed.">        if (saslClient != null)</span>
+<span class="nc" id="L502">            saslClient.dispose();</span>
+<span class="nc" id="L503">    }</span>
+
+    private byte[] receiveToken() throws IOException {
+<span class="nc bnc" id="L506" title="All 2 branches missed.">        if (saslAuthenticateVersion == DISABLE_KAFKA_SASL_AUTHENTICATE_HEADER) {</span>
+<span class="nc" id="L507">            return receiveResponseOrToken();</span>
+        } else {
+<span class="nc" id="L509">            SaslAuthenticateResponse response = (SaslAuthenticateResponse) receiveKafkaResponse();</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">            if (response != null) {</span>
+<span class="nc" id="L511">                Errors error = response.error();</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                if (error != Errors.NONE) {</span>
+<span class="nc" id="L513">                    setSaslState(SaslState.FAILED);</span>
+<span class="nc" id="L514">                    String errMsg = response.errorMessage();</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">                    throw errMsg == null ? error.exception() : error.exception(errMsg);</span>
+                }
+<span class="nc" id="L517">                long sessionLifetimeMs = response.sessionLifetimeMs();</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">                if (sessionLifetimeMs &gt; 0L)</span>
+<span class="nc" id="L519">                    reauthInfo.positiveSessionLifetimeMs = sessionLifetimeMs;</span>
+<span class="nc" id="L520">                return Utils.copyArray(response.saslAuthBytes());</span>
+            } else
+<span class="nc" id="L522">                return null;</span>
+        }
+    }
+
+
+    private byte[] createSaslToken(final byte[] saslToken, boolean isInitial) throws SaslException {
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        if (saslToken == null)</span>
+<span class="nc" id="L529">            throw new IllegalSaslStateException(&quot;Error authenticating with the Kafka Broker: received a `null` saslToken.&quot;);</span>
+
+        try {
+<span class="nc bnc" id="L532" title="All 4 branches missed.">            if (isInitial &amp;&amp; !saslClient.hasInitialResponse())</span>
+<span class="nc" id="L533">                return saslToken;</span>
+            else
+<span class="nc" id="L535">                return SecurityManagerCompatibility.get().callAs(subject, () -&gt; saslClient.evaluateChallenge(saslToken));</span>
+<span class="nc" id="L536">        } catch (CompletionException e) {</span>
+<span class="nc" id="L537">            String error = &quot;An error: (&quot; + e + &quot;) occurred when evaluating SASL token received from the Kafka Broker.&quot;;</span>
+<span class="nc" id="L538">            KerberosError kerberosError = KerberosError.fromException(e);</span>
+            // Try to provide hints to use about what went wrong so they can fix their configuration.
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            if (kerberosError == KerberosError.SERVER_NOT_FOUND) {</span>
+<span class="nc" id="L541">                error += &quot; This may be caused by Java's being unable to resolve the Kafka Broker's&quot; +</span>
+                    &quot; hostname correctly. You may want to try to adding&quot; +
+                    &quot; '-Dsun.net.spi.nameservice.provider.1=dns,sun' to your client's JVMFLAGS environment.&quot; +
+                    &quot; Users must configure FQDN of kafka brokers when authenticating using SASL and&quot; +
+                    &quot; `socketChannel.socket().getInetAddress().getHostName()` must match the hostname in `principal/hostname@realm`&quot;;
+            }
+            //Unwrap the SaslException
+<span class="nc" id="L548">            Throwable cause = e.getCause();</span>
+            // Treat transient Kerberos errors as non-fatal SaslExceptions that are processed as I/O exceptions
+            // and all other failures as fatal SaslAuthenticationException.
+<span class="nc bnc" id="L551" title="All 8 branches missed.">            if ((kerberosError != null &amp;&amp; kerberosError.retriable()) || (kerberosError == null &amp;&amp; KerberosError.isRetriableClientGssException(e))) {</span>
+<span class="nc" id="L552">                error += &quot; Kafka Client will retry.&quot;;</span>
+<span class="nc" id="L553">                throw new SaslException(error, cause);</span>
+            } else {
+<span class="nc" id="L555">                error += &quot; Kafka Client will go to AUTHENTICATION_FAILED state.&quot;;</span>
+<span class="nc" id="L556">                throw new SaslAuthenticationException(error, cause);</span>
+            }
+        }
+    }
+
+    private boolean flushNetOutBuffer() throws IOException {
+<span class="nc bnc" id="L562" title="All 2 branches missed.">        if (!netOutBuffer.completed()) {</span>
+<span class="nc" id="L563">            netOutBuffer.writeTo(transportLayer);</span>
+        }
+<span class="nc" id="L565">        return netOutBuffer.completed();</span>
+    }
+
+    private AbstractResponse receiveKafkaResponse() throws IOException {
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        if (netInBuffer == null)</span>
+<span class="nc" id="L570">            netInBuffer = new NetworkReceive(node);</span>
+<span class="nc" id="L571">        NetworkReceive receive = netInBuffer;</span>
+        try {
+<span class="nc" id="L573">            byte[] responseBytes = receiveResponseOrToken();</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">            if (responseBytes == null)</span>
+<span class="nc" id="L575">                return null;</span>
+            else {
+<span class="nc" id="L577">                AbstractResponse response = NetworkClient.parseResponse(ByteBuffer.wrap(responseBytes), currentRequestHeader);</span>
+<span class="nc" id="L578">                currentRequestHeader = null;</span>
+<span class="nc" id="L579">                return response;</span>
+            }
+<span class="nc" id="L581">        } catch (BufferUnderflowException | SchemaException | IllegalArgumentException e) {</span>
+            /*
+             * Account for the fact that during re-authentication there may be responses
+             * arriving for requests that were sent in the past.
+             */
+<span class="nc bnc" id="L586" title="All 2 branches missed.">            if (reauthInfo.reauthenticating()) {</span>
+                /*
+                 * It didn't match the current request header, so it must be unrelated to
+                 * re-authentication. Save it so it can be processed later.
+                 */
+<span class="nc" id="L591">                receive.payload().rewind();</span>
+<span class="nc" id="L592">                reauthInfo.pendingAuthenticatedReceives.add(receive);</span>
+<span class="nc" id="L593">                return null;</span>
+            }
+<span class="nc" id="L595">            log.debug(&quot;Invalid SASL mechanism response, server may be expecting only GSSAPI tokens&quot;);</span>
+<span class="nc" id="L596">            setSaslState(SaslState.FAILED);</span>
+<span class="nc" id="L597">            throw new IllegalSaslStateException(&quot;Invalid SASL mechanism response, server may be expecting a different protocol&quot;, e);</span>
+        }
+    }
+
+    private void handleSaslHandshakeResponse(SaslHandshakeResponse response) {
+<span class="nc" id="L602">        Errors error = response.error();</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">        if (error != Errors.NONE)</span>
+<span class="nc" id="L604">            setSaslState(SaslState.FAILED);</span>
+<span class="nc bnc" id="L605" title="All 4 branches missed.">        switch (error) {</span>
+            case NONE:
+<span class="nc" id="L607">                break;</span>
+            case UNSUPPORTED_SASL_MECHANISM:
+<span class="nc" id="L609">                throw new UnsupportedSaslMechanismException(String.format(&quot;Client SASL mechanism '%s' not enabled in the server, enabled mechanisms are %s&quot;,</span>
+<span class="nc" id="L610">                    mechanism, response.enabledMechanisms()));</span>
+            case ILLEGAL_SASL_STATE:
+<span class="nc" id="L612">                throw new IllegalSaslStateException(String.format(&quot;Unexpected handshake request with client mechanism %s, enabled mechanisms are %s&quot;,</span>
+<span class="nc" id="L613">                    mechanism, response.enabledMechanisms()));</span>
+            default:
+<span class="nc" id="L615">                throw new IllegalSaslStateException(String.format(&quot;Unknown error code %s, client mechanism is %s, enabled mechanisms are %s&quot;,</span>
+<span class="nc" id="L616">                    response.error(), mechanism, response.enabledMechanisms()));</span>
+        }
+<span class="nc" id="L618">    }</span>
+
+    /**
+     * Returns the first Principal from Subject.
+     * @throws KafkaException if there are no Principals in the Subject.
+     *     During Kerberos re-login, principal is reset on Subject. An exception is
+     *     thrown so that the connection is retried after any configured backoff.
+     */
+    public static String firstPrincipal(Subject subject) {
+<span class="nc" id="L627">        Set&lt;Principal&gt; principals = subject.getPrincipals();</span>
+<span class="nc" id="L628">        synchronized (principals) {</span>
+<span class="nc" id="L629">            Iterator&lt;Principal&gt; iterator = principals.iterator();</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">            if (iterator.hasNext())</span>
+<span class="nc" id="L631">                return iterator.next().getName();</span>
+            else
+<span class="nc" id="L633">                throw new KafkaException(&quot;Principal could not be determined from Subject, this may be a transient failure due to Kerberos re-login&quot;);</span>
+        }
+    }
+
+    /**
+     * Information related to re-authentication
+     */
+<span class="nc" id="L640">    private class ReauthInfo {</span>
+        public ApiVersionsResponse apiVersionsResponseFromOriginalAuthentication;
+        public long reauthenticationBeginNanos;
+<span class="nc" id="L643">        public List&lt;NetworkReceive&gt; pendingAuthenticatedReceives = new ArrayList&lt;&gt;();</span>
+        public ApiVersionsResponse apiVersionsResponseReceivedFromBroker;
+        public Long positiveSessionLifetimeMs;
+        public long authenticationEndNanos;
+        public Long clientSessionReauthenticationTimeNanos;
+
+        public void reauthenticating(ApiVersionsResponse apiVersionsResponseFromOriginalAuthentication,
+                                     long reauthenticationBeginNanos) {
+<span class="nc" id="L651">            this.apiVersionsResponseFromOriginalAuthentication = Objects</span>
+<span class="nc" id="L652">                    .requireNonNull(apiVersionsResponseFromOriginalAuthentication);</span>
+<span class="nc" id="L653">            this.reauthenticationBeginNanos = reauthenticationBeginNanos;</span>
+<span class="nc" id="L654">        }</span>
+
+        public boolean reauthenticating() {
+<span class="nc bnc" id="L657" title="All 2 branches missed.">            return apiVersionsResponseFromOriginalAuthentication != null;</span>
+        }
+
+        public ApiVersionsResponse apiVersionsResponse() {
+<span class="nc bnc" id="L661" title="All 2 branches missed.">            return reauthenticating() ? apiVersionsResponseFromOriginalAuthentication</span>
+<span class="nc" id="L662">                    : apiVersionsResponseReceivedFromBroker;</span>
+        }
+
+        /**
+         * Return the (always non-null but possibly empty) NetworkReceive response that
+         * arrived during re-authentication that is unrelated to re-authentication, if
+         * any. This corresponds to a request sent prior to the beginning of
+         * re-authentication; the request was made when the channel was successfully
+         * authenticated, and the response arrived during the re-authentication
+         * process.
+         * 
+         * @return the (always non-null but possibly empty) NetworkReceive response
+         *         that arrived during re-authentication that is unrelated to
+         *         re-authentication, if any
+         */
+        public Optional&lt;NetworkReceive&gt; pollResponseReceivedDuringReauthentication() {
+<span class="nc bnc" id="L678" title="All 2 branches missed.">            if (pendingAuthenticatedReceives.isEmpty())</span>
+<span class="nc" id="L679">                return Optional.empty();</span>
+<span class="nc" id="L680">            return Optional.of(pendingAuthenticatedReceives.remove(0));</span>
+        }
+
+        public void setAuthenticationEndAndSessionReauthenticationTimes(long nowNanos) {
+<span class="nc" id="L684">            authenticationEndNanos = nowNanos;</span>
+            long sessionLifetimeMsToUse;
+<span class="nc bnc" id="L686" title="All 2 branches missed.">            if (positiveSessionLifetimeMs != null) {</span>
+                // pick a random percentage between 85% and 95% for session re-authentication
+<span class="nc" id="L688">                double pctWindowFactorToTakeNetworkLatencyAndClockDriftIntoAccount = 0.85;</span>
+<span class="nc" id="L689">                double pctWindowJitterToAvoidReauthenticationStormAcrossManyChannelsSimultaneously = 0.10;</span>
+<span class="nc" id="L690">                double pctToUse = pctWindowFactorToTakeNetworkLatencyAndClockDriftIntoAccount + RNG.nextDouble()</span>
+                        * pctWindowJitterToAvoidReauthenticationStormAcrossManyChannelsSimultaneously;
+<span class="nc" id="L692">                sessionLifetimeMsToUse = (long) (positiveSessionLifetimeMs * pctToUse);</span>
+<span class="nc" id="L693">                clientSessionReauthenticationTimeNanos = Math.addExact(authenticationEndNanos, Utils.msToNs(sessionLifetimeMsToUse));</span>
+<span class="nc" id="L694">                log.debug(</span>
+                        &quot;Finished {} with session expiration in {} ms and session re-authentication on or after {} ms&quot;,
+<span class="nc" id="L696">                        authenticationOrReauthenticationText(), positiveSessionLifetimeMs, sessionLifetimeMsToUse);</span>
+<span class="nc" id="L697">            } else</span>
+<span class="nc" id="L698">                log.debug(&quot;Finished {} with no session expiration and no session re-authentication&quot;,</span>
+<span class="nc" id="L699">                        authenticationOrReauthenticationText());</span>
+<span class="nc" id="L700">        }</span>
+
+        public Long reauthenticationLatencyMs() {
+<span class="nc bnc" id="L703" title="All 2 branches missed.">            return reauthenticating()</span>
+<span class="nc" id="L704">                    ? Math.round((authenticationEndNanos - reauthenticationBeginNanos) / 1000.0 / 1000.0)</span>
+<span class="nc" id="L705">                    : null;</span>
+        }
+
+        private String authenticationOrReauthenticationText() {
+<span class="nc bnc" id="L709" title="All 2 branches missed.">            return reauthenticating() ? &quot;re-authentication&quot; : &quot;authentication&quot;;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

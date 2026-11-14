@@ -1,0 +1,100 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "array.h"
+#include "hash.h"
+#include "istream.h"
+#include "iso8601-date.h"
+#include "mail-storage.h"
+
+#include <time.h>
+
+#include "push-notification-drivers.h"
+#include "push-notification-events.h"
+#include "push-notification-event-message-common.h"
+#include "push-notification-event-messageappend.h"
+#include "push-notification-txn-msg.h"
+
+#define EVENT_NAME "MessageAppend"
+
+static struct push_notification_event_messageappend_config default_config;
+
+static void *push_notification_event_messageappend_default_config(void)
+{
+	i_zero(&default_config);
+
+	return &default_config;
+}
+
+static void
+push_notification_event_messageappend_debug_msg(
+	struct push_notification_txn_event *event)
+{
+	struct event *log_event = event->event->log_event;
+	struct push_notification_event_messageappend_data *data = event->data;
+	struct tm *tm;
+
+	if (data->date != -1) {
+		tm = gmtime(&data->date);
+		e_debug(log_event, "%s: Date [%s]", EVENT_NAME,
+			iso8601_date_create_tm(tm, data->date_tz));
+	}
+
+	if (data->from != NULL)
+		e_debug(log_event, "%s: From [%s]", EVENT_NAME, data->from);
+	if (data->snippet != NULL)
+		e_debug(log_event, "%s: Snippet [%s]", EVENT_NAME, data->snippet);
+	if (data->subject != NULL)
+		e_debug(log_event, "%s: Subject [%s]", EVENT_NAME, data->subject);
+	if (data->to != NULL)
+		e_debug(log_event, "%s: To [%s]", EVENT_NAME, data->to);
+}
+
+static void
+push_notification_event_messageappend_event(
+	struct push_notification_txn *ptxn,
+	struct push_notification_event_config *ec,
+	struct push_notification_txn_msg *msg, struct mail *mail)
+{
+	struct push_notification_event_messageappend_config *config =
+		(struct push_notification_event_messageappend_config *)
+			ec->config;
+	struct push_notification_event_messageappend_data *data;
+
+	if (config->flags == 0)
+		return;
+
+	data = push_notification_txn_msg_get_eventdata(msg, EVENT_NAME);
+	if (data == NULL) {
+		data = p_new(ptxn->pool,
+			     struct push_notification_event_messageappend_data, 1);
+		data->date = -1;
+		push_notification_txn_msg_set_eventdata(ptxn, msg, ec, data);
+	}
+
+	push_notification_message_fill(mail, ptxn->pool, config->flags,
+				       &data->from, &data->to, &data->subject,
+				       &data->date, &data->date_tz,
+				       &data->message_id,
+				       &data->flags, &data->flags_set,
+				       &data->keywords,
+				       &data->snippet, &data->ext);
+}
+
+/* Event definition */
+
+extern struct push_notification_event push_notification_event_messageappend;
+
+struct push_notification_event push_notification_event_messageappend = {
+	.name = EVENT_NAME,
+	.init = {
+		.default_config =
+			push_notification_event_messageappend_default_config,
+	},
+	.msg = {
+		.debug_msg = push_notification_event_messageappend_debug_msg,
+	},
+	.msg_triggers = {
+		.append = push_notification_event_messageappend_event,
+	},
+};

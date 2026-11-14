@@ -1,0 +1,353 @@
+#ifndef MAILBOX_LIST_INDEX_H
+#define MAILBOX_LIST_INDEX_H
+
+/* Mailbox list index basically contains:
+
+   Header contains ID => name mapping. The name isn't the full mailbox name,
+   but rather each hierarchy level has its own ID and name. For example a
+   mailbox name "foo/bar" (with '/' as separator) would have separate IDs for
+   "foo" and "bar" names.
+
+   The records contain { parent_uid, uid, name_id } field that can be used to
+   build the whole mailbox tree. parent_uid=0 means root, otherwise it's the
+   parent node's uid.
+
+   Each record also contains GUID for each selectable mailbox. If a mailbox
+   is recreated using the same name, its GUID also changes. Note however that
+   the UID doesn't change, because the UID refers to the mailbox name, not to
+   the mailbox itself.
+
+   The records may contain also extensions for allowing mailbox_get_status()
+   to return values directly from the mailbox list index. Storage backends
+   may also add their own extensions to figure out if a record is up to date.
+*/
+
+#include "module-context.h"
+#include "mail-types.h"
+#include "mail-storage.h"
+#include "mailbox-list-private.h"
+
+#include <sys/time.h>
+
+#define MAILBOX_LIST_INDEX_HIERARCHY_SEP '~'
+#define MAILBOX_LIST_INDEX_HIERARCHY_ALT_SEP '^'
+
+#define INDEX_LIST_CONTEXT(obj) \
+	MODULE_CONTEXT(obj, mailbox_list_index_module)
+#define INDEX_LIST_CONTEXT_REQUIRE(obj) \
+	MODULE_CONTEXT_REQUIRE(obj, mailbox_list_index_module)
+
+/* Should the STATUS information for this mailbox not be written to the
+   mailbox list index? */
+#define MAILBOX_IS_NEVER_IN_INDEX(box) \
+	((box)->inbox_any && !(box)->storage->set->mailbox_list_index_include_inbox)
+
+struct mail_index_view;
+struct mailbox_index_vsize;
+struct mailbox_vfuncs;
+
+/* stored in mail_index_record.flags: */
+enum mailbox_list_index_flags {
+	MAILBOX_LIST_INDEX_FLAG_NONEXISTENT = MAIL_DELETED,
+	MAILBOX_LIST_INDEX_FLAG_NOSELECT = MAIL_DRAFT,
+	MAILBOX_LIST_INDEX_FLAG_NOINFERIORS = MAIL_ANSWERED,
+	MAILBOX_LIST_INDEX_FLAG_CORRUPTED_NAME = MAIL_SEEN,
+
+	/* set during syncing for mailboxes that still exist */
+	MAILBOX_LIST_INDEX_FLAG_SYNC_EXISTS = MAIL_FLAGGED
+};
+
+struct mailbox_list_index_header {
+	uint8_t refresh_flag;
+	/* array of { uint32_t id; char name[]; } */
+};
+
+/* name_id => name mapping from struct mailbox_list_index_header */
+struct mailbox_list_index_name {
+	uint32_t id;
+	const char *name;
+};
+ARRAY_DEFINE_TYPE(mailbox_list_index_name, struct mailbox_list_index_name);
+
+struct mailbox_list_index_name_iter {
+	const unsigned char *data;
+	size_t size, offset;
+	uint32_t prev_id;
+	string_t *str;
+};
+
+struct mailbox_list_index_header2 {
+	/* ID number in mailbox_list_index_header which should be considered
+	   as the <prefix>/INBOX mailbox, which would be escaped as
+	   <escape char>49NBOX to differentiate it from the actual INBOX.
+	   The name in the header can be anything - it would be used only by
+	   old Dovecot versions. */
+	uint32_t inbox_inbox_name_id;
+};
+
+struct mailbox_list_index_record {
+	/* points to given id in header */
+	uint32_t name_id;
+	/* parent mailbox's UID, 0 = root */
+	uint32_t parent_uid;
+
+	/* the following fields are temporarily zero while unknown,
+	   also permanently zero for \NoSelect and \Nonexistent mailboxes: */
+
+	guid_128_t guid;
+	uint32_t uid_validity;
+};
+
+struct mailbox_list_index_msgs_record {
+	uint32_t messages;
+	uint32_t unseen;
+	uint32_t recent;
+	uint32_t uidnext;
+};
+
+struct mailbox_list_index_node {
+	struct mailbox_list_index_node *parent;
+	struct mailbox_list_index_node *next;
+	struct mailbox_list_index_node *children;
+
+	uint32_t name_id, uid;
+	enum mailbox_list_index_flags flags;
+	/* extension data is corrupted on disk - need to update it */
+	bool corrupted_ext;
+	/* flags are corrupted on disk - need to update it */
+	bool corrupted_flags;
+	/* Raw (unescaped) mailbox name. Unfortunately for now, it may be
+	   either in UTF8 or mUTF-7 depending on the mailbox_list_utf8 setting.
+
+	   As a special case, if raw_name points to ilist->inbox_inbox_name,
+	   it's actually the <ns prefix>/INBOX mailbox (not INBOX). */
+	const char *raw_name;
+};
+
+struct mailbox_list_index {
+	union mailbox_list_module_context module_ctx;
+	struct mailbox_list *list;
+
+	const char *path;
+	struct mail_index *index;
+	uint32_t ext_id, ext2_id, msgs_ext_id, hmodseq_ext_id, subs_hdr_ext_id;
+	uint32_t vsize_ext_id, first_saved_ext_id, deleted_count_id;
+	struct timeval last_refresh_timeval;
+
+	pool_t mailbox_pool;
+	/* uin32_t id => name */
+	HASH_TABLE(void *, char *) mailbox_names;
+	uint32_t highest_name_id;
+
+	struct mailbox_list_index_sync_context *sync_ctx;
+	uint32_t sync_log_file_seq;
+	uoff_t sync_log_file_offset;
+	uint32_t sync_stamp;
+	struct timeout *to_refresh;
+
+	/* If mailbox_list_index_node.raw_name contains this pointer, it's
+	   the <ns prefix>/INBOX (not INBOX). Note: Compare this against the
+	   raw_name pointer directly - not the string content. */
+	void *raw_inbox_inbox_name_ptr;
+	/* <escape char>49NBOX, if mailbox_list_storage_escape_char is specified.
+	   Otherwise NULL. */
+	const char *inbox_inbox_storage_name;
+	/* If mailbox_list_index_record.name_id contains this (non-0) ID, it's
+	   the <ns prefix>/INBOX (not INBOX). */
+	uint32_t inbox_inbox_name_id;
+
+	/* uint32_t uid => node */
+	HASH_TABLE(void *, struct mailbox_list_index_node *) mailbox_hash;
+	/* full storage name => node */
+	HASH_TABLE(const char *, struct mailbox_list_index_node *) mailbox_storage_name_hash;
+	struct mailbox_list_index_node *mailbox_tree;
+
+	enum mail_index_error_code index_error_code;
+
+	bool pending_init:1;
+	bool opened:1;
+	bool syncing:1;
+	/* The list index's transaction log is locked by this process. */
+	bool index_locked:1;
+	bool updating_status:1;
+	bool has_backing_store:1;
+	bool index_last_check_changed:1;
+	bool corrupted_names_or_parents:1;
+	bool handling_corruption:1;
+	bool call_corruption_callback:1;
+	bool rebuild_on_missing_inbox:1;
+	bool force_resynced:1;
+	bool force_resync_failed:1;
+	bool last_refresh_success:1;
+	bool index_created:1;
+};
+
+struct mailbox_list_index_iterate_context {
+	struct mailbox_list_iterate_context ctx;
+	pool_t mailbox_pool;
+
+	struct mailbox_info info;
+
+	size_t parent_len;
+	string_t *path;
+	struct mailbox_list_index_node *next_node;
+
+	bool failed:1;
+	bool prefix_inbox_list:1;
+};
+
+extern MODULE_CONTEXT_DEFINE(mailbox_list_index_module,
+			     &mailbox_list_module_register);
+
+void mailbox_list_index_set_index_error(struct mailbox_list *list);
+struct mailbox_list_index_node *
+mailbox_list_index_lookup(struct mailbox_list *list, const char *name);
+struct mailbox_list_index_node *
+mailbox_list_index_lookup_uid(struct mailbox_list_index *ilist, uint32_t uid);
+void mailbox_list_index_node_get_path(struct mailbox_list *list,
+				      const struct mailbox_list_index_node *node,
+				      string_t *storage_name);
+void mailbox_list_index_node_hash_insert(struct mailbox_list_index *ilist,
+					 struct mailbox_list_index_node *node);
+void mailbox_list_index_subtree_hash_remove(struct mailbox_list_index *ilist,
+					    struct mailbox_list_index_node *node);
+void mailbox_list_index_subtree_hash_insert(struct mailbox_list_index *ilist,
+					    struct mailbox_list_index_node *node);
+void mailbox_list_index_node_unlink(struct mailbox_list_index *ilist,
+				    struct mailbox_list_index_node *node);
+
+void mailbox_list_get_escaped_mailbox_name(struct mailbox_list *list,
+					   const struct mailbox_list_index_node *node,
+					   string_t *escaped_name);
+
+/* Flags appended to box-name header after the mailbox name's trailing NUL.
+   Old Dovecot versions wrote no trailing NUL and no flag byte. The flag byte
+   is only present when at least one bit is set, so a 0 byte never encodes
+   "no flags" - that case is encoded by omitting the trailing NUL+flag. */
+enum mailbox_name_hdr_flags {
+	/* The mailbox is <ns prefix>/INBOX (encoded in the header as just
+	   "INBOX" so that old Dovecot versions still see a sensible name). */
+	MAILBOX_NAME_HDR_FLAG_INBOX_INBOX = 0x01,
+};
+
+/* Return mailbox name encoded into box-name header. */
+const unsigned char *
+mailbox_name_hdr_encode(struct mailbox_list *list, const char *storage_name,
+			size_t *name_len_r);
+/* Return mailbox name decoded from box-name header. If flags_r is non-NULL,
+   it is set to the decoded flag bits (0 if the header is in the old format
+   without a flag byte). */
+const char *
+mailbox_name_hdr_decode_storage_name(struct mailbox_list *list,
+				     const unsigned char *name_hdr,
+				     size_t name_hdr_size,
+				     uint8_t *flags_r);
+/* Returns TRUE if a mailbox can be created and accessed with the given
+   storage name. A name recovered from a corrupted index may be unusable.
+   reason_r is set to the reason when the name can't be used. */
+bool mailbox_list_index_name_is_usable(struct mailbox_list *list,
+				       const char *storage_name,
+				       const char **reason_r);
+
+int mailbox_list_index_index_open(struct mailbox_list *list);
+bool mailbox_list_index_need_refresh(struct mailbox_list_index *ilist,
+				     struct mail_index_view *view);
+/* Refresh the index, but only if it hasn't been refreshed "recently"
+   (= within this same ioloop run) */
+int mailbox_list_index_refresh(struct mailbox_list *list);
+/* Refresh the index regardless of when the last refresh was done. */
+int mailbox_list_index_refresh_force(struct mailbox_list *list);
+void mailbox_list_index_refresh_later(struct mailbox_list *list);
+int mailbox_list_index_handle_corruption(struct mailbox_list *list);
+int mailbox_list_index_set_uncorrupted(struct mailbox_list *list);
+
+/* Returns TRUE and index_r if mailbox list index exists, FALSE if not. */
+bool mailbox_list_index_get_index(struct mailbox_list *list,
+				  struct mail_index **index_r);
+/* Open mailbox list index's view and get the given mailbox's sequence number
+   in it. If require_refreshed is TRUE, the mailbox must have up-to-date
+   information in the mailbox list index. Returns 1 if ok, 0 if mailbox wasn't
+   found or it wasn't up-to-date as requested, -1 if there was an error. The
+   error is stored to the mailbox storage. */
+int mailbox_list_index_view_open(struct mailbox *box, bool require_refreshed,
+				 struct mail_index_view **view_r,
+				 uint32_t *seq_r);
+
+struct mailbox_list_index_node *
+mailbox_list_index_node_find_sibling(struct mailbox_list *list,
+				     struct mailbox_list_index_node *node,
+				     const char *name);
+void mailbox_list_index_reset(struct mailbox_list_index *ilist);
+
+/* Iterate through the name_id => name mappings in a
+   struct mailbox_list_index_header. The header may come from an index view or
+   straight from a transaction log record. Note that the iterator uses the data
+   stack. */
+void mailbox_list_index_name_iter_init(
+	struct mailbox_list_index_name_iter *iter,
+	const void *data, size_t size);
+/* Returns 1 if the next name was returned, 0 at the end of the header, or -1
+   if the header is corrupted. The returned name is always valid UTF-8; if the
+   header's name wasn't, it's replaced with a fixed one and *fixed_r is set to
+   TRUE. The name points to the header data or to the data stack, so it must be
+   duplicated to be kept. */
+int mailbox_list_index_name_iter_next(struct mailbox_list_index_name_iter *iter,
+				      uint32_t *id_r, const char **name_r,
+				      bool *fixed_r);
+int mailbox_list_index_parse(struct mailbox_list *list,
+			     struct mail_index_view *view, bool force);
+/* Same as mailbox_list_index_parse(), but the view isn't known to be fully
+   consistent, so a parsing failure isn't treated as index corruption. Returns
+   -1 if the view couldn't be parsed, leaving the mailbox tree unusable until
+   the next mailbox_list_index_parse().
+
+   names are used for the name_ids that the view's index header doesn't have.
+   It may be NULL. */
+int mailbox_list_index_parse_try(struct mailbox_list *list,
+				 struct mail_index_view *view,
+				 const ARRAY_TYPE(mailbox_list_index_name) *names);
+
+struct mailbox_list_iterate_context *
+mailbox_list_index_iter_init(struct mailbox_list *list,
+			     const char *const *patterns,
+			     enum mailbox_list_iter_flags flags);
+const struct mailbox_info *
+mailbox_list_index_iter_next(struct mailbox_list_iterate_context *ctx);
+int mailbox_list_index_iter_deinit(struct mailbox_list_iterate_context *ctx);
+
+bool mailbox_list_index_status(struct mailbox_list *list,
+			       struct mail_index_view *view,
+			       uint32_t seq, enum mailbox_status_items items,
+			       struct mailbox_status *status_r,
+			       uint8_t *mailbox_guid,
+			       struct mailbox_index_vsize *vsize_r,
+			       const char **reason_r);
+void mailbox_list_index_status_set_info_flags(struct mailbox *box, uint32_t uid,
+					      enum mailbox_info_flags *flags);
+void mailbox_list_index_update_mailbox_index(struct mailbox *box,
+					     const struct mailbox_update *update);
+
+int mailbox_list_index_notify_init(struct mailbox_list *list,
+				   enum mailbox_list_notify_event mask,
+				   struct mailbox_list_notify **notify_r);
+void mailbox_list_index_notify_deinit(struct mailbox_list_notify *notify);
+int mailbox_list_index_notify_next(struct mailbox_list_notify *notify,
+				   const struct mailbox_list_notify_rec **rec_r);
+void mailbox_list_index_notify_wait(struct mailbox_list_notify *notify,
+				    void (*callback)(void *context),
+				    void *context);
+void mailbox_list_index_notify_flush(struct mailbox_list_notify *notify);
+
+void mailbox_list_index_status_init_mailbox(struct mailbox_vfuncs *v);
+bool mailbox_list_index_backend_init_mailbox(struct mailbox *box,
+					     struct mailbox_vfuncs *v);
+void mailbox_list_index_status_init_finish(struct mailbox_list *list);
+
+void mailbox_list_index_status_sync_init(struct mailbox *box);
+void mailbox_list_index_status_sync_deinit(struct mailbox *box);
+
+void mailbox_list_index_backend_sync_init(struct mailbox *box,
+					  enum mailbox_sync_flags flags);
+int mailbox_list_index_backend_sync_deinit(struct mailbox *box);
+
+#endif

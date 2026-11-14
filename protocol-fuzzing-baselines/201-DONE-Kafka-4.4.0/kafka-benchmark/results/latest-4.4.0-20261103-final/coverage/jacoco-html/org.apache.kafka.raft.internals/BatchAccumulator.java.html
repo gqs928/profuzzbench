@@ -1,0 +1,647 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BatchAccumulator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.raft.internals</a> &gt; <span class="el_source">BatchAccumulator.java</span></div><h1>BatchAccumulator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.raft.internals;
+
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.errors.RecordBatchTooLargeException;
+import org.apache.kafka.common.memory.MemoryPool;
+import org.apache.kafka.common.message.LeaderChangeMessage;
+import org.apache.kafka.common.message.SnapshotFooterRecord;
+import org.apache.kafka.common.message.SnapshotHeaderRecord;
+import org.apache.kafka.common.message.VotersRecord;
+import org.apache.kafka.common.protocol.ObjectSerializationCache;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.MutableRecordBatch;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.raft.errors.BufferAllocationException;
+import org.apache.kafka.raft.errors.NotLeaderException;
+import org.apache.kafka.server.common.serialization.RecordSerde;
+
+import java.io.Closeable;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class BatchAccumulator&lt;T&gt; implements Closeable {
+    @FunctionalInterface
+    public interface MemoryRecordsCreator {
+        MemoryRecords create(
+            long baseOffset,
+            int epoch,
+            Compression compression,
+            ByteBuffer byteBuffer
+        );
+    }
+
+    private final int epoch;
+    private final Time time;
+    private final int lingerMs;
+    private final int maxBatchSizeBytes;
+    private final int maxNumberOfBatches;
+    private final Compression compression;
+    private final MemoryPool memoryPool;
+    private final RecordSerde&lt;T&gt; serde;
+
+<span class="nc" id="L67">    private final SimpleTimer lingerTimer = new SimpleTimer();</span>
+<span class="nc" id="L68">    private final AtomicLong drainOffset = new AtomicLong(Long.MAX_VALUE);</span>
+<span class="nc" id="L69">    private final ConcurrentLinkedQueue&lt;CompletedBatch&lt;T&gt;&gt; completed = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="nc" id="L70">    private volatile DrainStatus drainStatus = DrainStatus.NONE;</span>
+
+    // These fields are protected by the append lock
+<span class="nc" id="L73">    private final ReentrantLock appendLock = new ReentrantLock();</span>
+    private long nextOffset;
+    private BatchBuilder&lt;T&gt; currentBatch;
+
+<span class="nc" id="L77">    private enum DrainStatus {</span>
+<span class="nc" id="L78">        STARTED, FINISHED, NONE</span>
+    }
+
+    public BatchAccumulator(
+        int epoch,
+        long baseOffset,
+        int lingerMs,
+        int maxBatchSizeBytes,
+        int maxNumberOfBatches,
+        MemoryPool memoryPool,
+        Time time,
+        Compression compression,
+        RecordSerde&lt;T&gt; serde
+<span class="nc" id="L91">    ) {</span>
+<span class="nc" id="L92">        this.epoch = epoch;</span>
+<span class="nc" id="L93">        this.lingerMs = lingerMs;</span>
+<span class="nc" id="L94">        this.maxBatchSizeBytes = maxBatchSizeBytes;</span>
+<span class="nc" id="L95">        this.maxNumberOfBatches = maxNumberOfBatches;</span>
+<span class="nc" id="L96">        this.memoryPool = memoryPool;</span>
+<span class="nc" id="L97">        this.time = time;</span>
+<span class="nc" id="L98">        this.compression = compression;</span>
+<span class="nc" id="L99">        this.serde = serde;</span>
+<span class="nc" id="L100">        this.nextOffset = baseOffset;</span>
+<span class="nc" id="L101">    }</span>
+
+    /**
+     * Append to the accumulator.
+     *
+     * @param epoch the leader epoch to append at
+     * @param records the records to append
+     * @param delayDrain whether the records could be drained
+     * @return the offset of the last record
+     *
+     * @throws NotLeaderException indicates that an append operation cannot be completed because the
+     *         provided leader epoch was too old
+     * @throws IllegalArgumentException indicates that an append operation cannot be completed
+     *         because the provided leader epoch was too new
+     * @throws IllegalStateException if the number of accumulated batches reaches the maximum
+     *         number of batches
+     */
+    public long append(int epoch, List&lt;T&gt; records, boolean delayDrain) {
+<span class="nc" id="L119">        int numberOfCompletedBatches = completed.size();</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">        if (epoch &lt; this.epoch) {</span>
+<span class="nc" id="L121">            throw new NotLeaderException(&quot;Append failed because the given epoch &quot; + epoch + &quot; is stale. &quot; +</span>
+<span class="nc" id="L122">                    &quot;Current leader epoch = &quot; + this.epoch());</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        } else if (epoch &gt; this.epoch) {</span>
+<span class="nc" id="L124">            throw new IllegalArgumentException(&quot;Attempt to append from epoch &quot; + epoch +</span>
+                &quot; which is larger than the current epoch &quot; + this.epoch);
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        } else if (numberOfCompletedBatches &gt;= maxNumberOfBatches) {</span>
+<span class="nc" id="L127">            throw new IllegalStateException(</span>
+<span class="nc" id="L128">                String.format(</span>
+                    &quot;Attempting to append records when the number of batches %s reached %s&quot;,
+<span class="nc" id="L130">                    numberOfCompletedBatches,</span>
+<span class="nc" id="L131">                    maxNumberOfBatches</span>
+                )
+            );
+        }
+
+<span class="nc" id="L136">        ObjectSerializationCache serializationCache = new ObjectSerializationCache();</span>
+
+<span class="nc" id="L138">        appendLock.lock();</span>
+        try {
+<span class="nc" id="L140">            long lastOffset = nextOffset + records.size() - 1;</span>
+<span class="nc" id="L141">            maybeCompleteDrain();</span>
+
+            BatchBuilder&lt;T&gt; batch;
+<span class="nc" id="L144">            batch = maybeAllocateBatch(records, serializationCache);</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">            if (batch == null) {</span>
+<span class="nc" id="L146">                throw new BufferAllocationException(&quot;Append failed because we failed to allocate memory to write the batch&quot;);</span>
+            }
+
+<span class="nc bnc" id="L149" title="All 2 branches missed.">            if (delayDrain) {</span>
+                // The user asked to not drain these records. If the drainOffset is not already set,
+                // then set the record at the current end offset (nextOffset) as maximum offset
+                // that can be drained.
+<span class="nc" id="L153">                drainOffset.compareAndSet(Long.MAX_VALUE, nextOffset);</span>
+            }
+
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            for (T record : records) {</span>
+<span class="nc" id="L157">                batch.appendRecord(record, serializationCache);</span>
+<span class="nc" id="L158">            }</span>
+
+<span class="nc" id="L160">            maybeResetLinger();</span>
+
+<span class="nc" id="L162">            nextOffset = lastOffset + 1;</span>
+<span class="nc" id="L163">            return lastOffset;</span>
+        } finally {
+<span class="nc" id="L165">            appendLock.unlock();</span>
+        }
+    }
+
+    private void maybeResetLinger() {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        if (!lingerTimer.isRunning()) {</span>
+<span class="nc" id="L171">            lingerTimer.reset(time.milliseconds() + lingerMs);</span>
+        }
+<span class="nc" id="L173">    }</span>
+
+    private BatchBuilder&lt;T&gt; maybeAllocateBatch(
+        Collection&lt;T&gt; records,
+        ObjectSerializationCache serializationCache
+    ) {
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (currentBatch == null) {</span>
+<span class="nc" id="L180">            startNewBatch();</span>
+        }
+
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        if (currentBatch != null) {</span>
+<span class="nc" id="L184">            OptionalInt bytesNeeded = currentBatch.bytesNeeded(records, serializationCache);</span>
+<span class="nc bnc" id="L185" title="All 4 branches missed.">            if (bytesNeeded.isPresent() &amp;&amp; bytesNeeded.getAsInt() &gt; maxBatchSizeBytes) {</span>
+<span class="nc" id="L186">                throw new RecordBatchTooLargeException(</span>
+<span class="nc" id="L187">                    String.format(</span>
+                        &quot;The total record(s) size of %d exceeds the maximum allowed batch size of %d&quot;,
+<span class="nc" id="L189">                        bytesNeeded.getAsInt(),</span>
+<span class="nc" id="L190">                        maxBatchSizeBytes</span>
+                    )
+                );
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            } else if (bytesNeeded.isPresent()) {</span>
+<span class="nc" id="L194">                completeCurrentBatch();</span>
+<span class="nc" id="L195">                startNewBatch();</span>
+            }
+        }
+
+<span class="nc" id="L199">        return currentBatch;</span>
+    }
+
+    private void completeCurrentBatch() {
+<span class="nc" id="L203">        MemoryRecords data = currentBatch.build();</span>
+<span class="nc" id="L204">        completed.add(new CompletedBatch&lt;&gt;(</span>
+<span class="nc" id="L205">            currentBatch.baseOffset(),</span>
+<span class="nc" id="L206">            currentBatch.records(),</span>
+            data,
+            memoryPool,
+<span class="nc" id="L209">            currentBatch.initialBuffer()</span>
+        ));
+<span class="nc" id="L211">        currentBatch = null;</span>
+<span class="nc" id="L212">    }</span>
+
+    /**
+     * Allows draining of all batches.
+     */
+    public void allowDrain() {
+<span class="nc" id="L218">        drainOffset.set(Long.MAX_VALUE);</span>
+<span class="nc" id="L219">    }</span>
+
+    /**
+     * Append a control batch from a supplied memory record.
+     *
+     * See the {@code valueCreator} parameter description for requirements on this function.
+     *
+     * @param valueCreator a function that uses the passed buffer to create the control
+     *        batch that will be appended. The memory records returned must contain one
+     *        control batch and that control batch have at least one record.
+     * @return the last of offset of the records created
+     */
+    public long appendControlMessages(MemoryRecordsCreator valueCreator) {
+<span class="nc" id="L232">        appendLock.lock();</span>
+        try {
+<span class="nc" id="L234">            ByteBuffer buffer = memoryPool.tryAllocate(maxBatchSizeBytes);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">            if (buffer != null) {</span>
+                try {
+<span class="nc" id="L237">                    forceDrain();</span>
+<span class="nc" id="L238">                    MemoryRecords memoryRecords = valueCreator.create(</span>
+                        nextOffset,
+                        epoch,
+                        compression,
+                        buffer
+                    );
+
+<span class="nc" id="L245">                    int numberOfRecords = validateMemoryRecordsAndReturnCount(memoryRecords);</span>
+
+<span class="nc" id="L247">                    completed.add(</span>
+                        new CompletedBatch&lt;&gt;(
+                            nextOffset,
+                            numberOfRecords,
+                            memoryRecords,
+                            memoryPool,
+                            buffer
+                        )
+                    );
+<span class="nc" id="L256">                    nextOffset += numberOfRecords;</span>
+<span class="nc" id="L257">                } catch (Exception e) {</span>
+                    // Release the buffer now since the buffer was not stored in completed for a delayed release
+<span class="nc" id="L259">                    memoryPool.release(buffer);</span>
+<span class="nc" id="L260">                    throw e;</span>
+<span class="nc" id="L261">                }</span>
+            } else {
+<span class="nc" id="L263">                throw new IllegalStateException(&quot;Could not allocate buffer for the control record&quot;);</span>
+            }
+
+<span class="nc" id="L266">            return nextOffset - 1;</span>
+        } finally {
+<span class="nc" id="L268">            appendLock.unlock();</span>
+        }
+    }
+
+    private int validateMemoryRecordsAndReturnCount(MemoryRecords memoryRecords) {
+        // Confirm that it is one control batch and it is at least one control record
+<span class="nc" id="L274">        Iterator&lt;MutableRecordBatch&gt; batches = memoryRecords.batches().iterator();</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        if (!batches.hasNext()) {</span>
+<span class="nc" id="L276">            throw new IllegalArgumentException(&quot;valueCreator didn't create a batch&quot;);</span>
+        }
+
+<span class="nc" id="L279">        MutableRecordBatch batch = batches.next();</span>
+<span class="nc" id="L280">        Integer numberOfRecords = batch.countOrNull();</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        if (!batch.isControlBatch()) {</span>
+<span class="nc" id="L282">            throw new IllegalArgumentException(&quot;valueCreator didn't create a control batch&quot;);</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        } else if (batch.baseOffset() != nextOffset) {</span>
+<span class="nc" id="L284">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L285">                String.format(</span>
+                    &quot;Expected a base offset of %d but got %d&quot;,
+<span class="nc" id="L287">                    nextOffset,</span>
+<span class="nc" id="L288">                    batch.baseOffset()</span>
+                )
+            );
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        } else if (batch.partitionLeaderEpoch() != epoch) {</span>
+<span class="nc" id="L292">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L293">                String.format(</span>
+                    &quot;Expected a partition leader epoch of %d but got %d&quot;,
+<span class="nc" id="L295">                    epoch,</span>
+<span class="nc" id="L296">                    batch.partitionLeaderEpoch()</span>
+                )
+            );
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        } else if (numberOfRecords == null) {</span>
+<span class="nc" id="L300">            throw new IllegalArgumentException(&quot;valueCreator didn't create a batch with the count&quot;);</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        } else if (numberOfRecords &lt; 1) {</span>
+<span class="nc" id="L302">            throw new IllegalArgumentException(&quot;valueCreator didn't create at least one control record&quot;);</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        } else if (batches.hasNext()) {</span>
+<span class="nc" id="L304">            throw new IllegalArgumentException(&quot;valueCreator created more than one batch&quot;);</span>
+        }
+
+<span class="nc" id="L307">        return numberOfRecords;</span>
+    }
+
+    /**
+     * Append a {@link VotersRecord} record to the batch
+     *
+     * @param voters the record to append
+     * @param currentTimestamp the current time in milliseconds
+     * @return the last of offset of the records created
+     * @throws IllegalStateException on failure to allocate a buffer for the record
+     */
+    public long appendVotersRecord(
+        VotersRecord voters,
+        long currentTimestamp
+    ) {
+<span class="nc" id="L322">        return appendControlMessages((baseOffset, epoch, compression, buffer) -&gt;</span>
+<span class="nc" id="L323">            MemoryRecords.withVotersRecord(</span>
+                baseOffset,
+                currentTimestamp,
+                epoch,
+                buffer,
+                voters
+            )
+        );
+    }
+
+
+    /**
+     * Append a {@link LeaderChangeMessage} record to the batch
+     *
+     * @param leaderChangeMessage The message to append
+     * @param currentTimestamp The current time in milliseconds
+     * @throws IllegalStateException on failure to allocate a buffer for the record
+     */
+    public void appendLeaderChangeMessage(
+        LeaderChangeMessage leaderChangeMessage,
+        long currentTimestamp
+    ) {
+<span class="nc" id="L345">        appendControlMessages((baseOffset, epoch, compression, buffer) -&gt;</span>
+<span class="nc" id="L346">            MemoryRecords.withLeaderChangeMessage(</span>
+                baseOffset,
+                currentTimestamp,
+                epoch,
+                buffer,
+                leaderChangeMessage
+            )
+        );
+<span class="nc" id="L354">    }</span>
+
+
+    /**
+     * Append a {@link SnapshotHeaderRecord} record to the batch
+     *
+     * @param snapshotHeaderRecord The record to append
+     * @param currentTimestamp The current time in milliseconds
+     * @throws IllegalStateException on failure to allocate a buffer for the record
+     */
+    public void appendSnapshotHeaderRecord(
+        SnapshotHeaderRecord snapshotHeaderRecord,
+        long currentTimestamp
+    ) {
+<span class="nc" id="L368">        appendControlMessages((baseOffset, epoch, compression, buffer) -&gt;</span>
+<span class="nc" id="L369">            MemoryRecords.withSnapshotHeaderRecord(</span>
+                baseOffset,
+                currentTimestamp,
+                epoch,
+                buffer,
+                snapshotHeaderRecord
+            )
+        );
+<span class="nc" id="L377">    }</span>
+
+    /**
+     * Append a {@link SnapshotFooterRecord} record to the batch
+     *
+     * @param snapshotFooterRecord The record to append
+     * @param currentTimestamp The current time in milliseconds
+     * @throws IllegalStateException on failure to allocate a buffer for the record
+     */
+    public void appendSnapshotFooterRecord(
+        SnapshotFooterRecord snapshotFooterRecord,
+        long currentTimestamp
+    ) {
+<span class="nc" id="L390">        appendControlMessages((baseOffset, epoch, compression, buffer) -&gt;</span>
+<span class="nc" id="L391">            MemoryRecords.withSnapshotFooterRecord(</span>
+                baseOffset,
+                currentTimestamp,
+                epoch,
+                buffer,
+                snapshotFooterRecord
+            )
+        );
+<span class="nc" id="L399">    }</span>
+
+    public void forceDrain() {
+<span class="nc" id="L402">        appendLock.lock();</span>
+        try {
+<span class="nc" id="L404">            drainStatus = DrainStatus.STARTED;</span>
+<span class="nc" id="L405">            maybeCompleteDrain();</span>
+        } finally {
+<span class="nc" id="L407">            appendLock.unlock();</span>
+        }
+<span class="nc" id="L409">    }</span>
+
+    private void maybeCompleteDrain() {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">        if (drainStatus == DrainStatus.STARTED) {</span>
+<span class="nc bnc" id="L413" title="All 4 branches missed.">            if (currentBatch != null &amp;&amp; currentBatch.nonEmpty()) {</span>
+<span class="nc" id="L414">                completeCurrentBatch();</span>
+            }
+            // Reset the timer to a large value. The linger clock will begin
+            // ticking after the next append.
+<span class="nc" id="L418">            lingerTimer.reset(Long.MAX_VALUE);</span>
+<span class="nc" id="L419">            drainStatus = DrainStatus.FINISHED;</span>
+        }
+<span class="nc" id="L421">    }</span>
+
+    private void startNewBatch() {
+<span class="nc" id="L424">        ByteBuffer buffer = memoryPool.tryAllocate(maxBatchSizeBytes);</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        if (buffer != null) {</span>
+<span class="nc" id="L426">            currentBatch = new BatchBuilder&lt;&gt;(</span>
+                buffer,
+                serde,
+                compression,
+                nextOffset,
+<span class="nc" id="L431">                time.milliseconds(),</span>
+                epoch,
+                maxBatchSizeBytes
+            );
+        }
+<span class="nc" id="L436">    }</span>
+
+    /**
+     * Check whether there are any batches which need to be drained now.
+     *
+     * @param currentTimeMs current time in milliseconds
+     * @return true if there are batches ready to drain, false otherwise
+     */
+    public boolean needsDrain(long currentTimeMs) {
+<span class="nc bnc" id="L445" title="All 2 branches missed.">        return timeUntilDrain(currentTimeMs) &lt;= 0;</span>
+    }
+
+    /**
+     * Check the time remaining until the next needed drain. If the accumulator
+     * is empty, then {@link Long#MAX_VALUE} will be returned.
+     *
+     * @param currentTimeMs current time in milliseconds
+     * @return the delay in milliseconds before the next expected drain
+     */
+    public long timeUntilDrain(long currentTimeMs) {
+<span class="nc" id="L456">        boolean drainableBatches = Optional.ofNullable(completed.peek())</span>
+<span class="nc" id="L457">            .map(batch -&gt; batch.drainable(drainOffset.get()))</span>
+<span class="nc" id="L458">            .orElse(false);</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        if (drainableBatches) {</span>
+<span class="nc" id="L460">            return 0;</span>
+        } else {
+<span class="nc" id="L462">            return lingerTimer.remainingMs(currentTimeMs);</span>
+        }
+    }
+
+    /**
+     * Get the leader epoch, which is constant for each instance.
+     *
+     * @return the leader epoch
+     */
+    public int epoch() {
+<span class="nc" id="L472">        return epoch;</span>
+    }
+
+    /**
+     * Drain completed batches. The caller is expected to first check whether
+     * {@link #needsDrain(long)} returns true in order to avoid unnecessary draining.
+     *
+     * Note on thread-safety: this method is safe in the presence of concurrent
+     * appends, but it assumes a single thread is responsible for draining.
+     *
+     * This call will not block, but the drain may require multiple attempts before
+     * it can be completed if the thread responsible for appending is holding the
+     * append lock. In the worst case, the append will be completed on the next
+     * call to {@link #append(int, List, boolean)} following the
+     * initial call to this method.
+     *
+     * The caller should respect the time to the next flush as indicated by
+     * {@link #timeUntilDrain(long)}.
+     *
+     * @return the list of completed batches
+     */
+    public List&lt;CompletedBatch&lt;T&gt;&gt; drain() {
+<span class="nc" id="L494">        return drain(drainOffset.get());</span>
+    }
+
+    private List&lt;CompletedBatch&lt;T&gt;&gt; drain(long drainOffset) {
+        // Start the drain if it has not been started already
+<span class="nc bnc" id="L499" title="All 2 branches missed.">        if (drainStatus == DrainStatus.NONE) {</span>
+<span class="nc" id="L500">            drainStatus = DrainStatus.STARTED;</span>
+        }
+
+        // Complete the drain ourselves if we can acquire the lock
+<span class="nc bnc" id="L504" title="All 2 branches missed.">        if (appendLock.tryLock()) {</span>
+            try {
+<span class="nc" id="L506">                maybeCompleteDrain();</span>
+            } finally {
+<span class="nc" id="L508">                appendLock.unlock();</span>
+            }
+        }
+
+        // If the drain has finished, then all of the batches will be completed
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        if (drainStatus == DrainStatus.FINISHED) {</span>
+<span class="nc" id="L514">            drainStatus = DrainStatus.NONE;</span>
+<span class="nc" id="L515">            return drainCompleted(drainOffset);</span>
+        } else {
+<span class="nc" id="L517">            return List.of();</span>
+        }
+    }
+
+    private List&lt;CompletedBatch&lt;T&gt;&gt; drainCompleted(long drainOffset) {
+<span class="nc" id="L522">        List&lt;CompletedBatch&lt;T&gt;&gt; res = new ArrayList&lt;&gt;();</span>
+        while (true) {
+<span class="nc" id="L524">            CompletedBatch&lt;T&gt; batch = completed.peek();</span>
+<span class="nc bnc" id="L525" title="All 4 branches missed.">            if (batch == null || !batch.drainable(drainOffset)) {</span>
+<span class="nc" id="L526">                return res;</span>
+            } else {
+                // The batch can be drained so remove the batch and add it to the result.
+<span class="nc" id="L529">                completed.poll();</span>
+<span class="nc" id="L530">                res.add(batch);</span>
+            }
+<span class="nc" id="L532">        }</span>
+    }
+
+    public boolean isEmpty() {
+        // The linger timer begins running when we have pending batches.
+        // We use this to infer when the accumulator is empty to avoid the
+        // need to acquire the append lock.
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        return !lingerTimer.isRunning();</span>
+    }
+
+    @Override
+    public void close() {
+        // Acquire the lock so that drain is guaranteed to complete the current batch
+<span class="nc" id="L545">        appendLock.lock();</span>
+        List&lt;CompletedBatch&lt;T&gt;&gt; unwritten;
+        try {
+<span class="nc" id="L548">            unwritten = drain(Long.MAX_VALUE);</span>
+        } finally {
+<span class="nc" id="L550">            appendLock.unlock();</span>
+        }
+<span class="nc" id="L552">        unwritten.forEach(CompletedBatch::release);</span>
+<span class="nc" id="L553">    }</span>
+
+    public static class CompletedBatch&lt;T&gt; {
+        public final long baseOffset;
+        public final int numRecords;
+        public final Optional&lt;List&lt;T&gt;&gt; records;
+        public final MemoryRecords data;
+        private final MemoryPool pool;
+        // Buffer that was allocated by the MemoryPool (pool). This may not be the buffer used in
+        // the MemoryRecords (data) object.
+        private final ByteBuffer initialBuffer;
+
+        private CompletedBatch(
+            long baseOffset,
+            List&lt;T&gt; records,
+            MemoryRecords data,
+            MemoryPool pool,
+            ByteBuffer initialBuffer
+<span class="nc" id="L571">        ) {</span>
+<span class="nc" id="L572">            this.baseOffset = baseOffset;</span>
+<span class="nc" id="L573">            this.records = Optional.of(records);</span>
+<span class="nc" id="L574">            this.numRecords = records.size();</span>
+<span class="nc" id="L575">            this.data = data;</span>
+<span class="nc" id="L576">            this.pool = pool;</span>
+<span class="nc" id="L577">            this.initialBuffer = initialBuffer;</span>
+
+<span class="nc" id="L579">            validateConstruction();</span>
+<span class="nc" id="L580">        }</span>
+
+        private CompletedBatch(
+            long baseOffset,
+            int numRecords,
+            MemoryRecords data,
+            MemoryPool pool,
+            ByteBuffer initialBuffer
+<span class="nc" id="L588">        ) {</span>
+<span class="nc" id="L589">            this.baseOffset = baseOffset;</span>
+<span class="nc" id="L590">            this.records = Optional.empty();</span>
+<span class="nc" id="L591">            this.numRecords = numRecords;</span>
+<span class="nc" id="L592">            this.data = data;</span>
+<span class="nc" id="L593">            this.pool = pool;</span>
+<span class="nc" id="L594">            this.initialBuffer = initialBuffer;</span>
+
+<span class="nc" id="L596">            validateConstruction();</span>
+<span class="nc" id="L597">        }</span>
+
+        private void validateConstruction() {
+<span class="nc" id="L600">            Objects.requireNonNull(data.firstBatch(), &quot;Expected memory records to contain one batch&quot;);</span>
+
+<span class="nc bnc" id="L602" title="All 2 branches missed.">            if (numRecords &lt;= 0) {</span>
+<span class="nc" id="L603">                throw new IllegalArgumentException(</span>
+<span class="nc" id="L604">                    String.format(&quot;Completed batch must contain at least one record: %s&quot;, numRecords)</span>
+                );
+            }
+<span class="nc" id="L607">        }</span>
+
+        public int sizeInBytes() {
+<span class="nc" id="L610">            return data.sizeInBytes();</span>
+        }
+
+        public void release() {
+<span class="nc" id="L614">            pool.release(initialBuffer);</span>
+<span class="nc" id="L615">        }</span>
+
+        public long appendTimestamp() {
+            // 1. firstBatch is not null because data has one and only one batch
+            // 2. maxTimestamp is the append time of the batch. This needs to be changed
+            //    to return the LastContainedLogTimestamp of the SnapshotHeaderRecord
+<span class="nc" id="L621">            return data.firstBatch().maxTimestamp();</span>
+        }
+
+        public boolean drainable(long drainOffset) {
+<span class="nc bnc" id="L625" title="All 2 branches missed.">            return baseOffset + numRecords - 1 &lt; drainOffset;</span>
+        }
+    }
+
+<span class="nc" id="L629">    private static class SimpleTimer {</span>
+        // We use an atomic long so that the Raft IO thread can query the linger
+        // time without any locking
+<span class="nc" id="L632">        private final AtomicLong deadlineMs = new AtomicLong(Long.MAX_VALUE);</span>
+
+        boolean isRunning() {
+<span class="nc bnc" id="L635" title="All 2 branches missed.">            return deadlineMs.get() != Long.MAX_VALUE;</span>
+        }
+
+        void reset(long deadlineMs) {
+<span class="nc" id="L639">            this.deadlineMs.set(deadlineMs);</span>
+<span class="nc" id="L640">        }</span>
+
+        long remainingMs(long currentTimeMs) {
+<span class="nc" id="L643">            return Math.max(0, deadlineMs.get() - currentTimeMs);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

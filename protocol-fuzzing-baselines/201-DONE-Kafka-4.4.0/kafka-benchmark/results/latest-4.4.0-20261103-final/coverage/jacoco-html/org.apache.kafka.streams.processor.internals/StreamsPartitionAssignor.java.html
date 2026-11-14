@@ -1,0 +1,1705 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamsPartitionAssignor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">StreamsPartitionAssignor.java</span></div><h1>StreamsPartitionAssignor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.ListOffsetsResult;
+import org.apache.kafka.clients.admin.ListOffsetsResult.ListOffsetsResultInfo;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
+import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.Configurable;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.streams.errors.MissingSourceTopicException;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.errors.TaskAssignmentException;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.assignment.ApplicationState;
+import org.apache.kafka.streams.processor.assignment.AssignmentConfigs;
+import org.apache.kafka.streams.processor.assignment.ProcessId;
+import org.apache.kafka.streams.processor.assignment.TaskAssignmentUtils;
+import org.apache.kafka.streams.processor.assignment.TaskAssignor.AssignmentError;
+import org.apache.kafka.streams.processor.assignment.TaskAssignor.TaskAssignment;
+import org.apache.kafka.streams.processor.assignment.TaskInfo;
+import org.apache.kafka.streams.processor.assignment.TaskTopicPartition;
+import org.apache.kafka.streams.processor.internals.InternalTopologyBuilder.TopicsInfo;
+import org.apache.kafka.streams.processor.internals.TopologyMetadata.Subtopology;
+import org.apache.kafka.streams.processor.internals.assignment.AssignmentInfo;
+import org.apache.kafka.streams.processor.internals.assignment.AssignorConfiguration;
+import org.apache.kafka.streams.processor.internals.assignment.AssignorConfiguration.AssignmentListener;
+import org.apache.kafka.streams.processor.internals.assignment.AssignorError;
+import org.apache.kafka.streams.processor.internals.assignment.ClientState;
+import org.apache.kafka.streams.processor.internals.assignment.CopartitionedTopicsEnforcer;
+import org.apache.kafka.streams.processor.internals.assignment.DefaultApplicationState;
+import org.apache.kafka.streams.processor.internals.assignment.DefaultTaskInfo;
+import org.apache.kafka.streams.processor.internals.assignment.DefaultTaskTopicPartition;
+import org.apache.kafka.streams.processor.internals.assignment.FallbackPriorTaskAssignor;
+import org.apache.kafka.streams.processor.internals.assignment.LegacyStickyTaskAssignor;
+import org.apache.kafka.streams.processor.internals.assignment.LegacyTaskAssignor;
+import org.apache.kafka.streams.processor.internals.assignment.RackAwareTaskAssignor;
+import org.apache.kafka.streams.processor.internals.assignment.RackUtils;
+import org.apache.kafka.streams.processor.internals.assignment.ReferenceContainer;
+import org.apache.kafka.streams.processor.internals.assignment.SubscriptionInfo;
+import org.apache.kafka.streams.state.HostInfo;
+
+import org.slf4j.Logger;
+
+import java.nio.ByteBuffer;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.PriorityQueue;
+import java.util.Queue;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import static java.util.Collections.singletonList;
+import static java.util.Collections.unmodifiableSet;
+import static java.util.Map.Entry.comparingByKey;
+import static org.apache.kafka.common.utils.Utils.filterMap;
+import static org.apache.kafka.streams.processor.internals.ClientUtils.fetchCommittedOffsets;
+import static org.apache.kafka.streams.processor.internals.ClientUtils.fetchEndOffsetsResult;
+import static org.apache.kafka.streams.processor.internals.assignment.StreamsAssignmentProtocolVersions.EARLIEST_PROBEABLE_VERSION;
+import static org.apache.kafka.streams.processor.internals.assignment.StreamsAssignmentProtocolVersions.LATEST_SUPPORTED_VERSION;
+import static org.apache.kafka.streams.processor.internals.assignment.StreamsAssignmentProtocolVersions.UNKNOWN;
+import static org.apache.kafka.streams.processor.internals.assignment.SubscriptionInfo.UNKNOWN_OFFSET_SUM;
+
+<span class="nc" id="L106">public class StreamsPartitionAssignor implements ConsumerPartitionAssignor, Configurable {</span>
+
+    private Logger log;
+    private String logPrefix;
+
+    private static class AssignedPartition implements Comparable&lt;AssignedPartition&gt; {
+
+        private final TaskId taskId;
+        private final TopicPartition partition;
+
+<span class="nc" id="L116">        AssignedPartition(final TaskId taskId, final TopicPartition partition) {</span>
+<span class="nc" id="L117">            this.taskId = taskId;</span>
+<span class="nc" id="L118">            this.partition = partition;</span>
+<span class="nc" id="L119">        }</span>
+
+        @Override
+        public int compareTo(final AssignedPartition that) {
+<span class="nc" id="L123">            return PARTITION_COMPARATOR.compare(partition, that.partition);</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (!(o instanceof AssignedPartition)) {</span>
+<span class="nc" id="L129">                return false;</span>
+            }
+<span class="nc" id="L131">            final AssignedPartition other = (AssignedPartition) o;</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">            return compareTo(other) == 0;</span>
+        }
+
+        @Override
+        public int hashCode() {
+            // Only partition is important for compareTo, equals and hashCode.
+<span class="nc" id="L138">            return partition.hashCode();</span>
+        }
+    }
+
+    public static class ClientMetadata {
+
+        private final HostInfo hostInfo;
+        private final ClientState state;
+        private final SortedSet&lt;String&gt; consumers;
+        private final Optional&lt;String&gt; rackId;
+
+<span class="nc" id="L149">        ClientMetadata(final ProcessId processId, final String endPoint, final Map&lt;String, String&gt; clientTags, final Optional&lt;String&gt; rackId) {</span>
+
+            // get the host info, or null if no endpoint is configured (ie endPoint == null)
+<span class="nc" id="L152">            hostInfo = HostInfo.buildFromEndpoint(endPoint);</span>
+
+            // initialize the consumer memberIds
+<span class="nc" id="L155">            consumers = new TreeSet&lt;&gt;();</span>
+
+            // initialize the client state with client tags
+<span class="nc" id="L158">            state = new ClientState(processId, clientTags);</span>
+
+<span class="nc" id="L160">            this.rackId = rackId;</span>
+<span class="nc" id="L161">        }</span>
+
+        void addConsumer(final String consumerMemberId, final List&lt;TopicPartition&gt; ownedPartitions) {
+<span class="nc" id="L164">            consumers.add(consumerMemberId);</span>
+<span class="nc" id="L165">            state.incrementCapacity();</span>
+<span class="nc" id="L166">            state.addOwnedPartitions(ownedPartitions, consumerMemberId);</span>
+<span class="nc" id="L167">        }</span>
+
+        void addPreviousTasksAndOffsetSums(final String consumerId, final Map&lt;TaskId, Long&gt; taskOffsetSums) {
+<span class="nc" id="L170">            state.addPreviousTasksAndOffsetSums(consumerId, taskOffsetSums);</span>
+<span class="nc" id="L171">        }</span>
+
+        public ClientState state() {
+<span class="nc" id="L174">            return state;</span>
+        }
+
+        public HostInfo hostInfo() {
+<span class="nc" id="L178">            return hostInfo;</span>
+        }
+
+        public Optional&lt;String&gt; rackId() {
+<span class="nc" id="L182">            return rackId;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L187">            return &quot;ClientMetadata{&quot; +</span>
+                &quot;hostInfo=&quot; + hostInfo +
+                &quot;, consumers=&quot; + consumers +
+                &quot;, state=&quot; + state +
+                '}';
+        }
+    }
+
+    @FunctionalInterface
+    public interface UserTaskAssignmentListener {
+        void onAssignmentComputed(GroupAssignment assignment, GroupSubscription subscription);
+    }
+
+    // keep track of any future consumers in a &quot;dummy&quot; Client since we can't decipher their subscription
+<span class="nc" id="L201">    private static final ProcessId FUTURE_ID = ProcessId.randomProcessId();</span>
+
+<span class="nc" id="L203">    protected static final Comparator&lt;TopicPartition&gt; PARTITION_COMPARATOR =</span>
+<span class="nc" id="L204">        Comparator.comparing(TopicPartition::topic).thenComparingInt(TopicPartition::partition);</span>
+
+    private String userEndPoint;
+    private AssignmentConfigs assignmentConfigs;
+
+    // for the main consumer, we need to use a supplier to break a cyclic setup dependency
+    private Supplier&lt;Consumer&lt;byte[], byte[]&gt;&gt; mainConsumerSupplier;
+    private Admin adminClient;
+    private TaskManager taskManager;
+    private StreamsMetadataState streamsMetadataState;
+    private PartitionGrouper partitionGrouper;
+    private AtomicInteger assignmentErrorCode;
+    private AtomicLong nextScheduledRebalanceMs;
+    private Queue&lt;StreamsException&gt; nonFatalExceptionsToHandle;
+    private Time time;
+
+    // since live upgrades from 2.3 (or earlier) to 4.0 or above are no longer supported, we can always
+    // start with the latest supported metadata version since version probing will take
+    // care of downgrading it if/when necessary
+<span class="nc" id="L223">    protected int usedSubscriptionMetadataVersion = LATEST_SUPPORTED_VERSION;</span>
+
+    private InternalTopicManager internalTopicManager;
+    private CopartitionedTopicsEnforcer copartitionedTopicsEnforcer;
+    private AssignmentListener assignmentListener;
+
+    private Supplier&lt;Optional&lt;org.apache.kafka.streams.processor.assignment.TaskAssignor&gt;&gt;
+        customTaskAssignorSupplier;
+    private Supplier&lt;LegacyTaskAssignor&gt; legacyTaskAssignorSupplier;
+    private byte uniqueField;
+    private Map&lt;String, String&gt; clientTags;
+
+    /**
+     * We need to have the PartitionAssignor and its StreamThread to be mutually accessible since the former needs
+     * latter's cached metadata while sending subscriptions, and the latter needs former's returned assignment when
+     * adding tasks.
+     *
+     * @throws KafkaException if the stream thread is not specified
+     */
+    @Override
+    public void configure(final Map&lt;String, ?&gt; configs) {
+<span class="nc" id="L244">        final AssignorConfiguration assignorConfiguration = new AssignorConfiguration(configs);</span>
+
+<span class="nc" id="L246">        logPrefix = assignorConfiguration.logPrefix();</span>
+<span class="nc" id="L247">        log = new LogContext(logPrefix).logger(getClass());</span>
+
+<span class="nc" id="L249">        final ReferenceContainer referenceContainer = assignorConfiguration.referenceContainer();</span>
+<span class="nc" id="L250">        mainConsumerSupplier = () -&gt; Objects.requireNonNull(referenceContainer.mainConsumer, &quot;Main consumer was not specified&quot;);</span>
+<span class="nc" id="L251">        adminClient = Objects.requireNonNull(referenceContainer.adminClient, &quot;Admin client was not specified&quot;);</span>
+<span class="nc" id="L252">        taskManager = Objects.requireNonNull(referenceContainer.taskManager, &quot;TaskManager was not specified&quot;);</span>
+<span class="nc" id="L253">        streamsMetadataState = Objects.requireNonNull(referenceContainer.streamsMetadataState, &quot;StreamsMetadataState was not specified&quot;);</span>
+<span class="nc" id="L254">        assignmentErrorCode = referenceContainer.assignmentErrorCode;</span>
+<span class="nc" id="L255">        nextScheduledRebalanceMs = referenceContainer.nextScheduledRebalanceMs;</span>
+<span class="nc" id="L256">        nonFatalExceptionsToHandle = referenceContainer.nonFatalExceptionsToHandle;</span>
+<span class="nc" id="L257">        time = Objects.requireNonNull(referenceContainer.time, &quot;Time was not specified&quot;);</span>
+<span class="nc" id="L258">        assignmentConfigs = assignorConfiguration.assignmentConfigs();</span>
+<span class="nc" id="L259">        partitionGrouper = new PartitionGrouper();</span>
+<span class="nc" id="L260">        userEndPoint = assignorConfiguration.userEndPoint();</span>
+<span class="nc" id="L261">        internalTopicManager = assignorConfiguration.internalTopicManager();</span>
+<span class="nc" id="L262">        copartitionedTopicsEnforcer = assignorConfiguration.copartitionedTopicsEnforcer();</span>
+<span class="nc" id="L263">        customTaskAssignorSupplier = assignorConfiguration::customTaskAssignor;</span>
+<span class="nc" id="L264">        legacyTaskAssignorSupplier = assignorConfiguration::taskAssignor;</span>
+<span class="nc" id="L265">        assignmentListener = assignorConfiguration.assignmentListener();</span>
+<span class="nc" id="L266">        uniqueField = 0;</span>
+<span class="nc" id="L267">        clientTags = referenceContainer.clientTags;</span>
+<span class="nc" id="L268">    }</span>
+
+    @Override
+    public String name() {
+<span class="nc" id="L272">        return &quot;stream&quot;;</span>
+    }
+
+    @Override
+    public List&lt;RebalanceProtocol&gt; supportedProtocols() {
+<span class="nc" id="L277">        return singletonList(RebalanceProtocol.COOPERATIVE);</span>
+    }
+
+    @Override
+    public ByteBuffer subscriptionUserData(final Set&lt;String&gt; topics) {
+        // Adds the following information to subscription
+        // 1. Client ProcessId (a UUID assigned to an instance of KafkaStreams)
+        // 2. Map from task id to its overall lag
+        // 3. Unique Field to ensure a rebalance when a thread rejoins by forcing the user data to be different
+
+<span class="nc" id="L287">        handleRebalanceStart(topics);</span>
+<span class="nc" id="L288">        uniqueField++;</span>
+
+<span class="nc" id="L290">        final Set&lt;String&gt; currentNamedTopologies = taskManager.topologyMetadata().namedTopologiesView();</span>
+
+        // If using NamedTopologies, filter out any that are no longer recognized/have been removed
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        final Map&lt;TaskId, Long&gt; taskOffsetSums = taskManager.topologyMetadata().hasNamedTopologies() ?</span>
+<span class="nc" id="L294">            filterMap(taskManager.taskOffsetSums(), t -&gt; currentNamedTopologies.contains(t.getKey().topologyName())) :</span>
+<span class="nc" id="L295">            taskManager.taskOffsetSums();</span>
+
+<span class="nc" id="L297">        return new SubscriptionInfo(</span>
+            usedSubscriptionMetadataVersion,
+            LATEST_SUPPORTED_VERSION,
+<span class="nc" id="L300">            taskManager.processId(),</span>
+            userEndPoint,
+            taskOffsetSums,
+            uniqueField,
+<span class="nc" id="L304">            assignmentErrorCode.get(),</span>
+            clientTags
+<span class="nc" id="L306">        ).encode();</span>
+    }
+
+    private Map&lt;String, Assignment&gt; errorAssignment(final Map&lt;ProcessId, ClientMetadata&gt; clientsMetadata,
+                                                    final int errorCode) {
+<span class="nc" id="L311">        final Map&lt;String, Assignment&gt; assignment = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        for (final ClientMetadata clientMetadata : clientsMetadata.values()) {</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            for (final String consumerId : clientMetadata.consumers) {</span>
+<span class="nc" id="L314">                assignment.put(consumerId, new Assignment(</span>
+<span class="nc" id="L315">                    Collections.emptyList(),</span>
+                    new AssignmentInfo(LATEST_SUPPORTED_VERSION,
+<span class="nc" id="L317">                        Collections.emptyList(),</span>
+<span class="nc" id="L318">                        Collections.emptyMap(),</span>
+<span class="nc" id="L319">                        Collections.emptyMap(),</span>
+<span class="nc" id="L320">                        Collections.emptyMap(),</span>
+<span class="nc" id="L321">                        errorCode).encode()</span>
+                ));
+<span class="nc" id="L323">            }</span>
+<span class="nc" id="L324">        }</span>
+<span class="nc" id="L325">        return assignment;</span>
+    }
+
+    /*
+     * This assigns tasks to consumer clients in the following steps.
+     *
+     * 0. decode the subscriptions to assemble the metadata for each client and check for version probing
+     *
+     * 1. check all repartition source topics and use internal topic manager to make sure
+     *    they have been created with the right number of partitions. Also verify and/or create
+     *    any changelog topics with the correct number of partitions.
+     *
+     * 2. use the partition grouper to generate tasks along with their assigned partitions, then use
+     *    the configured TaskAssignor to construct the mapping of tasks to clients.
+     *
+     * 3. construct the global mapping of host to partitions to enable query routing.
+     *
+     * 4. within each client, assign tasks to consumer clients.
+     */
+    @Override
+    public GroupAssignment assign(final Cluster metadata, final GroupSubscription groupSubscription) {
+<span class="nc" id="L346">        final Map&lt;String, Subscription&gt; subscriptions = groupSubscription.groupSubscription();</span>
+
+        // ---------------- Step Zero ---------------- //
+
+        // construct the client metadata from the decoded subscription info
+
+<span class="nc" id="L352">        final Map&lt;ProcessId, ClientMetadata&gt; clientMetadataMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L353">        final Set&lt;TopicPartition&gt; allOwnedPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L354">        final Map&lt;ProcessId, Map&lt;String, Optional&lt;String&gt;&gt;&gt; racksForProcessConsumer = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L356">        int minReceivedMetadataVersion = LATEST_SUPPORTED_VERSION;</span>
+<span class="nc" id="L357">        int minSupportedMetadataVersion = LATEST_SUPPORTED_VERSION;</span>
+
+<span class="nc" id="L359">        boolean shutdownRequested = false;</span>
+<span class="nc" id="L360">        boolean assignmentErrorFound = false;</span>
+<span class="nc" id="L361">        int futureMetadataVersion = UNKNOWN;</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        for (final Map.Entry&lt;String, Subscription&gt; entry : subscriptions.entrySet()) {</span>
+<span class="nc" id="L363">            final String consumerId = entry.getKey();</span>
+<span class="nc" id="L364">            final Subscription subscription = entry.getValue();</span>
+<span class="nc" id="L365">            final SubscriptionInfo info = SubscriptionInfo.decode(subscription.userData());</span>
+<span class="nc" id="L366">            final int usedVersion = info.version();</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">            if (info.errorCode() == AssignorError.SHUTDOWN_REQUESTED.code()) {</span>
+<span class="nc" id="L368">                shutdownRequested = true;</span>
+            }
+
+<span class="nc" id="L371">            minReceivedMetadataVersion = updateMinReceivedVersion(usedVersion, minReceivedMetadataVersion);</span>
+<span class="nc" id="L372">            minSupportedMetadataVersion = updateMinSupportedVersion(info.latestSupportedVersion(), minSupportedMetadataVersion);</span>
+
+            final ProcessId processId;
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            if (usedVersion &gt; LATEST_SUPPORTED_VERSION) {</span>
+<span class="nc" id="L376">                futureMetadataVersion = usedVersion;</span>
+<span class="nc" id="L377">                processId = FUTURE_ID;</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                if (!clientMetadataMap.containsKey(FUTURE_ID)) {</span>
+<span class="nc" id="L379">                    clientMetadataMap.put(FUTURE_ID, new ClientMetadata(FUTURE_ID, null, Collections.emptyMap(), subscription.rackId()));</span>
+                }
+            } else {
+<span class="nc" id="L382">                processId = info.processId();</span>
+            }
+
+<span class="nc" id="L385">            racksForProcessConsumer.computeIfAbsent(processId, kv -&gt; new HashMap&lt;&gt;()).put(consumerId, subscription.rackId());</span>
+
+<span class="nc" id="L387">            ClientMetadata clientMetadata = clientMetadataMap.get(processId);</span>
+
+            // create the new client metadata if necessary
+<span class="nc bnc" id="L390" title="All 2 branches missed.">            if (clientMetadata == null) {</span>
+<span class="nc" id="L391">                clientMetadata = new ClientMetadata(info.processId(), info.userEndPoint(), info.clientTags(), subscription.rackId());</span>
+<span class="nc" id="L392">                clientMetadataMap.put(info.processId(), clientMetadata);</span>
+            }
+
+            // add the consumer and any info in its subscription to the client
+<span class="nc" id="L396">            clientMetadata.addConsumer(consumerId, subscription.ownedPartitions());</span>
+<span class="nc" id="L397">            final int prevSize = allOwnedPartitions.size();</span>
+<span class="nc" id="L398">            allOwnedPartitions.addAll(subscription.ownedPartitions());</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">            if (allOwnedPartitions.size() &lt; prevSize + subscription.ownedPartitions().size()) {</span>
+<span class="nc" id="L400">                assignmentErrorFound = true;</span>
+            }
+<span class="nc" id="L402">            clientMetadata.addPreviousTasksAndOffsetSums(consumerId, info.taskOffsetSums());</span>
+<span class="nc" id="L403">        }</span>
+
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        if (assignmentErrorFound) {</span>
+<span class="nc" id="L406">            log.warn(&quot;The previous assignment contains a partition more than once. &quot; +</span>
+                &quot;\t Mapping: {}&quot;, subscriptions);
+        }
+
+        try {
+<span class="nc" id="L411">            log.debug(&quot;Constructed client metadata {} from the member subscriptions.&quot;, clientMetadataMap);</span>
+
+            // ---------------- Step One ---------------- //
+
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            if (shutdownRequested) {</span>
+<span class="nc" id="L416">                return new GroupAssignment(errorAssignment(clientMetadataMap, AssignorError.SHUTDOWN_REQUESTED.code()));</span>
+            }
+
+            // parse the topology to determine the repartition source topics,
+            // making sure they are created with the number of partitions as
+            // the maximum of the depending sub-topologies source topics' number of partitions
+<span class="nc" id="L422">            final RepartitionTopics repartitionTopics = prepareRepartitionTopics(metadata);</span>
+<span class="nc" id="L423">            final Map&lt;TopicPartition, PartitionInfo&gt; allRepartitionTopicPartitions = repartitionTopics.topicPartitionsInfo();</span>
+
+<span class="nc" id="L425">            final Cluster fullMetadata = metadata.withPartitions(allRepartitionTopicPartitions);</span>
+<span class="nc" id="L426">            log.debug(&quot;Created repartition topics {} from the parsed topology.&quot;, allRepartitionTopicPartitions.values());</span>
+
+            // ---------------- Step Two ---------------- //
+
+            // construct the assignment of tasks to clients
+
+<span class="nc" id="L432">            final Map&lt;Subtopology, TopicsInfo&gt; topicGroups =</span>
+<span class="nc" id="L433">                taskManager.topologyMetadata().subtopologyTopicsInfoMapExcluding(repartitionTopics.topologiesWithMissingInputTopics());</span>
+
+<span class="nc" id="L435">            final Set&lt;String&gt; allSourceTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L436">            final Map&lt;Subtopology, Set&lt;String&gt;&gt; sourceTopicsByGroup = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">            for (final Map.Entry&lt;Subtopology, TopicsInfo&gt; entry : topicGroups.entrySet()) {</span>
+<span class="nc" id="L438">                allSourceTopics.addAll(entry.getValue().sourceTopics);</span>
+<span class="nc" id="L439">                sourceTopicsByGroup.put(entry.getKey(), entry.getValue().sourceTopics);</span>
+<span class="nc" id="L440">            }</span>
+
+            // get the tasks as partition groups from the partition grouper
+<span class="nc" id="L443">            final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask =</span>
+<span class="nc" id="L444">                partitionGrouper.partitionGroups(sourceTopicsByGroup, fullMetadata);</span>
+
+<span class="nc" id="L446">            final Set&lt;TaskId&gt; statefulTasks = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L448">            final boolean versionProbing =</span>
+<span class="nc" id="L449">                checkMetadataVersions(minReceivedMetadataVersion, minSupportedMetadataVersion, futureMetadataVersion);</span>
+<span class="nc" id="L450">            final UserTaskAssignmentListener userTaskAssignmentListener = assignTasksToClients(fullMetadata, groupSubscription,</span>
+                allSourceTopics, topicGroups, clientMetadataMap, partitionsForTask, racksForProcessConsumer, statefulTasks);
+
+            // ---------------- Step Three ---------------- //
+
+            // construct the global partition assignment per host map
+
+<span class="nc" id="L457">            final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; partitionsByHost = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L458">            final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; standbyPartitionsByHost = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">            if (minReceivedMetadataVersion &gt;= 2) {</span>
+<span class="nc" id="L460">                populatePartitionsByHostMaps(partitionsByHost, standbyPartitionsByHost, partitionsForTask, clientMetadataMap);</span>
+            }
+
+            // ---------------- Step Four ---------------- //
+
+            // compute the assignment of tasks to threads within each client and build the final group assignment
+<span class="nc" id="L466">            final Map&lt;String, Assignment&gt; assignment = computeNewAssignment(</span>
+                statefulTasks,
+                clientMetadataMap,
+                partitionsForTask,
+                partitionsByHost,
+                standbyPartitionsByHost,
+                allOwnedPartitions,
+                minReceivedMetadataVersion,
+                minSupportedMetadataVersion,
+                versionProbing
+            );
+
+<span class="nc" id="L478">            final GroupAssignment groupAssignment = new GroupAssignment(assignment);</span>
+<span class="nc" id="L479">            userTaskAssignmentListener.onAssignmentComputed(groupAssignment, groupSubscription);</span>
+<span class="nc" id="L480">            return groupAssignment;</span>
+<span class="nc" id="L481">        } catch (final MissingSourceTopicException e) {</span>
+<span class="nc" id="L482">            log.error(&quot;Caught an error in the task assignment. Returning an error assignment.&quot;, e);</span>
+<span class="nc" id="L483">            return new GroupAssignment(</span>
+<span class="nc" id="L484">                errorAssignment(clientMetadataMap, AssignorError.INCOMPLETE_SOURCE_TOPIC_METADATA.code())</span>
+            );
+<span class="nc" id="L486">        } catch (final TaskAssignmentException e) {</span>
+<span class="nc" id="L487">            log.error(&quot;Caught an error in the task assignment. Returning an error assignment.&quot;, e);</span>
+<span class="nc" id="L488">            return new GroupAssignment(</span>
+<span class="nc" id="L489">                errorAssignment(clientMetadataMap, AssignorError.ASSIGNMENT_ERROR.code())</span>
+            );
+        }
+    }
+
+    /**
+     *
+     * @param clientMetadataMap the map of process id to client metadata used to build an immutable
+     *                          {@code ApplicationState}
+     * @return The {@code ApplicationState} needed by the TaskAssigner to compute new task
+     *         assignments.
+     */
+    private ApplicationState buildApplicationState(final TopologyMetadata topologyMetadata,
+                                                   final Map&lt;ProcessId, ClientMetadata&gt; clientMetadataMap,
+                                                   final Map&lt;Subtopology, TopicsInfo&gt; topicGroups,
+                                                   final Cluster cluster) {
+<span class="nc" id="L505">        final Map&lt;Subtopology, Set&lt;String&gt;&gt; sourceTopicsByGroup = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L506">        final Map&lt;Subtopology, Set&lt;String&gt;&gt; changelogTopicsByGroup = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">        for (final Map.Entry&lt;Subtopology, TopicsInfo&gt; entry : topicGroups.entrySet()) {</span>
+<span class="nc" id="L508">            final Set&lt;String&gt; sourceTopics = entry.getValue().sourceTopics;</span>
+<span class="nc" id="L509">            final Set&lt;String&gt; changelogTopics = entry.getValue().changelogTopics();</span>
+<span class="nc" id="L510">            sourceTopicsByGroup.put(entry.getKey(), sourceTopics);</span>
+<span class="nc" id="L511">            changelogTopicsByGroup.put(entry.getKey(), changelogTopics);</span>
+<span class="nc" id="L512">        }</span>
+
+<span class="nc" id="L514">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; changelogPartitionsForTask = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L515">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; sourcePartitionsForTask =</span>
+<span class="nc" id="L516">            partitionGrouper.partitionGroups(sourceTopicsByGroup, changelogTopicsByGroup,</span>
+                changelogPartitionsForTask, cluster);
+
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        if (!sourcePartitionsForTask.keySet().equals(changelogPartitionsForTask.keySet())) {</span>
+<span class="nc" id="L520">            log.error(&quot;Partition grouper returned {} tasks for source topics but {} tasks for changelog topics&quot;,</span>
+<span class="nc" id="L521">                sourcePartitionsForTask.size(), changelogPartitionsForTask.size());</span>
+<span class="nc" id="L522">            throw new TaskAssignmentException(&quot;Partition grouper returned conflicting information about the &quot;</span>
+                                              + &quot;tasks for source topics vs changelog topics.&quot;);
+        }
+
+<span class="nc" id="L526">        final Set&lt;DefaultTaskTopicPartition&gt; topicsRequiringRackInfo = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L527">        final AtomicBoolean rackInformationFetched = new AtomicBoolean(false);</span>
+<span class="nc" id="L528">        final Runnable fetchRackInformation = () -&gt; {</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">            if (!rackInformationFetched.get()) {</span>
+<span class="nc" id="L530">                RackUtils.annotateTopicPartitionsWithRackInfo(cluster, internalTopicManager, topicsRequiringRackInfo);</span>
+<span class="nc" id="L531">                rackInformationFetched.set(true);</span>
+            }
+<span class="nc" id="L533">        };</span>
+
+<span class="nc" id="L535">        final Map&lt;TaskId, Set&lt;TaskTopicPartition&gt;&gt; topicPartitionsForTask = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L536">        final Set&lt;TaskId&gt; logicalTaskIds = unmodifiableSet(sourcePartitionsForTask.keySet());</span>
+<span class="nc" id="L537">        logicalTaskIds.forEach(taskId -&gt; {</span>
+<span class="nc" id="L538">            final Set&lt;TaskTopicPartition&gt; topicPartitions = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            for (final TopicPartition topicPartition : sourcePartitionsForTask.get(taskId)) {</span>
+<span class="nc" id="L541">                final boolean isSource = true;</span>
+<span class="nc" id="L542">                final boolean isChangelog = changelogPartitionsForTask.get(taskId).contains(topicPartition);</span>
+<span class="nc" id="L543">                final DefaultTaskTopicPartition racklessTopicPartition = new DefaultTaskTopicPartition(</span>
+                    topicPartition, isSource, isChangelog, fetchRackInformation);
+<span class="nc" id="L545">                topicsRequiringRackInfo.add(racklessTopicPartition);</span>
+<span class="nc" id="L546">                topicPartitions.add(racklessTopicPartition);</span>
+<span class="nc" id="L547">            }</span>
+
+<span class="nc bnc" id="L549" title="All 2 branches missed.">            for (final TopicPartition topicPartition : changelogPartitionsForTask.get(taskId)) {</span>
+<span class="nc" id="L550">                final boolean isSource = sourcePartitionsForTask.get(taskId).contains(topicPartition);</span>
+<span class="nc" id="L551">                final boolean isChangelog = true;</span>
+<span class="nc" id="L552">                final DefaultTaskTopicPartition racklessTopicPartition = new DefaultTaskTopicPartition(</span>
+                    topicPartition, isSource, isChangelog, fetchRackInformation);
+<span class="nc" id="L554">                topicsRequiringRackInfo.add(racklessTopicPartition);</span>
+<span class="nc" id="L555">                topicPartitions.add(racklessTopicPartition);</span>
+<span class="nc" id="L556">            }</span>
+
+<span class="nc" id="L558">            topicPartitionsForTask.put(taskId, topicPartitions);</span>
+<span class="nc" id="L559">        });</span>
+
+<span class="nc" id="L561">        final Map&lt;TaskId, TaskInfo&gt; logicalTasks = logicalTaskIds.stream().collect(Collectors.toMap(</span>
+<span class="nc" id="L562">            Function.identity(),</span>
+            taskId -&gt; {
+<span class="nc" id="L564">                final Set&lt;String&gt; stateStoreNames = topologyMetadata</span>
+<span class="nc" id="L565">                    .stateStoreNamesForSubtopology(taskId.topologyName(), taskId.subtopology());</span>
+<span class="nc" id="L566">                final Set&lt;TaskTopicPartition&gt; topicPartitions = topicPartitionsForTask.get(taskId);</span>
+<span class="nc" id="L567">                return new DefaultTaskInfo(</span>
+                    taskId,
+<span class="nc bnc" id="L569" title="All 2 branches missed.">                    !stateStoreNames.isEmpty(),</span>
+                    stateStoreNames,
+                    topicPartitions
+                );
+            }
+        ));
+
+<span class="nc" id="L576">        return new DefaultApplicationState(</span>
+            assignmentConfigs,
+            logicalTasks,
+            clientMetadataMap
+        );
+    }
+
+    private void processStreamsPartitionAssignment(final org.apache.kafka.streams.processor.assignment.TaskAssignor assignor,
+                                                   final TaskAssignment taskAssignment,
+                                                   final AssignmentError assignmentError,
+                                                   final Map&lt;ProcessId, ClientMetadata&gt; clientMetadataMap,
+                                                   final GroupSubscription groupSubscription) {
+<span class="nc bnc" id="L588" title="All 4 branches missed.">        if (assignmentError == AssignmentError.UNKNOWN_PROCESS_ID || assignmentError == AssignmentError.UNKNOWN_TASK_ID) {</span>
+<span class="nc" id="L589">            assignor.onAssignmentComputed(new GroupAssignment(Collections.emptyMap()), groupSubscription, assignmentError);</span>
+<span class="nc" id="L590">            log.error(&quot;Rebalance failed due to task assignor returning assignment with error {}, &quot; +</span>
+                      &quot;assignor callback will receive empty GroupAssignment due to this error&quot;, assignmentError);
+<span class="nc" id="L592">            throw new StreamsException(&quot;Task assignment with &quot; + assignor.getClass().getName() +</span>
+                                       &quot; returned a fatal error: &quot; + assignmentError);
+        }
+
+<span class="nc" id="L596">        taskAssignment.assignment().forEach(kafkaStreamsAssignment -&gt; {</span>
+<span class="nc" id="L597">            final ProcessId processId = kafkaStreamsAssignment.processId();</span>
+<span class="nc" id="L598">            final ClientMetadata clientMetadata = clientMetadataMap.get(processId);</span>
+<span class="nc" id="L599">            clientMetadata.state.setAssignedTasks(kafkaStreamsAssignment);</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">            if (kafkaStreamsAssignment.followupRebalanceDeadline().isPresent()) {</span>
+<span class="nc" id="L601">                clientMetadata.state.setFollowupRebalanceDeadline(kafkaStreamsAssignment.followupRebalanceDeadline().get());</span>
+            }
+<span class="nc" id="L603">        });</span>
+<span class="nc" id="L604">    }</span>
+
+    /**
+     * Verify the subscription versions are within the expected bounds and check for version probing.
+     *
+     * @return whether this was a version probing rebalance
+     */
+    private boolean checkMetadataVersions(final int minReceivedMetadataVersion,
+                                          final int minSupportedMetadataVersion,
+                                          final int futureMetadataVersion) {
+        final boolean versionProbing;
+
+<span class="nc bnc" id="L616" title="All 2 branches missed.">        if (futureMetadataVersion == UNKNOWN) {</span>
+<span class="nc" id="L617">            versionProbing = false;</span>
+<span class="nc bnc" id="L618" title="All 2 branches missed.">        } else if (minReceivedMetadataVersion &gt;= EARLIEST_PROBEABLE_VERSION) {</span>
+<span class="nc" id="L619">            versionProbing = true;</span>
+<span class="nc" id="L620">            log.info(&quot;Received a future (version probing) subscription (version: {}).&quot;</span>
+                         + &quot; Sending assignment back (with supported version {}).&quot;,
+<span class="nc" id="L622">                futureMetadataVersion,</span>
+<span class="nc" id="L623">                minSupportedMetadataVersion);</span>
+
+        } else {
+<span class="nc" id="L626">            throw new TaskAssignmentException(</span>
+                &quot;Received a future (version probing) subscription (version: &quot; + futureMetadataVersion
+                    + &quot;) and an incompatible pre Kafka 2.0 subscription (version: &quot; + minReceivedMetadataVersion
+                    + &quot;) at the same time.&quot;
+            );
+        }
+
+<span class="nc bnc" id="L633" title="All 2 branches missed.">        if (minReceivedMetadataVersion &lt; LATEST_SUPPORTED_VERSION) {</span>
+<span class="nc" id="L634">            log.info(&quot;Downgrade metadata to version {}. Latest supported version is {}.&quot;,</span>
+<span class="nc" id="L635">                minReceivedMetadataVersion,</span>
+<span class="nc" id="L636">                LATEST_SUPPORTED_VERSION);</span>
+        }
+<span class="nc bnc" id="L638" title="All 2 branches missed.">        if (minSupportedMetadataVersion &lt; LATEST_SUPPORTED_VERSION) {</span>
+<span class="nc" id="L639">            log.info(&quot;Downgrade latest supported metadata to version {}. Latest supported version is {}.&quot;,</span>
+<span class="nc" id="L640">                minSupportedMetadataVersion,</span>
+<span class="nc" id="L641">                LATEST_SUPPORTED_VERSION);</span>
+        }
+<span class="nc" id="L643">        return versionProbing;</span>
+    }
+
+    /**
+     * Computes and assembles all repartition topic metadata then creates the topics if necessary. Also verifies
+     * that all user input topics of each topology have been created ahead of time. If any such source topics are
+     * missing from a NamedTopology, the assignor will skip distributing its tasks until they have been created
+     * and invoke the exception handler (without killing the thread) once for each topology to alert the user of
+     * the missing topics.
+     * &lt;p&gt;
+     * For regular applications without named topologies, the assignor will instead send a shutdown signal to
+     * all clients so the user can identify and resolve the problem.
+     *
+     * @return application metadata such as partition info of repartition topics, missing external topics, etc
+     */
+    private RepartitionTopics prepareRepartitionTopics(final Cluster metadata) {
+<span class="nc" id="L659">        final RepartitionTopics repartitionTopics = new RepartitionTopics(</span>
+<span class="nc" id="L660">            taskManager.topologyMetadata(),</span>
+            internalTopicManager,
+            copartitionedTopicsEnforcer,
+            metadata,
+            logPrefix
+        );
+<span class="nc" id="L666">        repartitionTopics.setup();</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">        final boolean isMissingInputTopics = !repartitionTopics.missingSourceTopicExceptions().isEmpty();</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">        if (isMissingInputTopics) {</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">            if (!taskManager.topologyMetadata().hasNamedTopologies()) {</span>
+<span class="nc" id="L670">                final String errorMsg = String.format(&quot;Missing source topics. %s&quot;, repartitionTopics.missingSourceTopics());</span>
+<span class="nc" id="L671">                log.error(errorMsg);</span>
+<span class="nc" id="L672">                throw new MissingSourceTopicException(errorMsg);</span>
+            } else {
+<span class="nc" id="L674">                nonFatalExceptionsToHandle.addAll(repartitionTopics.missingSourceTopicExceptions());</span>
+            }
+        }
+<span class="nc" id="L677">        return repartitionTopics;</span>
+    }
+
+
+    /**
+     * Populates the taskForPartition and tasksForTopicGroup maps, and checks that partitions are assigned to exactly
+     * one task.
+     *
+     * @param taskForPartition a map from partition to the corresponding task. Populated here.
+     * @param tasksForTopicGroup a map from the topicGroupId to the set of corresponding tasks. Populated here.
+     * @param allSourceTopics a set of all source topics in the topology
+     * @param partitionsForTask a map from task to the set of input partitions
+     * @param fullMetadata the cluster metadata
+     */
+    private void populateTasksForMaps(final Map&lt;TopicPartition, TaskId&gt; taskForPartition,
+                                      final Map&lt;Subtopology, Set&lt;TaskId&gt;&gt; tasksForTopicGroup,
+                                      final Set&lt;String&gt; allSourceTopics,
+                                      final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask,
+                                      final Cluster fullMetadata) {
+        // check if all partitions are assigned, and there are no duplicates of partitions in multiple tasks
+<span class="nc" id="L697">        final Set&lt;TopicPartition&gt; allAssignedPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L698" title="All 2 branches missed.">        for (final Map.Entry&lt;TaskId, Set&lt;TopicPartition&gt;&gt; entry : partitionsForTask.entrySet()) {</span>
+<span class="nc" id="L699">            final TaskId id = entry.getKey();</span>
+<span class="nc" id="L700">            final Set&lt;TopicPartition&gt; partitions = entry.getValue();</span>
+
+<span class="nc bnc" id="L702" title="All 2 branches missed.">            for (final TopicPartition partition : partitions) {</span>
+<span class="nc" id="L703">                taskForPartition.put(partition, id);</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">                if (allAssignedPartitions.contains(partition)) {</span>
+<span class="nc" id="L705">                    log.warn(&quot;Partition {} is assigned to more than one tasks: {}&quot;, partition, partitionsForTask);</span>
+                }
+<span class="nc" id="L707">            }</span>
+<span class="nc" id="L708">            allAssignedPartitions.addAll(partitions);</span>
+
+<span class="nc" id="L710">            tasksForTopicGroup.computeIfAbsent(new Subtopology(id.subtopology(), id.topologyName()), k -&gt; new HashSet&lt;&gt;()).add(id);</span>
+<span class="nc" id="L711">        }</span>
+
+<span class="nc" id="L713">        checkAllPartitions(allSourceTopics, partitionsForTask, allAssignedPartitions, fullMetadata);</span>
+<span class="nc" id="L714">    }</span>
+
+    // Logs a warning if any partitions are not assigned to a task, or a task has no assigned partitions
+    private void checkAllPartitions(final Set&lt;String&gt; allSourceTopics,
+                                    final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask,
+                                    final Set&lt;TopicPartition&gt; allAssignedPartitions,
+                                    final Cluster fullMetadata) {
+<span class="nc bnc" id="L721" title="All 2 branches missed.">        for (final String topic : allSourceTopics) {</span>
+<span class="nc" id="L722">            final List&lt;PartitionInfo&gt; partitionInfoList = fullMetadata.partitionsForTopic(topic);</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">            if (partitionInfoList.isEmpty()) {</span>
+<span class="nc" id="L724">                log.warn(&quot;No partitions found for topic {}&quot;, topic);</span>
+            } else {
+<span class="nc bnc" id="L726" title="All 2 branches missed.">                for (final PartitionInfo partitionInfo : partitionInfoList) {</span>
+<span class="nc" id="L727">                    final TopicPartition partition = new TopicPartition(partitionInfo.topic(),</span>
+<span class="nc" id="L728">                        partitionInfo.partition());</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">                    if (!allAssignedPartitions.contains(partition)) {</span>
+<span class="nc" id="L730">                        log.warn(&quot;Partition {} is not assigned to any tasks: {}&quot;</span>
+                                     + &quot; Possible causes of a partition not getting assigned&quot;
+                                     + &quot; is that another topic defined in the topology has not been&quot;
+                                     + &quot; created when starting your streams application,&quot;
+                                     + &quot; resulting in no tasks created for this topology at all.&quot;, partition,
+                            partitionsForTask);
+                    }
+<span class="nc" id="L737">                }</span>
+            }
+<span class="nc" id="L739">        }</span>
+<span class="nc" id="L740">    }</span>
+
+    /**
+     * Assigns a set of tasks to each client (Streams instance) using the configured task assignor, and also
+     * populate the stateful tasks that have been assigned to the clients
+     */
+    private UserTaskAssignmentListener assignTasksToClients(final Cluster fullMetadata,
+                                                            final GroupSubscription groupSubscription,
+                                                            final Set&lt;String&gt; allSourceTopics,
+                                                            final Map&lt;Subtopology, TopicsInfo&gt; topicGroups,
+                                                            final Map&lt;ProcessId, ClientMetadata&gt; clientMetadataMap,
+                                                            final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask,
+                                                            final Map&lt;ProcessId, Map&lt;String, Optional&lt;String&gt;&gt;&gt; racksForProcessConsumer,
+                                                            final Set&lt;TaskId&gt; statefulTasks) {
+<span class="nc bnc" id="L754" title="All 2 branches missed.">        if (!statefulTasks.isEmpty()) {</span>
+<span class="nc" id="L755">            throw new TaskAssignmentException(&quot;The stateful tasks should not be populated before assigning tasks to clients&quot;);</span>
+        }
+
+<span class="nc" id="L758">        final Map&lt;TopicPartition, TaskId&gt; taskForPartition = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L759">        final Map&lt;Subtopology, Set&lt;TaskId&gt;&gt; tasksForTopicGroup = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L760">        populateTasksForMaps(taskForPartition, tasksForTopicGroup, allSourceTopics, partitionsForTask, fullMetadata);</span>
+
+<span class="nc" id="L762">        final ChangelogTopics changelogTopics = new ChangelogTopics(</span>
+            internalTopicManager,
+            topicGroups,
+            tasksForTopicGroup,
+            logPrefix
+        );
+<span class="nc" id="L768">        changelogTopics.setup();</span>
+
+<span class="nc" id="L770">        final Map&lt;ProcessId, ClientState&gt; clientStates = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L771">        final boolean lagComputationSuccessful =</span>
+<span class="nc" id="L772">            populateClientStatesMap(clientStates, clientMetadataMap, taskForPartition, changelogTopics);</span>
+
+
+<span class="nc" id="L775">        log.info(&quot;{} client nodes and {} consumers participating in this rebalance: \n{}.&quot;,</span>
+<span class="nc" id="L776">                 clientStates.size(),</span>
+<span class="nc" id="L777">                 clientStates.values().stream().map(ClientState::capacity).reduce(Integer::sum).orElse(0),</span>
+<span class="nc" id="L778">                 clientStates.entrySet().stream()</span>
+<span class="nc" id="L779">                     .sorted(comparingByKey())</span>
+<span class="nc" id="L780">                     .map(entry -&gt; entry.getKey() + &quot;: &quot; + entry.getValue().consumers())</span>
+<span class="nc" id="L781">                     .collect(Collectors.joining(Utils.NL)));</span>
+
+<span class="nc" id="L783">        final Set&lt;TaskId&gt; allTasks = partitionsForTask.keySet();</span>
+<span class="nc" id="L784">        statefulTasks.addAll(changelogTopics.statefulTaskIds());</span>
+
+<span class="nc" id="L786">        log.info(&quot;Assigning stateful tasks: {}\n&quot;</span>
+                     + &quot;and stateless tasks: {}&quot;,
+                 statefulTasks,
+<span class="nc bnc" id="L789" title="All 2 branches missed.">                 allTasks.stream().filter(t -&gt; !statefulTasks.contains(t)).collect(Collectors.toSet()));</span>
+<span class="nc" id="L790">        log.debug(&quot;Assigning tasks and {} standby replicas to client nodes {}&quot;,</span>
+<span class="nc" id="L791">                  numStandbyReplicas(), clientStates);</span>
+
+<span class="nc" id="L793">        final Optional&lt;org.apache.kafka.streams.processor.assignment.TaskAssignor&gt; userTaskAssignor =</span>
+<span class="nc" id="L794">            customTaskAssignorSupplier.get();</span>
+        final UserTaskAssignmentListener customTaskAssignmentListener;
+<span class="nc bnc" id="L796" title="All 2 branches missed.">        if (userTaskAssignor.isPresent()) {</span>
+<span class="nc" id="L797">            final ApplicationState applicationState = buildApplicationState(</span>
+<span class="nc" id="L798">                taskManager.topologyMetadata(),</span>
+                clientMetadataMap,
+                topicGroups,
+                fullMetadata
+            );
+<span class="nc" id="L803">            final org.apache.kafka.streams.processor.assignment.TaskAssignor assignor = userTaskAssignor.get();</span>
+<span class="nc" id="L804">            final TaskAssignment taskAssignment = assignor.assign(applicationState);</span>
+<span class="nc" id="L805">            final AssignmentError assignmentError = TaskAssignmentUtils.validateTaskAssignment(applicationState, taskAssignment);</span>
+<span class="nc" id="L806">            processStreamsPartitionAssignment(assignor, taskAssignment, assignmentError, clientMetadataMap, groupSubscription);</span>
+<span class="nc" id="L807">            customTaskAssignmentListener = (assignment, subscription) -&gt; {</span>
+<span class="nc" id="L808">                assignor.onAssignmentComputed(assignment, subscription, assignmentError);</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">                if (assignmentError != AssignmentError.NONE) {</span>
+<span class="nc" id="L810">                    log.error(&quot;Rebalance failed due to task assignor returning assignment with error {}&quot;, assignmentError);</span>
+<span class="nc" id="L811">                    throw new StreamsException(&quot;Task assignment with &quot; + assignor.getClass().getName() +</span>
+                                               &quot; returned an error: &quot; + assignmentError);
+                }
+<span class="nc" id="L814">            };</span>
+<span class="nc" id="L815">        } else {</span>
+<span class="nc" id="L816">            customTaskAssignmentListener = (assignment, subscription) -&gt; { };</span>
+<span class="nc" id="L817">            final LegacyTaskAssignor taskAssignor = createTaskAssignor(lagComputationSuccessful);</span>
+<span class="nc" id="L818">            final RackAwareTaskAssignor rackAwareTaskAssignor = new RackAwareTaskAssignor(</span>
+                fullMetadata,
+                partitionsForTask,
+<span class="nc" id="L821">                changelogTopics.changelogPartionsForTask(),</span>
+                tasksForTopicGroup,
+                racksForProcessConsumer,
+                internalTopicManager,
+                assignmentConfigs,
+                time
+            );
+<span class="nc" id="L828">            final boolean probingRebalanceNeeded = taskAssignor.assign(clientStates,</span>
+                allTasks,
+                statefulTasks,
+                rackAwareTaskAssignor,
+                assignmentConfigs);
+<span class="nc bnc" id="L833" title="All 2 branches missed.">            if (probingRebalanceNeeded) {</span>
+                // Arbitrarily choose the leader's client to be responsible for triggering the probing rebalance,
+                // note once we pick the first consumer within the process to trigger probing rebalance, other consumer
+                // would not set to trigger any more.
+<span class="nc" id="L837">                final ClientMetadata rebalanceClientMetadata = clientMetadataMap.get(taskManager.processId());</span>
+<span class="nc bnc" id="L838" title="All 2 branches missed.">                if (rebalanceClientMetadata != null) {</span>
+<span class="nc" id="L839">                    final Instant rebalanceDeadline = Instant.ofEpochMilli(time.milliseconds() + probingRebalanceIntervalMs());</span>
+<span class="nc" id="L840">                    rebalanceClientMetadata.state.setFollowupRebalanceDeadline(rebalanceDeadline);</span>
+                }
+            }
+        }
+
+        // Break this up into multiple logs to make sure the summary info gets through, which helps avoid
+        // info loss for example due to long line truncation with large apps
+<span class="nc" id="L847">        log.info(&quot;Assigned {} total tasks including {} stateful tasks to {} client nodes.&quot;,</span>
+<span class="nc" id="L848">                 allTasks.size(),</span>
+<span class="nc" id="L849">                 statefulTasks.size(),</span>
+<span class="nc" id="L850">                 clientStates.size());</span>
+<span class="nc" id="L851">        log.info(&quot;Assignment of tasks to nodes: {}&quot;,</span>
+<span class="nc" id="L852">                 clientStates.entrySet().stream()</span>
+<span class="nc" id="L853">                     .sorted(comparingByKey())</span>
+<span class="nc" id="L854">                     .map(entry -&gt; entry.getKey() + &quot;=&quot; + entry.getValue().currentAssignment())</span>
+<span class="nc" id="L855">                     .collect(Collectors.joining(Utils.NL)));</span>
+<span class="nc" id="L856">        return customTaskAssignmentListener;</span>
+    }
+
+    private LegacyTaskAssignor createTaskAssignor(final boolean lagComputationSuccessful) {
+<span class="nc" id="L860">        final LegacyTaskAssignor taskAssignor = legacyTaskAssignorSupplier.get();</span>
+<span class="nc bnc" id="L861" title="All 2 branches missed.">        if (taskAssignor instanceof LegacyStickyTaskAssignor) {</span>
+            // special case: to preserve pre-existing behavior, we invoke the LegacyStickyTaskAssignor
+            // whether or not lag computation failed.
+<span class="nc" id="L864">            return taskAssignor;</span>
+<span class="nc bnc" id="L865" title="All 2 branches missed.">        } else if (lagComputationSuccessful) {</span>
+<span class="nc" id="L866">            return taskAssignor;</span>
+        } else {
+<span class="nc" id="L868">            log.info(&quot;Failed to fetch end offsets for changelogs, will return previous assignment to clients and &quot;</span>
+                         + &quot;trigger another rebalance to retry.&quot;);
+<span class="nc" id="L870">            return new FallbackPriorTaskAssignor();</span>
+        }
+    }
+
+    /**
+     * Builds a map from client to state, and readies each ClientState for assignment by adding any missing prev tasks
+     * and computing the per-task overall lag based on the fetched end offsets for each changelog.
+     *
+     * @param clientStates a map from each client to its state, including offset lags. Populated by this method.
+     * @param clientMetadataMap a map from each client to its full metadata
+     * @param taskForPartition map from topic partition to its corresponding task
+     * @param changelogTopics object that manages changelog topics
+     *
+     * @return whether we were able to successfully fetch the changelog end offsets and compute each client's lag
+     */
+    private boolean populateClientStatesMap(final Map&lt;ProcessId, ClientState&gt; clientStates,
+                                            final Map&lt;ProcessId, ClientMetadata&gt; clientMetadataMap,
+                                            final Map&lt;TopicPartition, TaskId&gt; taskForPartition,
+                                            final ChangelogTopics changelogTopics) {
+        boolean fetchEndOffsetsSuccessful;
+        Map&lt;TaskId, Long&gt; allTaskEndOffsetSums;
+        try {
+            // Make the listOffsets request first so it can  fetch the offsets for non-source changelogs
+            // asynchronously while we use the blocking Consumer#committed call to fetch source-changelog offsets;
+            // note that we would need to wrap all exceptions as Streams exception with partition-level fine-grained
+            // error messages
+<span class="nc" id="L896">            final ListOffsetsResult endOffsetsResult =</span>
+<span class="nc" id="L897">                fetchEndOffsetsResult(changelogTopics.preExistingNonSourceTopicBasedPartitions(), adminClient);</span>
+
+<span class="nc" id="L899">            final Map&lt;TopicPartition, Long&gt; sourceChangelogEndOffsets =</span>
+<span class="nc" id="L900">                fetchCommittedOffsets(changelogTopics.preExistingSourceTopicBasedPartitions(), mainConsumerSupplier.get());</span>
+
+<span class="nc" id="L902">            final Map&lt;TopicPartition, ListOffsetsResultInfo&gt; endOffsets = ClientUtils.getEndOffsets(</span>
+<span class="nc" id="L903">                endOffsetsResult, changelogTopics.preExistingNonSourceTopicBasedPartitions());</span>
+
+<span class="nc" id="L905">            allTaskEndOffsetSums = computeEndOffsetSumsByTask(</span>
+                endOffsets,
+                sourceChangelogEndOffsets,
+                changelogTopics
+            );
+<span class="nc" id="L910">            fetchEndOffsetsSuccessful = true;</span>
+<span class="nc" id="L911">        } catch (final StreamsException | TimeoutException e) {</span>
+<span class="nc" id="L912">            log.info(&quot;Failed to retrieve all end offsets for changelogs, and hence could not calculate the per-task lag; &quot; +</span>
+                &quot;this is not a fatal error but would cause the assignor to fallback to a naive algorithm&quot;, e);
+<span class="nc" id="L914">            allTaskEndOffsetSums = changelogTopics.statefulTaskIds().stream().collect(Collectors.toMap(t -&gt; t, t -&gt; UNKNOWN_OFFSET_SUM));</span>
+<span class="nc" id="L915">            fetchEndOffsetsSuccessful = false;</span>
+<span class="nc" id="L916">        }</span>
+
+<span class="nc bnc" id="L918" title="All 2 branches missed.">        for (final Map.Entry&lt;ProcessId, ClientMetadata&gt; entry : clientMetadataMap.entrySet()) {</span>
+<span class="nc" id="L919">            final ProcessId processId = entry.getKey();</span>
+<span class="nc" id="L920">            final ClientState state = entry.getValue().state;</span>
+<span class="nc" id="L921">            state.initializePrevTasks(taskForPartition, taskManager.topologyMetadata().hasNamedTopologies());</span>
+
+<span class="nc" id="L923">            state.computeTaskLags(processId, allTaskEndOffsetSums);</span>
+<span class="nc" id="L924">            clientStates.put(processId, state);</span>
+<span class="nc" id="L925">        }</span>
+
+<span class="nc" id="L927">        return fetchEndOffsetsSuccessful;</span>
+    }
+
+    /**
+     * @param endOffsets the listOffsets result from the adminClient
+     * @param sourceChangelogEndOffsets the end (committed) offsets of optimized source changelogs
+     * @param changelogTopics object that manages changelog topics
+     *
+     * @return Map from stateful task to its total end offset summed across all changelog partitions
+     */
+    private Map&lt;TaskId, Long&gt; computeEndOffsetSumsByTask(final Map&lt;TopicPartition, ListOffsetsResultInfo&gt; endOffsets,
+                                                         final Map&lt;TopicPartition, Long&gt; sourceChangelogEndOffsets,
+                                                         final ChangelogTopics changelogTopics) {
+
+<span class="nc" id="L941">        final Map&lt;TaskId, Long&gt; taskEndOffsetSums = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">        for (final TaskId taskId : changelogTopics.statefulTaskIds()) {</span>
+<span class="nc" id="L943">            taskEndOffsetSums.put(taskId, 0L);</span>
+<span class="nc bnc" id="L944" title="All 2 branches missed.">            for (final TopicPartition changelogPartition : changelogTopics.preExistingPartitionsFor(taskId)) {</span>
+                final long changelogPartitionEndOffset;
+<span class="nc bnc" id="L946" title="All 2 branches missed.">                if (sourceChangelogEndOffsets.containsKey(changelogPartition)) {</span>
+<span class="nc" id="L947">                    changelogPartitionEndOffset = sourceChangelogEndOffsets.get(changelogPartition);</span>
+<span class="nc bnc" id="L948" title="All 2 branches missed.">                } else if (endOffsets.containsKey(changelogPartition)) {</span>
+<span class="nc" id="L949">                    changelogPartitionEndOffset = endOffsets.get(changelogPartition).offset();</span>
+                } else {
+<span class="nc" id="L951">                    log.debug(&quot;Fetched offsets did not contain the changelog {} of task {}&quot;, changelogPartition, taskId);</span>
+<span class="nc" id="L952">                    throw new IllegalStateException(&quot;Could not get end offset for &quot; + changelogPartition);</span>
+                }
+<span class="nc" id="L954">                final long newEndOffsetSum = taskEndOffsetSums.get(taskId) + changelogPartitionEndOffset;</span>
+<span class="nc bnc" id="L955" title="All 2 branches missed.">                if (newEndOffsetSum &lt; 0) {</span>
+<span class="nc" id="L956">                    taskEndOffsetSums.put(taskId, Long.MAX_VALUE);</span>
+<span class="nc" id="L957">                    break;</span>
+                } else {
+<span class="nc" id="L959">                    taskEndOffsetSums.put(taskId, newEndOffsetSum);</span>
+                }
+<span class="nc" id="L961">            }</span>
+<span class="nc" id="L962">        }</span>
+<span class="nc" id="L963">        return taskEndOffsetSums;</span>
+    }
+
+    /**
+     * Populates the global partitionsByHost and standbyPartitionsByHost maps that are sent to each member
+     *
+     * @param partitionsByHost a map from host to the set of partitions hosted there. Populated here.
+     * @param standbyPartitionsByHost a map from host to the set of standby partitions hosted there. Populated here.
+     * @param partitionsForTask a map from task to its set of assigned partitions
+     * @param clientMetadataMap a map from client to its metadata and state
+     */
+    private void populatePartitionsByHostMaps(final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; partitionsByHost,
+                                              final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; standbyPartitionsByHost,
+                                              final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask,
+                                              final Map&lt;ProcessId, ClientMetadata&gt; clientMetadataMap) {
+<span class="nc bnc" id="L978" title="All 2 branches missed.">        for (final Map.Entry&lt;ProcessId, ClientMetadata&gt; entry : clientMetadataMap.entrySet()) {</span>
+<span class="nc" id="L979">            final HostInfo hostInfo = entry.getValue().hostInfo;</span>
+
+            // if application server is configured, also include host state map
+<span class="nc bnc" id="L982" title="All 2 branches missed.">            if (hostInfo != null) {</span>
+<span class="nc" id="L983">                final Set&lt;TopicPartition&gt; topicPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L984">                final Set&lt;TopicPartition&gt; standbyPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L985">                final ClientState state = entry.getValue().state;</span>
+
+<span class="nc bnc" id="L987" title="All 2 branches missed.">                for (final TaskId id : state.activeTasks()) {</span>
+<span class="nc" id="L988">                    topicPartitions.addAll(partitionsForTask.get(id));</span>
+<span class="nc" id="L989">                }</span>
+
+<span class="nc bnc" id="L991" title="All 2 branches missed.">                for (final TaskId id : state.standbyTasks()) {</span>
+<span class="nc" id="L992">                    standbyPartitions.addAll(partitionsForTask.get(id));</span>
+<span class="nc" id="L993">                }</span>
+
+<span class="nc" id="L995">                partitionsByHost.put(hostInfo, topicPartitions);</span>
+<span class="nc" id="L996">                standbyPartitionsByHost.put(hostInfo, standbyPartitions);</span>
+            }
+<span class="nc" id="L998">        }</span>
+<span class="nc" id="L999">    }</span>
+
+    /**
+     * Computes the assignment of tasks to threads within each client and assembles the final assignment to send out.
+     *
+     * @return the final assignment for each StreamThread consumer
+     */
+    private Map&lt;String, Assignment&gt; computeNewAssignment(final Set&lt;TaskId&gt; statefulTasks,
+                                                         final Map&lt;ProcessId, ClientMetadata&gt; clientsMetadata,
+                                                         final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask,
+                                                         final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; partitionsByHostState,
+                                                         final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; standbyPartitionsByHost,
+                                                         final Set&lt;TopicPartition&gt; allOwnedPartitions,
+                                                         final int minUserMetadataVersion,
+                                                         final int minSupportedMetadataVersion,
+                                                         final boolean versionProbing) {
+<span class="nc" id="L1015">        boolean rebalanceRequired = versionProbing;</span>
+<span class="nc" id="L1016">        final Map&lt;String, Assignment&gt; assignment = new HashMap&lt;&gt;();</span>
+
+        // within the client, distribute tasks to its owned consumers
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">        for (final Map.Entry&lt;ProcessId, ClientMetadata&gt; clientEntry : clientsMetadata.entrySet()) {</span>
+<span class="nc" id="L1020">            final ProcessId clientId = clientEntry.getKey();</span>
+<span class="nc" id="L1021">            final ClientMetadata clientMetadata = clientEntry.getValue();</span>
+<span class="nc" id="L1022">            final ClientState state = clientMetadata.state;</span>
+<span class="nc" id="L1023">            final SortedSet&lt;String&gt; consumers = clientMetadata.consumers;</span>
+<span class="nc" id="L1024">            final Map&lt;String, Integer&gt; threadTaskCounts = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L1026">            final Map&lt;String, List&lt;TaskId&gt;&gt; activeTaskStatefulAssignment = assignTasksToThreads(</span>
+<span class="nc" id="L1027">                state.statefulActiveTasks(),</span>
+                true,
+                consumers,
+                state,
+                threadTaskCounts
+            );
+
+<span class="nc" id="L1034">            final Map&lt;String, List&lt;TaskId&gt;&gt; standbyTaskAssignment = assignTasksToThreads(</span>
+<span class="nc" id="L1035">                state.standbyTasks(),</span>
+                true,
+                consumers,
+                state,
+                threadTaskCounts
+            );
+
+<span class="nc" id="L1042">            final Map&lt;String, List&lt;TaskId&gt;&gt; activeTaskStatelessAssignment = assignTasksToThreads(</span>
+<span class="nc" id="L1043">                state.statelessActiveTasks(),</span>
+                false,
+                consumers,
+                state,
+                threadTaskCounts
+            );
+
+            // Combine activeTaskStatefulAssignment and activeTaskStatelessAssignment together into
+            // activeTaskStatelessAssignment
+<span class="nc" id="L1052">            final Map&lt;String, List&lt;TaskId&gt;&gt; activeTaskAssignment = activeTaskStatefulAssignment;</span>
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">            for (final Map.Entry&lt;String, List&lt;TaskId&gt;&gt; threadEntry : activeTaskStatelessAssignment.entrySet()) {</span>
+<span class="nc" id="L1054">                activeTaskAssignment.get(threadEntry.getKey()).addAll(threadEntry.getValue());</span>
+<span class="nc" id="L1055">            }</span>
+
+<span class="nc" id="L1057">            final boolean isNextProbingRebalanceEncoded = clientMetadata.state.followupRebalanceDeadline().isPresent();</span>
+
+<span class="nc" id="L1059">            final boolean tasksRevoked = addClientAssignments(</span>
+                statefulTasks,
+                assignment,
+                clientMetadata,
+                partitionsForTask,
+                partitionsByHostState,
+                standbyPartitionsByHost,
+                allOwnedPartitions,
+                activeTaskAssignment,
+                standbyTaskAssignment,
+                minUserMetadataVersion,
+                minSupportedMetadataVersion
+            );
+
+<span class="nc bnc" id="L1073" title="All 4 branches missed.">            if (tasksRevoked || isNextProbingRebalanceEncoded) {</span>
+<span class="nc" id="L1074">                rebalanceRequired = true;</span>
+<span class="nc" id="L1075">                log.debug(&quot;Requested client {} to schedule a followup rebalance&quot;, clientId);</span>
+            }
+
+<span class="nc" id="L1078">            log.info(&quot;Client {} per-consumer assignment:\n&quot; +</span>
+                &quot;\tprev owned active {}\n&quot; +
+                &quot;\tprev owned standby {}\n&quot; +
+                &quot;\tassigned active {}\n&quot; +
+                &quot;\trevoking active {}\n&quot; +
+                &quot;\tassigned standby {}\n&quot;,
+                clientId,
+<span class="nc" id="L1085">                clientMetadata.state.prevOwnedActiveTasksByConsumer(),</span>
+<span class="nc" id="L1086">                clientMetadata.state.prevOwnedStandbyByConsumer(),</span>
+<span class="nc" id="L1087">                clientMetadata.state.assignedActiveTasksByConsumer(),</span>
+<span class="nc" id="L1088">                clientMetadata.state.revokingActiveTasksByConsumer(),</span>
+<span class="nc" id="L1089">                clientMetadata.state.assignedStandbyTasksByConsumer());</span>
+<span class="nc" id="L1090">        }</span>
+
+<span class="nc bnc" id="L1092" title="All 2 branches missed.">        if (rebalanceRequired) {</span>
+<span class="nc" id="L1093">            assignmentListener.onAssignmentComplete(false);</span>
+<span class="nc" id="L1094">            log.info(&quot;Finished unstable assignment of tasks, a followup rebalance will be scheduled.&quot;);</span>
+        } else {
+<span class="nc" id="L1096">            assignmentListener.onAssignmentComplete(true);</span>
+<span class="nc" id="L1097">            log.info(&quot;Finished stable assignment of tasks, no followup rebalances required.&quot;);</span>
+        }
+
+<span class="nc" id="L1100">        return assignment;</span>
+    }
+
+    /**
+     * Adds the encoded assignment for each StreamThread consumer in the client to the overall assignment map
+     * @return true if a followup rebalance will be required due to revoked tasks
+     */
+    private boolean addClientAssignments(final Set&lt;TaskId&gt; statefulTasks,
+                                         final Map&lt;String, Assignment&gt; assignment,
+                                         final ClientMetadata clientMetadata,
+                                         final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask,
+                                         final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; partitionsByHostState,
+                                         final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; standbyPartitionsByHost,
+                                         final Set&lt;TopicPartition&gt; allOwnedPartitions,
+                                         final Map&lt;String, List&lt;TaskId&gt;&gt; activeTaskAssignments,
+                                         final Map&lt;String, List&lt;TaskId&gt;&gt; standbyTaskAssignments,
+                                         final int minUserMetadataVersion,
+                                         final int minSupportedMetadataVersion) {
+<span class="nc" id="L1118">        boolean followupRebalanceRequiredForRevokedTasks = false;</span>
+
+        // We only want to encode a scheduled probing rebalance for a single member in this client
+<span class="nc" id="L1121">        final Optional&lt;Instant&gt; followupRebalanceDeadline = clientMetadata.state.followupRebalanceDeadline();</span>
+<span class="nc" id="L1122">        boolean shouldEncodeProbingRebalance = followupRebalanceDeadline.isPresent();</span>
+
+        // Loop through the consumers and build their assignment
+<span class="nc bnc" id="L1125" title="All 2 branches missed.">        for (final String consumer : clientMetadata.consumers) {</span>
+<span class="nc" id="L1126">            final List&lt;TaskId&gt; activeTasksForConsumer = activeTaskAssignments.get(consumer);</span>
+
+            // These will be filled in by populateActiveTaskAndPartitionsLists below
+<span class="nc" id="L1129">            final List&lt;TopicPartition&gt; activePartitionsList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1130">            final List&lt;TaskId&gt; assignedActiveList = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L1132">            final Set&lt;TaskId&gt; activeTasksRemovedPendingRevocation = populateActiveTaskAndPartitionsLists(</span>
+                activePartitionsList,
+                assignedActiveList,
+                consumer,
+                clientMetadata.state,
+                activeTasksForConsumer,
+                partitionsForTask,
+                allOwnedPartitions
+            );
+
+<span class="nc" id="L1142">            final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTaskMap = buildStandbyTaskMap(</span>
+                    consumer,
+<span class="nc" id="L1144">                    standbyTaskAssignments.get(consumer),</span>
+                    activeTasksRemovedPendingRevocation,
+                    statefulTasks,
+                    partitionsForTask,
+                    clientMetadata.state
+                );
+
+<span class="nc" id="L1151">            final AssignmentInfo info = new AssignmentInfo(</span>
+                minUserMetadataVersion,
+                minSupportedMetadataVersion,
+                assignedActiveList,
+                standbyTaskMap,
+                partitionsByHostState,
+                standbyPartitionsByHost,
+<span class="nc" id="L1158">                AssignorError.NONE.code()</span>
+            );
+
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">            if (!activeTasksRemovedPendingRevocation.isEmpty()) {</span>
+                // TODO: once KAFKA-10078 is resolved we can leave it to the client to trigger this rebalance
+<span class="nc" id="L1163">                log.info(&quot;Requesting followup rebalance be scheduled immediately by {} due to tasks changing ownership.&quot;, consumer);</span>
+<span class="nc" id="L1164">                info.setNextRebalanceTime(0L);</span>
+<span class="nc" id="L1165">                followupRebalanceRequiredForRevokedTasks = true;</span>
+                // Don't bother to schedule a probing rebalance if an immediate one is already scheduled
+<span class="nc" id="L1167">                shouldEncodeProbingRebalance = false;</span>
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">            } else if (shouldEncodeProbingRebalance) {</span>
+<span class="nc" id="L1169">                final long nextRebalanceTimeMs = followupRebalanceDeadline.get().toEpochMilli();</span>
+<span class="nc" id="L1170">                log.info(&quot;Requesting followup rebalance be scheduled by {} for {} to probe for caught-up replica tasks.&quot;,</span>
+<span class="nc" id="L1171">                        consumer, Utils.toLogDateTimeFormat(nextRebalanceTimeMs));</span>
+<span class="nc" id="L1172">                info.setNextRebalanceTime(nextRebalanceTimeMs);</span>
+<span class="nc" id="L1173">                shouldEncodeProbingRebalance = false;</span>
+            }
+
+<span class="nc" id="L1176">            assignment.put(</span>
+                consumer,
+                new Assignment(
+                    activePartitionsList,
+<span class="nc" id="L1180">                    info.encode()</span>
+                )
+            );
+<span class="nc" id="L1183">        }</span>
+<span class="nc" id="L1184">        return followupRebalanceRequiredForRevokedTasks;</span>
+    }
+
+    /**
+     * Populates the lists of active tasks and active task partitions for the consumer with a 1:1 mapping between them
+     * such that the nth task corresponds to the nth partition in the list. This means tasks with multiple partitions
+     * will be repeated in the list.
+     */
+    private Set&lt;TaskId&gt; populateActiveTaskAndPartitionsLists(final List&lt;TopicPartition&gt; activePartitionsList,
+                                                             final List&lt;TaskId&gt; assignedActiveList,
+                                                             final String consumer,
+                                                             final ClientState clientState,
+                                                             final List&lt;TaskId&gt; activeTasksForConsumer,
+                                                             final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask,
+                                                             final Set&lt;TopicPartition&gt; allOwnedPartitions) {
+<span class="nc" id="L1199">        final List&lt;AssignedPartition&gt; assignedPartitions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1200">        final Set&lt;TaskId&gt; removedActiveTasks = new TreeSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">        for (final TaskId taskId : activeTasksForConsumer) {</span>
+            // Populate the consumer for assigned tasks without considering revocation,
+            // this is for debugging purposes only
+<span class="nc" id="L1205">            clientState.assignActiveToConsumer(taskId, consumer);</span>
+
+<span class="nc" id="L1207">            final List&lt;AssignedPartition&gt; assignedPartitionsForTask = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">            for (final TopicPartition partition : partitionsForTask.get(taskId)) {</span>
+<span class="nc" id="L1209">                final String oldOwner = clientState.previousOwnerForPartition(partition);</span>
+<span class="nc bnc" id="L1210" title="All 4 branches missed.">                final boolean newPartitionForConsumer = oldOwner == null || !oldOwner.equals(consumer);</span>
+
+                // If the partition is new to this consumer but is still owned by another, remove from the assignment
+                // until it has been revoked and can safely be reassigned according to the COOPERATIVE protocol
+<span class="nc bnc" id="L1214" title="All 4 branches missed.">                if (newPartitionForConsumer &amp;&amp; allOwnedPartitions.contains(partition)) {</span>
+<span class="nc" id="L1215">                    log.info(</span>
+                        &quot;Removing task {} from {} active assignment until it is safely revoked in followup rebalance&quot;,
+                        taskId,
+                        consumer
+                    );
+<span class="nc" id="L1220">                    removedActiveTasks.add(taskId);</span>
+
+<span class="nc" id="L1222">                    clientState.revokeActiveFromConsumer(taskId, consumer);</span>
+
+                    // Clear the assigned partitions list for this task if any partition can not safely be assigned,
+                    // so as not to encode a partial task
+<span class="nc" id="L1226">                    assignedPartitionsForTask.clear();</span>
+
+                    // This has no effect on the assignment, as we'll never consult the ClientState again, but
+                    // it does perform a useful assertion that the task was actually assigned.
+<span class="nc" id="L1230">                    clientState.unassignActive(taskId);</span>
+<span class="nc" id="L1231">                    break;</span>
+                } else {
+<span class="nc" id="L1233">                    assignedPartitionsForTask.add(new AssignedPartition(taskId, partition));</span>
+                }
+<span class="nc" id="L1235">            }</span>
+            // assignedPartitionsForTask will either contain all partitions for the task or be empty, so just add all
+<span class="nc" id="L1237">            assignedPartitions.addAll(assignedPartitionsForTask);</span>
+<span class="nc" id="L1238">        }</span>
+
+        // Add one copy of a task for each corresponding partition, so the receiver can determine the task &lt;-&gt; tp mapping
+<span class="nc" id="L1241">        Collections.sort(assignedPartitions);</span>
+<span class="nc bnc" id="L1242" title="All 2 branches missed.">        for (final AssignedPartition partition : assignedPartitions) {</span>
+<span class="nc" id="L1243">            assignedActiveList.add(partition.taskId);</span>
+<span class="nc" id="L1244">            activePartitionsList.add(partition.partition);</span>
+<span class="nc" id="L1245">        }</span>
+<span class="nc" id="L1246">        return removedActiveTasks;</span>
+    }
+
+    /**
+     * @return map from task id to its assigned partitions for all standby tasks
+     */
+    private Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; buildStandbyTaskMap(final String consumer,
+                                                                 final Iterable&lt;TaskId&gt; standbyTasks,
+                                                                 final Iterable&lt;TaskId&gt; revokedTasks,
+                                                                 final Set&lt;TaskId&gt; allStatefulTasks,
+                                                                 final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; partitionsForTask,
+                                                                 final ClientState clientState) {
+<span class="nc" id="L1258">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTaskMap = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1260" title="All 2 branches missed.">        for (final TaskId task : standbyTasks) {</span>
+<span class="nc" id="L1261">            clientState.assignStandbyToConsumer(task, consumer);</span>
+<span class="nc" id="L1262">            standbyTaskMap.put(task, partitionsForTask.get(task));</span>
+<span class="nc" id="L1263">        }</span>
+
+<span class="nc bnc" id="L1265" title="All 2 branches missed.">        for (final TaskId task : revokedTasks) {</span>
+            // If this task is stateful and already owned by the consumer, but can't (yet) be assigned as an active
+            // task during this rebalance as it must be revoked from another consumer first, place a temporary
+            // standby task here until it can receive the active task to avoid closing the state store (and losing
+            // all of the accumulated state in the case of in-memory stores)
+<span class="nc bnc" id="L1270" title="All 4 branches missed.">            if (clientState.previouslyOwnedStandby(task) &amp;&amp; allStatefulTasks.contains(task)) {</span>
+<span class="nc" id="L1271">                log.info(&quot;Adding removed stateful active task {} as a standby for {} until it is revoked and can &quot;</span>
+                             + &quot;be transitioned to active in a followup rebalance&quot;, task, consumer);
+
+                // This has no effect on the assignment, as we'll never consult the ClientState again, but
+                // it does perform a useful assertion that the it's legal to assign this task as a standby to this instance
+<span class="nc" id="L1276">                clientState.assignStandbyToConsumer(task, consumer);</span>
+<span class="nc" id="L1277">                clientState.assignStandby(task);</span>
+
+<span class="nc" id="L1279">                standbyTaskMap.put(task, partitionsForTask.get(task));</span>
+            }
+<span class="nc" id="L1281">        }</span>
+<span class="nc" id="L1282">        return standbyTaskMap;</span>
+    }
+
+    /**
+     * Generate an assignment that tries to preserve thread-level stickiness for stateful tasks without violating
+     * balance. The tasks are balanced across threads. Stateful tasks without previous owners will be interleaved by
+     * group id to spread subtopologies across threads and further balance the workload.
+     * Stateless tasks are simply spread across threads without taking into account previous ownership.
+     * threadLoad is a map that keeps track of task load per thread across multiple calls so active and standby
+     * tasks are evenly distributed
+     */
+    static Map&lt;String, List&lt;TaskId&gt;&gt; assignTasksToThreads(final Collection&lt;TaskId&gt; tasksToAssign,
+                                                          final boolean isStateful,
+                                                          final SortedSet&lt;String&gt; consumers,
+                                                          final ClientState state,
+                                                          final Map&lt;String, Integer&gt; threadLoad) {
+<span class="nc" id="L1298">        final Map&lt;String, List&lt;TaskId&gt;&gt; assignment = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1299" title="All 2 branches missed.">        for (final String consumer : consumers) {</span>
+<span class="nc" id="L1300">            assignment.put(consumer, new ArrayList&lt;&gt;());</span>
+<span class="nc" id="L1301">        }</span>
+
+<span class="nc" id="L1303">        final int totalTasks = threadLoad.values().stream().reduce(tasksToAssign.size(), Integer::sum);</span>
+
+<span class="nc" id="L1305">        final int minTasksPerThread = (int) Math.floor(((double) totalTasks) / consumers.size());</span>
+<span class="nc" id="L1306">        final PriorityQueue&lt;TaskId&gt; unassignedTasks = new PriorityQueue&lt;&gt;(tasksToAssign);</span>
+
+<span class="nc" id="L1308">        final Queue&lt;String&gt; consumersToFill = new LinkedList&lt;&gt;();</span>
+        // keep track of tasks that we have to skip during the first pass in case we can reassign them later
+        // using tree-map to make sure the iteration ordering over keys are preserved
+<span class="nc" id="L1311">        final Map&lt;TaskId, String&gt; unassignedTaskToPreviousOwner = new TreeMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1313" title="All 2 branches missed.">        if (!unassignedTasks.isEmpty()) {</span>
+            // First assign tasks to previous owner, up to the min expected tasks/thread if these are stateful
+<span class="nc bnc" id="L1315" title="All 2 branches missed.">            for (final String consumer : consumers) {</span>
+<span class="nc" id="L1316">                final List&lt;TaskId&gt; threadAssignment = assignment.get(consumer);</span>
+                // The number of tasks we have to assign here to hit minTasksPerThread
+<span class="nc" id="L1318">                final int tasksTargetCount = minTasksPerThread - threadLoad.getOrDefault(consumer, 0);</span>
+
+<span class="nc bnc" id="L1320" title="All 2 branches missed.">                if (isStateful) {</span>
+<span class="nc bnc" id="L1321" title="All 2 branches missed.">                    for (final TaskId task : state.prevTasksByLag(consumer)) {</span>
+<span class="nc bnc" id="L1322" title="All 2 branches missed.">                        if (unassignedTasks.contains(task)) {</span>
+<span class="nc bnc" id="L1323" title="All 2 branches missed.">                            if (threadAssignment.size() &lt; tasksTargetCount) {</span>
+<span class="nc" id="L1324">                                threadAssignment.add(task);</span>
+<span class="nc" id="L1325">                                unassignedTasks.remove(task);</span>
+                            } else {
+<span class="nc" id="L1327">                                unassignedTaskToPreviousOwner.put(task, consumer);</span>
+                            }
+                        }
+<span class="nc" id="L1330">                    }</span>
+                }
+
+<span class="nc bnc" id="L1333" title="All 2 branches missed.">                if (threadAssignment.size() &lt; tasksTargetCount) {</span>
+<span class="nc" id="L1334">                    consumersToFill.offer(consumer);</span>
+                }
+<span class="nc" id="L1336">            }</span>
+
+            // Next interleave remaining unassigned tasks amongst unfilled consumers
+<span class="nc bnc" id="L1339" title="All 2 branches missed.">            while (!consumersToFill.isEmpty()) {</span>
+<span class="nc" id="L1340">                final TaskId task = unassignedTasks.poll();</span>
+<span class="nc bnc" id="L1341" title="All 2 branches missed.">                if (task != null) {</span>
+<span class="nc" id="L1342">                    final String consumer = consumersToFill.poll();</span>
+<span class="nc" id="L1343">                    final List&lt;TaskId&gt; threadAssignment = assignment.get(consumer);</span>
+<span class="nc" id="L1344">                    threadAssignment.add(task);</span>
+<span class="nc" id="L1345">                    final int threadTaskCount = threadAssignment.size() + threadLoad.getOrDefault(consumer, 0);</span>
+<span class="nc bnc" id="L1346" title="All 2 branches missed.">                    if (threadTaskCount &lt; minTasksPerThread) {</span>
+<span class="nc" id="L1347">                        consumersToFill.offer(consumer);</span>
+                    }
+<span class="nc" id="L1349">                } else {</span>
+<span class="nc" id="L1350">                    throw new TaskAssignmentException(&quot;Ran out of unassigned stateful tasks but some members were not at capacity&quot;);</span>
+                }
+<span class="nc" id="L1352">            }</span>
+
+            // At this point all consumers are at the min or min + 1 capacity.
+            // The min + 1 case can occur for standbys where there's fewer standbys than consumers and after assigning
+            // the active tasks some consumers already have min + 1 one tasks assigned.
+            // The tasks still remaining should now be distributed over the consumers that are still at min capacity
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">            if (!unassignedTasks.isEmpty()) {</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">                for (final String consumer : consumers) {</span>
+<span class="nc" id="L1360">                    final int taskCount = assignment.get(consumer).size() + threadLoad.getOrDefault(consumer, 0);</span>
+<span class="nc bnc" id="L1361" title="All 2 branches missed.">                    if (taskCount == minTasksPerThread) {</span>
+<span class="nc" id="L1362">                        consumersToFill.add(consumer);</span>
+                    }
+<span class="nc" id="L1364">                }</span>
+
+                // Go over the tasks we skipped earlier and assign them to their previous owner when possible
+<span class="nc bnc" id="L1367" title="All 2 branches missed.">                for (final Map.Entry&lt;TaskId, String&gt; taskEntry : unassignedTaskToPreviousOwner.entrySet()) {</span>
+<span class="nc" id="L1368">                    final TaskId task = taskEntry.getKey();</span>
+<span class="nc" id="L1369">                    final String consumer = taskEntry.getValue();</span>
+<span class="nc bnc" id="L1370" title="All 4 branches missed.">                    if (consumersToFill.contains(consumer) &amp;&amp; unassignedTasks.contains(task)) {</span>
+<span class="nc" id="L1371">                        assignment.get(consumer).add(task);</span>
+<span class="nc" id="L1372">                        unassignedTasks.remove(task);</span>
+                        // Remove this consumer since we know it is now at minCapacity + 1
+<span class="nc" id="L1374">                        consumersToFill.remove(consumer);</span>
+                    }
+<span class="nc" id="L1376">                }</span>
+
+                // Now just distribute the remaining unassigned stateful tasks over the consumers still at min capacity
+<span class="nc bnc" id="L1379" title="All 2 branches missed.">                for (final TaskId task : unassignedTasks) {</span>
+<span class="nc" id="L1380">                    final String consumer = consumersToFill.poll();</span>
+<span class="nc" id="L1381">                    final List&lt;TaskId&gt; threadAssignment = assignment.get(consumer);</span>
+<span class="nc" id="L1382">                    threadAssignment.add(task);</span>
+<span class="nc" id="L1383">                }</span>
+            }
+        }
+        // Update threadLoad
+<span class="nc bnc" id="L1387" title="All 2 branches missed.">        for (final Map.Entry&lt;String, List&lt;TaskId&gt;&gt; taskEntry : assignment.entrySet()) {</span>
+<span class="nc" id="L1388">            final String consumer = taskEntry.getKey();</span>
+<span class="nc" id="L1389">            final int totalCount = threadLoad.getOrDefault(consumer, 0) + taskEntry.getValue().size();</span>
+<span class="nc" id="L1390">            threadLoad.put(consumer, totalCount);</span>
+<span class="nc" id="L1391">        }</span>
+
+<span class="nc" id="L1393">        return assignment;</span>
+    }
+
+    private void validateMetadataVersions(final int receivedAssignmentMetadataVersion,
+                                          final int latestCommonlySupportedVersion) {
+
+<span class="nc bnc" id="L1399" title="All 2 branches missed.">        if (receivedAssignmentMetadataVersion &gt; usedSubscriptionMetadataVersion) {</span>
+<span class="nc" id="L1400">            log.error(&quot;Leader sent back an assignment with version {} which was greater than our used version {}&quot;,</span>
+<span class="nc" id="L1401">                receivedAssignmentMetadataVersion, usedSubscriptionMetadataVersion);</span>
+<span class="nc" id="L1402">            throw new TaskAssignmentException(</span>
+                &quot;Sent a version &quot; + usedSubscriptionMetadataVersion
+                    + &quot; subscription but got an assignment with higher version &quot;
+                    + receivedAssignmentMetadataVersion + &quot;.&quot;
+            );
+        }
+
+<span class="nc bnc" id="L1409" title="All 2 branches missed.">        if (latestCommonlySupportedVersion &gt; LATEST_SUPPORTED_VERSION) {</span>
+<span class="nc" id="L1410">            log.error(&quot;Leader sent back assignment with commonly supported version {} that is greater than our &quot;</span>
+<span class="nc" id="L1411">                + &quot;actual latest supported version {}&quot;, latestCommonlySupportedVersion, LATEST_SUPPORTED_VERSION);</span>
+<span class="nc" id="L1412">            throw new TaskAssignmentException(&quot;Can't upgrade to metadata version greater than we support&quot;);</span>
+        }
+<span class="nc" id="L1414">    }</span>
+
+    // Returns true if subscription version was changed, indicating version probing and need to rebalance again
+    protected boolean maybeUpdateSubscriptionVersion(final int receivedAssignmentMetadataVersion,
+                                                     final int latestCommonlySupportedVersion) {
+<span class="nc bnc" id="L1419" title="All 2 branches missed.">        if (receivedAssignmentMetadataVersion &gt;= EARLIEST_PROBEABLE_VERSION) {</span>
+            // If the latest commonly supported version is now greater than our used version, this indicates we have just
+            // completed the rolling upgrade and can now update our subscription version for the final rebalance
+<span class="nc bnc" id="L1422" title="All 2 branches missed.">            if (latestCommonlySupportedVersion &gt; usedSubscriptionMetadataVersion) {</span>
+<span class="nc" id="L1423">                log.info(</span>
+                    &quot;Sent a version {} subscription and group's latest commonly supported version is {} (successful &quot;
+                        +
+                        &quot;version probing and end of rolling upgrade). Upgrading subscription metadata version to &quot; +
+                        &quot;{} for next rebalance.&quot;,
+<span class="nc" id="L1428">                    usedSubscriptionMetadataVersion,</span>
+<span class="nc" id="L1429">                    latestCommonlySupportedVersion,</span>
+<span class="nc" id="L1430">                    latestCommonlySupportedVersion</span>
+                );
+<span class="nc" id="L1432">                usedSubscriptionMetadataVersion = latestCommonlySupportedVersion;</span>
+<span class="nc" id="L1433">                return true;</span>
+            }
+
+            // If we received a lower version than we sent, someone else in the group still hasn't upgraded. We
+            // should downgrade our subscription until everyone is on the latest version
+<span class="nc bnc" id="L1438" title="All 2 branches missed.">            if (receivedAssignmentMetadataVersion &lt; usedSubscriptionMetadataVersion) {</span>
+<span class="nc" id="L1439">                log.info(</span>
+                    &quot;Sent a version {} subscription and got version {} assignment back (successful version probing). &quot;
+                        +
+                        &quot;Downgrade subscription metadata to commonly supported version {} and trigger new rebalance.&quot;,
+<span class="nc" id="L1443">                    usedSubscriptionMetadataVersion,</span>
+<span class="nc" id="L1444">                    receivedAssignmentMetadataVersion,</span>
+<span class="nc" id="L1445">                    latestCommonlySupportedVersion</span>
+                );
+<span class="nc" id="L1447">                usedSubscriptionMetadataVersion = latestCommonlySupportedVersion;</span>
+<span class="nc" id="L1448">                return true;</span>
+            }
+        } else {
+<span class="nc" id="L1451">            log.debug(&quot;Received an assignment version {} that is less than the earliest version that allows version &quot; +</span>
+                &quot;probing {}. If this is not during a rolling upgrade from version 2.0 or below, this is an error.&quot;,
+<span class="nc" id="L1453">                receivedAssignmentMetadataVersion, EARLIEST_PROBEABLE_VERSION);</span>
+        }
+
+<span class="nc" id="L1456">        return false;</span>
+    }
+
+    @Override
+    public void onAssignment(final Assignment assignment, final ConsumerGroupMetadata metadata) {
+<span class="nc" id="L1461">        final List&lt;TopicPartition&gt; partitions = new ArrayList&lt;&gt;(assignment.partitions());</span>
+<span class="nc" id="L1462">        partitions.sort(PARTITION_COMPARATOR);</span>
+
+<span class="nc" id="L1464">        final AssignmentInfo info = AssignmentInfo.decode(assignment.userData());</span>
+<span class="nc bnc" id="L1465" title="All 2 branches missed.">        if (info.errCode() != AssignorError.NONE.code()) {</span>
+            // set flag to shutdown streams app
+<span class="nc" id="L1467">            assignmentErrorCode.set(info.errCode());</span>
+<span class="nc" id="L1468">            return;</span>
+        }
+        /*
+         * latestCommonlySupportedVersion belongs to [usedSubscriptionMetadataVersion, LATEST_SUPPORTED_VERSION]
+         * receivedAssignmentMetadataVersion belongs to [EARLIEST_PROBEABLE_VERSION, usedSubscriptionMetadataVersion]
+         *
+         * usedSubscriptionMetadataVersion will be downgraded to receivedAssignmentMetadataVersion during a rolling
+         * bounce upgrade with version probing.
+         *
+         * usedSubscriptionMetadataVersion will be upgraded to latestCommonlySupportedVersion when all members have
+         * been bounced and it is safe to use the latest version.
+         */
+<span class="nc" id="L1480">        final int receivedAssignmentMetadataVersion = info.version();</span>
+<span class="nc" id="L1481">        final int latestCommonlySupportedVersion = info.commonlySupportedVersion();</span>
+
+<span class="nc" id="L1483">        validateMetadataVersions(receivedAssignmentMetadataVersion, latestCommonlySupportedVersion);</span>
+
+        // version 1 field
+        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasks;
+        // version 2 fields
+        final Map&lt;TopicPartition, PartitionInfo&gt; topicToPartitionInfo;
+        final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; partitionsByHost;
+        final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; standbyPartitionsByHost;
+        final long encodedNextScheduledRebalanceMs;
+
+<span class="nc bnc" id="L1493" title="All 5 branches missed.">        switch (receivedAssignmentMetadataVersion) {</span>
+            case 1:
+<span class="nc" id="L1495">                validateActiveTaskEncoding(partitions, info, logPrefix);</span>
+
+<span class="nc" id="L1497">                activeTasks = getActiveTasks(partitions, info);</span>
+<span class="nc" id="L1498">                partitionsByHost = Collections.emptyMap();</span>
+<span class="nc" id="L1499">                standbyPartitionsByHost = Collections.emptyMap();</span>
+<span class="nc" id="L1500">                topicToPartitionInfo = Collections.emptyMap();</span>
+<span class="nc" id="L1501">                encodedNextScheduledRebalanceMs = Long.MAX_VALUE;</span>
+<span class="nc" id="L1502">                break;</span>
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+<span class="nc" id="L1507">                validateActiveTaskEncoding(partitions, info, logPrefix);</span>
+
+<span class="nc" id="L1509">                activeTasks = getActiveTasks(partitions, info);</span>
+<span class="nc" id="L1510">                partitionsByHost = info.partitionsByHost();</span>
+<span class="nc" id="L1511">                standbyPartitionsByHost = Collections.emptyMap();</span>
+<span class="nc" id="L1512">                topicToPartitionInfo = getTopicPartitionInfo(partitionsByHost);</span>
+<span class="nc" id="L1513">                encodedNextScheduledRebalanceMs = Long.MAX_VALUE;</span>
+<span class="nc" id="L1514">                break;</span>
+            case 6:
+<span class="nc" id="L1516">                validateActiveTaskEncoding(partitions, info, logPrefix);</span>
+
+<span class="nc" id="L1518">                activeTasks = getActiveTasks(partitions, info);</span>
+<span class="nc" id="L1519">                partitionsByHost = info.partitionsByHost();</span>
+<span class="nc" id="L1520">                standbyPartitionsByHost = info.standbyPartitionByHost();</span>
+<span class="nc" id="L1521">                topicToPartitionInfo = getTopicPartitionInfo(partitionsByHost);</span>
+<span class="nc" id="L1522">                encodedNextScheduledRebalanceMs = Long.MAX_VALUE;</span>
+<span class="nc" id="L1523">                break;</span>
+            case 7:
+            case 8:
+            case 9:
+            case 10:
+            case 11:
+<span class="nc" id="L1529">                validateActiveTaskEncoding(partitions, info, logPrefix);</span>
+
+<span class="nc" id="L1531">                activeTasks = getActiveTasks(partitions, info);</span>
+<span class="nc" id="L1532">                partitionsByHost = info.partitionsByHost();</span>
+<span class="nc" id="L1533">                standbyPartitionsByHost = info.standbyPartitionByHost();</span>
+<span class="nc" id="L1534">                topicToPartitionInfo = getTopicPartitionInfo(partitionsByHost);</span>
+<span class="nc" id="L1535">                encodedNextScheduledRebalanceMs = info.nextRebalanceMs();</span>
+<span class="nc" id="L1536">                break;</span>
+            default:
+<span class="nc" id="L1538">                throw new IllegalStateException(</span>
+                    &quot;This code should never be reached.&quot;
+                        + &quot; Please file a bug report at https://issues.apache.org/jira/projects/KAFKA/&quot;
+                );
+        }
+
+<span class="nc" id="L1544">        maybeScheduleFollowupRebalance(</span>
+            encodedNextScheduledRebalanceMs,
+            receivedAssignmentMetadataVersion,
+            latestCommonlySupportedVersion,
+<span class="nc" id="L1548">            partitionsByHost.keySet()</span>
+        );
+
+<span class="nc" id="L1551">        streamsMetadataState.onChange(partitionsByHost, standbyPartitionsByHost, topicToPartitionInfo);</span>
+
+        // we do not capture any exceptions but just let the exception thrown from consumer.poll directly
+        // since when stream thread captures it, either we close all tasks as dirty or we close thread
+<span class="nc" id="L1555">        taskManager.handleAssignment(activeTasks, info.standbyTasks());</span>
+<span class="nc" id="L1556">    }</span>
+
+    private void maybeScheduleFollowupRebalance(final long encodedNextScheduledRebalanceMs,
+                                                final int receivedAssignmentMetadataVersion,
+                                                final int latestCommonlySupportedVersion,
+                                                final Set&lt;HostInfo&gt; groupHostInfo) {
+<span class="nc bnc" id="L1562" title="All 2 branches missed.">        if (maybeUpdateSubscriptionVersion(receivedAssignmentMetadataVersion, latestCommonlySupportedVersion)) {</span>
+<span class="nc" id="L1563">            log.info(&quot;Requested to schedule immediate rebalance due to version probing.&quot;);</span>
+<span class="nc" id="L1564">            nextScheduledRebalanceMs.set(0L);</span>
+<span class="nc bnc" id="L1565" title="All 2 branches missed.">        } else if (!verifyHostInfo(groupHostInfo)) {</span>
+<span class="nc" id="L1566">            log.info(&quot;Requested to schedule immediate rebalance to update group with new host endpoint = {}.&quot;, userEndPoint);</span>
+<span class="nc" id="L1567">            nextScheduledRebalanceMs.set(0L);</span>
+<span class="nc bnc" id="L1568" title="All 2 branches missed.">        } else if (encodedNextScheduledRebalanceMs == 0L) {</span>
+<span class="nc" id="L1569">            log.info(&quot;Requested to schedule immediate rebalance for new tasks to be safely revoked from current owner.&quot;);</span>
+<span class="nc" id="L1570">            nextScheduledRebalanceMs.set(0L);</span>
+<span class="nc bnc" id="L1571" title="All 2 branches missed.">        } else if (encodedNextScheduledRebalanceMs &lt; Long.MAX_VALUE) {</span>
+<span class="nc" id="L1572">            log.info(</span>
+                &quot;Requested to schedule next probing rebalance at {} to try for a more balanced assignment.&quot;,
+<span class="nc" id="L1574">                Utils.toLogDateTimeFormat(encodedNextScheduledRebalanceMs)</span>
+            );
+<span class="nc" id="L1576">            nextScheduledRebalanceMs.set(encodedNextScheduledRebalanceMs);</span>
+        } else {
+<span class="nc" id="L1578">            log.info(&quot;No followup rebalance was requested, resetting the rebalance schedule.&quot;);</span>
+<span class="nc" id="L1579">            nextScheduledRebalanceMs.set(Long.MAX_VALUE);</span>
+        }
+<span class="nc" id="L1581">    }</span>
+
+    /**
+     * Verify that this client's host info was included in the map returned in the assignment, and trigger a
+     * rebalance if not. This may be necessary when using static membership, as a rejoining client will be handed
+     * back its original assignment to avoid an unnecessary rebalance. If the client's endpoint has changed, we need
+     * to force a rebalance for the other members in the group to get the updated host info for this client.
+     *
+     * @param groupHostInfo the HostInfo of all clients in the group
+     * @return false if the current host info does not match that in the group assignment
+     */
+    private boolean verifyHostInfo(final Set&lt;HostInfo&gt; groupHostInfo) {
+<span class="nc bnc" id="L1593" title="All 4 branches missed.">        if (userEndPoint != null &amp;&amp; !groupHostInfo.isEmpty()) {</span>
+<span class="nc" id="L1594">            final HostInfo myHostInfo = HostInfo.buildFromEndpoint(userEndPoint);</span>
+
+<span class="nc" id="L1596">            return groupHostInfo.contains(myHostInfo);</span>
+        } else {
+<span class="nc" id="L1598">            return true;</span>
+        }
+    }
+
+    // protected for upgrade test
+    protected static Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; getActiveTasks(final List&lt;TopicPartition&gt; partitions, final AssignmentInfo info) {
+<span class="nc" id="L1604">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasks = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1605" title="All 2 branches missed.">        for (int i = 0; i &lt; partitions.size(); i++) {</span>
+<span class="nc" id="L1606">            final TopicPartition partition = partitions.get(i);</span>
+<span class="nc" id="L1607">            final TaskId id = info.activeTasks().get(i);</span>
+<span class="nc" id="L1608">            activeTasks.computeIfAbsent(id, k1 -&gt; new HashSet&lt;&gt;()).add(partition);</span>
+        }
+<span class="nc" id="L1610">        return activeTasks;</span>
+    }
+
+    static Map&lt;TopicPartition, PartitionInfo&gt; getTopicPartitionInfo(final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; partitionsByHost) {
+<span class="nc" id="L1614">        final Map&lt;TopicPartition, PartitionInfo&gt; topicToPartitionInfo = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1615" title="All 2 branches missed.">        for (final Set&lt;TopicPartition&gt; value : partitionsByHost.values()) {</span>
+<span class="nc bnc" id="L1616" title="All 2 branches missed.">            for (final TopicPartition topicPartition : value) {</span>
+<span class="nc" id="L1617">                topicToPartitionInfo.put(</span>
+                    topicPartition,
+                    new PartitionInfo(
+<span class="nc" id="L1620">                        topicPartition.topic(),</span>
+<span class="nc" id="L1621">                        topicPartition.partition(),</span>
+                        null,
+                        new Node[0],
+                        new Node[0]
+                    )
+                );
+<span class="nc" id="L1627">            }</span>
+<span class="nc" id="L1628">        }</span>
+<span class="nc" id="L1629">        return topicToPartitionInfo;</span>
+    }
+
+    private static void validateActiveTaskEncoding(final List&lt;TopicPartition&gt; partitions, final AssignmentInfo info, final String logPrefix) {
+        // the number of assigned partitions should be the same as number of active tasks, which
+        // could be duplicated if one task has more than one assigned partitions
+<span class="nc bnc" id="L1635" title="All 2 branches missed.">        if (partitions.size() != info.activeTasks().size()) {</span>
+<span class="nc" id="L1636">            throw new TaskAssignmentException(</span>
+<span class="nc" id="L1637">                String.format(</span>
+                    &quot;%sNumber of assigned partitions %d is not equal to &quot;
+                        + &quot;the number of active taskIds %d, assignmentInfo=%s&quot;,
+<span class="nc" id="L1640">                    logPrefix, partitions.size(),</span>
+<span class="nc" id="L1641">                    info.activeTasks().size(), info</span>
+                )
+            );
+        }
+<span class="nc" id="L1645">    }</span>
+
+    private int updateMinReceivedVersion(final int usedVersion, final int minReceivedMetadataVersion) {
+<span class="nc" id="L1648">        return Math.min(usedVersion, minReceivedMetadataVersion);</span>
+    }
+
+    private int updateMinSupportedVersion(final int supportedVersion, final int minSupportedMetadataVersion) {
+<span class="nc bnc" id="L1652" title="All 2 branches missed.">        if (supportedVersion &lt; minSupportedMetadataVersion) {</span>
+<span class="nc" id="L1653">            log.debug(&quot;Downgrade the current minimum supported version {} to the smaller seen supported version {}&quot;,</span>
+<span class="nc" id="L1654">                minSupportedMetadataVersion, supportedVersion);</span>
+<span class="nc" id="L1655">            return supportedVersion;</span>
+        } else {
+<span class="nc" id="L1657">            log.debug(&quot;Current minimum supported version remains at {}, last seen supported version was {}&quot;,</span>
+<span class="nc" id="L1658">                minSupportedMetadataVersion, supportedVersion);</span>
+<span class="nc" id="L1659">            return minSupportedMetadataVersion;</span>
+        }
+    }
+
+    // following functions are for test only
+    void setInternalTopicManager(final InternalTopicManager internalTopicManager) {
+<span class="nc" id="L1665">        this.internalTopicManager = internalTopicManager;</span>
+<span class="nc" id="L1666">    }</span>
+
+    protected String userEndPoint() {
+<span class="nc" id="L1669">        return userEndPoint;</span>
+    }
+
+    protected TaskManager taskManager() {
+<span class="nc" id="L1673">        return taskManager;</span>
+    }
+
+    protected byte uniqueField() {
+<span class="nc" id="L1677">        return uniqueField;</span>
+    }
+
+    protected Map&lt;String, String&gt; clientTags() {
+<span class="nc" id="L1681">        return clientTags;</span>
+    }
+
+    protected void handleRebalanceStart(final Set&lt;String&gt; topics) {
+<span class="nc" id="L1685">        taskManager.handleRebalanceStart(topics);</span>
+<span class="nc" id="L1686">    }</span>
+
+    long acceptableRecoveryLag() {
+<span class="nc" id="L1689">        return assignmentConfigs.acceptableRecoveryLag();</span>
+    }
+
+    int maxWarmupReplicas() {
+<span class="nc" id="L1693">        return assignmentConfigs.maxWarmupReplicas();</span>
+    }
+
+    int numStandbyReplicas() {
+<span class="nc" id="L1697">        return assignmentConfigs.numStandbyReplicas();</span>
+    }
+
+    long probingRebalanceIntervalMs() {
+<span class="nc" id="L1701">        return assignmentConfigs.probingRebalanceIntervalMs();</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

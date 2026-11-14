@@ -1,0 +1,1481 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamsMembershipManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">StreamsMembershipManager.java</span></div><h1>StreamsMembershipManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.consumer.CloseOptions;
+import org.apache.kafka.clients.consumer.internals.events.BackgroundEventHandler;
+import org.apache.kafka.clients.consumer.internals.events.ErrorEvent;
+import org.apache.kafka.clients.consumer.internals.events.StreamsOnAllTasksLostCallbackCompletedEvent;
+import org.apache.kafka.clients.consumer.internals.events.StreamsOnAllTasksLostCallbackNeededEvent;
+import org.apache.kafka.clients.consumer.internals.events.StreamsOnTasksAssignedCallbackCompletedEvent;
+import org.apache.kafka.clients.consumer.internals.events.StreamsOnTasksRevokedCallbackCompletedEvent;
+import org.apache.kafka.clients.consumer.internals.events.StreamsOnTasksRevokedCallbackNeededEvent;
+import org.apache.kafka.clients.consumer.internals.events.StreamsTasksAssignedEvent;
+import org.apache.kafka.clients.consumer.internals.metrics.ConsumerRebalanceMetricsManager;
+import org.apache.kafka.clients.consumer.internals.metrics.RebalanceMetricsManager;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.StreamsGroupHeartbeatResponseData;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.StreamsGroupHeartbeatRequest;
+import org.apache.kafka.common.requests.StreamsGroupHeartbeatResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static java.util.Collections.unmodifiableList;
+
+/**
+ * Tracks the state of a single member in relationship to a group:
+ * &lt;p/&gt;
+ * Responsible for:
+ * &lt;ul&gt;
+ *   &lt;li&gt;Keeping member state&lt;/li&gt;
+ *   &lt;li&gt;Keeping assignment for the member&lt;/li&gt;
+ *   &lt;li&gt;Reconciling assignment, for example, if tasks need to be revoked before other tasks can be assigned&lt;/li&gt;
+ *   &lt;li&gt;Calling the assignment and revocation callbacks on the Streams client&lt;/li&gt;
+ * &lt;/ul&gt;
+ */
+public class StreamsMembershipManager implements RequestManager {
+
+    /**
+     * A data structure to represent the current task assignment, and target task assignment of a member in a
+     * streams group.
+     * &lt;p/&gt;
+     * Besides the assigned tasks, it contains a local epoch that is bumped whenever the assignment changes, to ensure
+     * that two assignments with the same tasks but different local epochs are not considered equal.
+     */
+    private static class LocalAssignment {
+        public static final long NONE_EPOCH = -1;
+<span class="nc" id="L81">        public static final LocalAssignment NONE = new LocalAssignment(</span>
+            NONE_EPOCH,
+<span class="nc" id="L83">            Collections.emptyMap(),</span>
+<span class="nc" id="L84">            Collections.emptyMap(),</span>
+<span class="nc" id="L85">            Collections.emptyMap(),</span>
+            false
+        );
+
+        public final long localEpoch;
+        public final Map&lt;String, SortedSet&lt;Integer&gt;&gt; activeTasks;
+        public final Map&lt;String, SortedSet&lt;Integer&gt;&gt; standbyTasks;
+        public final Map&lt;String, SortedSet&lt;Integer&gt;&gt; warmupTasks;
+        public final boolean isGroupReady;
+
+        public LocalAssignment(final long localEpoch,
+                               final Map&lt;String, SortedSet&lt;Integer&gt;&gt; activeTasks,
+                               final Map&lt;String, SortedSet&lt;Integer&gt;&gt; standbyTasks,
+                               final Map&lt;String, SortedSet&lt;Integer&gt;&gt; warmupTasks,
+<span class="nc" id="L99">                               final boolean isGroupReady) {</span>
+<span class="nc" id="L100">            this.localEpoch = localEpoch;</span>
+<span class="nc" id="L101">            this.activeTasks = activeTasks;</span>
+<span class="nc" id="L102">            this.standbyTasks = standbyTasks;</span>
+<span class="nc" id="L103">            this.warmupTasks = warmupTasks;</span>
+<span class="nc" id="L104">            this.isGroupReady = isGroupReady;</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">            if (localEpoch == NONE_EPOCH &amp;&amp;</span>
+<span class="nc bnc" id="L106" title="All 6 branches missed.">                    (!activeTasks.isEmpty() || !standbyTasks.isEmpty() || !warmupTasks.isEmpty())) {</span>
+<span class="nc" id="L107">                throw new IllegalArgumentException(&quot;Local epoch must be set if tasks are assigned.&quot;);</span>
+            }
+<span class="nc" id="L109">        }</span>
+
+        Optional&lt;LocalAssignment&gt; updateWith(final Map&lt;String, SortedSet&lt;Integer&gt;&gt; activeTasks,
+                                             final Map&lt;String, SortedSet&lt;Integer&gt;&gt; standbyTasks,
+                                             final Map&lt;String, SortedSet&lt;Integer&gt;&gt; warmupTasks,
+                                             final boolean isGroupReady) {
+<span class="nc bnc" id="L115" title="All 2 branches missed.">            if (localEpoch != NONE_EPOCH &amp;&amp;</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">                    activeTasks.equals(this.activeTasks) &amp;&amp;</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">                    standbyTasks.equals(this.standbyTasks) &amp;&amp;</span>
+<span class="nc bnc" id="L118" title="All 4 branches missed.">                    warmupTasks.equals(this.warmupTasks) &amp;&amp;</span>
+                    isGroupReady == this.isGroupReady
+            ) {
+<span class="nc" id="L121">                return Optional.empty();</span>
+            }
+
+<span class="nc" id="L124">            long nextLocalEpoch = localEpoch + 1;</span>
+<span class="nc" id="L125">            return Optional.of(new LocalAssignment(nextLocalEpoch, activeTasks, standbyTasks, warmupTasks, isGroupReady));</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L130">            return &quot;LocalAssignment{&quot; +</span>
+                &quot;localEpoch=&quot; + localEpoch +
+                &quot;, activeTasks=&quot; + activeTasks +
+                &quot;, standbyTasks=&quot; + standbyTasks +
+                &quot;, warmupTasks=&quot; + warmupTasks +
+                &quot;, isGroupReady=&quot; + isGroupReady +
+                '}';
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L141" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L142" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L143">            LocalAssignment that = (LocalAssignment) o;</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">            return localEpoch == that.localEpoch &amp;&amp;</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">                Objects.equals(activeTasks, that.activeTasks) &amp;&amp;</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">                Objects.equals(standbyTasks, that.standbyTasks) &amp;&amp;</span>
+<span class="nc bnc" id="L147" title="All 4 branches missed.">                Objects.equals(warmupTasks, that.warmupTasks) &amp;&amp;</span>
+                isGroupReady == that.isGroupReady;
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L153">            return Objects.hash(localEpoch, activeTasks, standbyTasks, warmupTasks, isGroupReady);</span>
+        }
+    }
+
+    /**
+     * TopicPartition comparator based on topic name and partition.
+     */
+<span class="nc" id="L160">    static final Utils.TopicPartitionComparator TOPIC_PARTITION_COMPARATOR = new Utils.TopicPartitionComparator();</span>
+
+    private final Logger log;
+
+    /**
+     * The processor that handles events from the background thread (a.k.a. ConsumerNetworkThread).
+     * For example, requests for invocation of assignment/revocation callbacks.
+     */
+    private final BackgroundEventHandler backgroundEventHandler;
+
+    /**
+     * Data needed to participate in the Streams rebalance protocol.
+     */
+    private final StreamsRebalanceData streamsRebalanceData;
+
+    /**
+     * Subscription state object holding the current assignment the member has for the topology
+     * of the Streams application.
+     */
+    private final SubscriptionState subscriptionState;
+
+    /**
+     * Current state of this member as part of the consumer group, as defined in {@link MemberState}.
+     */
+    private MemberState state;
+
+    /**
+     * Group ID of the streams group the member will be part of, provided when creating the current
+     * membership manager.
+     */
+    private final String groupId;
+
+    /**
+     * Member ID generated by the consumer at startup, which is unique within the group and remains consistent
+     * for the entire lifetime of the process. This ID acts as an incarnation identifier for the consumer process
+     * and does not reset or change, even if the consumer leaves and rejoins the group.
+     * The Member ID remains the same until the process is completely stopped or terminated.
+     */
+<span class="nc" id="L198">    private final String memberId = Uuid.randomUuid().toString();</span>
+
+    /**
+     * Group instance ID to be used by a static member, provided when creating the current membership manager.
+     */
+    private final Optional&lt;String&gt; groupInstanceId;
+
+    /**
+     * Current epoch of the member. It will be set to 0 by the member, and provided to the server
+     * on the heartbeat request, to join the group. It will be then maintained by the server,
+     * incremented as the member reconciles and acknowledges the assignments it receives. It will
+     * be reset to 0 if the member gets fenced.
+     */
+<span class="nc" id="L211">    private int memberEpoch = 0;</span>
+
+    /**
+     * If the member is currently leaving the group after a call to {@link #leaveGroup()} or
+     * {@link #leaveGroupOnClose(CloseOptions.GroupMembershipOperation)}, this will have a future that will 
+     * complete when the ongoing leave operation completes (callbacks executed and heartbeat request to leave 
+     * is sent out). This will be empty if the member is not leaving.
+     */
+<span class="nc" id="L219">    private Optional&lt;CompletableFuture&lt;Void&gt;&gt; leaveGroupInProgress = Optional.empty();</span>
+
+    /**
+     * The operation the member will perform on leaving the group. Remains {@code DEFAULT} until the
+     * member is closing.
+     *
+     * @see CloseOptions.GroupMembershipOperation
+     */
+<span class="nc" id="L227">    private CloseOptions.GroupMembershipOperation leaveGroupOperation = CloseOptions.GroupMembershipOperation.DEFAULT;</span>
+
+    /**
+     * Future that will complete when a stale member completes releasing its assignment after
+     * leaving the group due to poll timer expired. Used to make sure that the member rejoins
+     * when the timer is reset, only when it completes releasing its assignment.
+     */
+    private CompletableFuture&lt;Void&gt; staleMemberAssignmentRelease;
+
+    /**
+     * If there is a reconciliation running (callbacks).
+     * This will be true if {@link #maybeReconcile()} has been triggered
+     * after receiving a heartbeat response, or a metadata update.
+     */
+    private boolean reconciliationInProgress;
+
+    /**
+     * True if a reconciliation is in progress and the member rejoined the group since the start
+     * of the reconciliation. Used to know that the reconciliation in progress should be
+     * interrupted and not be applied.
+     */
+    private boolean rejoinedWhileReconciliationInProgress;
+
+    /**
+     * Registered listeners that will be notified whenever the member epoch gets updated
+     * (valid values received from the broker, or values cleared due to member leaving
+     * the group, getting fenced or failing).
+     */
+<span class="nc" id="L255">    private final List&lt;MemberStateListener&gt; stateUpdatesListeners = new ArrayList&lt;&gt;();</span>
+
+    /**
+     * Tasks received in the last target assignment, together with its local epoch.
+     *
+     * This member variable is reassigned every time a new assignment is received.
+     * It is equal to LocalAssignment.NONE whenever we are not in a group.
+     */
+<span class="nc" id="L263">    private LocalAssignment targetAssignment = LocalAssignment.NONE;</span>
+
+    /**
+     * Assignment that the member received from the server and successfully processed, together with
+     * its local epoch.
+     *
+     * This is equal to LocalAssignment.NONE when we are not in a group, or we haven't reconciled any assignment yet.
+     */
+<span class="nc" id="L271">    private LocalAssignment currentAssignment = LocalAssignment.NONE;</span>
+
+    /**
+     * AtomicBoolean to track whether the subscription is updated.
+     * If it's true and subscription state is UNSUBSCRIBED, the next {@link #onConsumerPoll()} will change member state to JOINING.
+     */
+<span class="nc" id="L277">    private final AtomicBoolean subscriptionUpdated = new AtomicBoolean(false);</span>
+
+    /**
+     * Measures successful rebalance latency and number of failed rebalances.
+     */
+    private final RebalanceMetricsManager metricsManager;
+
+    private final Time time;
+
+    /**
+     * True if the poll timer has expired, signaled by a call to
+     * {@link #transitionToSendingLeaveGroup(boolean)} with dueToExpiredPollTimer param true. This
+     * will be used to determine that the member should transition to STALE after leaving the
+     * group, to release its assignment and wait for the timer to be reset.
+     */
+    private boolean isPollTimerExpired;
+
+    /**
+     * Constructs the Streams membership manager.
+     *
+     * @param groupId                The ID of the group.
+     * @param streamsRebalanceData   Data needed to participate in the Streams rebalance protocol.
+     * @param subscriptionState      The subscription state of the member.
+     * @param backgroundEventHandler The handler that handles events from the background thread.
+     * @param logContext             The log context.
+     * @param time                   The time.
+     * @param metrics                The metrics.
+     */
+    public StreamsMembershipManager(final String groupId,
+                                    final Optional&lt;String&gt; groupInstanceId,
+                                    final StreamsRebalanceData streamsRebalanceData,
+                                    final SubscriptionState subscriptionState,
+                                    final BackgroundEventHandler backgroundEventHandler,
+                                    final LogContext logContext,
+                                    final Time time,
+<span class="nc" id="L312">                                    final Metrics metrics) {</span>
+<span class="nc" id="L313">        log = logContext.logger(StreamsMembershipManager.class);</span>
+<span class="nc" id="L314">        this.state = MemberState.UNSUBSCRIBED;</span>
+<span class="nc" id="L315">        this.groupId = groupId;</span>
+<span class="nc" id="L316">        this.groupInstanceId = groupInstanceId;</span>
+<span class="nc" id="L317">        this.backgroundEventHandler = backgroundEventHandler;</span>
+<span class="nc" id="L318">        this.streamsRebalanceData = streamsRebalanceData;</span>
+<span class="nc" id="L319">        this.subscriptionState = subscriptionState;</span>
+<span class="nc" id="L320">        metricsManager = new ConsumerRebalanceMetricsManager(metrics, subscriptionState);</span>
+<span class="nc" id="L321">        this.time = time;</span>
+<span class="nc" id="L322">    }</span>
+
+    /**
+     * @return Group ID of the group the member is part of (or wants to be part of).
+     */
+    public String groupId() {
+<span class="nc" id="L328">        return groupId;</span>
+    }
+
+    /**
+     * @return Member ID that is generated at startup and remains unchanged for the entire lifetime of the process.
+     */
+    public String memberId() {
+<span class="nc" id="L335">        return memberId;</span>
+    }
+
+    /**
+     * @return Instance ID used by the member when joining the group. If non-empty, it will indicate that
+     * this is a static member.
+     */
+    public Optional&lt;String&gt; groupInstanceId() {
+<span class="nc" id="L343">        return groupInstanceId;</span>
+    }
+
+    /**
+     * @return Current epoch of the member, maintained by the server.
+     */
+    public int memberEpoch() {
+<span class="nc" id="L350">        return memberEpoch;</span>
+    }
+
+    /**
+     * @return Current state of this member in relationship to a group, as defined in
+     * {@link MemberState}.
+     */
+    public MemberState state() {
+<span class="nc" id="L358">        return state;</span>
+    }
+
+    /**
+     * @return the operation the member will perform on leaving the group.
+     */
+    public CloseOptions.GroupMembershipOperation leaveGroupOperation() {
+<span class="nc" id="L365">        return leaveGroupOperation;</span>
+    }
+
+    /**
+     * @return True if the member is preparing to leave the group or leaving and a leave heartbeat
+     *         should be sent. Returns false for dynamic members with REMAIN_IN_GROUP, which skip
+     *         the leave heartbeat entirely.
+     */
+    public boolean isLeavingGroup() {
+<span class="nc bnc" id="L374" title="All 4 branches missed.">        if (CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP == leaveGroupOperation &amp;&amp; groupInstanceId.isEmpty()) {</span>
+<span class="nc" id="L375">            return false;</span>
+        }
+<span class="nc" id="L377">        MemberState currentState = state();</span>
+<span class="nc bnc" id="L378" title="All 4 branches missed.">        boolean isLeavingState = currentState == MemberState.PREPARE_LEAVING || currentState == MemberState.LEAVING;</span>
+<span class="nc bnc" id="L379" title="All 4 branches missed.">        boolean hasLeaveOperation =</span>
+            // Default operation: both static and dynamic members will send a leave heartbeat
+            CloseOptions.GroupMembershipOperation.DEFAULT == leaveGroupOperation
+            // Leave group operation: both static and dynamic members will send a leave heartbeat
+            || CloseOptions.GroupMembershipOperation.LEAVE_GROUP == leaveGroupOperation
+            // Remain in group: static members will send a leave heartbeat with -2 epoch to signal
+            // that a member using this instance ID is temporarily gone and will rejoin within session timeout.
+<span class="nc bnc" id="L386" title="All 2 branches missed.">            || groupInstanceId.isPresent();</span>
+<span class="nc bnc" id="L387" title="All 4 branches missed.">        return isLeavingState &amp;&amp; hasLeaveOperation;</span>
+    }
+
+    private boolean isNotInGroup() {
+<span class="nc bnc" id="L391" title="All 8 branches missed.">        return state == MemberState.UNSUBSCRIBED ||</span>
+            state == MemberState.FENCED ||
+            state == MemberState.FATAL ||
+            state == MemberState.STALE;
+    }
+
+    /**
+     * Register a new listener that will be invoked whenever the member state changes, or a new
+     * member ID or epoch is received.
+     *
+     * @param listener Listener to invoke.
+     */
+    public void registerStateListener(MemberStateListener listener) {
+<span class="nc" id="L404">        Objects.requireNonNull(listener, &quot;State updates listener cannot be null&quot;);</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        for (MemberStateListener registeredListener : stateUpdatesListeners) {</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">            if (registeredListener == listener) {</span>
+<span class="nc" id="L407">                throw new IllegalArgumentException(&quot;Listener is already registered.&quot;);</span>
+            }
+<span class="nc" id="L409">        }</span>
+<span class="nc" id="L410">        stateUpdatesListeners.add(listener);</span>
+<span class="nc" id="L411">    }</span>
+
+    /**
+     * Call all listeners that are registered to get notified when the member epoch is updated.
+     * This also includes the member ID in the notification. If the member fails or leaves
+     * the group, this will be invoked with empty epoch.
+     */
+    private void notifyEpochChange(Optional&lt;Integer&gt; epoch) {
+<span class="nc" id="L419">        stateUpdatesListeners.forEach(stateListener -&gt; stateListener.onMemberEpochUpdated(epoch, memberId));</span>
+<span class="nc" id="L420">    }</span>
+
+    /**
+     * Invokes the {@link MemberStateListener#onGroupAssignmentUpdated(java.util.Set)} callback for each listener when the
+     * set of assigned partitions changes. This includes on assignment changes, unsubscribe, and when leaving
+     * the group.
+     */
+    void notifyAssignmentChange(Set&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L428">        stateUpdatesListeners.forEach(stateListener -&gt; stateListener.onGroupAssignmentUpdated(partitions));</span>
+<span class="nc" id="L429">    }</span>
+
+    /**
+     * Apply the assignment update to the subscription state. This is called from the background
+     * thread when processing an ApplyAssignmentEvent that was triggered by the application
+     * thread during poll. This ensures that the assignment update happens on the background thread
+     * but is coordinated by the application thread, so consumer.assignment() only changes within
+     * a call to consumer.poll().
+     *
+     * @param assignedPartitions The full assignment to apply
+     * @param addedPartitions The newly added partitions
+     */
+    public void applyAssignment(Set&lt;TopicPartition&gt; assignedPartitions, Set&lt;TopicPartition&gt; addedPartitions) {
+<span class="nc" id="L442">        subscriptionState.assignFromSubscribedAwaitingCallback(assignedPartitions, addedPartitions);</span>
+<span class="nc" id="L443">        notifyAssignmentChange(assignedPartitions);</span>
+<span class="nc" id="L444">    }</span>
+
+    /**
+     * Transition to the {@link MemberState#JOINING} state, indicating that the member will
+     * try to join the group on the next heartbeat request. This is expected to be invoked when
+     * the user calls the subscribe API, or when the member wants to rejoin after getting fenced.
+     * Visible for testing.
+     */
+    private void transitionToJoining() {
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if (state == MemberState.FATAL) {</span>
+<span class="nc" id="L454">            log.warn(&quot;No action taken to join the group with the updated subscription because &quot; +</span>
+                &quot;the member is in FATAL state&quot;);
+<span class="nc" id="L456">            return;</span>
+        }
+<span class="nc bnc" id="L458" title="All 2 branches missed.">        if (reconciliationInProgress) {</span>
+<span class="nc" id="L459">            rejoinedWhileReconciliationInProgress = true;</span>
+        }
+<span class="nc" id="L461">        leaveGroupOperation = CloseOptions.GroupMembershipOperation.DEFAULT;</span>
+<span class="nc" id="L462">        resetEpoch();</span>
+<span class="nc" id="L463">        transitionTo(MemberState.JOINING);</span>
+<span class="nc" id="L464">        clearCurrentTaskAssignment();</span>
+<span class="nc" id="L465">    }</span>
+
+    /**
+     * Reset member epoch to the value required for the leave the group heartbeat request, and
+     * transition to the {@link MemberState#LEAVING} state so that a heartbeat request is sent
+     * out with it.
+     *
+     * @param dueToExpiredPollTimer True if the leave group is due to an expired poll timer. This
+     *                              will indicate that the member must remain STALE after leaving,
+     *                              until it releases its assignment and the timer is reset.
+     */
+    private void transitionToSendingLeaveGroup(boolean dueToExpiredPollTimer) {
+<span class="nc bnc" id="L477" title="All 2 branches missed.">        if (state == MemberState.FATAL) {</span>
+<span class="nc" id="L478">            log.warn(&quot;Member {} with epoch {} won't send leave group request because it is in &quot; +</span>
+<span class="nc" id="L479">                &quot;FATAL state&quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L480">            return;</span>
+        }
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        if (state == MemberState.UNSUBSCRIBED) {</span>
+<span class="nc" id="L483">            log.warn(&quot;Member {} won't send leave group request because it is already out of the group.&quot;,</span>
+                memberId);
+<span class="nc" id="L485">            return;</span>
+        }
+
+<span class="nc bnc" id="L488" title="All 2 branches missed.">        if (dueToExpiredPollTimer) {</span>
+<span class="nc" id="L489">            isPollTimerExpired = true;</span>
+            // Briefly transition through prepare leaving. The member does not have to release
+            // any assignment before sending the leave group given that is stale. It will invoke
+            // onAllTasksLost after sending the leave group on the STALE state.
+<span class="nc" id="L493">            transitionTo(MemberState.PREPARE_LEAVING);</span>
+        }
+<span class="nc" id="L495">        finalizeLeaving();</span>
+<span class="nc" id="L496">        transitionTo(MemberState.LEAVING);</span>
+<span class="nc" id="L497">    }</span>
+
+    private void finalizeLeaving() {
+<span class="nc" id="L500">        updateMemberEpoch(leaveGroupEpoch());</span>
+<span class="nc" id="L501">        clearCurrentTaskAssignment();</span>
+<span class="nc" id="L502">    }</span>
+
+    /**
+     * Returns the epoch to use in the leave group heartbeat. Static members use (LEAVE_GROUP_STATIC_MEMBER_EPOCH) 
+     * so the broker holds the assignment until session timeout, unless the operation is LEAVE_GROUP which forces 
+     * permanent removal.
+     */
+    public int leaveGroupEpoch() {
+<span class="nc" id="L510">        boolean isStaticMember = groupInstanceId.isPresent();</span>
+        
+<span class="nc bnc" id="L512" title="All 2 branches missed.">        if (CloseOptions.GroupMembershipOperation.LEAVE_GROUP == leaveGroupOperation) {</span>
+<span class="nc" id="L513">            return StreamsGroupHeartbeatRequest.LEAVE_GROUP_MEMBER_EPOCH;</span>
+        }
+<span class="nc bnc" id="L515" title="All 2 branches missed.">        return isStaticMember</span>
+<span class="nc" id="L516">            ? StreamsGroupHeartbeatRequest.LEAVE_GROUP_STATIC_MEMBER_EPOCH</span>
+<span class="nc" id="L517">            : StreamsGroupHeartbeatRequest.LEAVE_GROUP_MEMBER_EPOCH;</span>
+    }
+
+    /**
+     * Transition to STALE to release assignments because the member has left the group due to
+     * expired poll timer. This will trigger the onAllTasksLost callback. Once the callback
+     * completes, the member will remain stale until the poll timer is reset by an application
+     * poll event. See {@link #maybeRejoinStaleMember()}.
+     */
+    private void transitionToStale() {
+<span class="nc" id="L527">        transitionTo(MemberState.STALE);</span>
+
+        // Mark partitions as pending revocation to stop fetching before callback
+<span class="nc" id="L530">        subscriptionState.markPendingRevocation(subscriptionState.assignedPartitions());</span>
+
+<span class="nc" id="L532">        final CompletableFuture&lt;Void&gt; onAllTasksLostCallbackExecuted = requestOnAllTasksLostCallbackInvocation();</span>
+<span class="nc" id="L533">        staleMemberAssignmentRelease = onAllTasksLostCallbackExecuted.whenComplete((result, error) -&gt; {</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L535">                log.error(&quot;Task revocation callback invocation failed &quot; +</span>
+                    &quot;after member left group due to expired poll timer.&quot;, error);
+            }
+<span class="nc" id="L538">            clearTaskAndPartitionAssignment();</span>
+<span class="nc" id="L539">            log.debug(&quot;Member {} sent leave group heartbeat and released its assignment. It will remain &quot; +</span>
+                    &quot;in {} state until the poll timer is reset, and it will then rejoin the group&quot;,
+                memberId, MemberState.STALE);
+<span class="nc" id="L542">        });</span>
+<span class="nc" id="L543">    }</span>
+
+    /**
+     * Transition the member to the FATAL state and update the member info as required. This is
+     * invoked when un-recoverable errors occur (ex. when the heartbeat returns a non-retriable
+     * error)
+     */
+    public void transitionToFatal() {
+<span class="nc" id="L551">        MemberState previousState = state;</span>
+<span class="nc" id="L552">        transitionTo(MemberState.FATAL);</span>
+<span class="nc" id="L553">        log.error(&quot;Member {} with epoch {} transitioned to fatal state&quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L554">        notifyEpochChange(Optional.empty());</span>
+
+<span class="nc bnc" id="L556" title="All 2 branches missed.">        if (previousState == MemberState.UNSUBSCRIBED) {</span>
+<span class="nc" id="L557">            log.debug(&quot;Member {} with epoch {} got fatal error from the broker but it already &quot; +</span>
+<span class="nc" id="L558">                &quot;left the group, so onAllTasksLost callback won't be triggered.&quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L559">            return;</span>
+        }
+
+<span class="nc bnc" id="L562" title="All 4 branches missed.">        if (previousState == MemberState.LEAVING || previousState == MemberState.PREPARE_LEAVING) {</span>
+<span class="nc" id="L563">            log.info(&quot;Member {} with epoch {} was leaving the group with state {} when it got a &quot; +</span>
+                &quot;fatal error from the broker. It will discard the ongoing leave and remain in &quot; +
+<span class="nc" id="L565">                &quot;fatal state.&quot;, memberId, memberEpoch, previousState);</span>
+<span class="nc" id="L566">            maybeCompleteLeaveInProgress();</span>
+<span class="nc" id="L567">            return;</span>
+        }
+
+        // Mark partitions as pending revocation to stop fetching before callback
+<span class="nc" id="L571">        subscriptionState.markPendingRevocation(subscriptionState.assignedPartitions());</span>
+
+<span class="nc" id="L573">        CompletableFuture&lt;Void&gt; onAllTasksLostCallbackExecuted = requestOnAllTasksLostCallbackInvocation();</span>
+<span class="nc" id="L574">        onAllTasksLostCallbackExecuted.whenComplete((result, error) -&gt; {</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L576">                log.error(&quot;onAllTasksLost callback invocation failed while releasing assignment &quot; +</span>
+                    &quot;after member failed with fatal error.&quot;, error);
+            }
+<span class="nc" id="L579">            clearTaskAndPartitionAssignment();</span>
+<span class="nc" id="L580">        });</span>
+<span class="nc" id="L581">    }</span>
+
+    /**
+     * Transition out of the {@link MemberState#LEAVING} state even if the heartbeat was not sent.
+     * This will ensure that the member is not blocked on {@link MemberState#LEAVING}. (best
+     * effort to send the request, without any response handling or retry logic)
+     */
+    public void onHeartbeatRequestSkipped() {
+<span class="nc bnc" id="L589" title="All 2 branches missed.">        if (state == MemberState.LEAVING) {</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            if (isLeavingGroup()) {</span>
+<span class="nc" id="L591">                log.warn(&quot;Heartbeat to leave group cannot be sent (most probably due to coordinator &quot; +</span>
+                        &quot;not known/available). Member {} with epoch {} will transition to {}.&quot;,
+<span class="nc" id="L593">                    memberId, memberEpoch, MemberState.UNSUBSCRIBED);</span>
+            }
+<span class="nc" id="L595">            transitionTo(MemberState.UNSUBSCRIBED);</span>
+<span class="nc" id="L596">            maybeCompleteLeaveInProgress();</span>
+        }
+<span class="nc" id="L598">    }</span>
+
+    /**
+     * Update the member state, setting it to the nextState only if it is a valid transition.
+     *
+     * @throws IllegalStateException If transitioning from the member {@link #state} to the
+     *                               nextState is not allowed as defined in {@link MemberState}.
+     */
+    private void transitionTo(MemberState nextState) {
+<span class="nc bnc" id="L607" title="All 4 branches missed.">        if (!state.equals(nextState) &amp;&amp; !nextState.getPreviousValidStates().contains(state)) {</span>
+<span class="nc" id="L608">            throw new IllegalStateException(String.format(&quot;Invalid state transition from %s to %s&quot;,</span>
+                state, nextState));
+        }
+
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        if (isCompletingRebalance(state, nextState)) {</span>
+<span class="nc" id="L613">            metricsManager.recordRebalanceEnded(time.milliseconds());</span>
+        }
+<span class="nc bnc" id="L615" title="All 2 branches missed.">        if (isStartingRebalance(state, nextState)) {</span>
+<span class="nc" id="L616">            metricsManager.recordRebalanceStarted(time.milliseconds());</span>
+        }
+
+<span class="nc" id="L619">        log.info(&quot;Member {} with epoch {} transitioned from {} to {}.&quot;, memberId, memberEpoch, state, nextState);</span>
+<span class="nc" id="L620">        this.state = nextState;</span>
+<span class="nc" id="L621">    }</span>
+
+    private static boolean isCompletingRebalance(MemberState currentState, MemberState nextState) {
+<span class="nc bnc" id="L624" title="All 6 branches missed.">        return currentState == MemberState.RECONCILING &amp;&amp;</span>
+            (nextState == MemberState.STABLE || nextState == MemberState.ACKNOWLEDGING);
+    }
+
+    private static boolean isStartingRebalance(MemberState currentState, MemberState nextState) {
+<span class="nc bnc" id="L629" title="All 4 branches missed.">        return currentState != MemberState.RECONCILING &amp;&amp; nextState == MemberState.RECONCILING;</span>
+    }
+
+    private void resetEpoch() {
+<span class="nc" id="L633">        updateMemberEpoch(StreamsGroupHeartbeatRequest.JOIN_GROUP_MEMBER_EPOCH);</span>
+<span class="nc" id="L634">    }</span>
+
+    private void updateMemberEpoch(int newEpoch) {
+<span class="nc bnc" id="L637" title="All 2 branches missed.">        boolean newEpochReceived = this.memberEpoch != newEpoch;</span>
+<span class="nc" id="L638">        this.memberEpoch = newEpoch;</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (newEpochReceived) {</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">            if (memberEpoch &gt; 0) {</span>
+<span class="nc" id="L641">                notifyEpochChange(Optional.of(memberEpoch));</span>
+            } else {
+<span class="nc" id="L643">                notifyEpochChange(Optional.empty());</span>
+            }
+        }
+<span class="nc" id="L646">    }</span>
+
+    /**
+     * Discard assignments received that have not been reconciled yet (waiting for metadata
+     * or the next reconciliation loop).
+     */
+    private void clearCurrentTaskAssignment() {
+<span class="nc" id="L653">        currentAssignment = LocalAssignment.NONE;</span>
+<span class="nc" id="L654">    }</span>
+
+    /**
+     * Clear the assigned partitions in the member subscription, pending assignments and metadata cache.
+     */
+    private void clearTaskAndPartitionAssignment() {
+<span class="nc" id="L660">        subscriptionState.assignFromSubscribed(Collections.emptySet());</span>
+<span class="nc" id="L661">        notifyAssignmentChange(Collections.emptySet());</span>
+<span class="nc" id="L662">        currentAssignment = LocalAssignment.NONE;</span>
+<span class="nc" id="L663">        targetAssignment = LocalAssignment.NONE;</span>
+<span class="nc" id="L664">    }</span>
+
+    /**
+     * @return True if the member should not send heartbeats, which is the case when it is in a
+     * state where it is not an active member of the group.
+     */
+    public boolean shouldSkipHeartbeat() {
+<span class="nc" id="L671">        return isNotInGroup();</span>
+    }
+
+    /**
+     * @return True if the member should send heartbeat to the coordinator without waiting for
+     * the interval.
+     */
+    public boolean shouldNotWaitForHeartbeatInterval() {
+<span class="nc bnc" id="L679" title="All 6 branches missed.">        return state == MemberState.ACKNOWLEDGING || state == MemberState.LEAVING || state == MemberState.JOINING;</span>
+    }
+
+    /**
+     * Set {@link #subscriptionUpdated} to true to indicate that the subscription has been updated.
+     * The next {@link #onConsumerPoll()} will join the group with the updated subscription, if the member is not part of it yet.
+     * If the member is already part of the group, this will only ensure that the updated subscription
+     * is included in the next heartbeat request.
+     * &lt;p/&gt;
+     * Note that the list of topics in the subscription is taken from the shared subscription state.
+     */
+    public void onSubscriptionUpdated() {
+<span class="nc" id="L691">        subscriptionUpdated.compareAndSet(false, true);</span>
+<span class="nc" id="L692">    }</span>
+
+    /**
+     * Join the group if the member is not part of it yet. This function separates {@link #transitionToJoining}
+     * from the {@link #onSubscriptionUpdated} to fulfill the requirement of the &quot;rebalances will only occur during an
+     * active call to {@link org.apache.kafka.clients.consumer.KafkaConsumer#poll(java.time.Duration)}&quot;
+     */
+    public void onConsumerPoll() {
+<span class="nc bnc" id="L700" title="All 4 branches missed.">        if (subscriptionUpdated.compareAndSet(true, false) &amp;&amp; state == MemberState.UNSUBSCRIBED) {</span>
+<span class="nc" id="L701">            transitionToJoining();</span>
+        }
+<span class="nc" id="L703">    }</span>
+
+    /**
+     * Update state when a heartbeat is generated. This will transition out of the states that end
+     * when a heartbeat request is sent, without waiting for a response (ex.
+     * {@link MemberState#ACKNOWLEDGING} and {@link MemberState#LEAVING}).
+     */
+    public void onHeartbeatRequestGenerated() {
+<span class="nc bnc" id="L711" title="All 2 branches missed.">        if (state == MemberState.ACKNOWLEDGING) {</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">            if (targetAssignmentReconciled()) {</span>
+<span class="nc" id="L713">                transitionTo(MemberState.STABLE);</span>
+            } else {
+<span class="nc" id="L715">                log.debug(&quot;Member {} with epoch {} transitioned to {} after a heartbeat was sent &quot; +</span>
+                    &quot;to ack a previous reconciliation. New assignments are ready to &quot; +
+<span class="nc" id="L717">                    &quot;be reconciled.&quot;, memberId, memberEpoch, MemberState.RECONCILING);</span>
+<span class="nc" id="L718">                transitionTo(MemberState.RECONCILING);</span>
+            }
+<span class="nc bnc" id="L720" title="All 2 branches missed.">        } else if (state == MemberState.LEAVING) {</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">            if (isPollTimerExpired) {</span>
+<span class="nc" id="L722">                log.debug(&quot;Member {} with epoch {} generated the heartbeat to leave due to expired poll timer. It will &quot; +</span>
+                    &quot;remain stale (no heartbeat) until it rejoins the group on the next consumer &quot; +
+<span class="nc" id="L724">                    &quot;poll.&quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L725">                transitionToStale();</span>
+            } else {
+<span class="nc" id="L727">                log.debug(&quot;Member {} with epoch {} generated the heartbeat to leave the group.&quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L728">                transitionTo(MemberState.UNSUBSCRIBED);</span>
+            }
+        }
+<span class="nc" id="L731">    }</span>
+
+    /**
+     * Notify about a successful heartbeat response.
+     *
+     * @param response Heartbeat response to extract member info and errors from.
+     */
+    public void onHeartbeatSuccess(StreamsGroupHeartbeatResponse response) {
+<span class="nc" id="L739">        StreamsGroupHeartbeatResponseData responseData = response.data();</span>
+<span class="nc" id="L740">        throwIfUnexpectedError(responseData);</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">        if (state == MemberState.LEAVING) {</span>
+<span class="nc" id="L742">            log.debug(&quot;Ignoring heartbeat response received from broker. Member {} with epoch {} is &quot; +</span>
+<span class="nc" id="L743">                &quot;already leaving the group.&quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L744">            return;</span>
+        }
+<span class="nc bnc" id="L746" title="All 6 branches missed.">        if (state == MemberState.UNSUBSCRIBED &amp;&amp; responseData.memberEpoch() &lt; 0 &amp;&amp; maybeCompleteLeaveInProgress()) {</span>
+<span class="nc" id="L747">            log.debug(&quot;Member {} with epoch {} received a successful response to the heartbeat &quot; +</span>
+<span class="nc" id="L748">                &quot;to leave the group and completed the leave operation. &quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L749">            return;</span>
+        }
+<span class="nc bnc" id="L751" title="All 2 branches missed.">        if (isNotInGroup()) {</span>
+<span class="nc" id="L752">            log.debug(&quot;Ignoring heartbeat response received from broker. Member {} is in {} state&quot; +</span>
+                &quot; so it's not a member of the group. &quot;, memberId, state);
+<span class="nc" id="L754">            return;</span>
+        }
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        if (responseData.memberEpoch() &lt; 0) {</span>
+<span class="nc" id="L757">            log.debug(&quot;Ignoring heartbeat response received from broker. Member {} with epoch {} &quot; +</span>
+<span class="nc" id="L758">                &quot;is in {} state and the member epoch is invalid: {}. &quot;, memberId, memberEpoch, state,</span>
+<span class="nc" id="L759">                responseData.memberEpoch());</span>
+<span class="nc" id="L760">            maybeCompleteLeaveInProgress();</span>
+<span class="nc" id="L761">            return;</span>
+        }
+        
+<span class="nc" id="L764">        updateMemberEpoch(responseData.memberEpoch());</span>
+
+<span class="nc" id="L766">        final List&lt;StreamsGroupHeartbeatResponseData.TaskIds&gt; activeTasks = responseData.activeTasks();</span>
+<span class="nc" id="L767">        final List&lt;StreamsGroupHeartbeatResponseData.TaskIds&gt; standbyTasks = responseData.standbyTasks();</span>
+<span class="nc" id="L768">        final List&lt;StreamsGroupHeartbeatResponseData.TaskIds&gt; warmupTasks = responseData.warmupTasks();</span>
+<span class="nc" id="L769">        final boolean isGroupReady = isGroupReady(responseData.status());</span>
+
+<span class="nc bnc" id="L771" title="All 6 branches missed.">        if (activeTasks != null &amp;&amp; standbyTasks != null &amp;&amp; warmupTasks != null) {</span>
+<span class="nc bnc" id="L772" title="All 2 branches missed.">            if (!state.canHandleNewAssignment()) {</span>
+<span class="nc" id="L773">                log.debug(&quot;Ignoring new assignment: active tasks {}, standby tasks {}, and warm-up tasks {} received &quot; +</span>
+                        &quot;from server because member is in {} state.&quot;,
+                    activeTasks, standbyTasks, warmupTasks, state);
+<span class="nc" id="L776">                return;</span>
+            }
+
+<span class="nc" id="L779">            final Set&lt;String&gt; unknownSubtopologies = unknownSubtopologies(activeTasks, standbyTasks, warmupTasks);</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">            if (!unknownSubtopologies.isEmpty()) {</span>
+<span class="nc" id="L781">                failOnUnknownSubtopologies(unknownSubtopologies);</span>
+<span class="nc" id="L782">                return;</span>
+            }
+
+<span class="nc" id="L785">            processAssignmentReceived(</span>
+<span class="nc" id="L786">                toTasksAssignment(activeTasks),</span>
+<span class="nc" id="L787">                toTasksAssignment(standbyTasks),</span>
+<span class="nc" id="L788">                toTasksAssignment(warmupTasks),</span>
+                isGroupReady
+            );
+<span class="nc bnc" id="L791" title="All 6 branches missed.">        } else if (responseData.activeTasks() != null || responseData.standbyTasks() != null || responseData.warmupTasks() != null) {</span>
+<span class="nc" id="L792">            throw new IllegalStateException(&quot;Invalid response data, task collections must be all null or all non-null: &quot;</span>
+                + responseData);
+<span class="nc bnc" id="L794" title="All 2 branches missed.">        } else if (isGroupReady != targetAssignment.isGroupReady) {</span>
+            // If the client did not provide a new assignment, but the group is now ready or not ready anymore, so
+            // update the target assignment and reconcile it.
+<span class="nc" id="L797">            processAssignmentReceived(</span>
+                targetAssignment.activeTasks,
+                targetAssignment.standbyTasks,
+                targetAssignment.warmupTasks,
+                isGroupReady
+            );
+        }
+<span class="nc" id="L804">    }</span>
+
+    private boolean isGroupReady(List&lt;StreamsGroupHeartbeatResponseData.Status&gt; statuses) {
+<span class="nc bnc" id="L807" title="All 2 branches missed.">        if (statuses != null) {</span>
+<span class="nc bnc" id="L808" title="All 2 branches missed.">            for (final StreamsGroupHeartbeatResponseData.Status status : statuses) {</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">                switch (StreamsGroupHeartbeatResponse.Status.fromCode(status.statusCode())) {</span>
+                    case MISSING_SOURCE_TOPICS:
+                    case MISSING_INTERNAL_TOPICS:
+                    case INCORRECTLY_PARTITIONED_TOPICS:
+                    case ASSIGNMENT_DELAYED:
+<span class="nc" id="L814">                        return false;</span>
+                    default:
+                        // continue checking other statuses
+                }
+<span class="nc" id="L818">            }</span>
+        }
+<span class="nc" id="L820">        return true;</span>
+    }
+
+    /**
+     * Notify the member that a retriable error heartbeat response was received.
+     */
+    public void onRetriableHeartbeatFailure() {
+<span class="nc" id="L827">        onHeartbeatFailure();</span>
+<span class="nc" id="L828">    }</span>
+
+    /**
+     * Notify the member that a fatal error heartbeat response was received.
+     */
+    public void onFatalHeartbeatFailure() {
+<span class="nc" id="L834">        metricsManager.maybeRecordRebalanceFailed();</span>
+<span class="nc" id="L835">        onHeartbeatFailure();</span>
+<span class="nc" id="L836">    }</span>
+
+    private void onHeartbeatFailure() {
+        // The leave group request is sent out once (not retried), so we should complete the leave
+        // operation once the request completes, regardless of the response.
+<span class="nc bnc" id="L841" title="All 4 branches missed.">        if (state == MemberState.UNSUBSCRIBED &amp;&amp; maybeCompleteLeaveInProgress()) {</span>
+<span class="nc" id="L842">            log.warn(&quot;Member {} with epoch {} received a failed response to the heartbeat to &quot; +</span>
+<span class="nc" id="L843">                &quot;leave the group and completed the leave operation. &quot;, memberId, memberEpoch);</span>
+        }
+<span class="nc" id="L845">    }</span>
+
+    /**
+     * Notify when the poll timer expired.
+     */
+    public void onPollTimerExpired() {
+<span class="nc" id="L851">        transitionToSendingLeaveGroup(true);</span>
+<span class="nc" id="L852">    }</span>
+
+    /**
+     * Notify when member is fenced.
+     */
+    public void onFenced() {
+<span class="nc bnc" id="L858" title="All 2 branches missed.">        if (state == MemberState.PREPARE_LEAVING) {</span>
+<span class="nc" id="L859">            log.debug(&quot;Member {} with epoch {} got fenced but it is already preparing to leave &quot; +</span>
+                &quot;the group, so it will stop sending heartbeat and won't attempt to send the &quot; +
+<span class="nc" id="L861">                &quot;leave request or rejoin.&quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L862">            finalizeLeaving();</span>
+<span class="nc" id="L863">            transitionTo(MemberState.UNSUBSCRIBED);</span>
+<span class="nc" id="L864">            maybeCompleteLeaveInProgress();</span>
+<span class="nc" id="L865">            return;</span>
+        }
+
+<span class="nc bnc" id="L868" title="All 2 branches missed.">        if (state == MemberState.LEAVING) {</span>
+<span class="nc" id="L869">            log.debug(&quot;Member {} with epoch {} got fenced before sending leave group heartbeat. &quot; +</span>
+<span class="nc" id="L870">                &quot;It will not send the leave request and won't attempt to rejoin.&quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L871">            transitionTo(MemberState.UNSUBSCRIBED);</span>
+<span class="nc" id="L872">            maybeCompleteLeaveInProgress();</span>
+<span class="nc" id="L873">            return;</span>
+        }
+<span class="nc bnc" id="L875" title="All 2 branches missed.">        if (state == MemberState.UNSUBSCRIBED) {</span>
+<span class="nc" id="L876">            log.debug(&quot;Member {} with epoch {} got fenced but it already left the group, so it &quot; +</span>
+<span class="nc" id="L877">                &quot;won't attempt to rejoin.&quot;, memberId, memberEpoch);</span>
+<span class="nc" id="L878">            return;</span>
+        }
+<span class="nc" id="L880">        transitionTo(MemberState.FENCED);</span>
+<span class="nc" id="L881">        resetEpoch();</span>
+<span class="nc" id="L882">        log.debug(&quot;Member {} with epoch {} transitioned to {} state. It will release its &quot; +</span>
+<span class="nc" id="L883">            &quot;assignment and rejoin the group.&quot;, memberId, memberEpoch, MemberState.FENCED);</span>
+
+        // Mark partitions as pending revocation to stop fetching before callback
+<span class="nc" id="L886">        subscriptionState.markPendingRevocation(subscriptionState.assignedPartitions());</span>
+
+<span class="nc" id="L888">        CompletableFuture&lt;Void&gt; onAllTasksLostCallbackExecuted = requestOnAllTasksLostCallbackInvocation();</span>
+<span class="nc" id="L889">        onAllTasksLostCallbackExecuted.whenComplete((result, error) -&gt; {</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L891">                log.error(&quot;onAllTasksLost callback invocation failed while releasing assignment&quot; +</span>
+                    &quot; after member got fenced. Member will rejoin the group anyways.&quot;, error);
+            }
+<span class="nc" id="L894">            clearTaskAndPartitionAssignment();</span>
+<span class="nc bnc" id="L895" title="All 2 branches missed.">            if (state == MemberState.FENCED) {</span>
+<span class="nc" id="L896">                transitionToJoining();</span>
+            } else {
+<span class="nc" id="L898">                log.debug(&quot;Fenced member onAllTasksLost callback completed but the state has &quot; +</span>
+                    &quot;already changed to {}, so the member won't rejoin the group&quot;, state);
+            }
+<span class="nc" id="L901">        });</span>
+<span class="nc" id="L902">    }</span>
+
+    private void throwIfUnexpectedError(StreamsGroupHeartbeatResponseData responseData) {
+<span class="nc bnc" id="L905" title="All 2 branches missed.">        if (responseData.errorCode() != Errors.NONE.code()) {</span>
+<span class="nc" id="L906">            String errorMessage = String.format(</span>
+                &quot;Unexpected error in Heartbeat response. Expected no error, but received: %s with message: '%s'&quot;,
+<span class="nc" id="L908">                Errors.forCode(responseData.errorCode()), responseData.errorMessage()</span>
+            );
+<span class="nc" id="L910">            throw new IllegalArgumentException(errorMessage);</span>
+        }
+<span class="nc" id="L912">    }</span>
+
+    /**
+     * Transition a {@link MemberState#STALE} member to {@link MemberState#JOINING} when it completes
+     * releasing its assignment. This is expected to be used when the poll timer is reset.
+     */
+    public void maybeRejoinStaleMember() {
+<span class="nc" id="L919">        isPollTimerExpired = false;</span>
+<span class="nc bnc" id="L920" title="All 2 branches missed.">        if (state == MemberState.STALE) {</span>
+<span class="nc" id="L921">            log.debug(&quot;Expired poll timer has been reset so stale member {} will rejoin the group &quot; +</span>
+                &quot;when it completes releasing its previous assignment.&quot;, memberId);
+<span class="nc" id="L923">            staleMemberAssignmentRelease.whenComplete((__, error) -&gt; transitionToJoining());</span>
+        }
+<span class="nc" id="L925">    }</span>
+
+    /**
+     * Complete the leave in progress (if any). This is expected to be used to complete the leave
+     * in progress when a member receives the response to the leave heartbeat.
+     */
+    private boolean maybeCompleteLeaveInProgress() {
+<span class="nc bnc" id="L932" title="All 2 branches missed.">        if (leaveGroupInProgress.isPresent()) {</span>
+<span class="nc" id="L933">            leaveGroupInProgress.get().complete(null);</span>
+<span class="nc" id="L934">            leaveGroupInProgress = Optional.empty();</span>
+<span class="nc" id="L935">            return true;</span>
+        }
+<span class="nc" id="L937">        return false;</span>
+    }
+
+    private static SortedSet&lt;StreamsRebalanceData.TaskId&gt; toTaskIdSet(final Map&lt;String, SortedSet&lt;Integer&gt;&gt; tasks) {
+<span class="nc" id="L941">        SortedSet&lt;StreamsRebalanceData.TaskId&gt; taskIdSet = new TreeSet&lt;&gt;();</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">        for (final Map.Entry&lt;String, SortedSet&lt;Integer&gt;&gt; task : tasks.entrySet()) {</span>
+<span class="nc" id="L943">            final String subtopologyId = task.getKey();</span>
+<span class="nc" id="L944">            final SortedSet&lt;Integer&gt; partitions = task.getValue();</span>
+<span class="nc bnc" id="L945" title="All 2 branches missed.">            for (final int partition : partitions) {</span>
+<span class="nc" id="L946">                taskIdSet.add(new StreamsRebalanceData.TaskId(subtopologyId, partition));</span>
+<span class="nc" id="L947">            }</span>
+<span class="nc" id="L948">        }</span>
+<span class="nc" id="L949">        return taskIdSet;</span>
+    }
+
+    private static Map&lt;String, SortedSet&lt;Integer&gt;&gt; toTasksAssignment(final List&lt;StreamsGroupHeartbeatResponseData.TaskIds&gt; taskIds) {
+<span class="nc" id="L953">        return taskIds.stream()</span>
+<span class="nc" id="L954">            .collect(Collectors.toMap(StreamsGroupHeartbeatResponseData.TaskIds::subtopologyId, taskId -&gt; new TreeSet&lt;&gt;(taskId.partitions())));</span>
+    }
+
+    private Set&lt;String&gt; unknownSubtopologies(final List&lt;StreamsGroupHeartbeatResponseData.TaskIds&gt; activeTasks,
+                                             final List&lt;StreamsGroupHeartbeatResponseData.TaskIds&gt; standbyTasks,
+                                             final List&lt;StreamsGroupHeartbeatResponseData.TaskIds&gt; warmupTasks) {
+<span class="nc" id="L960">        final Set&lt;String&gt; knownSubtopologies = streamsRebalanceData.subtopologies().keySet();</span>
+<span class="nc" id="L961">        final Set&lt;String&gt; unknownSubtopologies = new TreeSet&lt;&gt;(); // use an ordered set for &quot;proper&quot; error logging</span>
+<span class="nc bnc" id="L962" title="All 2 branches missed.">        for (final List&lt;StreamsGroupHeartbeatResponseData.TaskIds&gt; tasks : List.of(activeTasks, standbyTasks, warmupTasks)) {</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">            for (final StreamsGroupHeartbeatResponseData.TaskIds taskIds : tasks) {</span>
+<span class="nc bnc" id="L964" title="All 2 branches missed.">                if (!knownSubtopologies.contains(taskIds.subtopologyId())) {</span>
+<span class="nc" id="L965">                    unknownSubtopologies.add(taskIds.subtopologyId());</span>
+                }
+<span class="nc" id="L967">            }</span>
+<span class="nc" id="L968">        }</span>
+<span class="nc" id="L969">        return unknownSubtopologies;</span>
+    }
+
+    private void failOnUnknownSubtopologies(final Set&lt;String&gt; unknownSubtopologies) {
+<span class="nc" id="L973">        final String errorMessage = String.format(</span>
+            &quot;Member %s of Streams group %s was assigned tasks of subtopologies %s, which are not part of the topology &quot;
+                + &quot;of this client (which has subtopologies %s). The assignment cannot be applied, because the &quot;
+                + &quot;partitions of a task are resolved through this client's own topology. This points at a problem on &quot;
+                + &quot;the group coordinator, for example in a custom broker-side task assignor, or at a topology that &quot;
+                + &quot;differs from the one the group was initialized with.&quot;,
+            memberId,
+            groupId,
+            unknownSubtopologies,
+<span class="nc" id="L982">            new TreeSet&lt;&gt;(streamsRebalanceData.subtopologies().keySet())</span>
+        );
+<span class="nc" id="L984">        log.error(errorMessage);</span>
+<span class="nc" id="L985">        backgroundEventHandler.add(new ErrorEvent(new KafkaException(errorMessage)));</span>
+<span class="nc" id="L986">        transitionToFatal();</span>
+<span class="nc" id="L987">    }</span>
+
+    /**
+     * Closes the member's participation in the group, honoring the requested {@link CloseOptions.GroupMembershipOperation}.
+     * Stores the operation and follows the normal leaving path; {@link StreamsGroupHeartbeatRequestManager}
+     * decides whether to send or skip the leave group heartbeat based on the operation.
+     *
+     * @param membershipOperation the requested close behavior
+     * @return future that will complete when the close operation is done
+     */
+    public CompletableFuture&lt;Void&gt; leaveGroupOnClose(final CloseOptions.GroupMembershipOperation membershipOperation) {
+<span class="nc" id="L998">        this.leaveGroupOperation = membershipOperation;</span>
+<span class="nc" id="L999">        return leaveGroup(true);</span>
+    }
+
+    /**
+     * Leaves the group.
+     *
+     * &lt;p&gt;
+     * This method does the following:
+     * &lt;ol&gt;
+     *     &lt;li&gt;Transitions member state to {@link MemberState#PREPARE_LEAVING}.&lt;/li&gt;
+     *     &lt;li&gt;Requests the invocation of the revocation callback or lost callback.&lt;/li&gt;
+     *     &lt;li&gt;Once the callback completes, it clears the current and target assignment, unsubscribes from
+     *     all topics and transitions the member state to {@link MemberState#LEAVING}.&lt;/li&gt;
+     * &lt;/ol&gt;
+     * States {@link MemberState#PREPARE_LEAVING} and {@link MemberState#LEAVING} cause the heartbeat request manager
+     * to send a leave group heartbeat.
+     * &lt;/p&gt;
+     *
+     * @return future that will complete when the revocation callback execution completes and the heartbeat
+     *         to leave the group has been sent out.
+     */
+    public CompletableFuture&lt;Void&gt; leaveGroup() {
+<span class="nc" id="L1021">        return leaveGroup(false);</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; leaveGroup(final boolean isOnClose) {
+<span class="nc bnc" id="L1025" title="All 2 branches missed.">        if (isNotInGroup()) {</span>
+<span class="nc bnc" id="L1026" title="All 2 branches missed.">            if (state == MemberState.FENCED) {</span>
+<span class="nc" id="L1027">                clearTaskAndPartitionAssignment();</span>
+<span class="nc" id="L1028">                transitionTo(MemberState.UNSUBSCRIBED);</span>
+            }
+<span class="nc" id="L1030">            subscriptionState.unsubscribe();</span>
+<span class="nc" id="L1031">            notifyAssignmentChange(Collections.emptySet());</span>
+<span class="nc" id="L1032">            return CompletableFuture.completedFuture(null);</span>
+        }
+
+<span class="nc bnc" id="L1035" title="All 4 branches missed.">        if (state == MemberState.PREPARE_LEAVING || state == MemberState.LEAVING) {</span>
+<span class="nc" id="L1036">            log.debug(&quot;Leave group operation already in progress for member {}&quot;, memberId);</span>
+<span class="nc" id="L1037">            return leaveGroupInProgress.get();</span>
+        }
+
+<span class="nc" id="L1040">        transitionTo(MemberState.PREPARE_LEAVING);</span>
+<span class="nc" id="L1041">        CompletableFuture&lt;Void&gt; onGroupLeft = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L1042">        leaveGroupInProgress = Optional.of(onGroupLeft);</span>
+<span class="nc bnc" id="L1043" title="All 2 branches missed.">        if (isOnClose) {</span>
+<span class="nc" id="L1044">            leaving();</span>
+        } else {
+<span class="nc" id="L1046">            CompletableFuture&lt;Void&gt; onAllActiveTasksReleasedCallbackExecuted = releaseActiveTasks();</span>
+<span class="nc" id="L1047">            onAllActiveTasksReleasedCallbackExecuted</span>
+<span class="nc" id="L1048">                .whenComplete((__, callbackError) -&gt; leavingAfterReleasingActiveTasks(callbackError));</span>
+        }
+
+<span class="nc" id="L1051">        return onGroupLeft;</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; releaseActiveTasks() {
+<span class="nc bnc" id="L1055" title="All 2 branches missed.">        if (memberEpoch &gt; 0) {</span>
+<span class="nc" id="L1056">            return revokeActiveTasks(toTaskIdSet(currentAssignment.activeTasks));</span>
+        } else {
+<span class="nc" id="L1058">            return releaseLostActiveTasks();</span>
+        }
+    }
+
+    private void leavingAfterReleasingActiveTasks(Throwable callbackError) {
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">        if (callbackError != null) {</span>
+<span class="nc" id="L1064">            log.error(&quot;Member {} callback to revoke task assignment failed. It will proceed &quot; +</span>
+                    &quot;to clear its assignment and send a leave group heartbeat&quot;,
+                memberId, callbackError);
+        } else {
+<span class="nc" id="L1068">            log.info(&quot;Member {} completed callback to revoke task assignment. It will proceed &quot; +</span>
+                    &quot;to clear its assignment and send a leave group heartbeat&quot;,
+                memberId);
+        }
+<span class="nc" id="L1072">        leaving();</span>
+<span class="nc" id="L1073">    }</span>
+
+    private void leaving() {
+<span class="nc" id="L1076">        clearTaskAndPartitionAssignment();</span>
+<span class="nc" id="L1077">        subscriptionState.unsubscribe();</span>
+<span class="nc" id="L1078">        transitionToSendingLeaveGroup(false);</span>
+<span class="nc" id="L1079">    }</span>
+
+    /**
+     * This will process the assignment received if it is different from the member's current
+     * assignment. If a new assignment is received, this will make sure reconciliation is attempted
+     * on the next call of `poll`. If another reconciliation is currently in process, the first `poll`
+     * after that reconciliation will trigger the new reconciliation.
+     *
+     * @param activeTasks Target active tasks assignment received from the broker.
+     * @param standbyTasks Target standby tasks assignment received from the broker.
+     * @param warmupTasks Target warm-up tasks assignment received from the broker.
+     * @param isGroupReady True if the group is ready, false otherwise.
+     */
+    private void processAssignmentReceived(Map&lt;String, SortedSet&lt;Integer&gt;&gt; activeTasks,
+                                           Map&lt;String, SortedSet&lt;Integer&gt;&gt; standbyTasks,
+                                           Map&lt;String, SortedSet&lt;Integer&gt;&gt; warmupTasks,
+                                           boolean isGroupReady) {
+<span class="nc" id="L1096">        replaceTargetAssignmentWithNewAssignment(activeTasks, standbyTasks, warmupTasks, isGroupReady);</span>
+<span class="nc bnc" id="L1097" title="All 2 branches missed.">        if (!targetAssignmentReconciled()) {</span>
+<span class="nc" id="L1098">            transitionTo(MemberState.RECONCILING);</span>
+        } else {
+<span class="nc" id="L1100">            log.debug(&quot;Target assignment {} received from the broker is equals to the member &quot; +</span>
+                    &quot;current assignment {}. Nothing to reconcile.&quot;,
+                targetAssignment, currentAssignment);
+<span class="nc bnc" id="L1103" title="All 4 branches missed.">            if (state == MemberState.RECONCILING || state == MemberState.JOINING) {</span>
+<span class="nc" id="L1104">                transitionTo(MemberState.STABLE);</span>
+            }
+        }
+<span class="nc" id="L1107">    }</span>
+
+    private boolean targetAssignmentReconciled() {
+<span class="nc" id="L1110">        return currentAssignment.equals(targetAssignment);</span>
+    }
+
+    private void replaceTargetAssignmentWithNewAssignment(Map&lt;String, SortedSet&lt;Integer&gt;&gt; activeTasks,
+                                                          Map&lt;String, SortedSet&lt;Integer&gt;&gt; standbyTasks,
+                                                          Map&lt;String, SortedSet&lt;Integer&gt;&gt; warmupTasks,
+                                                          boolean isGroupReady) {
+<span class="nc" id="L1117">        targetAssignment.updateWith(activeTasks, standbyTasks, warmupTasks, isGroupReady)</span>
+<span class="nc" id="L1118">            .ifPresent(updatedAssignment -&gt; {</span>
+<span class="nc" id="L1119">                log.debug(&quot;Target assignment updated from {} to {}. Member will reconcile it on the next poll.&quot;,</span>
+                    targetAssignment, updatedAssignment);
+<span class="nc" id="L1121">                targetAssignment = updatedAssignment;</span>
+<span class="nc" id="L1122">            });</span>
+<span class="nc" id="L1123">    }</span>
+
+    /**
+     * Called by the network thread to reconcile the current and target assignment.
+     */
+    @Override
+    public NetworkClientDelegate.PollResult poll(long currentTimeMs) {
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">        if (state == MemberState.RECONCILING) {</span>
+<span class="nc" id="L1131">            maybeReconcile();</span>
+        }
+<span class="nc" id="L1133">        return NetworkClientDelegate.PollResult.EMPTY;</span>
+    }
+
+    /**
+     * Reconcile the assignment that has been received from the server. Reconciliation will trigger the
+     * callbacks and update the subscription state.
+     *
+     * There are two conditions under which no reconciliation will be triggered:
+     *  - We have already reconciled the assignment (the target assignment is the same as the current assignment).
+     *  - Another reconciliation is already in progress.
+     */
+    private void maybeReconcile() {
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">        if (targetAssignmentReconciled()) {</span>
+<span class="nc" id="L1146">            log.trace(&quot;Ignoring reconciliation attempt. Target assignment is equal to the &quot; +</span>
+                &quot;current assignment.&quot;);
+<span class="nc" id="L1148">            return;</span>
+        }
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">        if (reconciliationInProgress) {</span>
+<span class="nc" id="L1151">            log.trace(&quot;Ignoring reconciliation attempt. Another reconciliation is already in progress. Assignment {}&quot; +</span>
+                &quot; will be handled in the next reconciliation loop.&quot;, targetAssignment);
+<span class="nc" id="L1153">            return;</span>
+        }
+
+<span class="nc" id="L1156">        markReconciliationInProgress();</span>
+
+<span class="nc" id="L1158">        SortedSet&lt;StreamsRebalanceData.TaskId&gt; assignedActiveTasks = toTaskIdSet(targetAssignment.activeTasks);</span>
+<span class="nc" id="L1159">        SortedSet&lt;StreamsRebalanceData.TaskId&gt; ownedActiveTasks = toTaskIdSet(currentAssignment.activeTasks);</span>
+<span class="nc" id="L1160">        SortedSet&lt;StreamsRebalanceData.TaskId&gt; activeTasksToRevoke = new TreeSet&lt;&gt;(ownedActiveTasks);</span>
+<span class="nc" id="L1161">        activeTasksToRevoke.removeAll(assignedActiveTasks);</span>
+<span class="nc" id="L1162">        SortedSet&lt;StreamsRebalanceData.TaskId&gt; assignedStandbyTasks = toTaskIdSet(targetAssignment.standbyTasks);</span>
+<span class="nc" id="L1163">        SortedSet&lt;StreamsRebalanceData.TaskId&gt; ownedStandbyTasks = toTaskIdSet(currentAssignment.standbyTasks);</span>
+<span class="nc" id="L1164">        SortedSet&lt;StreamsRebalanceData.TaskId&gt; assignedWarmupTasks = toTaskIdSet(targetAssignment.warmupTasks);</span>
+<span class="nc" id="L1165">        SortedSet&lt;StreamsRebalanceData.TaskId&gt; ownedWarmupTasks = toTaskIdSet(currentAssignment.warmupTasks);</span>
+<span class="nc" id="L1166">        boolean isGroupReady = targetAssignment.isGroupReady;</span>
+
+<span class="nc" id="L1168">        log.info(&quot;Assigned tasks with local epoch {} and group {}\n&quot; +</span>
+                &quot;\tMember:                        {}\n&quot; +
+                &quot;\tAssigned active tasks:         {}\n&quot; +
+                &quot;\tOwned active tasks:            {}\n&quot; +
+                &quot;\tActive tasks to revoke:        {}\n&quot; +
+                &quot;\tAssigned standby tasks:        {}\n&quot; +
+                &quot;\tOwned standby tasks:           {}\n&quot; +
+                &quot;\tAssigned warm-up tasks:        {}\n&quot; +
+                &quot;\tOwned warm-up tasks:           {}\n&quot;,
+<span class="nc" id="L1177">            targetAssignment.localEpoch,</span>
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">            isGroupReady ? &quot;is ready&quot; : &quot;is not ready&quot;,</span>
+            memberId,
+            assignedActiveTasks,
+            ownedActiveTasks,
+            activeTasksToRevoke,
+            assignedStandbyTasks,
+            ownedStandbyTasks,
+            assignedWarmupTasks,
+            ownedWarmupTasks
+        );
+
+<span class="nc" id="L1189">        SortedSet&lt;TopicPartition&gt; ownedTopicPartitionsFromSubscriptionState = new TreeSet&lt;&gt;(TOPIC_PARTITION_COMPARATOR);</span>
+<span class="nc" id="L1190">        ownedTopicPartitionsFromSubscriptionState.addAll(subscriptionState.assignedPartitions());</span>
+<span class="nc" id="L1191">        SortedSet&lt;TopicPartition&gt; ownedTopicPartitionsFromAssignedTasks =</span>
+<span class="nc" id="L1192">            topicPartitionsForActiveTasks(currentAssignment.activeTasks);</span>
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">        if (!ownedTopicPartitionsFromAssignedTasks.equals(ownedTopicPartitionsFromSubscriptionState)) {</span>
+<span class="nc" id="L1194">            throw new IllegalStateException(&quot;Owned partitions from subscription state and owned partitions from &quot; +</span>
+                &quot;assigned active tasks are not equal. &quot; +
+                &quot;Owned partitions from subscription state: &quot; + ownedTopicPartitionsFromSubscriptionState + &quot;, &quot; +
+                &quot;Owned partitions from assigned active tasks: &quot; + ownedTopicPartitionsFromAssignedTasks);
+        }
+<span class="nc" id="L1199">        SortedSet&lt;TopicPartition&gt; assignedTopicPartitions = topicPartitionsForActiveTasks(targetAssignment.activeTasks);</span>
+<span class="nc" id="L1200">        SortedSet&lt;TopicPartition&gt; partitionsToRevoke = new TreeSet&lt;&gt;(ownedTopicPartitionsFromSubscriptionState);</span>
+<span class="nc" id="L1201">        partitionsToRevoke.removeAll(assignedTopicPartitions);</span>
+
+<span class="nc" id="L1203">        final CompletableFuture&lt;Void&gt; tasksRevoked = revokeActiveTasks(activeTasksToRevoke);</span>
+
+<span class="nc" id="L1205">        final CompletableFuture&lt;Void&gt; tasksRevokedAndAssigned = tasksRevoked.thenCompose(__ -&gt; {</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">            if (!maybeAbortReconciliation()) {</span>
+<span class="nc" id="L1207">                return assignTasks(assignedActiveTasks, ownedActiveTasks, assignedStandbyTasks, assignedWarmupTasks, isGroupReady);</span>
+            }
+<span class="nc" id="L1209">            return CompletableFuture.completedFuture(null);</span>
+        });
+
+        // The current target assignment is captured to ensure that acknowledging the current assignment is done with
+        // the same target assignment that was used when this reconciliation was initiated.
+<span class="nc" id="L1214">        LocalAssignment currentTargetAssignment = targetAssignment;</span>
+<span class="nc" id="L1215">        tasksRevokedAndAssigned.whenComplete((__, callbackError) -&gt; {</span>
+<span class="nc bnc" id="L1216" title="All 2 branches missed.">            if (callbackError != null) {</span>
+<span class="nc" id="L1217">                log.error(&quot;Reconciliation failed for tasks {}&quot;,</span>
+                    currentTargetAssignment, callbackError);
+<span class="nc" id="L1219">                markReconciliationCompleted();</span>
+            } else {
+<span class="nc bnc" id="L1221" title="All 4 branches missed.">                if (reconciliationInProgress &amp;&amp; !maybeAbortReconciliation()) {</span>
+<span class="nc" id="L1222">                    currentAssignment = currentTargetAssignment;</span>
+<span class="nc" id="L1223">                    transitionTo(MemberState.ACKNOWLEDGING);</span>
+<span class="nc" id="L1224">                    markReconciliationCompleted();</span>
+                }
+            }
+<span class="nc" id="L1227">        });</span>
+<span class="nc" id="L1228">    }</span>
+
+    private CompletableFuture&lt;Void&gt; revokeActiveTasks(final SortedSet&lt;StreamsRebalanceData.TaskId&gt; activeTasksToRevoke) {
+<span class="nc bnc" id="L1231" title="All 2 branches missed.">        if (activeTasksToRevoke.isEmpty()) {</span>
+<span class="nc" id="L1232">            return CompletableFuture.completedFuture(null);</span>
+        }
+
+<span class="nc" id="L1235">        log.info(&quot;Revoking previously assigned active tasks {}&quot;, activeTasksToRevoke.stream()</span>
+<span class="nc" id="L1236">            .map(StreamsRebalanceData.TaskId::toString)</span>
+<span class="nc" id="L1237">            .collect(Collectors.joining(&quot;, &quot;)));</span>
+
+<span class="nc" id="L1239">        final SortedSet&lt;TopicPartition&gt; partitionsToRevoke = topicPartitionsForActiveTasks(activeTasksToRevoke);</span>
+<span class="nc" id="L1240">        log.debug(&quot;Marking partitions pending for revocation: {}&quot;, partitionsToRevoke);</span>
+<span class="nc" id="L1241">        subscriptionState.markPendingRevocation(partitionsToRevoke);</span>
+
+<span class="nc" id="L1243">        CompletableFuture&lt;Void&gt; tasksRevoked = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L1244">        CompletableFuture&lt;Void&gt; onTasksRevokedCallbackExecuted = requestOnTasksRevokedCallbackInvocation(activeTasksToRevoke);</span>
+<span class="nc" id="L1245">        onTasksRevokedCallbackExecuted.whenComplete((__, callbackError) -&gt; {</span>
+<span class="nc bnc" id="L1246" title="All 2 branches missed.">            if (callbackError != null) {</span>
+<span class="nc" id="L1247">                log.error(&quot;onTasksRevoked callback invocation failed for tasks {}&quot;,</span>
+                    activeTasksToRevoke, callbackError);
+<span class="nc" id="L1249">                tasksRevoked.completeExceptionally(callbackError);</span>
+            } else {
+<span class="nc" id="L1251">                tasksRevoked.complete(null);</span>
+            }
+<span class="nc" id="L1253">        });</span>
+<span class="nc" id="L1254">        return tasksRevoked;</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; assignTasks(final SortedSet&lt;StreamsRebalanceData.TaskId&gt; activeTasksToAssign,
+                                                final SortedSet&lt;StreamsRebalanceData.TaskId&gt; ownedActiveTasks,
+                                                final SortedSet&lt;StreamsRebalanceData.TaskId&gt; standbyTasksToAssign,
+                                                final SortedSet&lt;StreamsRebalanceData.TaskId&gt; warmupTasksToAssign,
+                                                final boolean isGroupReady) {
+<span class="nc" id="L1262">        log.info(&quot;Assigning active tasks {{}}, standby tasks {{}}, and warm-up tasks {{}} to the member.&quot;,</span>
+<span class="nc" id="L1263">            activeTasksToAssign.stream()</span>
+<span class="nc" id="L1264">                .map(StreamsRebalanceData.TaskId::toString)</span>
+<span class="nc" id="L1265">                .collect(Collectors.joining(&quot;, &quot;)),</span>
+<span class="nc" id="L1266">            standbyTasksToAssign.stream()</span>
+<span class="nc" id="L1267">                .map(StreamsRebalanceData.TaskId::toString)</span>
+<span class="nc" id="L1268">                .collect(Collectors.joining(&quot;, &quot;)),</span>
+<span class="nc" id="L1269">            warmupTasksToAssign.stream()</span>
+<span class="nc" id="L1270">                .map(StreamsRebalanceData.TaskId::toString)</span>
+<span class="nc" id="L1271">                .collect(Collectors.joining(&quot;, &quot;))</span>
+        );
+
+<span class="nc" id="L1274">        final SortedSet&lt;TopicPartition&gt; partitionsToAssign = topicPartitionsForActiveTasks(activeTasksToAssign);</span>
+<span class="nc" id="L1275">        final SortedSet&lt;TopicPartition&gt; partitionsToAssignNotPreviouslyOwned =</span>
+<span class="nc" id="L1276">            partitionsToAssignNotPreviouslyOwned(partitionsToAssign, topicPartitionsForActiveTasks(ownedActiveTasks));</span>
+
+        // Enqueue event to app thread to apply assignment within poll() and invoke callback.
+        // The app thread will trigger ApplyAssignmentEvent to update subscription state on background thread.
+<span class="nc" id="L1280">        CompletableFuture&lt;Void&gt; partitionsAssignedAndCallbackExecuted =</span>
+<span class="nc" id="L1281">            enqueueStreamsPartitionsAssignedEvent(</span>
+                partitionsToAssign,
+                partitionsToAssignNotPreviouslyOwned,
+                new StreamsRebalanceData.Assignment(
+                    activeTasksToAssign,
+                    standbyTasksToAssign,
+                    warmupTasksToAssign,
+                    isGroupReady
+                )
+            );
+<span class="nc" id="L1291">        partitionsAssignedAndCallbackExecuted.whenComplete((__, callbackError) -&gt; {</span>
+<span class="nc bnc" id="L1292" title="All 2 branches missed.">            if (callbackError == null) {</span>
+<span class="nc" id="L1293">                subscriptionState.enablePartitionsAwaitingCallback(partitionsToAssign);</span>
+            } else {
+<span class="nc bnc" id="L1295" title="All 4 branches missed.">                if (!partitionsToAssignNotPreviouslyOwned.isEmpty() &amp;&amp; subscriptionState.assignedPartitions().containsAll(partitionsToAssignNotPreviouslyOwned)) {</span>
+<span class="nc" id="L1296">                    log.warn(&quot;Leaving newly assigned partitions {} marked as non-fetchable and not &quot; +</span>
+                            &quot;requiring initializing positions after onTasksAssigned callback failed.&quot;,
+                        partitionsToAssignNotPreviouslyOwned, callbackError);
+                }
+            }
+<span class="nc" id="L1301">        });</span>
+
+<span class="nc" id="L1303">        return partitionsAssignedAndCallbackExecuted;</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; releaseLostActiveTasks() {
+<span class="nc" id="L1307">        final SortedSet&lt;StreamsRebalanceData.TaskId&gt; activeTasksToRelease = toTaskIdSet(currentAssignment.activeTasks);</span>
+<span class="nc" id="L1308">        log.info(&quot;Revoking previously assigned and now lost active tasks {}&quot;, activeTasksToRelease.stream()</span>
+<span class="nc" id="L1309">            .map(StreamsRebalanceData.TaskId::toString)</span>
+<span class="nc" id="L1310">            .collect(Collectors.joining(&quot;, &quot;)));</span>
+
+<span class="nc" id="L1312">        final SortedSet&lt;TopicPartition&gt; partitionsToRelease = topicPartitionsForActiveTasks(activeTasksToRelease);</span>
+<span class="nc" id="L1313">        log.debug(&quot;Marking lost partitions pending for revocation: {}&quot;, partitionsToRelease);</span>
+<span class="nc" id="L1314">        subscriptionState.markPendingRevocation(partitionsToRelease);</span>
+
+<span class="nc" id="L1316">        return requestOnAllTasksLostCallbackInvocation();</span>
+    }
+
+    private SortedSet&lt;TopicPartition&gt; partitionsToAssignNotPreviouslyOwned(final SortedSet&lt;TopicPartition&gt; assignedTopicPartitions,
+                                                                           final SortedSet&lt;TopicPartition&gt; ownedTopicPartitions) {
+<span class="nc" id="L1321">        SortedSet&lt;TopicPartition&gt; assignedPartitionsNotPreviouslyOwned = new TreeSet&lt;&gt;(TOPIC_PARTITION_COMPARATOR);</span>
+<span class="nc" id="L1322">        assignedPartitionsNotPreviouslyOwned.addAll(assignedTopicPartitions);</span>
+<span class="nc" id="L1323">        assignedPartitionsNotPreviouslyOwned.removeAll(ownedTopicPartitions);</span>
+<span class="nc" id="L1324">        return assignedPartitionsNotPreviouslyOwned;</span>
+    }
+
+    private SortedSet&lt;TopicPartition&gt; topicPartitionsForActiveTasks(final Map&lt;String, SortedSet&lt;Integer&gt;&gt; activeTasks) {
+<span class="nc" id="L1328">        final SortedSet&lt;TopicPartition&gt; topicPartitions = new TreeSet&lt;&gt;(TOPIC_PARTITION_COMPARATOR);</span>
+<span class="nc" id="L1329">        activeTasks.forEach((subtopologyId, partitionIds) -&gt;</span>
+<span class="nc" id="L1330">            Stream.concat(</span>
+<span class="nc" id="L1331">                streamsRebalanceData.subtopologies().get(subtopologyId).sourceTopics().stream(),</span>
+<span class="nc" id="L1332">                streamsRebalanceData.subtopologies().get(subtopologyId).repartitionSourceTopics().keySet().stream()</span>
+<span class="nc" id="L1333">            ).forEach(topic -&gt; {</span>
+<span class="nc bnc" id="L1334" title="All 2 branches missed.">                for (final int partitionId : partitionIds) {</span>
+<span class="nc" id="L1335">                    topicPartitions.add(new TopicPartition(topic, partitionId));</span>
+<span class="nc" id="L1336">                }</span>
+<span class="nc" id="L1337">            })</span>
+        );
+<span class="nc" id="L1339">        return topicPartitions;</span>
+    }
+
+    private SortedSet&lt;TopicPartition&gt; topicPartitionsForActiveTasks(final SortedSet&lt;StreamsRebalanceData.TaskId&gt; activeTasks) {
+<span class="nc" id="L1343">        final SortedSet&lt;TopicPartition&gt; topicPartitions = new TreeSet&lt;&gt;(TOPIC_PARTITION_COMPARATOR);</span>
+<span class="nc" id="L1344">        activeTasks.forEach(task -&gt;</span>
+<span class="nc" id="L1345">            Stream.concat(</span>
+<span class="nc" id="L1346">                streamsRebalanceData.subtopologies().get(task.subtopologyId()).sourceTopics().stream(),</span>
+<span class="nc" id="L1347">                streamsRebalanceData.subtopologies().get(task.subtopologyId()).repartitionSourceTopics().keySet().stream()</span>
+<span class="nc" id="L1348">            ).forEach(topic -&gt;</span>
+<span class="nc" id="L1349">                topicPartitions.add(new TopicPartition(topic, task.partitionId()))</span>
+            )
+        );
+<span class="nc" id="L1352">        return topicPartitions;</span>
+    }
+
+    private void markReconciliationCompleted() {
+<span class="nc" id="L1356">        reconciliationInProgress = false;</span>
+<span class="nc" id="L1357">        rejoinedWhileReconciliationInProgress = false;</span>
+<span class="nc" id="L1358">    }</span>
+
+    private boolean maybeAbortReconciliation() {
+<span class="nc bnc" id="L1361" title="All 4 branches missed.">        boolean shouldAbort = state != MemberState.RECONCILING || rejoinedWhileReconciliationInProgress;</span>
+<span class="nc bnc" id="L1362" title="All 2 branches missed.">        if (shouldAbort) {</span>
+<span class="nc bnc" id="L1363" title="All 2 branches missed.">            String reason = rejoinedWhileReconciliationInProgress ?</span>
+<span class="nc" id="L1364">                &quot;the member has re-joined the group&quot; :</span>
+<span class="nc" id="L1365">                &quot;the member already transitioned out of the reconciling state into &quot; + state;</span>
+<span class="nc" id="L1366">            log.info(&quot;Interrupting reconciliation that is not relevant anymore because {}&quot;, reason);</span>
+<span class="nc" id="L1367">            markReconciliationCompleted();</span>
+        }
+<span class="nc" id="L1369">        return shouldAbort;</span>
+    }
+
+    private void markReconciliationInProgress() {
+<span class="nc" id="L1373">        reconciliationInProgress = true;</span>
+<span class="nc" id="L1374">        rejoinedWhileReconciliationInProgress = false;</span>
+<span class="nc" id="L1375">    }</span>
+
+    private CompletableFuture&lt;Void&gt; requestOnAllTasksLostCallbackInvocation() {
+<span class="nc" id="L1378">        final StreamsOnAllTasksLostCallbackNeededEvent onAllTasksLostCallbackNeededEvent = new StreamsOnAllTasksLostCallbackNeededEvent();</span>
+<span class="nc" id="L1379">        backgroundEventHandler.add(onAllTasksLostCallbackNeededEvent);</span>
+<span class="nc" id="L1380">        return onAllTasksLostCallbackNeededEvent.future();</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; requestOnTasksRevokedCallbackInvocation(final Set&lt;StreamsRebalanceData.TaskId&gt; activeTasksToRevoke) {
+<span class="nc" id="L1384">        final StreamsOnTasksRevokedCallbackNeededEvent onTasksRevokedCallbackNeededEvent = new StreamsOnTasksRevokedCallbackNeededEvent(activeTasksToRevoke);</span>
+<span class="nc" id="L1385">        backgroundEventHandler.add(onTasksRevokedCallbackNeededEvent);</span>
+<span class="nc" id="L1386">        return onTasksRevokedCallbackNeededEvent.future();</span>
+    }
+
+    /**
+     * Enqueue event to notify the app thread that new partitions have been reconciled.
+     * The app thread will trigger the assignment update (via ApplyAssignmentEvent) and invoke
+     * the onTasksAssigned callback.
+     *
+     * @param partitionsToAssign The full partition assignment to apply
+     * @param addedPartitions The newly added partitions
+     * @param assignment The task assignment for the callback
+     * @return Future that completes when the assignment is applied and the callback executed
+     */
+    private CompletableFuture&lt;Void&gt; enqueueStreamsPartitionsAssignedEvent(
+            final SortedSet&lt;TopicPartition&gt; partitionsToAssign,
+            final SortedSet&lt;TopicPartition&gt; addedPartitions,
+            final StreamsRebalanceData.Assignment assignment) {
+<span class="nc" id="L1403">        final StreamsTasksAssignedEvent event = new StreamsTasksAssignedEvent(</span>
+            partitionsToAssign,
+            addedPartitions,
+            assignment
+        );
+<span class="nc" id="L1408">        backgroundEventHandler.add(event);</span>
+<span class="nc" id="L1409">        log.debug(&quot;Enqueued StreamsTasksAssignedEvent to apply assignment and trigger onTasksAssigned callback&quot;);</span>
+<span class="nc" id="L1410">        return event.future();</span>
+    }
+
+    /**
+     * Completes the future that marks the completed execution of the onTasksRevoked callback.
+
+     * @param event The event containing the future sent from the application thread to the network thread to
+     *              confirm the execution of the callback.
+     */
+    public void onTasksRevokedCallbackCompleted(final StreamsOnTasksRevokedCallbackCompletedEvent event) {
+<span class="nc" id="L1420">        Optional&lt;KafkaException&gt; error = event.error();</span>
+<span class="nc" id="L1421">        CompletableFuture&lt;Void&gt; future = event.future();</span>
+
+<span class="nc bnc" id="L1423" title="All 2 branches missed.">        if (error.isPresent()) {</span>
+<span class="nc" id="L1424">            Exception e = error.get();</span>
+<span class="nc" id="L1425">            log.warn(&quot;The onTasksRevoked callback completed with an error ({}); &quot; +</span>
+<span class="nc" id="L1426">                &quot;signaling to continue to the next phase of rebalance&quot;, e.getMessage());</span>
+<span class="nc" id="L1427">            future.completeExceptionally(e);</span>
+<span class="nc" id="L1428">        } else {</span>
+<span class="nc" id="L1429">            log.debug(&quot;The onTasksRevoked callback completed successfully; signaling to continue to the next phase of rebalance&quot;);</span>
+<span class="nc" id="L1430">            future.complete(null);</span>
+        }
+<span class="nc" id="L1432">    }</span>
+
+    /**
+     * Completes the future that marks the completed execution of the onTasksAssigned callback.
+
+     * @param event The event containing the future sent from the application thread to the network thread to
+     *              confirm the execution of the callback.
+     */
+    public void onTasksAssignedCallbackCompleted(final StreamsOnTasksAssignedCallbackCompletedEvent event) {
+<span class="nc" id="L1441">        Optional&lt;KafkaException&gt; error = event.error();</span>
+<span class="nc" id="L1442">        CompletableFuture&lt;Void&gt; future = event.future();</span>
+
+<span class="nc bnc" id="L1444" title="All 2 branches missed.">        if (error.isPresent()) {</span>
+<span class="nc" id="L1445">            Exception e = error.get();</span>
+<span class="nc" id="L1446">            log.warn(&quot;The onTasksAssigned callback completed with an error ({}); &quot; +</span>
+<span class="nc" id="L1447">                &quot;signaling to continue to the next phase of rebalance&quot;, e.getMessage());</span>
+<span class="nc" id="L1448">            future.completeExceptionally(e);</span>
+<span class="nc" id="L1449">        } else {</span>
+<span class="nc" id="L1450">            log.debug(&quot;The onTasksAssigned callback completed successfully; signaling to continue to the next phase of rebalance&quot;);</span>
+<span class="nc" id="L1451">            future.complete(null);</span>
+        }
+<span class="nc" id="L1453">    }</span>
+
+    /**
+     * Completes the future that marks the completed execution of the onAllTasksLost callback.
+
+     * @param event The event containing the future sent from the application thread to the network thread to
+     *              confirm the execution of the callback.
+     */
+    public void onAllTasksLostCallbackCompleted(final StreamsOnAllTasksLostCallbackCompletedEvent event) {
+<span class="nc" id="L1462">        Optional&lt;KafkaException&gt; error = event.error();</span>
+<span class="nc" id="L1463">        CompletableFuture&lt;Void&gt; future = event.future();</span>
+
+<span class="nc bnc" id="L1465" title="All 2 branches missed.">        if (error.isPresent()) {</span>
+<span class="nc" id="L1466">            Exception e = error.get();</span>
+<span class="nc" id="L1467">            log.warn(&quot;The onAllTasksLost callback completed with an error ({}); &quot; +</span>
+<span class="nc" id="L1468">                &quot;signaling to continue to the next phase of rebalance&quot;, e.getMessage());</span>
+<span class="nc" id="L1469">            future.completeExceptionally(e);</span>
+<span class="nc" id="L1470">        } else {</span>
+<span class="nc" id="L1471">            log.debug(&quot;The onAllTasksLost callback completed successfully; signaling to continue to the next phase of rebalance&quot;);</span>
+<span class="nc" id="L1472">            future.complete(null);</span>
+        }
+<span class="nc" id="L1474">    }</span>
+
+    // visible for testing
+    List&lt;MemberStateListener&gt; stateListeners() {
+<span class="nc" id="L1478">        return unmodifiableList(stateUpdatesListeners);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

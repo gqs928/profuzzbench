@@ -1,0 +1,646 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogCleaner.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.storage.internals.log</a> &gt; <span class="el_source">LogCleaner.java</span></div><h1>LogCleaner.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.storage.internals.log;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.errors.KafkaStorageException;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.server.config.ServerConfigs;
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+import org.apache.kafka.server.util.ShutdownableThread;
+import org.apache.kafka.storage.internals.utils.Throttler;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.security.DigestException;
+import java.security.NoSuchAlgorithmException;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+/**
+ * The cleaner is responsible for removing obsolete records from logs which have the &quot;compact&quot; retention strategy.
+ * A message with key K and offset O is obsolete if there exists a message with key K and offset O' such that O &lt; O'.
+ * &lt;p&gt;
+ * Each log can be thought of being split into two sections of segments: a &quot;clean&quot; section which has previously been cleaned followed by a
+ * &quot;dirty&quot; section that has not yet been cleaned. The dirty section is further divided into the &quot;cleanable&quot; section followed by an &quot;uncleanable&quot; section.
+ * The uncleanable section is excluded from cleaning. The active log segment is always uncleanable. If there is a
+ * compaction lag time set, segments whose largest message timestamp is within the compaction lag time of the cleaning operation are also uncleanable.
+ * &lt;p&gt;
+ * The cleaning is carried out by a pool of background threads. Each thread chooses the dirtiest log that has the &quot;compact&quot; retention policy
+ * and cleans that. The dirtiness of the log is guessed by taking the ratio of bytes in the dirty section of the log to the total bytes in the log.
+ * &lt;p&gt;
+ * To clean a log the cleaner first builds a mapping of key=&gt;last_offset for the dirty section of the log. See {@link OffsetMap} for details of
+ * the implementation of the mapping.
+ * &lt;p&gt;
+ * Once the key=&gt;last_offset map is built, the log is cleaned by recopying each log segment but omitting any key that appears in the offset map with a
+ * higher offset than what is found in the segment (i.e. messages with a key that appears in the dirty section of the log).
+ * &lt;p&gt;
+ * To avoid segments shrinking to very small sizes with repeated cleanings we implement a rule by which if we will merge successive segments when
+ * doing a cleaning if their log and index size are less than the maximum log and index size prior to the clean beginning.
+ * &lt;p&gt;
+ * Cleaned segments are swapped into the log as they become available.
+ * &lt;p&gt;
+ * One nuance that the cleaner must handle is log truncation. If a log is truncated while it is being cleaned the cleaning of that log is aborted.
+ * &lt;p&gt;
+ * Messages with null payload are treated as deletes for the purpose of log compaction. This means that they receive special treatment by the cleaner.
+ * The cleaner will only retain delete records for a period of time to avoid accumulating space indefinitely. This period of time is configurable on a per-topic
+ * basis and is measured from the time the segment enters the clean portion of the log (at which point any prior message with that key has been removed).
+ * Delete markers in the clean section of the log that are older than this time will not be retained when log segments are being recopied as part of cleaning.
+ * This time is tracked by setting the base timestamp of a record batch with delete markers when the batch is recopied in the first cleaning that encounters
+ * it. The relative timestamps of the records in the batch are also modified when recopied in this cleaning according to the new base timestamp of the batch.
+ * &lt;p&gt;
+ * Note that cleaning is more complicated with the idempotent/transactional producer capabilities. The following
+ * are the key points:
+ * &lt;p&gt;
+ * &lt;ol&gt;
+ * &lt;li&gt;In order to maintain sequence number continuity for active producers, we always retain the last batch
+ *    from each producerId, even if all the records from the batch have been removed. The batch will be removed
+ *    once the producer either writes a new batch or is expired due to inactivity.&lt;/li&gt;
+ * &lt;li&gt;We do not clean beyond the last stable offset. This ensures that all records observed by the cleaner have
+ *    been decided (i.e. committed or aborted). In particular, this allows us to use the transaction index to
+ *    collect the aborted transactions ahead of time.&lt;/li&gt;
+ * &lt;li&gt;Records from aborted transactions are removed by the cleaner immediately without regard to record keys.&lt;/li&gt;
+ * &lt;li&gt;Transaction markers are retained until all record batches from the same transaction have been removed and
+ *    a sufficient amount of time has passed to reasonably ensure that an active consumer wouldn't consume any
+ *    data from the transaction prior to reaching the offset of the marker. This follows the same logic used for
+ *    tombstone deletion.&lt;/li&gt;
+ * &lt;/ol&gt;
+ */
+public class LogCleaner {
+<span class="nc" id="L97">    private static final Logger LOG = LoggerFactory.getLogger(LogCleaner.class);</span>
+
+<span class="nc" id="L99">    public static final Set&lt;String&gt; RECONFIGURABLE_CONFIGS = Set.of(</span>
+            CleanerConfig.LOG_CLEANER_THREADS_PROP,
+            CleanerConfig.LOG_CLEANER_DEDUPE_BUFFER_SIZE_PROP,
+            CleanerConfig.LOG_CLEANER_DEDUPE_BUFFER_LOAD_FACTOR_PROP,
+            CleanerConfig.LOG_CLEANER_IO_BUFFER_SIZE_PROP,
+            ServerConfigs.MESSAGE_MAX_BYTES_CONFIG,
+            CleanerConfig.LOG_CLEANER_IO_MAX_BYTES_PER_SECOND_PROP,
+            CleanerConfig.LOG_CLEANER_BACKOFF_MS_PROP
+    );
+
+    // Visible for test
+    public static final String MAX_BUFFER_UTILIZATION_PERCENT_METRIC_NAME = &quot;max-buffer-utilization-percent&quot;;
+    public static final String MAX_CLEAN_TIME_METRIC_NAME = &quot;max-clean-time-secs&quot;;
+    public static final String MAX_COMPACTION_DELAY_METRICS_NAME = &quot;max-compaction-delay-secs&quot;;
+
+    private static final String CLEANER_RECOPY_PERCENT_METRIC_NAME = &quot;cleaner-recopy-percent&quot;;
+    private static final String DEAD_THREAD_COUNT_METRIC_NAME = &quot;DeadThreadCount&quot;;
+
+    // Visible for test
+<span class="nc" id="L118">    public static final Set&lt;String&gt; METRIC_NAMES = Set.of(</span>
+            MAX_BUFFER_UTILIZATION_PERCENT_METRIC_NAME,
+            CLEANER_RECOPY_PERCENT_METRIC_NAME,
+            MAX_CLEAN_TIME_METRIC_NAME,
+            MAX_COMPACTION_DELAY_METRICS_NAME,
+            DEAD_THREAD_COUNT_METRIC_NAME
+    );
+
+    // For compatibility, metrics are defined to be under `kafka.log.LogCleaner` class
+<span class="nc" id="L127">    private final KafkaMetricsGroup metricsGroup = new KafkaMetricsGroup(&quot;kafka.log&quot;, &quot;LogCleaner&quot;);</span>
+
+    /**
+     * For managing the state of partitions being cleaned.
+     */
+    private final LogCleanerManager cleanerManager;
+
+    /**
+     * A throttle used to limit the I/O of all the cleaner threads to a user-specified maximum rate.
+     */
+    private final Throttler throttler;
+    private final ConcurrentMap&lt;TopicPartition, UnifiedLog&gt; logs;
+    private final LogDirFailureChannel logDirFailureChannel;
+    private final Time time;
+<span class="nc" id="L141">    private final List&lt;CleanerThread&gt; cleaners = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+    /**
+     * Log cleaner configuration which may be dynamically updated.
+     */
+    private volatile CleanerConfig config;
+
+    /**
+     * @param initialConfig Initial configuration parameters for the cleaner. Actual config may be dynamically updated.
+     * @param logDirs The directories where offset checkpoints reside
+     * @param logs The map of logs
+     * @param logDirFailureChannel The channel used to add offline log dirs that may be encountered when cleaning the log
+     * @param time A way to control the passage of time
+     */
+    @SuppressWarnings(&quot;this-escape&quot;)
+    public LogCleaner(CleanerConfig initialConfig,
+                      List&lt;File&gt; logDirs,
+                      ConcurrentMap&lt;TopicPartition, UnifiedLog&gt; logs,
+                      LogDirFailureChannel logDirFailureChannel,
+<span class="nc" id="L160">                      Time time) {</span>
+<span class="nc" id="L161">        config = initialConfig;</span>
+<span class="nc" id="L162">        this.logs = logs;</span>
+<span class="nc" id="L163">        this.logDirFailureChannel = logDirFailureChannel;</span>
+<span class="nc" id="L164">        cleanerManager = new LogCleanerManager(logDirs, logs, this.logDirFailureChannel);</span>
+<span class="nc" id="L165">        this.time = time;</span>
+<span class="nc" id="L166">        throttler = new Throttler(config.maxIoBytesPerSecond, 300, &quot;cleaner-io&quot;, &quot;bytes&quot;, this.time);</span>
+
+<span class="nc" id="L168">        registerMetrics();</span>
+<span class="nc" id="L169">    }</span>
+
+    private void registerMetrics() {
+        /* a metric to track the maximum utilization of any thread's buffer in the last cleaning */
+<span class="nc" id="L173">        metricsGroup.newGauge(MAX_BUFFER_UTILIZATION_PERCENT_METRIC_NAME,</span>
+<span class="nc" id="L174">                () -&gt; (int) (maxOverCleanerThreads(t -&gt; t.lastStats.bufferUtilization) * 100));</span>
+
+        /* a metric to track the recopy rate of each thread's last cleaning */
+<span class="nc" id="L177">        metricsGroup.newGauge(CLEANER_RECOPY_PERCENT_METRIC_NAME, () -&gt; {</span>
+<span class="nc" id="L178">            List&lt;CleanerStats&gt; stats = cleaners.stream().map(t -&gt; t.lastStats).toList();</span>
+<span class="nc" id="L179">            double recopyRate = (double) stats.stream().mapToLong(stat -&gt; stat.bytesWritten).sum() /</span>
+<span class="nc" id="L180">                    Math.max(stats.stream().mapToLong(stat -&gt; stat.bytesRead).sum(), 1);</span>
+<span class="nc" id="L181">            return (int) (100 * recopyRate);</span>
+        });
+
+        /* a metric to track the maximum cleaning time for the last cleaning from each thread */
+<span class="nc" id="L185">        metricsGroup.newGauge(MAX_CLEAN_TIME_METRIC_NAME, () -&gt; (int) maxOverCleanerThreads(t -&gt; t.lastStats.elapsedSecs()));</span>
+
+        // a metric to track delay between the time when a log is required to be compacted
+        // as determined by max compaction lag and the time of last cleaner run.
+<span class="nc" id="L189">        metricsGroup.newGauge(MAX_COMPACTION_DELAY_METRICS_NAME,</span>
+<span class="nc" id="L190">                () -&gt; (int) (maxOverCleanerThreads(t -&gt; (double) t.lastPreCleanStats.maxCompactionDelayMs()) / 1000));</span>
+
+<span class="nc" id="L192">        metricsGroup.newGauge(DEAD_THREAD_COUNT_METRIC_NAME, this::deadThreadCount);</span>
+<span class="nc" id="L193">    }</span>
+
+    /**
+     * Start the background cleaner threads.
+     */
+    public void startup() {
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        if (config.numThreads &lt; 1) {</span>
+<span class="nc" id="L200">            LOG.warn(&quot;Invalid value for `log.cleaner.threads`: must be &gt;= 1 starting from Kafka 5.0 since log cleaner&quot; +</span>
+                    &quot; is always enabled.&quot;);
+        }
+
+<span class="nc" id="L204">        LOG.info(&quot;Starting the log cleaner&quot;);</span>
+<span class="nc" id="L205">        IntStream.range(0, config.numThreads).forEach(i -&gt; {</span>
+            try {
+<span class="nc" id="L207">                CleanerThread cleaner = new CleanerThread(i);</span>
+<span class="nc" id="L208">                cleaners.add(cleaner);</span>
+<span class="nc" id="L209">                cleaner.start();</span>
+<span class="nc" id="L210">            } catch (NoSuchAlgorithmException e) {</span>
+<span class="nc" id="L211">                throw new RuntimeException(e);</span>
+<span class="nc" id="L212">            }</span>
+<span class="nc" id="L213">        });</span>
+<span class="nc" id="L214">    }</span>
+
+    /**
+     * Stop the background cleaner threads.
+     */
+    private void shutdownCleaners() {
+<span class="nc" id="L220">        LOG.info(&quot;Shutting down the log cleaner.&quot;);</span>
+<span class="nc" id="L221">        cleaners.forEach(thread -&gt; {</span>
+            try {
+<span class="nc" id="L223">                thread.shutdown();</span>
+<span class="nc" id="L224">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L225">                throw new RuntimeException(e);</span>
+<span class="nc" id="L226">            }</span>
+<span class="nc" id="L227">        });</span>
+<span class="nc" id="L228">        cleaners.clear();</span>
+<span class="nc" id="L229">    }</span>
+
+    /**
+     * Stop the background cleaner threads.
+     */
+    public void shutdown() {
+        try {
+<span class="nc" id="L236">            shutdownCleaners();</span>
+        } finally {
+<span class="nc" id="L238">            removeMetrics();</span>
+        }
+<span class="nc" id="L240">    }</span>
+
+    /**
+     * Remove metrics.
+     */
+    public void removeMetrics() {
+<span class="nc" id="L246">        METRIC_NAMES.forEach(metricsGroup::removeMetric);</span>
+<span class="nc" id="L247">        cleanerManager.removeMetrics();</span>
+<span class="nc" id="L248">    }</span>
+
+    public Set&lt;String&gt; reconfigurableConfigs() {
+<span class="nc" id="L251">        return RECONFIGURABLE_CONFIGS;</span>
+    }
+
+    /**
+     * Validate the new cleaner threads num is reasonable.
+     *
+     * @param newConfig the submitted cleaner config
+     */
+    public void validateReconfiguration(CleanerConfig newConfig) {
+<span class="nc" id="L260">        int numThreads = newConfig.numThreads;</span>
+<span class="nc" id="L261">        int currentThreads = config.numThreads;</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        if (numThreads &lt; 1)</span>
+<span class="nc" id="L263">            throw new ConfigException(&quot;Log cleaner threads should be at least 1&quot;);</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        if (numThreads &lt; currentThreads / 2)</span>
+<span class="nc" id="L265">            throw new ConfigException(&quot;Log cleaner threads cannot be reduced to less than half the current value &quot; + currentThreads);</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (numThreads &gt; currentThreads * 2)</span>
+<span class="nc" id="L267">            throw new ConfigException(&quot;Log cleaner threads cannot be increased to more than double the current value &quot; + currentThreads);</span>
+
+<span class="nc" id="L269">    }</span>
+
+    /**
+     * Reconfigure log clean config. The will:
+     * &lt;ol&gt;
+     *   &lt;li&gt;update desiredRatePerSec in Throttler with logCleanerIoMaxBytesPerSecond, if necessary&lt;/li&gt;
+     *   &lt;li&gt;stop current log cleaners and create new ones.&lt;/li&gt;
+     * &lt;/ol&gt;
+     * That ensures that if any of the cleaners had failed, new cleaners are created to match the new config.
+     *
+     * @param oldConfig the old log cleaner config
+     * @param newConfig the new log cleaner config reconfigured
+     */
+    public void reconfigure(CleanerConfig oldConfig, CleanerConfig newConfig) {
+<span class="nc" id="L283">        config = newConfig;</span>
+
+<span class="nc" id="L285">        double maxIoBytesPerSecond = config.maxIoBytesPerSecond;</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        if (maxIoBytesPerSecond != oldConfig.maxIoBytesPerSecond) {</span>
+<span class="nc" id="L287">            LOG.info(&quot;Updating logCleanerIoMaxBytesPerSecond: {}&quot;, maxIoBytesPerSecond);</span>
+<span class="nc" id="L288">            throttler.updateDesiredRatePerSec(maxIoBytesPerSecond);</span>
+        }
+        // call shutdownCleaners() instead of shutdown to avoid unnecessary deletion of metrics
+<span class="nc" id="L291">        shutdownCleaners();</span>
+<span class="nc" id="L292">        startup();</span>
+<span class="nc" id="L293">    }</span>
+
+    /**
+     *  Abort the cleaning of a particular partition, if it's in progress. This call blocks until the cleaning of
+     *  the partition is aborted.
+     *
+     *  @param topicPartition The topic and partition to abort cleaning
+     */
+    public void abortCleaning(TopicPartition topicPartition) {
+<span class="nc" id="L302">        cleanerManager.abortCleaning(topicPartition);</span>
+<span class="nc" id="L303">    }</span>
+
+    /**
+     * Update checkpoint file to remove partitions if necessary.
+     *
+     * @param dataDir The data dir to be updated if necessary
+     * @param partitionToRemove The topicPartition to be removed
+     */
+    public void updateCheckpoints(File dataDir, Optional&lt;TopicPartition&gt; partitionToRemove) {
+<span class="nc" id="L312">        cleanerManager.updateCheckpoints(dataDir, Optional.empty(), partitionToRemove);</span>
+<span class="nc" id="L313">    }</span>
+
+    /**
+     * Alter the checkpoint directory for the `topicPartition`, to remove the data in `sourceLogDir`, and add the data in `destLogDir`.
+     * Generally occurs when the disk balance ends and replaces the previous file with the future file.
+     *
+     * @param topicPartition The topic and partition to alter checkpoint
+     * @param sourceLogDir The source log dir to remove checkpoint
+     * @param destLogDir The dest log dir to remove checkpoint
+     */
+    public void alterCheckpointDir(TopicPartition topicPartition, File sourceLogDir, File destLogDir) {
+<span class="nc" id="L324">        cleanerManager.alterCheckpointDir(topicPartition, sourceLogDir, destLogDir);</span>
+<span class="nc" id="L325">    }</span>
+
+    /**
+     * Stop cleaning logs in the provided directory when handling log dir failure.
+     *
+     * @param dir     the absolute path of the log dir
+     */
+    public void handleLogDirFailure(String dir) {
+<span class="nc" id="L333">        cleanerManager.handleLogDirFailure(dir);</span>
+<span class="nc" id="L334">    }</span>
+
+    /**
+     * Truncate cleaner offset checkpoint for the given partition if its checkpoint offset is larger than the given offset.
+     *
+     * @param dataDir The data dir to be truncated if necessary
+     * @param topicPartition The topic and partition to truncate checkpoint offset
+     * @param offset The given offset to be compared
+     */
+    public void maybeTruncateCheckpoint(File dataDir, TopicPartition topicPartition, long offset) {
+<span class="nc" id="L344">        cleanerManager.maybeTruncateCheckpoint(dataDir, topicPartition, offset);</span>
+<span class="nc" id="L345">    }</span>
+
+    /**
+     *  Abort the cleaning of a particular partition if it's in progress, and pause any future cleaning of this partition.
+     *  This call blocks until the cleaning of the partition is aborted and paused.
+     *
+     *  @param topicPartition The topic and partition to abort and pause cleaning
+     */
+    public void abortAndPauseCleaning(TopicPartition topicPartition) {
+<span class="nc" id="L354">        cleanerManager.abortAndPauseCleaning(topicPartition);</span>
+<span class="nc" id="L355">    }</span>
+
+    /**
+     *  Resume the cleaning of paused partitions.
+     *
+     *  @param topicPartitions The collection of topicPartitions to be resumed cleaning
+     */
+    public void resumeCleaning(Set&lt;TopicPartition&gt; topicPartitions) {
+<span class="nc" id="L363">        cleanerManager.resumeCleaning(topicPartitions);</span>
+<span class="nc" id="L364">    }</span>
+
+    /**
+     * For testing, a way to know when work has completed. This method waits until the
+     * cleaner has processed up to the given offset on the specified topic/partition.
+     *
+     * @param topicPartition The topic and partition to be cleaned
+     * @param offset The first dirty offset that the cleaner doesn't have to clean
+     * @param maxWaitMs The maximum time in ms to wait for cleaner
+     *
+     * @return A boolean indicating whether the work has completed before timeout
+     */
+    public boolean awaitCleaned(TopicPartition topicPartition, long offset, long maxWaitMs) throws InterruptedException {
+<span class="nc" id="L377">        long remainingWaitMs = maxWaitMs;</span>
+<span class="nc bnc" id="L378" title="All 4 branches missed.">        while (!isCleaned(topicPartition, offset) &amp;&amp; remainingWaitMs &gt; 0) {</span>
+<span class="nc" id="L379">            long sleepTime = Math.min(100, remainingWaitMs);</span>
+<span class="nc" id="L380">            Thread.sleep(sleepTime);</span>
+<span class="nc" id="L381">            remainingWaitMs -= sleepTime;</span>
+<span class="nc" id="L382">        }</span>
+<span class="nc" id="L383">        return isCleaned(topicPartition, offset);</span>
+    }
+
+    private boolean isCleaned(TopicPartition topicPartition, long offset) {
+<span class="nc" id="L387">        return Optional.ofNullable(cleanerManager.allCleanerCheckpoints().get(topicPartition))</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">                .map(checkpoint -&gt; checkpoint &gt;= offset)</span>
+<span class="nc" id="L389">                .orElse(false);</span>
+    }
+
+    /**
+     * To prevent race between retention and compaction,
+     * retention threads need to make this call to obtain:
+     *
+     * @return A map of log partitions that retention threads can safely work on
+     */
+    public Map&lt;TopicPartition, UnifiedLog&gt; pauseCleaningForNonCompactedPartitions() {
+<span class="nc" id="L399">        return cleanerManager.pauseCleaningForNonCompactedPartitions().stream()</span>
+<span class="nc" id="L400">                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+    }
+
+    /**
+     * @param f to compute the result
+     * @return the max value or 0 if there is no cleaner
+     */
+    public double maxOverCleanerThreads(Function&lt;CleanerThread, Double&gt; f) {
+<span class="nc" id="L408">        return cleaners.stream()</span>
+<span class="nc" id="L409">                .mapToDouble(f::apply)</span>
+<span class="nc" id="L410">                .max()</span>
+<span class="nc" id="L411">                .orElse(0.0d);</span>
+    }
+
+    public int deadThreadCount() {
+<span class="nc" id="L415">        return (int) cleaners.stream()</span>
+<span class="nc" id="L416">                .filter(ShutdownableThread::isThreadFailed)</span>
+<span class="nc" id="L417">                .count();</span>
+    }
+
+    // Only for testing
+    public LogCleanerManager cleanerManager() {
+<span class="nc" id="L422">        return cleanerManager;</span>
+    }
+
+    // Only for testing
+    public Throttler throttler() {
+<span class="nc" id="L427">        return throttler;</span>
+    }
+
+    // Only for testing
+    public ConcurrentMap&lt;TopicPartition, UnifiedLog&gt; logs() {
+<span class="nc" id="L432">        return logs;</span>
+    }
+
+    // Only for testing
+    public List&lt;CleanerThread&gt; cleaners() {
+<span class="nc" id="L437">        return cleaners;</span>
+    }
+
+    // Only for testing
+    public KafkaMetricsGroup metricsGroup() {
+<span class="nc" id="L442">        return metricsGroup;</span>
+    }
+
+    // Only for testing
+    public CleanerConfig currentConfig() {
+<span class="nc" id="L447">        return config;</span>
+    }
+
+    // Only for testing
+    public int cleanerCount() {
+<span class="nc" id="L452">        return cleaners.size();</span>
+    }
+
+    /**
+     * The cleaner threads do the actual log cleaning. Each thread processes does its cleaning repeatedly by
+     * choosing the dirtiest log, cleaning it, and then swapping in the cleaned segments.
+     */
+    public final class CleanerThread extends ShutdownableThread {
+<span class="nc" id="L460">        private final Logger logger = new LogContext(logPrefix).logger(CleanerThread.class);</span>
+
+        private final Cleaner cleaner;
+
+<span class="nc" id="L464">        private volatile CleanerStats lastStats = new CleanerStats(Time.SYSTEM);</span>
+<span class="nc" id="L465">        private volatile PreCleanStats lastPreCleanStats = new PreCleanStats();</span>
+
+<span class="nc" id="L467">        public CleanerThread(int threadId) throws NoSuchAlgorithmException {</span>
+<span class="nc" id="L468">            super(&quot;kafka-log-cleaner-thread-&quot; + threadId, false);</span>
+
+<span class="nc" id="L470">            cleaner = new Cleaner(</span>
+                    threadId,
+<span class="nc" id="L472">                    new SkimpyOffsetMap((int) Math.min(config.dedupeBufferSize / config.numThreads, Integer.MAX_VALUE), config.hashAlgorithm()),</span>
+                    config.ioBufferSize / config.numThreads / 2,
+                    config.maxMessageSize,
+                    config.dedupeBufferLoadFactor,
+                    throttler,
+                    time,
+                    this::checkDone
+            );
+
+<span class="nc bnc" id="L481" title="All 2 branches missed.">            if (config.dedupeBufferSize / config.numThreads &gt; Integer.MAX_VALUE) {</span>
+<span class="nc" id="L482">                logger.warn(&quot;Cannot use more than 2G of cleaner buffer space per cleaner thread, ignoring excess buffer space...&quot;);</span>
+            }
+<span class="nc" id="L484">        }</span>
+
+        /**
+         *  Check if the cleaning for a partition is aborted. If so, throw an exception.
+         *
+         *  @param topicPartition The topic and partition to check
+         */
+        private void checkDone(TopicPartition topicPartition) {
+<span class="nc bnc" id="L492" title="All 2 branches missed.">            if (!isRunning()) {</span>
+<span class="nc" id="L493">                throw new ThreadShutdownException();</span>
+            }
+
+<span class="nc" id="L496">            cleanerManager.checkCleaningAborted(topicPartition);</span>
+<span class="nc" id="L497">        }</span>
+
+        /**
+         * The main loop for the cleaner thread.
+         * Clean a log if there is a dirty log available, otherwise sleep for a bit.
+         */
+        @Override
+        public void doWork() {
+<span class="nc" id="L505">            boolean cleaned = tryCleanFilthiestLog();</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">            if (!cleaned) {</span>
+                try {
+<span class="nc" id="L508">                    pause(config.backoffMs, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L509">                } catch (InterruptedException e) {</span>
+<span class="nc" id="L510">                    throw new RuntimeException(e);</span>
+<span class="nc" id="L511">                }</span>
+            }
+
+<span class="nc" id="L514">            cleanerManager.maintainUncleanablePartitions();</span>
+<span class="nc" id="L515">        }</span>
+
+        public CleanerStats lastStats() {
+<span class="nc" id="L518">            return lastStats;</span>
+        }
+
+        public void setLastStats(CleanerStats lastStats) {
+<span class="nc" id="L522">            this.lastStats = lastStats;</span>
+<span class="nc" id="L523">        }</span>
+
+        public PreCleanStats lastPreCleanStats() {
+<span class="nc" id="L526">            return lastPreCleanStats;</span>
+        }
+
+        /**
+         * Cleans a log if there is a dirty log available.
+         *
+         * @return whether a log was cleaned
+         */
+        private boolean tryCleanFilthiestLog() {
+            try {
+<span class="nc" id="L536">                return cleanFilthiestLog();</span>
+<span class="nc" id="L537">            } catch (LogCleaningException e) {</span>
+<span class="nc" id="L538">                logger.warn(&quot;Unexpected exception thrown when cleaning log {}. Marking its partition ({}) as uncleanable&quot;, e.log, e.log.topicPartition(), e);</span>
+<span class="nc" id="L539">                cleanerManager.markPartitionUncleanable(e.log.parentDir(), e.log.topicPartition());</span>
+
+<span class="nc" id="L541">                return false;</span>
+            }
+        }
+
+        private boolean cleanFilthiestLog() throws LogCleaningException {
+<span class="nc" id="L546">            PreCleanStats preCleanStats = new PreCleanStats();</span>
+<span class="nc" id="L547">            Optional&lt;LogToClean&gt; ltc = cleanerManager.grabFilthiestCompactedLog(time, preCleanStats);</span>
+            boolean cleaned;
+
+<span class="nc bnc" id="L550" title="All 2 branches missed.">            if (ltc.isEmpty()) {</span>
+<span class="nc" id="L551">                cleaned = false;</span>
+            } else {
+                // there's a log, clean it
+<span class="nc" id="L554">                this.lastPreCleanStats = preCleanStats;</span>
+<span class="nc" id="L555">                LogToClean cleanable = ltc.get();</span>
+                try {
+<span class="nc" id="L557">                    cleanLog(cleanable);</span>
+<span class="nc" id="L558">                    cleaned = true;</span>
+<span class="nc" id="L559">                } catch (ThreadShutdownException e) {</span>
+<span class="nc" id="L560">                    throw e;</span>
+<span class="nc" id="L561">                } catch (Exception e) {</span>
+<span class="nc" id="L562">                    throw new LogCleaningException(cleanable.log(), e.getMessage(), e);</span>
+<span class="nc" id="L563">                }</span>
+            }
+
+<span class="nc" id="L566">            Map&lt;TopicPartition, UnifiedLog&gt; deletable = cleanerManager.deletableLogs();</span>
+            try {
+<span class="nc" id="L568">                deletable.forEach((topicPartition, log) -&gt; {</span>
+                    try {
+<span class="nc" id="L570">                        log.deleteOldSegments();</span>
+<span class="nc" id="L571">                    } catch (ThreadShutdownException e) {</span>
+<span class="nc" id="L572">                        throw e;</span>
+<span class="nc" id="L573">                    } catch (Exception e) {</span>
+<span class="nc" id="L574">                        throw new LogCleaningException(log, e.getMessage(), e);</span>
+<span class="nc" id="L575">                    }</span>
+<span class="nc" id="L576">                });</span>
+            } finally {
+<span class="nc" id="L578">                cleanerManager.doneDeleting(deletable.keySet().stream().toList());</span>
+            }
+
+<span class="nc" id="L581">            return cleaned;</span>
+        }
+
+        private void cleanLog(LogToClean cleanable) throws DigestException {
+<span class="nc" id="L585">            long startOffset = cleanable.firstDirtyOffset();</span>
+<span class="nc" id="L586">            long endOffset = startOffset;</span>
+            try {
+<span class="nc" id="L588">                Map.Entry&lt;Long, CleanerStats&gt; entry = cleaner.clean(cleanable);</span>
+<span class="nc" id="L589">                endOffset = entry.getKey();</span>
+<span class="nc" id="L590">                recordStats(cleaner.id(), cleanable.log().name(), startOffset, endOffset, entry.getValue());</span>
+<span class="nc" id="L591">            } catch (LogCleaningAbortedException ignored) {</span>
+                // task can be aborted, let it go.
+<span class="nc" id="L593">            } catch (KafkaStorageException ignored) {</span>
+                // partition is already offline. let it go.
+<span class="nc" id="L595">            } catch (IOException e) {</span>
+<span class="nc" id="L596">                String logDirectory = cleanable.log().parentDir();</span>
+<span class="nc" id="L597">                String msg = String.format(&quot;Failed to clean up log for %s in dir %s due to IOException&quot;, cleanable.topicPartition(), logDirectory);</span>
+<span class="nc" id="L598">                logDirFailureChannel.maybeAddOfflineLogDir(logDirectory, msg, e);</span>
+            } finally {
+<span class="nc" id="L600">                cleanerManager.doneCleaning(cleanable.topicPartition(), cleanable.log().parentDirFile(), endOffset);</span>
+            }
+<span class="nc" id="L602">        }</span>
+
+        /**
+         * Log out statistics on a single run of the cleaner.
+         *
+         * @param id The cleaner thread id
+         * @param name The cleaned log name
+         * @param from The cleaned offset that is the first dirty offset to begin
+         * @param to The cleaned offset that is the first not cleaned offset to end
+         * @param stats The statistics for this round of cleaning
+         */
+        private void recordStats(int id, String name, long from, long to, CleanerStats stats) {
+<span class="nc" id="L614">            this.lastStats = stats;</span>
+<span class="nc" id="L615">            String message = String.format(&quot;%n\tLog cleaner thread %d cleaned log %s (dirty section = [%d, %d])%n&quot;, id, name, from, to) +</span>
+<span class="nc" id="L616">                        String.format(&quot;\t%,.1f MB of log processed in %,.1f seconds (%,.1f MB/sec).%n&quot;, mb(stats.bytesRead),</span>
+<span class="nc" id="L617">                                stats.elapsedSecs(),</span>
+<span class="nc" id="L618">                                mb(stats.bytesRead / stats.elapsedSecs())) +</span>
+<span class="nc" id="L619">                        String.format(&quot;\tIndexed %,.1f MB in %.1f seconds (%,.1f Mb/sec, %.1f%% of total time)%n&quot;, mb(stats.mapBytesRead),</span>
+<span class="nc" id="L620">                                stats.elapsedIndexSecs(),</span>
+<span class="nc" id="L621">                                mb(stats.mapBytesRead) / stats.elapsedIndexSecs(),</span>
+<span class="nc" id="L622">                                100 * stats.elapsedIndexSecs() / stats.elapsedSecs()) +</span>
+<span class="nc" id="L623">                        String.format(&quot;\tBuffer utilization: %.1f%%%n&quot;, 100 * stats.bufferUtilization) +</span>
+<span class="nc" id="L624">                        String.format(&quot;\tCleaned %,.1f MB in %.1f seconds (%,.1f Mb/sec, %.1f%% of total time)%n&quot;, mb(stats.bytesRead),</span>
+<span class="nc" id="L625">                                stats.elapsedSecs() - stats.elapsedIndexSecs(),</span>
+<span class="nc" id="L626">                                mb(stats.bytesRead) / (stats.elapsedSecs() - stats.elapsedIndexSecs()), 100 * (stats.elapsedSecs() - stats.elapsedIndexSecs()) / stats.elapsedSecs()) +</span>
+<span class="nc" id="L627">                        String.format(&quot;\tStart size: %,.1f MB (%,d messages)%n&quot;, mb(stats.bytesRead), stats.messagesRead) +</span>
+<span class="nc" id="L628">                        String.format(&quot;\tEnd size: %,.1f MB (%,d messages)%n&quot;, mb(stats.bytesWritten), stats.messagesWritten) +</span>
+<span class="nc" id="L629">                        String.format(&quot;\t%.1f%% size reduction (%.1f%% fewer messages)%n&quot;, 100.0 * (1.0 - Long.valueOf(stats.bytesWritten).doubleValue() / stats.bytesRead),</span>
+<span class="nc" id="L630">                                100.0 * (1.0 - Long.valueOf(stats.messagesWritten).doubleValue() / stats.messagesRead));</span>
+<span class="nc" id="L631">            logger.info(message);</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">            if (lastPreCleanStats.delayedPartitions() &gt; 0) {</span>
+<span class="nc" id="L633">                logger.info(&quot;\tCleanable partitions: {}, Delayed partitions: {}, max delay: {}&quot;,</span>
+<span class="nc" id="L634">                        lastPreCleanStats.cleanablePartitions(), lastPreCleanStats.delayedPartitions(), lastPreCleanStats.maxCompactionDelayMs());</span>
+            }
+<span class="nc bnc" id="L636" title="All 2 branches missed.">            if (stats.invalidMessagesRead &gt; 0) {</span>
+<span class="nc" id="L637">                logger.warn(&quot;\tFound {} invalid messages during compaction.&quot;, stats.invalidMessagesRead);</span>
+            }
+<span class="nc" id="L639">        }</span>
+
+        private double mb(double bytes) {
+<span class="nc" id="L642">            return bytes / (1024 * 1024);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

@@ -1,0 +1,1694 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SocketServer.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">kafka.network</a> &gt; <span class="el_source">SocketServer.scala</span></div><h1>SocketServer.scala</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.network
+
+import java.io.IOException
+import java.net._
+import java.nio.channels.{Selector =&gt; NSelector, _}
+import java.util
+import java.util.Optional
+import java.util.concurrent._
+import java.util.concurrent.atomic._
+import org.apache.kafka.network.{CloseConnectionResponse, EndThrottlingResponse, NoOpResponse, Response, SendResponse, StartThrottlingResponse}
+import kafka.server.{BrokerReconfigurable, KafkaConfig}
+import org.apache.kafka.common.message.ApiMessageType.ListenerType
+import kafka.utils._
+import org.apache.kafka.common.config.ConfigException
+import org.apache.kafka.common.memory.{MemoryPool, SimpleMemoryPool}
+import org.apache.kafka.common.metrics._
+import org.apache.kafka.common.metrics.stats.{Avg, CumulativeSum, Meter, Rate}
+import org.apache.kafka.common.network.KafkaChannel.ChannelMuteEvent
+import org.apache.kafka.common.network.{ChannelBuilder, ChannelBuilders, ClientInformation, KafkaChannel, ListenerName, ListenerReconfigurable, NetworkSend, Selectable, Send, ServerConnectionId, Selector =&gt; KSelector}
+import org.apache.kafka.common.protocol.ApiKeys
+import org.apache.kafka.common.requests.{ApiVersionsRequest, RequestContext, RequestHeader}
+import org.apache.kafka.common.security.auth.SecurityProtocol
+import org.apache.kafka.common.utils.{Time, Utils}
+import org.apache.kafka.common.utils.internals.LogContext
+import org.apache.kafka.common.{Endpoint, KafkaException, MetricName, Reconfigurable}
+import org.apache.kafka.network.{ConnectionQuotaEntity, ConnectionThrottledException, Processor =&gt; JProcessor, Request, SocketServer =&gt; JSocketServer, SocketServerConfigs, TooManyConnectionsException}
+import org.apache.kafka.security.CredentialProvider
+import org.apache.kafka.server.{ApiVersionManager, ServerSocketFactory}
+import org.apache.kafka.server.config.QuotaConfig
+import org.apache.kafka.common.metrics.internals.MetricsUtils
+import org.apache.kafka.common.utils.internals.KafkaThread
+import org.apache.kafka.server.metrics.KafkaMetricsGroup
+import org.apache.kafka.server.network.ConnectionDisconnectListener
+import org.apache.kafka.server.quota.QuotaUtils
+import org.apache.kafka.server.util.FutureUtils
+import org.slf4j.event.Level
+
+import scala.collection._
+import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
+import scala.util.control.ControlThrowable
+
+/**
+ * Handles new connections, requests and responses to and from broker.
+ * Kafka supports two types of request planes :
+ *  - data-plane :
+ *    - Handles requests from clients and other brokers in the cluster.
+ *    - The threading model is
+ *      1 Acceptor thread per listener, that handles new connections.
+ *      It is possible to configure multiple data-planes by specifying multiple &quot;,&quot; separated endpoints for &quot;listeners&quot; in KafkaConfig.
+ *      Acceptor has N Processor threads that each have their own selector and read requests from sockets
+ *      M Handler threads that handle requests and produce responses back to the processor threads for writing.
+ */
+<span class="nc bnc" id="L71" title="All 4 branches missed.">class SocketServer(</span>
+<span class="nc" id="L72">  val config: KafkaConfig,</span>
+<span class="nc" id="L73">  val metrics: Metrics,</span>
+<span class="nc" id="L74">  val time: Time,</span>
+<span class="nc" id="L75">  val credentialProvider: CredentialProvider,</span>
+<span class="nc" id="L76">  val apiVersionManager: ApiVersionManager,</span>
+<span class="nc" id="L77">  val socketFactory: ServerSocketFactory = ServerSocketFactory.INSTANCE,</span>
+<span class="nc" id="L78">  val connectionDisconnectListeners: Seq[ConnectionDisconnectListener] = Seq.empty</span>
+<span class="nc" id="L79">) extends Logging with BrokerReconfigurable {</span>
+  // Changing the package or class name may cause incompatibility with existing code and metrics configuration
+<span class="nc" id="L81">  private val metricsPackage = &quot;kafka.network&quot;</span>
+<span class="nc" id="L82">  private val metricsClassName = &quot;SocketServer&quot;</span>
+<span class="nc" id="L83">  private val metricsGroup = new KafkaMetricsGroup(metricsPackage, metricsClassName)</span>
+
+<span class="nc" id="L85">  private val maxQueuedRequests = config.queuedMaxRequests</span>
+
+<span class="nc" id="L87">  protected val nodeId: Int = config.brokerId</span>
+
+<span class="nc" id="L89">  private val logContext = new LogContext(s&quot;[SocketServer listenerType=${apiVersionManager.listenerType}, nodeId=$nodeId] &quot;)</span>
+
+<span class="nc" id="L91">  this.logIdent = logContext.logPrefix</span>
+
+<span class="nc bnc" id="L93" title="All 2 branches missed.">  private val memoryPoolSensor = metrics.sensor(&quot;MemoryPoolUtilization&quot;)</span>
+<span class="nc" id="L94">  private val memoryPoolDepletedPercentMetricName = metrics.metricName(&quot;MemoryPoolAvgDepletedPercent&quot;, JSocketServer.METRICS_GROUP)</span>
+<span class="nc" id="L95">  private val memoryPoolDepletedTimeMetricName = metrics.metricName(&quot;MemoryPoolDepletedTimeTotal&quot;, JSocketServer.METRICS_GROUP)</span>
+<span class="nc bnc" id="L96" title="All 2 branches missed.">  memoryPoolSensor.add(new Meter(TimeUnit.MILLISECONDS, memoryPoolDepletedPercentMetricName, memoryPoolDepletedTimeMetricName))</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">  private[network] val memoryPool = if (config.queuedMaxBytes &gt; 0) new SimpleMemoryPool(config.queuedMaxBytes, config.socketRequestMaxBytes, false, memoryPoolSensor) else MemoryPool.NONE</span>
+  // data-plane
+<span class="nc" id="L99">  private[network] val dataPlaneAcceptors = new ConcurrentHashMap[Endpoint, DataPlaneAcceptor]()</span>
+<span class="nc" id="L100">  val dataPlaneRequestChannel = new RequestChannel(maxQueuedRequests, time, apiVersionManager.newRequestMetrics)</span>
+
+<span class="nc" id="L102">  private[this] val nextProcessorId: AtomicInteger = new AtomicInteger(0)</span>
+<span class="nc" id="L103">  val connectionQuotas = new ConnectionQuotas(config, time, metrics)</span>
+
+  /**
+   * A future which is completed once all the authorizer futures are complete.
+   */
+<span class="nc" id="L108">  private val allAuthorizerFuturesComplete = new CompletableFuture[Void]</span>
+
+  /**
+   * True if the SocketServer is stopped. Must be accessed under the SocketServer lock.
+   */
+<span class="nc" id="L113">  private var stopped = false</span>
+
+  // Socket server metrics
+<span class="nc" id="L116">  metricsGroup.newGauge(s&quot;NetworkProcessorAvgIdlePercent&quot;, () =&gt; SocketServer.this.synchronized {</span>
+<span class="nc" id="L117">    val dataPlaneProcessors = dataPlaneAcceptors.asScala.values.flatMap(a =&gt; a.processors)</span>
+<span class="nc" id="L118">    val ioWaitRatioMetricNames = dataPlaneProcessors.map { p =&gt;</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">      metrics.metricName(&quot;io-wait-ratio&quot;, JSocketServer.METRICS_GROUP, p.metricTags)</span>
+    }
+<span class="nc bnc" id="L121" title="All 2 branches missed.">    if (dataPlaneProcessors.isEmpty) {</span>
+<span class="nc" id="L122">      1.0</span>
+    } else {
+<span class="nc" id="L124">      ioWaitRatioMetricNames.map { metricName =&gt;</span>
+<span class="nc" id="L125">        Option(metrics.metric(metricName)).fold(0.0)(m =&gt; Math.min(m.metricValue.asInstanceOf[Double], 1.0))</span>
+<span class="nc" id="L126">      }.sum / dataPlaneProcessors.size</span>
+    }
+  })
+
+<span class="nc" id="L130">  metricsGroup.newGauge(&quot;MemoryPoolAvailable&quot;, () =&gt; memoryPool.availableMemory)</span>
+<span class="nc" id="L131">  metricsGroup.newGauge(&quot;MemoryPoolUsed&quot;, () =&gt; memoryPool.size() - memoryPool.availableMemory)</span>
+<span class="nc" id="L132">  metricsGroup.newGauge(s&quot;ExpiredConnectionsKilledCount&quot;, () =&gt; SocketServer.this.synchronized {</span>
+<span class="nc" id="L133">    val dataPlaneProcessors = dataPlaneAcceptors.asScala.values.flatMap(a =&gt; a.processors)</span>
+<span class="nc" id="L134">    val expiredConnectionsKilledCountMetricNames = dataPlaneProcessors.map { p =&gt;</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">      metrics.metricName(&quot;expired-connections-killed-count&quot;, JSocketServer.METRICS_GROUP, p.metricTags)</span>
+    }
+<span class="nc" id="L137">    expiredConnectionsKilledCountMetricNames.map { metricName =&gt;</span>
+<span class="nc" id="L138">      Option(metrics.metric(metricName)).fold(0.0)(m =&gt; m.metricValue.asInstanceOf[Double])</span>
+<span class="nc" id="L139">    }.sum</span>
+  })
+
+  // Create acceptors and processors for the statically configured endpoints when the
+  // SocketServer is constructed. Note that this just opens the ports and creates the data
+  // structures. It does not start the acceptors and processors or their associated JVM
+  // threads.
+<span class="nc bnc" id="L146" title="All 2 branches missed.">  if (apiVersionManager.listenerType.equals(ListenerType.CONTROLLER)) {</span>
+<span class="nc" id="L147">    config.controllerListeners.foreach(createDataPlaneAcceptorAndProcessors)</span>
+  } else {
+<span class="nc" id="L149">    config.dataPlaneListeners.foreach(createDataPlaneAcceptorAndProcessors)</span>
+  }
+
+  // Processors are now created by each Acceptor. However to preserve compatibility, we need to number the processors
+  // globally, so we keep the nextProcessorId counter in SocketServer
+  def nextProcessorId(): Int = {
+<span class="nc" id="L155">    nextProcessorId.getAndIncrement()</span>
+  }
+
+  /**
+   * This method enables request processing for all endpoints managed by this SocketServer. Each
+   * endpoint will be brought up asynchronously as soon as its associated future is completed.
+   * Therefore, we do not know that any particular request processor will be running by the end of
+   * this function -- just that it might be running.
+   *
+   * @param authorizerFutures     Future per [[Endpoint]] used to wait before starting the
+   *                              processor corresponding to the [[Endpoint]]. Any endpoint
+   *                              that does not appear in this map will be started once all
+   *                              authorizerFutures are complete.
+   *
+   * @return                      A future which is completed when all of the acceptor threads have
+   *                              successfully started. If any of them do not start, the future will
+   *                              be completed with an exception.
+   */
+  def enableRequestProcessing(
+    authorizerFutures: Map[Endpoint, CompletableFuture[Void]]
+  ): CompletableFuture[Void] = this.synchronized {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">    if (stopped) {</span>
+<span class="nc" id="L177">      throw new RuntimeException(&quot;Can't enable request processing: SocketServer is stopped.&quot;)</span>
+    }
+
+    def chainAcceptorFuture(acceptor: Acceptor): Unit = {
+      // Because of ephemeral ports, we need to match acceptors to futures by looking at
+      // the listener name, rather than the endpoint object.
+<span class="nc" id="L183">      val authorizerFuture = authorizerFutures.find {</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        case (endpoint, _) =&gt; acceptor.endPoint.listener.equals(endpoint.listener())</span>
+      } match {
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        case None =&gt; allAuthorizerFuturesComplete</span>
+<span class="nc bnc" id="L187" title="All 4 branches missed.">        case Some((_, future)) =&gt; future</span>
+      }
+<span class="nc" id="L189">      authorizerFuture.whenComplete((_, e) =&gt; {</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (e != null) {</span>
+          // If the authorizer failed to start, fail the acceptor's startedFuture.
+<span class="nc" id="L192">          acceptor.startedFuture.completeExceptionally(e)</span>
+        } else {
+          // Once the authorizer has started, attempt to start the associated acceptor. The Acceptor.start()
+          // function will complete the acceptor started future (either successfully or not)
+<span class="nc" id="L196">          acceptor.start()</span>
+        }
+      })
+    }
+
+<span class="nc" id="L201">    info(&quot;Enabling request processing.&quot;)</span>
+<span class="nc" id="L202">    dataPlaneAcceptors.values().forEach(chainAcceptorFuture)</span>
+<span class="nc" id="L203">    FutureUtils.chainFuture(CompletableFuture.allOf(authorizerFutures.values.toArray: _*),</span>
+<span class="nc" id="L204">        allAuthorizerFuturesComplete)</span>
+
+    // Construct a future that will be completed when all Acceptors have been successfully started.
+    // Alternately, if any of them fail to start, this future will be completed exceptionally.
+<span class="nc" id="L208">    val enableFuture = new CompletableFuture[Void]</span>
+<span class="nc" id="L209">    FutureUtils.chainFuture(CompletableFuture.allOf(dataPlaneAcceptors.values().asScala.toArray.map(_.startedFuture): _*), enableFuture)</span>
+<span class="nc" id="L210">    enableFuture</span>
+  }
+
+  private def createDataPlaneAcceptorAndProcessors(endpoint: Endpoint): Unit = synchronized {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">    if (stopped) {</span>
+<span class="nc" id="L215">      throw new RuntimeException(&quot;Can't create new data plane acceptor and processors: SocketServer is stopped.&quot;)</span>
+    }
+<span class="nc" id="L217">    val listenerName =  ListenerName.normalised(endpoint.listener)</span>
+<span class="nc" id="L218">    val parsedConfigs = config.valuesFromThisConfigWithPrefixOverride(listenerName.configPrefix)</span>
+<span class="nc" id="L219">    connectionQuotas.addListener(config, listenerName)</span>
+<span class="nc bnc" id="L220" title="All 4 branches missed.">    val isPrivilegedListener = config.interBrokerListenerName == listenerName</span>
+<span class="nc" id="L221">    val dataPlaneAcceptor = createDataPlaneAcceptor(endpoint, isPrivilegedListener, dataPlaneRequestChannel)</span>
+<span class="nc" id="L222">    config.addReconfigurable(dataPlaneAcceptor)</span>
+<span class="nc" id="L223">    dataPlaneAcceptor.configure(parsedConfigs)</span>
+<span class="nc" id="L224">    dataPlaneAcceptors.put(endpoint, dataPlaneAcceptor)</span>
+<span class="nc" id="L225">    info(s&quot;Created data-plane acceptor and processors for endpoint : ${listenerName}&quot;)</span>
+  }
+
+<span class="nc" id="L228">  private def endpoints = config.listeners.map(l =&gt; ListenerName.normalised(l.listener) -&gt; l).toMap</span>
+
+  protected def createDataPlaneAcceptor(endPoint: Endpoint, isPrivilegedListener: Boolean, requestChannel: RequestChannel): DataPlaneAcceptor = {
+<span class="nc" id="L231">    new DataPlaneAcceptor(this, endPoint, config, nodeId, connectionQuotas, time, isPrivilegedListener, requestChannel, metrics, credentialProvider, logContext, memoryPool, apiVersionManager)</span>
+  }
+
+  /**
+   * Stop processing requests and new connections.
+   */
+  def stopProcessingRequests(): Unit = synchronized {
+<span class="nc bnc" id="L238" title="All 2 branches missed.">    if (!stopped) {</span>
+<span class="nc" id="L239">      stopped = true</span>
+<span class="nc" id="L240">      info(&quot;Stopping socket server request processors&quot;)</span>
+<span class="nc" id="L241">      dataPlaneAcceptors.asScala.values.foreach(_.beginShutdown())</span>
+<span class="nc" id="L242">      dataPlaneAcceptors.asScala.values.foreach(_.close())</span>
+<span class="nc" id="L243">      dataPlaneRequestChannel.clear()</span>
+<span class="nc" id="L244">      info(&quot;Stopped socket server request processors&quot;)</span>
+    }
+  }
+
+  /**
+   * Shutdown the socket server. If still processing requests, shutdown
+   * acceptors and processors first.
+   */
+  def shutdown(): Unit = {
+<span class="nc" id="L253">    info(&quot;Shutting down socket server&quot;)</span>
+<span class="nc" id="L254">    allAuthorizerFuturesComplete.completeExceptionally(new TimeoutException(&quot;The socket &quot; +</span>
+      &quot;server was shut down before the Authorizer could be completely initialized.&quot;))
+<span class="nc" id="L256">    this.synchronized {</span>
+<span class="nc" id="L257">      stopProcessingRequests()</span>
+<span class="nc" id="L258">      dataPlaneRequestChannel.shutdown()</span>
+<span class="nc" id="L259">      connectionQuotas.close()</span>
+    }
+<span class="nc" id="L261">    info(&quot;Shutdown completed&quot;)</span>
+  }
+
+  def boundPort(listenerName: ListenerName): Int = {
+    try {
+<span class="nc" id="L266">      val acceptor = dataPlaneAcceptors.get(endpoints(listenerName))</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">      if (acceptor != null) {</span>
+<span class="nc" id="L268">        acceptor.localPort</span>
+      } else {
+<span class="nc" id="L270">        throw new KafkaException(&quot;Could not find listenerName : &quot; + listenerName + &quot; in data-plane.&quot;)</span>
+      }
+    } catch {
+      case e: Exception =&gt;
+<span class="nc" id="L274">        throw new KafkaException(&quot;Tried to check for port of non-existing protocol&quot;, e)</span>
+    }
+  }
+
+  /**
+   * This method is called to dynamically add listeners.
+   */
+  def addListeners(listenersAdded: Seq[Endpoint]): Unit = synchronized {
+<span class="nc bnc" id="L282" title="All 2 branches missed.">    if (stopped) {</span>
+<span class="nc" id="L283">      throw new RuntimeException(&quot;can't add new listeners: SocketServer is stopped.&quot;)</span>
+    }
+<span class="nc" id="L285">    info(s&quot;Adding data-plane listeners for endpoints $listenersAdded&quot;)</span>
+<span class="nc" id="L286">    listenersAdded.foreach { endpoint =&gt;</span>
+<span class="nc" id="L287">      createDataPlaneAcceptorAndProcessors(endpoint)</span>
+<span class="nc" id="L288">      val acceptor = dataPlaneAcceptors.get(endpoint)</span>
+      // There is no authorizer future for this new listener endpoint. So start the
+      // listener once all authorizer futures are complete.
+<span class="nc" id="L291">      allAuthorizerFuturesComplete.whenComplete((_, e) =&gt; {</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        if (e != null) {</span>
+<span class="nc" id="L293">          acceptor.startedFuture.completeExceptionally(e)</span>
+        } else {
+<span class="nc" id="L295">          acceptor.start()</span>
+        }
+      })
+    }
+  }
+
+  def removeListeners(listenersRemoved: Seq[Endpoint]): Unit = synchronized {
+<span class="nc" id="L302">    info(s&quot;Removing data-plane listeners for endpoints $listenersRemoved&quot;)</span>
+<span class="nc" id="L303">    listenersRemoved.foreach { endpoint =&gt;</span>
+<span class="nc" id="L304">      connectionQuotas.removeListener(config, ListenerName.normalised(endpoint.listener))</span>
+<span class="nc" id="L305">      dataPlaneAcceptors.asScala.remove(endpoint).foreach { acceptor =&gt;</span>
+<span class="nc" id="L306">        acceptor.beginShutdown()</span>
+<span class="nc" id="L307">        acceptor.close()</span>
+<span class="nc" id="L308">        config.removeReconfigurable(acceptor)</span>
+      }
+    }
+  }
+
+<span class="nc" id="L313">  override def reconfigurableConfigs: util.Set[String] = JSocketServer.RECONFIGURABLE_CONFIGS</span>
+
+  override def validateReconfiguration(newConfig: KafkaConfig): Unit = {
+
+  }
+
+  override def reconfigure(oldConfig: KafkaConfig, newConfig: KafkaConfig): Unit = {
+<span class="nc" id="L320">    val maxConnectionsPerIp = newConfig.maxConnectionsPerIp</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">    if (maxConnectionsPerIp != oldConfig.maxConnectionsPerIp) {</span>
+<span class="nc" id="L322">      info(s&quot;Updating maxConnectionsPerIp: $maxConnectionsPerIp&quot;)</span>
+<span class="nc" id="L323">      connectionQuotas.updateMaxConnectionsPerIp(maxConnectionsPerIp)</span>
+    }
+<span class="nc" id="L325">    val maxConnectionsPerIpOverrides = newConfig.maxConnectionsPerIpOverrides</span>
+<span class="nc bnc" id="L326" title="All 6 branches missed.">    if (maxConnectionsPerIpOverrides != oldConfig.maxConnectionsPerIpOverrides) {</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">      info(s&quot;Updating maxConnectionsPerIpOverrides: ${maxConnectionsPerIpOverrides.asScala.map { case (k, v) =&gt; s&quot;$k=$v&quot; }.mkString(&quot;,&quot;)}&quot;)</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">      connectionQuotas.updateMaxConnectionsPerIpOverride(maxConnectionsPerIpOverrides.asScala.map  { case (k, v) =&gt; (k, v.intValue()) }.toMap)</span>
+    }
+<span class="nc" id="L330">    val maxConnections = newConfig.maxConnections</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">    if (maxConnections != oldConfig.maxConnections) {</span>
+<span class="nc" id="L332">      info(s&quot;Updating broker-wide maxConnections: $maxConnections&quot;)</span>
+<span class="nc" id="L333">      connectionQuotas.updateBrokerMaxConnections(maxConnections)</span>
+    }
+<span class="nc" id="L335">    val maxConnectionRate = newConfig.maxConnectionCreationRate</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">    if (maxConnectionRate != oldConfig.maxConnectionCreationRate) {</span>
+<span class="nc" id="L337">      info(s&quot;Updating broker-wide maxConnectionCreationRate: $maxConnectionRate&quot;)</span>
+<span class="nc" id="L338">      connectionQuotas.updateBrokerMaxConnectionRate(maxConnectionRate)</span>
+    }
+  }
+
+  // For test usage
+  private[network] def connectionCount(address: InetAddress): Int =
+<span class="nc" id="L344">    Option(connectionQuotas).fold(0)(_.get(address))</span>
+
+  // For test usage
+<span class="nc bnc" id="L347" title="All 2 branches missed.">  def dataPlaneAcceptor(listenerName: String): Option[DataPlaneAcceptor] = {</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">    dataPlaneAcceptors.asScala.foreach { case (endPoint, acceptor) =&gt;</span>
+<span class="nc bnc" id="L349" title="All 6 branches missed.">      if (endPoint.listener == listenerName)</span>
+<span class="nc" id="L350">        return Some(acceptor)</span>
+    }
+<span class="nc" id="L352">    None</span>
+  }
+}
+
+<span class="nc" id="L356">object DataPlaneAcceptor {</span>
+<span class="nc" id="L357">  val ListenerReconfigurableConfigs: Set[String] = Set(SocketServerConfigs.NUM_NETWORK_THREADS_CONFIG)</span>
+}
+
+<span class="nc" id="L360">class DataPlaneAcceptor(socketServer: SocketServer,</span>
+                        endPoint: Endpoint,
+                        config: KafkaConfig,
+                        nodeId: Int,
+                        connectionQuotas: ConnectionQuotas,
+                        time: Time,
+                        isPrivilegedListener: Boolean,
+                        requestChannel: RequestChannel,
+                        metrics: Metrics,
+                        credentialProvider: CredentialProvider,
+                        logContext: LogContext,
+                        memoryPool: MemoryPool,
+                        apiVersionManager: ApiVersionManager)
+<span class="nc" id="L373">  extends Acceptor(socketServer,</span>
+<span class="nc" id="L374">                   endPoint,</span>
+<span class="nc" id="L375">                   config,</span>
+<span class="nc" id="L376">                   nodeId,</span>
+<span class="nc" id="L377">                   connectionQuotas,</span>
+<span class="nc" id="L378">                   time,</span>
+<span class="nc" id="L379">                   isPrivilegedListener,</span>
+<span class="nc" id="L380">                   requestChannel,</span>
+<span class="nc" id="L381">                   metrics,</span>
+<span class="nc" id="L382">                   credentialProvider,</span>
+<span class="nc" id="L383">                   logContext,</span>
+<span class="nc" id="L384">                   memoryPool,</span>
+<span class="nc" id="L385">                   apiVersionManager) with ListenerReconfigurable {</span>
+
+  /**
+   * Returns the listener name associated with this reconfigurable. Listener-specific
+   * configs corresponding to this listener name are provided for reconfiguration.
+   */
+<span class="nc" id="L391">  override def listenerName(): ListenerName = ListenerName.normalised(endPoint.listener)</span>
+
+  /**
+   * Returns the names of configs that may be reconfigured.
+   */
+<span class="nc" id="L396">  override def reconfigurableConfigs(): util.Set[String] = DataPlaneAcceptor.ListenerReconfigurableConfigs.asJava</span>
+
+
+  /**
+   * Validates the provided configuration. The provided map contains
+   * all configs including any reconfigurable configs that may be different
+   * from the initial configuration. Reconfiguration will be not performed
+   * if this method throws any exception.
+   *
+   * @throws ConfigException if the provided configs are not valid. The exception
+   *                         message from ConfigException will be returned to the client in
+   *                         the AlterConfigs response.
+   */
+  override def validateReconfiguration(configs: util.Map[String, _]): Unit = {
+<span class="nc" id="L410">    configs.forEach { (k, v) =&gt;</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">      if (reconfigurableConfigs().contains(k)) {</span>
+<span class="nc" id="L412">        val newValue = v.asInstanceOf[Int]</span>
+<span class="nc" id="L413">        val oldValue = processors.length</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">        if (newValue != oldValue) {</span>
+<span class="nc" id="L415">          val errorMsg = s&quot;Dynamic thread count update validation failed for $k=$v&quot;</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">          if (newValue &lt;= 0)</span>
+<span class="nc" id="L417">            throw new ConfigException(s&quot;$errorMsg, value should be at least 1&quot;)</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">          if (newValue &lt; oldValue / 2)</span>
+<span class="nc" id="L419">            throw new ConfigException(s&quot;$errorMsg, value should be at least half the current value $oldValue&quot;)</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">          if (newValue &gt; oldValue * 2)</span>
+<span class="nc" id="L421">            throw new ConfigException(s&quot;$errorMsg, value should not be greater than double the current value $oldValue&quot;)</span>
+        }
+      }
+    }
+  }
+
+  /**
+   * Reconfigures this instance with the given key-value pairs. The provided
+   * map contains all configs including any reconfigurable configs that
+   * may have changed since the object was initially configured using
+   * [[org.apache.kafka.common.Configurable#configure( Map )]]. This method will only be invoked if
+   * the configs have passed validation using [[validateReconfiguration( Map )]].
+   */
+  override def reconfigure(configs: util.Map[String, _]): Unit = {
+<span class="nc" id="L435">    val newNumNetworkThreads = configs.get(SocketServerConfigs.NUM_NETWORK_THREADS_CONFIG).asInstanceOf[Int]</span>
+
+<span class="nc bnc" id="L437" title="All 2 branches missed.">    if (newNumNetworkThreads != processors.length) {</span>
+<span class="nc" id="L438">      info(s&quot;Resizing network thread pool size for ${endPoint.listener} listener from ${processors.length} to $newNumNetworkThreads&quot;)</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">      if (newNumNetworkThreads &gt; processors.length) {</span>
+<span class="nc" id="L440">        addProcessors(newNumNetworkThreads - processors.length)</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">      } else if (newNumNetworkThreads &lt; processors.length) {</span>
+<span class="nc" id="L442">        removeProcessors(processors.length - newNumNetworkThreads)</span>
+      }
+    }
+  }
+
+  /**
+   * Configure this class with the given key-value pairs
+   */
+  override def configure(configs: util.Map[String, _]): Unit = {
+<span class="nc" id="L451">    addProcessors(configs.get(SocketServerConfigs.NUM_NETWORK_THREADS_CONFIG).asInstanceOf[Int])</span>
+  }
+}
+
+/**
+ * Thread that accepts and configures new connections. There is one of these per endpoint.
+ */
+<span class="nc bnc" id="L458" title="All 4 branches missed.">private[kafka] abstract class Acceptor(val socketServer: SocketServer,</span>
+<span class="nc" id="L459">                                       val endPoint: Endpoint,</span>
+<span class="nc" id="L460">                                       var config: KafkaConfig,</span>
+<span class="nc" id="L461">                                       nodeId: Int,</span>
+<span class="nc" id="L462">                                       val connectionQuotas: ConnectionQuotas,</span>
+<span class="nc" id="L463">                                       time: Time,</span>
+<span class="nc" id="L464">                                       isPrivilegedListener: Boolean,</span>
+<span class="nc" id="L465">                                       requestChannel: RequestChannel,</span>
+<span class="nc" id="L466">                                       metrics: Metrics,</span>
+<span class="nc" id="L467">                                       credentialProvider: CredentialProvider,</span>
+<span class="nc" id="L468">                                       logContext: LogContext,</span>
+<span class="nc" id="L469">                                       memoryPool: MemoryPool,</span>
+<span class="nc" id="L470">                                       apiVersionManager: ApiVersionManager)</span>
+<span class="nc" id="L471">  extends Runnable with Logging {</span>
+<span class="nc" id="L472">  val shouldRun = new AtomicBoolean(true)</span>
+
+<span class="nc" id="L474">  private val sendBufferSize = config.socketSendBufferBytes</span>
+<span class="nc" id="L475">  private val recvBufferSize = config.socketReceiveBufferBytes</span>
+<span class="nc" id="L476">  private val listenBacklogSize = config.socketListenBacklogSize</span>
+
+<span class="nc" id="L478">  private val nioSelector = NSelector.open()</span>
+
+  // If the port is configured as 0, we are using a wildcard port, so we need to open the socket
+  // before we can find out what port we have. If it is set to a nonzero value, defer opening
+  // the socket until we start the Acceptor. The reason for deferring the socket opening is so
+  // that systems which assume that the socket being open indicates readiness are not confused.
+<span class="nc" id="L484">  private[network] var serverChannel: ServerSocketChannel  = _</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">  private[network] val localPort: Int  = if (endPoint.port != 0) {</span>
+<span class="nc" id="L486">    endPoint.port</span>
+  } else {
+<span class="nc" id="L488">    serverChannel = openServerSocket(endPoint.host, endPoint.port, listenBacklogSize)</span>
+<span class="nc" id="L489">    val newPort = serverChannel.socket().getLocalPort</span>
+<span class="nc" id="L490">    info(s&quot;Opened wildcard endpoint ${endPoint.host}:$newPort&quot;)</span>
+<span class="nc" id="L491">    newPort</span>
+  }
+
+<span class="nc" id="L494">  private[network] val processors = new ArrayBuffer[Processor]()</span>
+  // Build the metric name explicitly in order to keep the existing name for compatibility
+<span class="nc" id="L496">  private val backwardCompatibilityMetricGroup = new KafkaMetricsGroup(&quot;kafka.network&quot;, &quot;Acceptor&quot;)</span>
+<span class="nc" id="L497">  private val blockedPercentMeterMetricName = backwardCompatibilityMetricGroup.metricName(</span>
+<span class="nc" id="L498">    &quot;AcceptorBlockedPercent&quot;,</span>
+<span class="nc" id="L499">    MetricsUtils.getTags(JProcessor.LISTENER_METRIC_TAG, endPoint.listener))</span>
+<span class="nc" id="L500">  private val blockedPercentMeter = backwardCompatibilityMetricGroup.newMeter(blockedPercentMeterMetricName,&quot;blocked time&quot;, TimeUnit.NANOSECONDS)</span>
+<span class="nc" id="L501">  private var currentProcessorIndex = 0</span>
+<span class="nc" id="L502">  private[network] val throttledSockets = new mutable.PriorityQueue[DelayedCloseSocket]()</span>
+<span class="nc" id="L503">  private val started = new AtomicBoolean()</span>
+<span class="nc" id="L504">  private[network] val startedFuture = new CompletableFuture[Void]()</span>
+
+<span class="nc" id="L506">  val thread: KafkaThread = KafkaThread.nonDaemon(</span>
+<span class="nc" id="L507">    s&quot;data-plane-kafka-socket-acceptor-${endPoint.listener}-${endPoint.securityProtocol}-${endPoint.port}&quot;,</span>
+<span class="nc" id="L508">    this)</span>
+
+<span class="nc" id="L510">  def start(): Unit = synchronized {</span>
+<span class="nc" id="L511">    try {</span>
+      if (!shouldRun.get()) {
+        throw new ClosedChannelException()
+      }
+      if (serverChannel == null) {
+        serverChannel = openServerSocket(endPoint.host, endPoint.port, listenBacklogSize)
+<span class="nc" id="L517">        debug(s&quot;Opened endpoint ${endPoint.host}:${endPoint.port}&quot;)</span>
+      }
+<span class="nc" id="L519">      debug(s&quot;Starting processors for listener ${endPoint.listener}&quot;)</span>
+<span class="nc" id="L520">      processors.foreach(_.start())</span>
+<span class="nc" id="L521">      debug(s&quot;Starting acceptor thread for listener ${endPoint.listener}&quot;)</span>
+      thread.start()
+      startedFuture.complete(null)
+      started.set(true)
+    } catch {
+      case e: ClosedChannelException =&gt;
+<span class="nc" id="L527">        debug(s&quot;Refusing to start acceptor for ${endPoint.listener} since the acceptor has already been shut down.&quot;)</span>
+        startedFuture.completeExceptionally(e)
+      case t: Throwable =&gt;
+<span class="nc" id="L530">        error(s&quot;Unable to start acceptor for ${endPoint.listener}&quot;, t)</span>
+        startedFuture.completeExceptionally(new RuntimeException(s&quot;Unable to start acceptor for ${endPoint.listener}&quot;, t))
+    }
+  }
+
+<span class="nc bnc" id="L535" title="All 34 branches missed.">  private[network] case class DelayedCloseSocket(socket: SocketChannel, endThrottleTimeMs: Long) extends Ordered[DelayedCloseSocket] {</span>
+<span class="nc" id="L536">    override def compare(that: DelayedCloseSocket): Int = endThrottleTimeMs compare that.endThrottleTimeMs</span>
+  }
+
+  private[network] def removeProcessors(removeCount: Int): Unit = synchronized {
+    // Shutdown `removeCount` processors. Remove them from the processor list first so that no more
+    // connections are assigned. Shutdown the removed processors, closing the selector and its connections.
+    // The processors are then removed from `requestChannel` and any pending responses to these processors are dropped.
+<span class="nc" id="L543">    val toRemove = processors.takeRight(removeCount)</span>
+<span class="nc" id="L544">    processors.remove(processors.size - removeCount, removeCount)</span>
+<span class="nc" id="L545">    toRemove.foreach(_.close())</span>
+<span class="nc" id="L546">    toRemove.foreach(processor =&gt; requestChannel.removeProcessor(processor.id))</span>
+  }
+
+  def beginShutdown(): Unit = {
+<span class="nc bnc" id="L550" title="All 2 branches missed.">    if (shouldRun.getAndSet(false)) {</span>
+<span class="nc" id="L551">      wakeup()</span>
+<span class="nc" id="L552">      synchronized {</span>
+<span class="nc" id="L553">        processors.foreach(_.beginShutdown())</span>
+      }
+    }
+  }
+
+  def close(): Unit = {
+<span class="nc" id="L559">    beginShutdown()</span>
+<span class="nc" id="L560">    thread.join()</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">    if (!started.get) {</span>
+<span class="nc" id="L562">      closeAll()</span>
+    }
+<span class="nc" id="L564">    synchronized {</span>
+<span class="nc" id="L565">      processors.foreach(_.close())</span>
+    }
+  }
+
+  /**
+   * Accept loop that checks for new connection attempts
+   */
+  override def run(): Unit = {
+<span class="nc" id="L573">    serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)</span>
+    try {
+<span class="nc bnc" id="L575" title="All 2 branches missed.">      while (shouldRun.get()) {</span>
+        try {
+<span class="nc" id="L577">          acceptNewConnections()</span>
+<span class="nc" id="L578">          closeThrottledConnections()</span>
+        }
+        catch {
+          // We catch all the throwables to prevent the acceptor thread from exiting on exceptions due
+          // to a select operation on a specific channel or a bad request. We don't want
+          // the broker to stop responding to requests from other clients in these scenarios.
+<span class="nc" id="L584">          case e: ControlThrowable =&gt; throw e</span>
+<span class="nc" id="L585">          case e: Throwable =&gt; error(&quot;Error occurred&quot;, e)</span>
+        }
+      }
+    } finally {
+<span class="nc" id="L589">      closeAll()</span>
+    }
+  }
+
+  private def closeAll(): Unit = {
+<span class="nc" id="L594">    debug(&quot;Closing server socket, selector, and any throttled sockets.&quot;)</span>
+    // The serverChannel will be null if Acceptor's thread is not started
+<span class="nc" id="L596">    Utils.closeQuietly(serverChannel, &quot;Acceptor serverChannel&quot;)</span>
+<span class="nc" id="L597">    Utils.closeQuietly(nioSelector, &quot;Acceptor nioSelector&quot;)</span>
+<span class="nc" id="L598">    throttledSockets.foreach(throttledSocket =&gt; JSocketServer.closeSocket(throttledSocket.socket))</span>
+<span class="nc" id="L599">    throttledSockets.clear()</span>
+  }
+
+  /**
+   * Create a server socket to listen for connections on.
+   */
+  private def openServerSocket(host: String, port: Int, listenBacklogSize: Int): ServerSocketChannel = {
+<span class="nc bnc" id="L606" title="All 2 branches missed.">    val socketAddress = if (Utils.isBlank(host)) {</span>
+<span class="nc" id="L607">      new InetSocketAddress(port)</span>
+    } else {
+<span class="nc" id="L609">      new InetSocketAddress(host, port)</span>
+    }
+<span class="nc" id="L611">    val serverChannel = socketServer.socketFactory.openServerSocket(</span>
+<span class="nc" id="L612">      endPoint.listener,</span>
+<span class="nc" id="L613">      socketAddress,</span>
+<span class="nc" id="L614">      listenBacklogSize,</span>
+<span class="nc" id="L615">      recvBufferSize)</span>
+<span class="nc" id="L616">    info(s&quot;Awaiting socket connections on ${socketAddress.getHostString}:${serverChannel.socket.getLocalPort}.&quot;)</span>
+<span class="nc" id="L617">    serverChannel</span>
+  }
+
+  /**
+   * Listen for new connections and assign accepted connections to processors using round-robin.
+   */
+  private def acceptNewConnections(): Unit = {
+<span class="nc" id="L624">    val ready = nioSelector.select(500)</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">    if (ready &gt; 0) {</span>
+<span class="nc" id="L626">      val keys = nioSelector.selectedKeys()</span>
+<span class="nc" id="L627">      val iter = keys.iterator()</span>
+<span class="nc bnc" id="L628" title="All 4 branches missed.">      while (iter.hasNext &amp;&amp; shouldRun.get()) {</span>
+        try {
+<span class="nc" id="L630">          val key = iter.next</span>
+<span class="nc" id="L631">          iter.remove()</span>
+
+<span class="nc bnc" id="L633" title="All 2 branches missed.">          if (key.isAcceptable) {</span>
+<span class="nc" id="L634">            accept(key).foreach { socketChannel =&gt;</span>
+              // Assign the channel to the next processor (using round-robin) to which the
+              // channel can be added without blocking. If newConnections queue is full on
+              // all processors, block until the last one is able to accept a connection.
+<span class="nc" id="L638">              var retriesLeft = synchronized(processors.length)</span>
+              var processor: Processor = null
+<span class="nc" id="L640">              do {</span>
+<span class="nc" id="L641">                retriesLeft -= 1</span>
+<span class="nc" id="L642">                processor = synchronized {</span>
+                  // adjust the index (if necessary) and retrieve the processor atomically for
+                  // correct behaviour in case the number of processors is reduced dynamically
+<span class="nc" id="L645">                  currentProcessorIndex = currentProcessorIndex % processors.length</span>
+<span class="nc" id="L646">                  processors(currentProcessorIndex)</span>
+                }
+<span class="nc" id="L648">                currentProcessorIndex += 1</span>
+<span class="nc bnc" id="L649" title="All 4 branches missed.">              } while (!assignNewConnection(socketChannel, processor, retriesLeft == 0))</span>
+            }
+          } else
+<span class="nc" id="L652">            throw new IllegalStateException(&quot;Unrecognized key state for acceptor thread.&quot;)</span>
+        } catch {
+<span class="nc" id="L654">          case e: Throwable =&gt; error(&quot;Error while accepting connection&quot;, e)</span>
+        }
+      }
+    }
+  }
+
+  /**
+   * Accept a new connection
+   */
+  private def accept(key: SelectionKey): Option[SocketChannel] = {
+<span class="nc" id="L664">    val serverSocketChannel = key.channel().asInstanceOf[ServerSocketChannel]</span>
+<span class="nc" id="L665">    val socketChannel = serverSocketChannel.accept()</span>
+<span class="nc" id="L666">    val listenerName = ListenerName.normalised(endPoint.listener)</span>
+    try {
+<span class="nc" id="L668">      connectionQuotas.inc(listenerName, socketChannel.socket.getInetAddress, blockedPercentMeter)</span>
+<span class="nc" id="L669">      configureAcceptedSocketChannel(socketChannel)</span>
+<span class="nc" id="L670">      Some(socketChannel)</span>
+    } catch {
+      case e: TooManyConnectionsException =&gt;
+<span class="nc" id="L673">        info(s&quot;Rejected connection from ${e.ip}, address already has the configured maximum of ${e.count} connections.&quot;)</span>
+<span class="nc" id="L674">        connectionQuotas.closeChannel(this, listenerName, socketChannel)</span>
+<span class="nc" id="L675">        None</span>
+      case e: ConnectionThrottledException =&gt;
+<span class="nc" id="L677">        val ip = socketChannel.socket.getInetAddress</span>
+<span class="nc" id="L678">        debug(s&quot;Delaying closing of connection from $ip for ${e.throttleTimeMs} ms&quot;)</span>
+<span class="nc" id="L679">        val endThrottleTimeMs = e.startThrottleTimeMs + e.throttleTimeMs</span>
+<span class="nc" id="L680">        throttledSockets += DelayedCloseSocket(socketChannel, endThrottleTimeMs)</span>
+<span class="nc" id="L681">        None</span>
+      case e: IOException =&gt;
+<span class="nc" id="L683">        error(s&quot;Encountered an error while configuring the connection, closing it.&quot;, e)</span>
+<span class="nc" id="L684">        connectionQuotas.closeChannel(this, listenerName, socketChannel)</span>
+<span class="nc" id="L685">        None</span>
+    }
+  }
+
+  protected def configureAcceptedSocketChannel(socketChannel: SocketChannel): Unit = {
+<span class="nc" id="L690">    socketChannel.configureBlocking(false)</span>
+<span class="nc" id="L691">    socketChannel.socket().setTcpNoDelay(true)</span>
+<span class="nc" id="L692">    socketChannel.socket().setKeepAlive(true)</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">    if (sendBufferSize != Selectable.USE_DEFAULT_BUFFER_SIZE)</span>
+<span class="nc" id="L694">      socketChannel.socket().setSendBufferSize(sendBufferSize)</span>
+  }
+
+  /**
+   * Close sockets for any connections that have been throttled.
+   */
+  private def closeThrottledConnections(): Unit = {
+<span class="nc" id="L701">    val timeMs = time.milliseconds</span>
+<span class="nc bnc" id="L702" title="All 4 branches missed.">    while (throttledSockets.headOption.exists(_.endThrottleTimeMs &lt; timeMs)) {</span>
+<span class="nc" id="L703">      val closingSocket = throttledSockets.dequeue()</span>
+<span class="nc" id="L704">      debug(s&quot;Closing socket from ip ${closingSocket.socket.getRemoteAddress}&quot;)</span>
+<span class="nc" id="L705">      JSocketServer.closeSocket(closingSocket.socket)</span>
+    }
+  }
+
+  private def assignNewConnection(socketChannel: SocketChannel, processor: Processor, mayBlock: Boolean): Boolean = {
+<span class="nc bnc" id="L710" title="All 2 branches missed.">    if (processor.accept(socketChannel, mayBlock, blockedPercentMeter)) {</span>
+<span class="nc" id="L711">      debug(s&quot;Accepted connection from ${socketChannel.socket.getRemoteSocketAddress} on&quot; +</span>
+<span class="nc" id="L712">        s&quot; ${socketChannel.socket.getLocalSocketAddress} and assigned it to processor ${processor.id},&quot; +</span>
+<span class="nc" id="L713">        s&quot; sendBufferSize [actual|requested]: [${socketChannel.socket.getSendBufferSize}|$sendBufferSize]&quot; +</span>
+<span class="nc" id="L714">        s&quot; recvBufferSize [actual|requested]: [${socketChannel.socket.getReceiveBufferSize}|$recvBufferSize]&quot;)</span>
+<span class="nc" id="L715">      true</span>
+    } else
+<span class="nc" id="L717">      false</span>
+  }
+
+  /**
+   * Wakeup the thread for selection.
+   */
+<span class="nc" id="L723">  def wakeup(): Unit = nioSelector.wakeup()</span>
+
+<span class="nc" id="L725">  def addProcessors(toCreate: Int): Unit = synchronized {</span>
+<span class="nc" id="L726">    val listenerName = ListenerName.normalised(endPoint.listener)</span>
+<span class="nc" id="L727">    val securityProtocol = endPoint.securityProtocol</span>
+<span class="nc" id="L728">    val listenerProcessors = new ArrayBuffer[Processor]()</span>
+
+<span class="nc" id="L730">    for (_ &lt;- 0 until toCreate) {</span>
+<span class="nc" id="L731">      val processor = newProcessor(socketServer.nextProcessorId(), listenerName, securityProtocol, socketServer.connectionDisconnectListeners)</span>
+<span class="nc" id="L732">      listenerProcessors += processor</span>
+<span class="nc" id="L733">      requestChannel.addProcessor(processor)</span>
+
+<span class="nc bnc" id="L735" title="All 2 branches missed.">      if (started.get) {</span>
+<span class="nc" id="L736">        processor.start()</span>
+      }
+    }
+<span class="nc" id="L739">    processors ++= listenerProcessors</span>
+  }
+
+  def newProcessor(id: Int,
+                   listenerName: ListenerName,
+                   securityProtocol: SecurityProtocol,
+                   connectionDisconnectListeners: Seq[ConnectionDisconnectListener]): Processor = {
+<span class="nc" id="L746">    val name = s&quot;data-plane-kafka-network-thread-$nodeId-${endPoint.listener}-${endPoint.securityProtocol}-$id&quot;</span>
+<span class="nc" id="L747">    new Processor(id,</span>
+<span class="nc" id="L748">                  time,</span>
+<span class="nc" id="L749">                  config.socketRequestMaxBytes,</span>
+<span class="nc" id="L750">                  requestChannel,</span>
+<span class="nc" id="L751">                  connectionQuotas,</span>
+<span class="nc" id="L752">                  config.connectionsMaxIdleMs,</span>
+<span class="nc" id="L753">                  config.failedAuthenticationDelayMs,</span>
+<span class="nc" id="L754">                  listenerName,</span>
+<span class="nc" id="L755">                  securityProtocol,</span>
+<span class="nc" id="L756">                  config,</span>
+<span class="nc" id="L757">                  metrics,</span>
+<span class="nc" id="L758">                  credentialProvider,</span>
+<span class="nc" id="L759">                  memoryPool,</span>
+<span class="nc" id="L760">                  logContext,</span>
+<span class="nc" id="L761">                  JProcessor.CONNECTION_QUEUE_SIZE,</span>
+<span class="nc" id="L762">                  isPrivilegedListener,</span>
+<span class="nc" id="L763">                  apiVersionManager,</span>
+<span class="nc" id="L764">                  name,</span>
+<span class="nc" id="L765">                  connectionDisconnectListeners)</span>
+  }
+}
+
+/**
+ * Thread that processes all requests from a single connection. There are N of these running in parallel
+ * each of which has its own selector
+ *
+ * @param isPrivilegedListener The privileged listener flag is used as one factor to determine whether
+ *                             a certain request is forwarded or not. When the control plane is defined,
+ *                             the control plane processor would be fellow broker's choice for sending
+ *                             forwarding requests; if the control plane is not defined, the processor
+ *                             relying on the inter broker listener would be acting as the privileged listener.
+ */
+<span class="nc bnc" id="L779" title="All 4 branches missed.">private[kafka] class Processor(</span>
+<span class="nc" id="L780">  val id: Int,</span>
+<span class="nc" id="L781">  time: Time,</span>
+<span class="nc" id="L782">  maxRequestSize: Int,</span>
+<span class="nc" id="L783">  requestChannel: RequestChannel,</span>
+<span class="nc" id="L784">  connectionQuotas: ConnectionQuotas,</span>
+<span class="nc" id="L785">  connectionsMaxIdleMs: Long,</span>
+<span class="nc" id="L786">  failedAuthenticationDelayMs: Int,</span>
+<span class="nc" id="L787">  listenerName: ListenerName,</span>
+<span class="nc" id="L788">  securityProtocol: SecurityProtocol,</span>
+<span class="nc" id="L789">  config: KafkaConfig,</span>
+<span class="nc" id="L790">  metrics: Metrics,</span>
+  credentialProvider: CredentialProvider,
+<span class="nc" id="L792">  memoryPool: MemoryPool,</span>
+<span class="nc" id="L793">  logContext: LogContext,</span>
+<span class="nc" id="L794">  connectionQueueSize: Int,</span>
+<span class="nc" id="L795">  isPrivilegedListener: Boolean,</span>
+<span class="nc" id="L796">  apiVersionManager: ApiVersionManager,</span>
+  threadName: String,
+<span class="nc" id="L798">  connectionDisconnectListeners: Seq[ConnectionDisconnectListener]</span>
+<span class="nc" id="L799">) extends Runnable with Logging {</span>
+<span class="nc" id="L800">  private val metricsPackage = &quot;kafka.network&quot;</span>
+<span class="nc" id="L801">  private val metricsClassName = &quot;Processor&quot;</span>
+<span class="nc" id="L802">  private val metricsGroup = new KafkaMetricsGroup(metricsPackage, metricsClassName)</span>
+
+<span class="nc" id="L804">  val shouldRun: AtomicBoolean = new AtomicBoolean(true)</span>
+<span class="nc" id="L805">  private val started: AtomicBoolean = new AtomicBoolean()</span>
+
+<span class="nc" id="L807">  val thread: KafkaThread = KafkaThread.nonDaemon(threadName, this)</span>
+
+<span class="nc" id="L809">  private val newConnections = new ArrayBlockingQueue[SocketChannel](connectionQueueSize)</span>
+<span class="nc" id="L810">  private val inflightResponses = mutable.Map[String, Response]()</span>
+<span class="nc" id="L811">  private val responseQueue = new LinkedBlockingDeque[Response]()</span>
+
+<span class="nc" id="L813">  private[kafka] val metricTags = mutable.LinkedHashMap(</span>
+<span class="nc" id="L814">    JProcessor.LISTENER_METRIC_TAG -&gt; listenerName.value,</span>
+<span class="nc" id="L815">    JProcessor.NETWORK_PROCESSOR_METRIC_TAG -&gt; id.toString</span>
+  ).asJava
+
+<span class="nc" id="L818">  metricsGroup.newGauge(JProcessor.IDLE_PERCENT_METRIC_NAME, () =&gt; {</span>
+<span class="nc bnc" id="L819" title="All 2 branches missed.">    Option(metrics.metric(metrics.metricName(&quot;io-wait-ratio&quot;, JSocketServer.METRICS_GROUP, metricTags))).fold(0.0)(m =&gt;</span>
+<span class="nc" id="L820">      Math.min(m.metricValue.asInstanceOf[Double], 1.0))</span>
+  },
+    // for compatibility, only add a networkProcessor tag to the Yammer Metrics alias (the equivalent Selector metric
+    // also includes the listener name)
+<span class="nc" id="L824">    MetricsUtils.getTags(JProcessor.NETWORK_PROCESSOR_METRIC_TAG, id.toString)</span>
+  )
+
+<span class="nc" id="L827">  private val expiredConnectionsKilledCount = new CumulativeSum()</span>
+<span class="nc bnc" id="L828" title="All 2 branches missed.">  private val expiredConnectionsKilledCountMetricName = metrics.metricName(&quot;expired-connections-killed-count&quot;, JSocketServer.METRICS_GROUP, metricTags)</span>
+<span class="nc" id="L829">  metrics.addMetric(expiredConnectionsKilledCountMetricName, expiredConnectionsKilledCount)</span>
+
+<span class="nc" id="L831">  private[network] val selector = createSelector(</span>
+    ChannelBuilders.serverChannelBuilder(
+<span class="nc" id="L833">      listenerName,</span>
+<span class="nc bnc" id="L834" title="All 2 branches missed.">      listenerName == config.interBrokerListenerName,</span>
+<span class="nc" id="L835">      securityProtocol,</span>
+<span class="nc" id="L836">      config,</span>
+<span class="nc" id="L837">      credentialProvider.credentialCache,</span>
+<span class="nc" id="L838">      credentialProvider.tokenCache,</span>
+<span class="nc" id="L839">      time,</span>
+<span class="nc" id="L840">      logContext,</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">      version =&gt; apiVersionManager.apiVersionResponse(0, version &lt; 4)</span>
+    )
+  )
+
+  // Visible to override for testing
+  protected[network] def createSelector(channelBuilder: ChannelBuilder): KSelector = {
+    channelBuilder match {
+<span class="nc bnc" id="L848" title="All 2 branches missed.">      case reconfigurable: Reconfigurable =&gt; config.addReconfigurable(reconfigurable)</span>
+      case _ =&gt;
+    }
+<span class="nc" id="L851">    new KSelector(</span>
+<span class="nc" id="L852">      maxRequestSize,</span>
+<span class="nc" id="L853">      connectionsMaxIdleMs,</span>
+<span class="nc" id="L854">      failedAuthenticationDelayMs,</span>
+<span class="nc" id="L855">      metrics,</span>
+<span class="nc" id="L856">      time,</span>
+<span class="nc" id="L857">      &quot;socket-server&quot;,</span>
+<span class="nc" id="L858">      metricTags,</span>
+<span class="nc" id="L859">      false,</span>
+<span class="nc" id="L860">      true,</span>
+<span class="nc" id="L861">      channelBuilder,</span>
+<span class="nc" id="L862">      memoryPool,</span>
+<span class="nc" id="L863">      logContext)</span>
+  }
+
+  // Connection ids have the format `localAddr:localPort-remoteAddr:remotePort-index`. The index is a
+  // non-negative incrementing value that ensures that even if remotePort is reused after a connection is
+  // closed, connection ids are not reused while requests from the closed connection are being processed.
+<span class="nc" id="L869">  private var nextConnectionIndex = 0</span>
+
+  override def run(): Unit = {
+    try {
+<span class="nc bnc" id="L873" title="All 2 branches missed.">      while (shouldRun.get()) {</span>
+        try {
+          // setup any new connections that have been queued up
+<span class="nc" id="L876">          configureNewConnections()</span>
+          // register any new responses for writing
+<span class="nc" id="L878">          processNewResponses()</span>
+<span class="nc" id="L879">          poll()</span>
+<span class="nc" id="L880">          processCompletedReceives()</span>
+<span class="nc" id="L881">          processCompletedSends()</span>
+<span class="nc" id="L882">          processDisconnected()</span>
+<span class="nc" id="L883">          closeExcessConnections()</span>
+        } catch {
+          // We catch all the throwables here to prevent the processor thread from exiting. We do this because
+          // letting a processor exit might cause a bigger impact on the broker. This behavior might need to be
+          // reviewed if we see an exception that needs the entire broker to stop. Usually the exceptions thrown would
+          // be either associated with a specific socket channel or a bad request. These exceptions are caught and
+          // processed by the individual methods above which close the failing channel and continue processing other
+          // channels. So this catch block should only ever see ControlThrowables.
+<span class="nc" id="L891">          case e: Throwable =&gt; processException(&quot;Processor got uncaught exception.&quot;, e)</span>
+        }
+      }
+    } finally {
+<span class="nc" id="L895">      debug(s&quot;Closing selector - processor $id&quot;)</span>
+<span class="nc" id="L896">      Utils.swallow(this.logger.underlying, Level.ERROR, () =&gt; closeAll())</span>
+    }
+  }
+
+  private[network] def processException(errorMessage: String, throwable: Throwable): Unit = {
+    throwable match {
+<span class="nc bnc" id="L902" title="All 2 branches missed.">      case e: ControlThrowable =&gt; throw e</span>
+<span class="nc" id="L903">      case e =&gt; error(errorMessage, e)</span>
+    }
+  }
+
+  private def processChannelException(channelId: String, errorMessage: String, throwable: Throwable): Unit = {
+<span class="nc bnc" id="L908" title="All 2 branches missed.">    if (openOrClosingChannel(channelId).isDefined) {</span>
+<span class="nc" id="L909">      error(s&quot;Closing socket for $channelId because of error&quot;, throwable)</span>
+<span class="nc" id="L910">      close(channelId)</span>
+    }
+<span class="nc" id="L912">    processException(errorMessage, throwable)</span>
+  }
+
+  private def processNewResponses(): Unit = {
+    var currentResponse: Response = null
+<span class="nc bnc" id="L917" title="All 2 branches missed.">    while ({currentResponse = dequeueResponse(); currentResponse != null}) {</span>
+<span class="nc" id="L918">      val channelId = currentResponse.request.context.connectionId</span>
+      try {
+<span class="nc" id="L920">        currentResponse match {</span>
+<span class="nc bnc" id="L921" title="All 2 branches missed.">          case response: NoOpResponse =&gt;</span>
+            // There is no response to send to the client, we need to read more pipelined requests
+            // that are sitting in the server's socket buffer
+<span class="nc" id="L924">            updateRequestMetrics(response)</span>
+<span class="nc" id="L925">            trace(s&quot;Socket server received empty response to send, registering for read: $response&quot;)</span>
+            // Try unmuting the channel. If there was no quota violation and the channel has not been throttled,
+            // it will be unmuted immediately. If the channel has been throttled, it will be unmuted only if the
+            // throttling delay has already passed by now.
+<span class="nc" id="L929">            handleChannelMuteEvent(channelId, ChannelMuteEvent.RESPONSE_SENT)</span>
+<span class="nc" id="L930">            tryUnmuteChannel(channelId)</span>
+
+<span class="nc bnc" id="L932" title="All 2 branches missed.">          case response: SendResponse =&gt;</span>
+<span class="nc" id="L933">            sendResponse(response, response.responseSend)</span>
+<span class="nc bnc" id="L934" title="All 2 branches missed.">          case response: CloseConnectionResponse =&gt;</span>
+<span class="nc" id="L935">            updateRequestMetrics(response)</span>
+<span class="nc" id="L936">            trace(&quot;Closing socket connection actively according to the response code.&quot;)</span>
+<span class="nc" id="L937">            close(channelId)</span>
+<span class="nc bnc" id="L938" title="All 2 branches missed.">          case _: StartThrottlingResponse =&gt;</span>
+<span class="nc" id="L939">            handleChannelMuteEvent(channelId, ChannelMuteEvent.THROTTLE_STARTED)</span>
+<span class="nc bnc" id="L940" title="All 2 branches missed.">          case _: EndThrottlingResponse =&gt;</span>
+            // Try unmuting the channel. The channel will be unmuted only if the response has already been sent out to
+            // the client.
+<span class="nc" id="L943">            handleChannelMuteEvent(channelId, ChannelMuteEvent.THROTTLE_ENDED)</span>
+<span class="nc" id="L944">            tryUnmuteChannel(channelId)</span>
+        }
+      } catch {
+        case e: Throwable =&gt;
+<span class="nc" id="L948">          processChannelException(channelId, s&quot;Exception while processing response for $channelId&quot;, e)</span>
+      }
+    }
+  }
+
+  // `protected` for test usage
+  protected[network] def sendResponse(response: Response, responseSend: Send): Unit = {
+<span class="nc" id="L955">    val connectionId = response.request.context.connectionId</span>
+<span class="nc" id="L956">    trace(s&quot;Socket server received response to send to $connectionId, registering for write and sending data: $response&quot;)</span>
+    // `channel` can be None if the connection was closed remotely or if selector closed it for being idle for too long
+<span class="nc bnc" id="L958" title="All 2 branches missed.">    if (channel(connectionId).isEmpty) {</span>
+<span class="nc" id="L959">      warn(s&quot;Attempting to send response via channel for which there is no open connection, connection id $connectionId&quot;)</span>
+<span class="nc" id="L960">      response.request.updateRequestMetrics(0L, response.responseLog)</span>
+    }
+    // Invoke send for closingChannel as well so that the send is failed and the channel closed properly and
+    // removed from the Selector after discarding any pending staged receives.
+    // `openOrClosingChannel` can be None if the selector closed the connection because it was idle for too long
+<span class="nc bnc" id="L965" title="All 2 branches missed.">    if (openOrClosingChannel(connectionId).isDefined) {</span>
+<span class="nc" id="L966">      selector.send(new NetworkSend(connectionId, responseSend))</span>
+<span class="nc" id="L967">      inflightResponses += (connectionId -&gt; response)</span>
+    }
+  }
+
+  private def poll(): Unit = {
+<span class="nc bnc" id="L972" title="All 2 branches missed.">    val pollTimeout = if (newConnections.isEmpty) 300 else 0</span>
+<span class="nc" id="L973">    try selector.poll(pollTimeout)</span>
+    catch {
+<span class="nc bnc" id="L975" title="All 6 branches missed.">      case e @ (_: IllegalStateException | _: IOException) =&gt;</span>
+        // The exception is not re-thrown and any completed sends/receives/connections/disconnections
+        // from this poll will be processed.
+<span class="nc" id="L978">        error(s&quot;Processor $id poll failed&quot;, e)</span>
+    }
+  }
+
+  private def processCompletedReceives(): Unit = {
+<span class="nc" id="L983">    selector.completedReceives.forEach { receive =&gt;</span>
+<span class="nc" id="L984">      var header: RequestHeader = null</span>
+<span class="nc" id="L985">      var req: Request = null</span>
+      try {
+<span class="nc" id="L987">        openOrClosingChannel(receive.source) match {</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">          case Some(channel) =&gt;</span>
+<span class="nc" id="L989">            header = JProcessor.parseRequestHeader(apiVersionManager, receive.payload)</span>
+<span class="nc bnc" id="L990" title="All 6 branches missed.">            if (header.apiKey == ApiKeys.SASL_HANDSHAKE &amp;&amp; channel.maybeBeginServerReauthentication(receive,</span>
+<span class="nc bnc" id="L991" title="All 2 branches missed.">              () =&gt; time.nanoseconds()))</span>
+<span class="nc" id="L992">              trace(s&quot;Begin re-authentication: $channel&quot;)</span>
+            else {
+<span class="nc" id="L994">              val nowNanos = time.nanoseconds()</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">              if (channel.serverAuthenticationSessionExpired(nowNanos)) {</span>
+                // be sure to decrease connection count and drop any in-flight responses
+<span class="nc" id="L997">                debug(s&quot;Disconnecting expired channel: $channel : $header&quot;)</span>
+<span class="nc" id="L998">                close(channel.id)</span>
+<span class="nc" id="L999">                receive.close() // return buffer to memory pool</span>
+<span class="nc" id="L1000">                expiredConnectionsKilledCount.record(null, 1, 0)</span>
+              } else {
+<span class="nc" id="L1002">                val connectionId = receive.source</span>
+<span class="nc" id="L1003">                val context = new RequestContext(header, connectionId, channel.socketAddress, Optional.of(channel.socketPort()),</span>
+<span class="nc" id="L1004">                  channel.principal, listenerName, securityProtocol, channel.channelMetadataRegistry.clientInformation,</span>
+<span class="nc" id="L1005">                  isPrivilegedListener, channel.principalSerde)</span>
+
+<span class="nc" id="L1007">                req = new Request(id, context, nowNanos, memoryPool, receive.payload, requestChannel.metrics)</span>
+
+                // KIP-511: ApiVersionsRequest is intercepted here to catch the client software name
+                // and version. It is done here to avoid wiring things up to the api layer.
+<span class="nc bnc" id="L1011" title="All 6 branches missed.">                if (header.apiKey == ApiKeys.API_VERSIONS) {</span>
+<span class="nc" id="L1012">                  val apiVersionsRequest = req.body(classOf[ApiVersionsRequest])</span>
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">                  if (apiVersionsRequest.isValid) {</span>
+<span class="nc" id="L1014">                    channel.channelMetadataRegistry.registerClientInformation(new ClientInformation(</span>
+<span class="nc" id="L1015">                      apiVersionsRequest.data.clientSoftwareName,</span>
+<span class="nc" id="L1016">                      apiVersionsRequest.data.clientSoftwareVersion))</span>
+                  }
+                }
+<span class="nc" id="L1019">                requestChannel.sendRequest(req)</span>
+<span class="nc" id="L1020">                selector.mute(connectionId)</span>
+<span class="nc" id="L1021">                handleChannelMuteEvent(connectionId, ChannelMuteEvent.REQUEST_RECEIVED)</span>
+              }
+            }
+<span class="nc bnc" id="L1024" title="All 2 branches missed.">          case None =&gt;</span>
+            // This should never happen since completed receives are processed immediately after `poll()`
+<span class="nc" id="L1026">            throw new IllegalStateException(s&quot;Channel ${receive.source} removed from selector before processing completed receive&quot;)</span>
+        }
+      } catch {
+        // note that even though we got an exception, we can assume that receive.source is valid.
+        // Issues with constructing a valid receive object were handled earlier
+        case e: Throwable =&gt;
+<span class="nc bnc" id="L1032" title="All 4 branches missed.">          if (header == null || req == null) {</span>
+<span class="nc" id="L1033">             receive.close() // return buffer to memory pool</span>
+          }
+<span class="nc" id="L1035">          processChannelException(receive.source, s&quot;Exception while processing request from ${receive.source}&quot;, e)</span>
+      }
+    }
+<span class="nc" id="L1038">    selector.clearCompletedReceives()</span>
+  }
+
+  private def processCompletedSends(): Unit = {
+<span class="nc" id="L1042">    selector.completedSends.forEach { send =&gt;</span>
+      try {
+<span class="nc" id="L1044">        val response = inflightResponses.remove(send.destinationId).getOrElse {</span>
+<span class="nc" id="L1045">          throw new IllegalStateException(s&quot;Send for ${send.destinationId} completed, but not in `inflightResponses`&quot;)</span>
+        }
+<span class="nc" id="L1047">        updateRequestMetrics(response)</span>
+
+        // Try unmuting the channel. If there was no quota violation and the channel has not been throttled,
+        // it will be unmuted immediately. If the channel has been throttled, it will unmuted only if the throttling
+        // delay has already passed by now.
+<span class="nc" id="L1052">        handleChannelMuteEvent(send.destinationId, ChannelMuteEvent.RESPONSE_SENT)</span>
+<span class="nc" id="L1053">        tryUnmuteChannel(send.destinationId)</span>
+      } catch {
+<span class="nc" id="L1055">        case e: Throwable =&gt; processChannelException(send.destinationId,</span>
+<span class="nc" id="L1056">          s&quot;Exception while processing completed send to ${send.destinationId}&quot;, e)</span>
+      }
+    }
+<span class="nc" id="L1059">    selector.clearCompletedSends()</span>
+  }
+
+  private def updateRequestMetrics(response: Response): Unit = {
+<span class="nc" id="L1063">    val request = response.request</span>
+<span class="nc" id="L1064">    val networkThreadTimeNanos = openOrClosingChannel(request.context.connectionId).fold(0L)(_.getAndResetNetworkThreadTimeNanos())</span>
+<span class="nc" id="L1065">    request.updateRequestMetrics(networkThreadTimeNanos, response.responseLog)</span>
+  }
+
+  private def processDisconnected(): Unit = {
+<span class="nc" id="L1069">    selector.disconnected.keySet.forEach { connectionId =&gt;</span>
+      try {
+<span class="nc" id="L1071">        val remoteHost = ServerConnectionId.fromString(connectionId).orElseThrow { () =&gt;</span>
+<span class="nc" id="L1072">          throw new IllegalStateException(s&quot;connectionId has unexpected format: $connectionId&quot;)</span>
+        }.remoteHost
+<span class="nc" id="L1074">        inflightResponses.remove(connectionId).foreach(updateRequestMetrics)</span>
+        // the channel has been closed by the selector but the quotas still need to be updated
+<span class="nc" id="L1076">        connectionQuotas.dec(listenerName, InetAddress.getByName(remoteHost))</span>
+        // Call listeners to notify for closed connection.
+<span class="nc" id="L1078">        connectionDisconnectListeners.foreach(listener =&gt; Utils.swallow(this.logger.underlying, Level.ERROR, () =&gt; {</span>
+<span class="nc" id="L1079">          () -&gt; listener.onDisconnect(connectionId)}))</span>
+      } catch {
+<span class="nc" id="L1081">        case e: Throwable =&gt; processException(s&quot;Exception while processing disconnection of $connectionId&quot;, e)</span>
+      }
+    }
+  }
+
+  private def closeExcessConnections(): Unit = {
+<span class="nc bnc" id="L1087" title="All 2 branches missed.">    if (connectionQuotas.maxConnectionsExceeded(listenerName)) {</span>
+<span class="nc" id="L1088">      val channel = selector.lowestPriorityChannel()</span>
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">      if (channel != null)</span>
+<span class="nc" id="L1090">        close(channel.id)</span>
+    }
+  }
+
+  /**
+   * Close the connection identified by `connectionId` and decrement the connection count.
+   * The channel will be immediately removed from the selector's `channels` or `closingChannels`
+   * and no further disconnect notifications will be sent for this channel by the selector.
+   * If responses are pending for the channel, they are dropped and metrics is updated.
+   * If the channel has already been removed from selector, no action is taken.
+   */
+  private def close(connectionId: String): Unit = {
+<span class="nc" id="L1102">    openOrClosingChannel(connectionId).foreach { channel =&gt;</span>
+<span class="nc" id="L1103">      debug(s&quot;Closing selector connection $connectionId&quot;)</span>
+<span class="nc" id="L1104">      val address = channel.socketAddress</span>
+<span class="nc bnc" id="L1105" title="All 2 branches missed.">      if (address != null)</span>
+<span class="nc" id="L1106">        connectionQuotas.dec(listenerName, address)</span>
+<span class="nc" id="L1107">      selector.close(connectionId)</span>
+      // Call listeners to notify for closed connection.
+<span class="nc" id="L1109">      connectionDisconnectListeners.foreach(listener =&gt; Utils.swallow(this.logger.underlying, Level.ERROR, () =&gt; {</span>
+<span class="nc" id="L1110">        () -&gt; listener.onDisconnect(connectionId)}))</span>
+
+<span class="nc" id="L1112">      inflightResponses.remove(connectionId).foreach(response =&gt; updateRequestMetrics(response))</span>
+    }
+  }
+
+  /**
+   * Queue up a new connection for reading
+   */
+  def accept(socketChannel: SocketChannel,
+             mayBlock: Boolean,
+             acceptorBlockedPercentMeter: com.yammer.metrics.core.Meter): Boolean = {
+    val accepted = {
+<span class="nc bnc" id="L1123" title="All 2 branches missed.">      if (newConnections.offer(socketChannel))</span>
+<span class="nc" id="L1124">        true</span>
+<span class="nc bnc" id="L1125" title="All 2 branches missed.">      else if (mayBlock) {</span>
+<span class="nc" id="L1126">        val startNs = time.nanoseconds</span>
+<span class="nc" id="L1127">        newConnections.put(socketChannel)</span>
+<span class="nc" id="L1128">        acceptorBlockedPercentMeter.mark(time.nanoseconds() - startNs)</span>
+<span class="nc" id="L1129">        true</span>
+      } else
+<span class="nc" id="L1131">        false</span>
+    }
+<span class="nc bnc" id="L1133" title="All 2 branches missed.">    if (accepted)</span>
+<span class="nc" id="L1134">      wakeup()</span>
+<span class="nc" id="L1135">    accepted</span>
+  }
+
+  /**
+   * Register any new connections that have been queued up. The number of connections processed
+   * in each iteration is limited to ensure that traffic and connection close notifications of
+   * existing channels are handled promptly.
+   */
+  private def configureNewConnections(): Unit = {
+<span class="nc" id="L1144">    var connectionsProcessed = 0</span>
+<span class="nc bnc" id="L1145" title="All 4 branches missed.">    while (connectionsProcessed &lt; connectionQueueSize &amp;&amp; !newConnections.isEmpty) {</span>
+<span class="nc" id="L1146">      val channel = newConnections.poll()</span>
+      try {
+<span class="nc" id="L1148">        debug(s&quot;Processor $id listening to new connection from ${channel.socket.getRemoteSocketAddress}&quot;)</span>
+<span class="nc" id="L1149">        selector.register(connectionId(channel.socket), channel)</span>
+<span class="nc" id="L1150">        connectionsProcessed += 1</span>
+      } catch {
+        // We explicitly catch all exceptions and close the socket to avoid a socket leak.
+        case e: Throwable =&gt;
+<span class="nc" id="L1154">          val remoteAddress = channel.socket.getRemoteSocketAddress</span>
+          // need to close the channel here to avoid a socket leak.
+<span class="nc" id="L1156">          connectionQuotas.closeChannel(this, listenerName, channel)</span>
+<span class="nc" id="L1157">          processException(s&quot;Processor $id closed connection from $remoteAddress&quot;, e)</span>
+      }
+    }
+  }
+
+  /**
+   * Close the selector and all open connections
+   */
+  private def closeAll(): Unit = {
+<span class="nc bnc" id="L1166" title="All 2 branches missed.">    while (!newConnections.isEmpty) {</span>
+<span class="nc" id="L1167">      newConnections.poll().close()</span>
+    }
+<span class="nc" id="L1169">    selector.channels.forEach { channel =&gt;</span>
+<span class="nc" id="L1170">      close(channel.id)</span>
+    }
+<span class="nc" id="L1172">    selector.close()</span>
+<span class="nc" id="L1173">    metricsGroup.removeMetric(JProcessor.IDLE_PERCENT_METRIC_NAME,</span>
+<span class="nc" id="L1174">      MetricsUtils.getTags(JProcessor.NETWORK_PROCESSOR_METRIC_TAG, id.toString))</span>
+  }
+
+  // 'protected` to allow override for testing
+  protected[network] def connectionId(socket: Socket): String = {
+<span class="nc" id="L1179">    val connId = ServerConnectionId.generateConnectionId(socket, id, nextConnectionIndex)</span>
+<span class="nc bnc" id="L1180" title="All 2 branches missed.">    nextConnectionIndex = if (nextConnectionIndex == Int.MaxValue) 0 else nextConnectionIndex + 1</span>
+<span class="nc" id="L1181">    connId</span>
+  }
+
+  private[network] def enqueueResponse(response: Response): Unit = {
+<span class="nc" id="L1185">    responseQueue.put(response)</span>
+<span class="nc" id="L1186">    wakeup()</span>
+  }
+
+  private def dequeueResponse(): Response = {
+<span class="nc" id="L1190">    val response = responseQueue.poll()</span>
+<span class="nc bnc" id="L1191" title="All 2 branches missed.">    if (response != null)</span>
+<span class="nc" id="L1192">      response.request.responseDequeueTimeNanos(Time.SYSTEM.nanoseconds)</span>
+<span class="nc" id="L1193">    response</span>
+  }
+
+<span class="nc" id="L1196">  private[network] def responseQueueSize = responseQueue.size</span>
+
+  // Only for testing
+<span class="nc" id="L1199">  private[network] def inflightResponseCount: Int = inflightResponses.size</span>
+
+  // Visible for testing
+  // Only methods that are safe to call on a disconnected channel should be invoked on 'openOrClosingChannel'.
+  private[network] def openOrClosingChannel(connectionId: String): Option[KafkaChannel] =
+<span class="nc" id="L1204">    Option(selector.channel(connectionId)).orElse(Option(selector.closingChannel(connectionId)))</span>
+
+  // Indicate the specified channel that the specified channel mute-related event has happened so that it can change its
+  // mute state.
+  private def handleChannelMuteEvent(connectionId: String, event: ChannelMuteEvent): Unit = {
+<span class="nc" id="L1209">    openOrClosingChannel(connectionId).foreach(c =&gt; c.handleChannelMuteEvent(event))</span>
+  }
+
+  private def tryUnmuteChannel(connectionId: String): Unit = {
+<span class="nc" id="L1213">    openOrClosingChannel(connectionId).foreach(c =&gt; selector.unmute(c.id))</span>
+  }
+
+  /* For test usage */
+  private[network] def channel(connectionId: String): Option[KafkaChannel] =
+<span class="nc" id="L1218">    Option(selector.channel(connectionId))</span>
+
+  def start(): Unit = {
+<span class="nc bnc" id="L1221" title="All 2 branches missed.">    if (!started.getAndSet(true)) {</span>
+<span class="nc" id="L1222">      thread.start()</span>
+    }
+  }
+
+  /**
+   * Wakeup the thread for selection.
+   */
+<span class="nc" id="L1229">  def wakeup(): Unit = selector.wakeup()</span>
+
+  def beginShutdown(): Unit = {
+<span class="nc bnc" id="L1232" title="All 2 branches missed.">    if (shouldRun.getAndSet(false)) {</span>
+<span class="nc" id="L1233">      wakeup()</span>
+    }
+  }
+
+  def close(): Unit = {
+    try {
+<span class="nc" id="L1239">      beginShutdown()</span>
+<span class="nc" id="L1240">      thread.join()</span>
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">      if (!started.get) {</span>
+<span class="nc" id="L1242">        Utils.swallow(this.logger.underlying, Level.ERROR, () =&gt; closeAll())</span>
+      }
+    } finally {
+<span class="nc" id="L1245">      metricsGroup.removeMetric(&quot;IdlePercent&quot;,</span>
+<span class="nc" id="L1246">        MetricsUtils.getTags(&quot;networkProcessor&quot;, id.toString))</span>
+<span class="nc" id="L1247">      metrics.removeMetric(expiredConnectionsKilledCountMetricName)</span>
+    }
+  }
+}
+
+<span class="nc bnc" id="L1252" title="All 4 branches missed.">class ConnectionQuotas(config: KafkaConfig, time: Time, metrics: Metrics) extends Logging with AutoCloseable {</span>
+
+<span class="nc" id="L1254">  @volatile private var defaultMaxConnectionsPerIp: Int = config.maxConnectionsPerIp</span>
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">  @volatile private var maxConnectionsPerIpOverrides = config.maxConnectionsPerIpOverrides.asScala.map { case (host, count) =&gt; (InetAddress.getByName(host), count.intValue()) }.toMap</span>
+<span class="nc" id="L1256">  @volatile private var brokerMaxConnections = config.maxConnections</span>
+<span class="nc" id="L1257">  private val interBrokerListenerName = config.interBrokerListenerName</span>
+<span class="nc" id="L1258">  private val counts = mutable.Map[InetAddress, Int]()</span>
+
+  // Listener counts and configs are synchronized on `counts`
+<span class="nc" id="L1261">  private val listenerCounts = mutable.Map[ListenerName, Int]()</span>
+<span class="nc" id="L1262">  private[network] val maxConnectionsPerListener = mutable.Map[ListenerName, ListenerConnectionQuota]()</span>
+<span class="nc" id="L1263">  @volatile private var totalCount = 0</span>
+  // updates to defaultConnectionRatePerIp or connectionRatePerIp must be synchronized on `counts`
+<span class="nc" id="L1265">  @volatile private var defaultConnectionRatePerIp = QuotaConfig.IP_CONNECTION_RATE_DEFAULT.intValue()</span>
+<span class="nc" id="L1266">  private val connectionRatePerIp = new ConcurrentHashMap[InetAddress, Int]()</span>
+  // sensor that tracks broker-wide connection creation rate and limit (quota)
+<span class="nc" id="L1268">  private val brokerConnectionRateSensor = getOrCreateConnectionRateQuotaSensor(config.maxConnectionCreationRate, ConnectionQuotaEntity.brokerQuotaEntity())</span>
+<span class="nc" id="L1269">  private val maxThrottleTimeMs = TimeUnit.SECONDS.toMillis(config.quotaConfig.quotaWindowSizeSeconds.toLong)</span>
+
+  def inc(listenerName: ListenerName, address: InetAddress, acceptorBlockedPercentMeter: com.yammer.metrics.core.Meter): Unit = {
+<span class="nc" id="L1272">    counts.synchronized {</span>
+<span class="nc" id="L1273">      waitForConnectionSlot(listenerName, acceptorBlockedPercentMeter)</span>
+
+<span class="nc" id="L1275">      recordIpConnectionMaybeThrottle(listenerName, address)</span>
+<span class="nc" id="L1276">      val count = counts.getOrElseUpdate(address, 0)</span>
+<span class="nc" id="L1277">      counts.put(address, count + 1)</span>
+<span class="nc" id="L1278">      totalCount += 1</span>
+<span class="nc bnc" id="L1279" title="All 2 branches missed.">      if (listenerCounts.contains(listenerName)) {</span>
+<span class="nc" id="L1280">        listenerCounts.put(listenerName, listenerCounts(listenerName) + 1)</span>
+      }
+<span class="nc" id="L1282">      val max = maxConnectionsPerIpOverrides.getOrElse(address, defaultMaxConnectionsPerIp)</span>
+<span class="nc bnc" id="L1283" title="All 2 branches missed.">      if (count &gt;= max)</span>
+<span class="nc" id="L1284">        throw new TooManyConnectionsException(address, max)</span>
+    }
+  }
+
+  private[network] def updateMaxConnectionsPerIp(maxConnectionsPerIp: Int): Unit = {
+<span class="nc" id="L1289">    defaultMaxConnectionsPerIp = maxConnectionsPerIp</span>
+  }
+
+  private[network] def updateMaxConnectionsPerIpOverride(overrideQuotas: Map[String, Int]): Unit = {
+<span class="nc bnc" id="L1293" title="All 2 branches missed.">    maxConnectionsPerIpOverrides = overrideQuotas.map { case (host, count) =&gt; (InetAddress.getByName(host), count) }.toMap</span>
+  }
+
+  private[network] def updateBrokerMaxConnections(maxConnections: Int): Unit = {
+<span class="nc" id="L1297">    counts.synchronized {</span>
+<span class="nc" id="L1298">      brokerMaxConnections = maxConnections</span>
+<span class="nc" id="L1299">      counts.notifyAll()</span>
+    }
+  }
+
+  private[network] def updateBrokerMaxConnectionRate(maxConnectionRate: Int): Unit = {
+    // if there is a connection waiting on the rate throttle delay, we will let it wait the original delay even if
+    // the rate limit increases, because it is just one connection per listener and the code is simpler that way
+<span class="nc" id="L1306">    updateConnectionRateQuota(maxConnectionRate, ConnectionQuotaEntity.brokerQuotaEntity())</span>
+  }
+
+  /**
+   * Update the connection rate quota for a given IP and updates quota configs for updated IPs.
+   * If an IP is given, metric config will be updated only for the given IP, otherwise
+   * all metric configs will be checked and updated if required.
+   *
+   * @param ip ip to update or default if None
+   * @param maxConnectionRate new connection rate, or resets entity to default if None
+   */
+  def updateIpConnectionRateQuota(ip: Option[InetAddress], maxConnectionRate: Option[Int]): Unit = synchronized {
+    def isIpConnectionRateMetric(metricName: MetricName) = {
+<span class="nc bnc" id="L1319" title="All 4 branches missed.">      metricName.name == ConnectionQuotaEntity.CONNECTION_RATE_METRIC_NAME &amp;&amp;</span>
+<span class="nc bnc" id="L1320" title="All 4 branches missed.">      metricName.group == JSocketServer.METRICS_GROUP &amp;&amp;</span>
+<span class="nc bnc" id="L1321" title="All 2 branches missed.">      metricName.tags.containsKey(ConnectionQuotaEntity.IP_METRIC_TAG)</span>
+    }
+
+    def shouldUpdateQuota(metric: KafkaMetric, quotaLimit: Int) = {
+<span class="nc bnc" id="L1325" title="All 2 branches missed.">      quotaLimit != metric.config.quota.bound</span>
+    }
+
+<span class="nc" id="L1328">    ip match {</span>
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">      case Some(address) =&gt;</span>
+        // synchronize on counts to ensure reading an IP connection rate quota and creating a quota config is atomic
+<span class="nc" id="L1331">        counts.synchronized {</span>
+<span class="nc" id="L1332">          maxConnectionRate match {</span>
+<span class="nc bnc" id="L1333" title="All 2 branches missed.">            case Some(rate) =&gt;</span>
+<span class="nc" id="L1334">              info(s&quot;Updating max connection rate override for $address to $rate&quot;)</span>
+<span class="nc" id="L1335">              connectionRatePerIp.put(address, rate)</span>
+<span class="nc bnc" id="L1336" title="All 2 branches missed.">            case None =&gt;</span>
+<span class="nc" id="L1337">              info(s&quot;Removing max connection rate override for $address&quot;)</span>
+<span class="nc" id="L1338">              connectionRatePerIp.remove(address)</span>
+          }
+        }
+<span class="nc" id="L1341">        updateConnectionRateQuota(connectionRateForIp(address), ConnectionQuotaEntity.ipQuotaEntity(address))</span>
+<span class="nc bnc" id="L1342" title="All 2 branches missed.">      case None =&gt;</span>
+        // synchronize on counts to ensure reading an IP connection rate quota and creating a quota config is atomic
+<span class="nc" id="L1344">        counts.synchronized {</span>
+<span class="nc" id="L1345">          defaultConnectionRatePerIp = maxConnectionRate.getOrElse(QuotaConfig.IP_CONNECTION_RATE_DEFAULT.intValue())</span>
+        }
+<span class="nc" id="L1347">        info(s&quot;Updated default max IP connection rate to $defaultConnectionRatePerIp&quot;)</span>
+<span class="nc" id="L1348">        metrics.metrics.forEach { (metricName, metric) =&gt;</span>
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">          if (isIpConnectionRateMetric(metricName)) {</span>
+<span class="nc" id="L1350">            val quota = connectionRateForIp(InetAddress.getByName(metricName.tags.get(ConnectionQuotaEntity.IP_METRIC_TAG)))</span>
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">            if (shouldUpdateQuota(metric, quota)) {</span>
+<span class="nc" id="L1352">              debug(s&quot;Updating existing connection rate quota config for ${metricName.tags} to $quota&quot;)</span>
+<span class="nc" id="L1353">              metric.config(rateQuotaMetricConfig(quota))</span>
+            }
+          }
+        }
+    }
+  }
+
+  // Visible for testing
+  def connectionRateForIp(ip: InetAddress): Int = {
+<span class="nc" id="L1362">    connectionRatePerIp.getOrDefault(ip, defaultConnectionRatePerIp)</span>
+  }
+
+  // Visible for testing
+  private[network] def maxConnectionsPerIpForIp(ip: InetAddress): Int = {
+<span class="nc" id="L1367">    maxConnectionsPerIpOverrides.getOrElse(ip, defaultMaxConnectionsPerIp)</span>
+  }
+  
+  // Visible for testing
+  private[network] def maxConnectionsPerIpOverrideForIp(ip: InetAddress): Option[Int] = {
+<span class="nc" id="L1372">    maxConnectionsPerIpOverrides.get(ip)</span>
+  }
+
+  private[network] def addListener(config: KafkaConfig, listenerName: ListenerName): Unit = {
+<span class="nc" id="L1376">    counts.synchronized {</span>
+<span class="nc bnc" id="L1377" title="All 2 branches missed.">      if (!maxConnectionsPerListener.contains(listenerName)) {</span>
+<span class="nc" id="L1378">        val newListenerQuota = new ListenerConnectionQuota(counts, listenerName)</span>
+<span class="nc" id="L1379">        maxConnectionsPerListener.put(listenerName, newListenerQuota)</span>
+<span class="nc" id="L1380">        listenerCounts.put(listenerName, 0)</span>
+<span class="nc" id="L1381">        config.addReconfigurable(newListenerQuota)</span>
+<span class="nc" id="L1382">        newListenerQuota.configure(config.valuesWithPrefixOverride(listenerName.configPrefix))</span>
+      }
+<span class="nc" id="L1384">      counts.notifyAll()</span>
+    }
+  }
+
+  private[network] def removeListener(config: KafkaConfig, listenerName: ListenerName): Unit = {
+<span class="nc" id="L1389">    counts.synchronized {</span>
+<span class="nc" id="L1390">      maxConnectionsPerListener.remove(listenerName).foreach { listenerQuota =&gt;</span>
+<span class="nc" id="L1391">        listenerCounts.remove(listenerName)</span>
+        // once listener is removed from maxConnectionsPerListener, no metrics will be recorded into listener's sensor
+        // so it is safe to remove sensor here
+<span class="nc" id="L1394">        listenerQuota.close()</span>
+<span class="nc" id="L1395">        counts.notifyAll() // wake up any waiting acceptors to close cleanly</span>
+<span class="nc" id="L1396">        config.removeReconfigurable(listenerQuota)</span>
+      }
+    }
+  }
+
+  def dec(listenerName: ListenerName, address: InetAddress): Unit = {
+<span class="nc" id="L1402">    counts.synchronized {</span>
+<span class="nc" id="L1403">      val count = counts.getOrElse(address,</span>
+<span class="nc" id="L1404">        throw new IllegalArgumentException(s&quot;Attempted to decrease connection count for address with no connections, address: $address&quot;))</span>
+<span class="nc bnc" id="L1405" title="All 2 branches missed.">      if (count == 1)</span>
+<span class="nc" id="L1406">        counts.remove(address)</span>
+      else
+<span class="nc" id="L1408">        counts.put(address, count - 1)</span>
+
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">      if (totalCount &lt;= 0)</span>
+<span class="nc" id="L1411">        error(s&quot;Attempted to decrease total connection count for broker with no connections&quot;)</span>
+<span class="nc" id="L1412">      totalCount -= 1</span>
+
+<span class="nc bnc" id="L1414" title="All 2 branches missed.">      if (maxConnectionsPerListener.contains(listenerName)) {</span>
+<span class="nc" id="L1415">        val listenerCount = listenerCounts(listenerName)</span>
+<span class="nc bnc" id="L1416" title="All 2 branches missed.">        if (listenerCount == 0)</span>
+<span class="nc" id="L1417">          error(s&quot;Attempted to decrease connection count for listener $listenerName with no connections&quot;)</span>
+        else
+<span class="nc" id="L1419">          listenerCounts.put(listenerName, listenerCount - 1)</span>
+      }
+<span class="nc" id="L1421">      counts.notifyAll() // wake up any acceptors waiting to process a new connection since listener connection limit was reached</span>
+    }
+  }
+
+<span class="nc" id="L1425">  def get(address: InetAddress): Int = counts.synchronized {</span>
+<span class="nc" id="L1426">    counts.getOrElse(address, 0)</span>
+  }
+
+  private def waitForConnectionSlot(listenerName: ListenerName,
+                                    acceptorBlockedPercentMeter: com.yammer.metrics.core.Meter): Unit = {
+<span class="nc" id="L1431">    counts.synchronized {</span>
+<span class="nc" id="L1432">      val startThrottleTimeMs = time.milliseconds</span>
+<span class="nc" id="L1433">      val throttleTimeMs = math.max(recordConnectionAndGetThrottleTimeMs(listenerName, startThrottleTimeMs), 0)</span>
+
+<span class="nc bnc" id="L1435" title="All 4 branches missed.">      if (throttleTimeMs &gt; 0 || !connectionSlotAvailable(listenerName)) {</span>
+<span class="nc" id="L1436">        val startNs = time.nanoseconds</span>
+<span class="nc" id="L1437">        val endThrottleTimeMs = startThrottleTimeMs + throttleTimeMs</span>
+<span class="nc" id="L1438">        var remainingThrottleTimeMs = throttleTimeMs</span>
+        do {
+<span class="nc" id="L1440">          counts.wait(remainingThrottleTimeMs)</span>
+<span class="nc" id="L1441">          remainingThrottleTimeMs = math.max(endThrottleTimeMs - time.milliseconds, 0)</span>
+<span class="nc bnc" id="L1442" title="All 4 branches missed.">        } while (remainingThrottleTimeMs &gt; 0 || !connectionSlotAvailable(listenerName))</span>
+<span class="nc" id="L1443">        acceptorBlockedPercentMeter.mark(time.nanoseconds - startNs)</span>
+      }
+    }
+  }
+
+  // This is invoked in every poll iteration and we close one LRU connection in an iteration
+  // if necessary
+  def maxConnectionsExceeded(listenerName: ListenerName): Boolean = {
+<span class="nc bnc" id="L1451" title="All 4 branches missed.">    totalCount &gt; brokerMaxConnections &amp;&amp; !protectedListener(listenerName)</span>
+  }
+
+  private def connectionSlotAvailable(listenerName: ListenerName): Boolean = {
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">    if (listenerCounts(listenerName) &gt;= maxListenerConnections(listenerName))</span>
+<span class="nc" id="L1456">      false</span>
+<span class="nc bnc" id="L1457" title="All 2 branches missed.">    else if (protectedListener(listenerName))</span>
+<span class="nc" id="L1458">      true</span>
+    else
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">      totalCount &lt; brokerMaxConnections</span>
+  }
+
+  private def protectedListener(listenerName: ListenerName): Boolean =
+<span class="nc bnc" id="L1464" title="All 8 branches missed.">    interBrokerListenerName == listenerName &amp;&amp; listenerCounts.size &gt; 1</span>
+
+  private def maxListenerConnections(listenerName: ListenerName): Int =
+<span class="nc" id="L1467">    maxConnectionsPerListener.get(listenerName).map(_.maxConnections).getOrElse(Int.MaxValue)</span>
+
+  /**
+   * Calculates the delay needed to bring the observed connection creation rate to listener-level limit or to broker-wide
+   * limit, whichever the longest. The delay is capped to the quota window size defined by QuotaWindowSizeSecondsProp
+   *
+   * @param listenerName listener for which calculate the delay
+   * @param timeMs current time in milliseconds
+   * @return delay in milliseconds
+   */
+  private def recordConnectionAndGetThrottleTimeMs(listenerName: ListenerName, timeMs: Long): Long = {
+    def recordAndGetListenerThrottleTime(minThrottleTimeMs: Int): Int = {
+<span class="nc" id="L1479">      maxConnectionsPerListener</span>
+<span class="nc" id="L1480">        .get(listenerName)</span>
+<span class="nc" id="L1481">        .map { listenerQuota =&gt;</span>
+<span class="nc" id="L1482">          val listenerThrottleTimeMs = recordAndGetThrottleTimeMs(listenerQuota.connectionRateSensor, timeMs)</span>
+<span class="nc" id="L1483">          val throttleTimeMs = math.max(minThrottleTimeMs, listenerThrottleTimeMs)</span>
+          // record throttle time due to hitting connection rate quota
+<span class="nc bnc" id="L1485" title="All 2 branches missed.">          if (throttleTimeMs &gt; 0) {</span>
+<span class="nc" id="L1486">            listenerQuota.listenerConnectionRateThrottleSensor.record(throttleTimeMs.toDouble, timeMs)</span>
+          }
+<span class="nc" id="L1488">          throttleTimeMs</span>
+        }
+<span class="nc" id="L1490">        .getOrElse(0)</span>
+    }
+
+<span class="nc bnc" id="L1493" title="All 2 branches missed.">    if (protectedListener(listenerName)) {</span>
+<span class="nc" id="L1494">      recordAndGetListenerThrottleTime(0)</span>
+    } else {
+<span class="nc" id="L1496">      val brokerThrottleTimeMs = recordAndGetThrottleTimeMs(brokerConnectionRateSensor, timeMs)</span>
+<span class="nc" id="L1497">      recordAndGetListenerThrottleTime(brokerThrottleTimeMs)</span>
+    }
+  }
+
+  /**
+   * Record IP throttle time on the corresponding listener. To avoid over-recording listener/broker connection rate, we
+   * also un-record the listener and broker connection if the IP gets throttled.
+   *
+   * @param listenerName listener to un-record connection
+   * @param throttleMs IP throttle time to record for listener
+   * @param timeMs current time in milliseconds
+   */
+  private def updateListenerMetrics(listenerName: ListenerName, throttleMs: Long, timeMs: Long): Unit = {
+<span class="nc bnc" id="L1510" title="All 2 branches missed.">    if (!protectedListener(listenerName)) {</span>
+<span class="nc" id="L1511">      brokerConnectionRateSensor.record(-1.0, timeMs, false)</span>
+    }
+<span class="nc" id="L1513">    maxConnectionsPerListener</span>
+<span class="nc" id="L1514">      .get(listenerName)</span>
+<span class="nc" id="L1515">      .foreach { listenerQuota =&gt;</span>
+<span class="nc" id="L1516">        listenerQuota.ipConnectionRateThrottleSensor.record(throttleMs.toDouble, timeMs)</span>
+<span class="nc" id="L1517">        listenerQuota.connectionRateSensor.record(-1.0, timeMs, false)</span>
+      }
+  }
+
+  /**
+   * Calculates the delay needed to bring the observed connection creation rate to the IP limit.
+   * If the connection would cause an IP quota violation, un-record the connection for both IP,
+   * listener, and broker connection rate and throw a ConnectionThrottledException. Calls to
+   * this function must be performed with the counts lock to ensure that reading the IP
+   * connection rate quota and creating the sensor's metric config is atomic.
+   *
+   * @param listenerName listener to unrecord connection if throttled
+   * @param address ip address to record connection
+   */
+  private def recordIpConnectionMaybeThrottle(listenerName: ListenerName, address: InetAddress): Unit = {
+<span class="nc" id="L1532">    val connectionRateQuota = connectionRateForIp(address)</span>
+<span class="nc bnc" id="L1533" title="All 2 branches missed.">    val quotaEnabled = connectionRateQuota != QuotaConfig.IP_CONNECTION_RATE_DEFAULT</span>
+<span class="nc bnc" id="L1534" title="All 2 branches missed.">    if (quotaEnabled) {</span>
+<span class="nc" id="L1535">      val sensor = getOrCreateConnectionRateQuotaSensor(connectionRateQuota, ConnectionQuotaEntity.ipQuotaEntity(address))</span>
+<span class="nc" id="L1536">      val timeMs = time.milliseconds</span>
+<span class="nc" id="L1537">      val throttleMs = recordAndGetThrottleTimeMs(sensor, timeMs)</span>
+<span class="nc bnc" id="L1538" title="All 2 branches missed.">      if (throttleMs &gt; 0) {</span>
+<span class="nc" id="L1539">        trace(s&quot;Throttling $address for $throttleMs ms&quot;)</span>
+        // unrecord the connection since we won't accept the connection
+<span class="nc" id="L1541">        sensor.record(-1.0, timeMs, false)</span>
+<span class="nc" id="L1542">        updateListenerMetrics(listenerName, throttleMs, timeMs)</span>
+<span class="nc" id="L1543">        throw new ConnectionThrottledException(address, timeMs, throttleMs)</span>
+      }
+    }
+  }
+
+  /**
+   * Records a new connection into a given connection acceptance rate sensor 'sensor' and returns throttle time
+   * in milliseconds if quota got violated
+   * @param sensor sensor to record connection
+   * @param timeMs current time in milliseconds
+   * @return throttle time in milliseconds if quota got violated, otherwise 0
+   */
+  private def recordAndGetThrottleTimeMs(sensor: Sensor, timeMs: Long): Int = {
+    try {
+<span class="nc" id="L1557">      sensor.record(1.0, timeMs)</span>
+<span class="nc" id="L1558">      0</span>
+    } catch {
+      case e: QuotaViolationException =&gt;
+<span class="nc" id="L1561">        val throttleTimeMs = QuotaUtils.boundedThrottleTime(e, maxThrottleTimeMs, timeMs).toInt</span>
+<span class="nc" id="L1562">        debug(s&quot;Quota violated for sensor (${sensor.name}). Delay time: $throttleTimeMs ms&quot;)</span>
+<span class="nc" id="L1563">        throttleTimeMs</span>
+    }
+  }
+
+  /**
+   * Creates sensor for tracking the connection creation rate and corresponding connection rate quota for a given
+   * listener or broker-wide, if listener is not provided.
+   * @param quotaLimit connection creation rate quota
+   * @param connectionQuotaEntity entity to create the sensor for
+   */
+  private def getOrCreateConnectionRateQuotaSensor(quotaLimit: Int, connectionQuotaEntity: ConnectionQuotaEntity): Sensor = {
+<span class="nc" id="L1574">    Option(metrics.getSensor(connectionQuotaEntity.sensorName)).getOrElse {</span>
+<span class="nc" id="L1575">      val sensor = metrics.sensor(</span>
+<span class="nc" id="L1576">        connectionQuotaEntity.sensorName,</span>
+<span class="nc" id="L1577">        rateQuotaMetricConfig(quotaLimit),</span>
+<span class="nc bnc" id="L1578" title="All 2 branches missed.">        connectionQuotaEntity.sensorExpiration</span>
+      )
+<span class="nc" id="L1580">      sensor.add(connectionRateMetricName(connectionQuotaEntity), new Rate, null)</span>
+<span class="nc" id="L1581">      sensor</span>
+    }
+  }
+
+  /**
+   * Updates quota configuration for a given connection quota entity
+   */
+  private def updateConnectionRateQuota(quotaLimit: Int, connectionQuotaEntity: ConnectionQuotaEntity): Unit = {
+<span class="nc" id="L1589">    Option(metrics.metric(connectionRateMetricName(connectionQuotaEntity))).foreach { metric =&gt;</span>
+<span class="nc" id="L1590">      metric.config(rateQuotaMetricConfig(quotaLimit))</span>
+<span class="nc" id="L1591">      info(s&quot;Updated ${connectionQuotaEntity.metricName} max connection creation rate to $quotaLimit&quot;)</span>
+    }
+  }
+
+  private def connectionRateMetricName(connectionQuotaEntity: ConnectionQuotaEntity): MetricName = {
+<span class="nc" id="L1596">    metrics.metricName(</span>
+<span class="nc" id="L1597">      connectionQuotaEntity.metricName,</span>
+<span class="nc" id="L1598">      JSocketServer.METRICS_GROUP,</span>
+<span class="nc" id="L1599">      s&quot;Tracking rate of accepting new connections (per second)&quot;,</span>
+<span class="nc" id="L1600">      connectionQuotaEntity.metricTags)</span>
+  }
+
+  private def rateQuotaMetricConfig(quotaLimit: Int): MetricConfig = {
+<span class="nc" id="L1604">    new MetricConfig()</span>
+<span class="nc" id="L1605">      .timeWindow(config.quotaConfig.quotaWindowSizeSeconds.toLong, TimeUnit.SECONDS)</span>
+<span class="nc" id="L1606">      .samples(config.quotaConfig.numQuotaSamples)</span>
+<span class="nc" id="L1607">      .quota(new Quota(quotaLimit, true))</span>
+  }
+
+  def close(): Unit = {
+<span class="nc" id="L1611">    metrics.removeSensor(brokerConnectionRateSensor.name)</span>
+<span class="nc" id="L1612">    maxConnectionsPerListener.values.foreach(_.close())</span>
+  }
+
+<span class="nc bnc" id="L1615" title="All 2 branches missed.">  class ListenerConnectionQuota(lock: Object, listener: ListenerName) extends ListenerReconfigurable with AutoCloseable {</span>
+<span class="nc" id="L1616">    @volatile private var _maxConnections = Int.MaxValue</span>
+<span class="nc" id="L1617">    private[network] val connectionRateSensor = getOrCreateConnectionRateQuotaSensor(Int.MaxValue, ConnectionQuotaEntity.listenerQuotaEntity(listener.value))</span>
+<span class="nc" id="L1618">    private[network] val listenerConnectionRateThrottleSensor = createConnectionRateThrottleSensor(ConnectionQuotaEntity.LISTENER_THROTTLE_PREFIX)</span>
+<span class="nc" id="L1619">    private[network] val ipConnectionRateThrottleSensor = createConnectionRateThrottleSensor(ConnectionQuotaEntity.IP_THROTTLE_PREFIX)</span>
+
+<span class="nc" id="L1621">    def maxConnections: Int = _maxConnections</span>
+
+<span class="nc" id="L1623">    override def listenerName(): ListenerName = listener</span>
+
+    override def configure(configs: util.Map[String, _]): Unit = {
+<span class="nc" id="L1626">      _maxConnections = maxConnections(configs)</span>
+<span class="nc" id="L1627">      updateConnectionRateQuota(maxConnectionCreationRate(configs), ConnectionQuotaEntity.listenerQuotaEntity(listener.value))</span>
+    }
+
+    override def reconfigurableConfigs(): util.Set[String] = {
+<span class="nc" id="L1631">      JSocketServer.LISTENER_RECONFIGURABLE_CONFIGS</span>
+    }
+
+    override def validateReconfiguration(configs: util.Map[String, _]): Unit = {
+<span class="nc" id="L1635">      val value = maxConnections(configs)</span>
+<span class="nc bnc" id="L1636" title="All 2 branches missed.">      if (value &lt;= 0)</span>
+<span class="nc" id="L1637">        throw new ConfigException(s&quot;Invalid ${SocketServerConfigs.MAX_CONNECTIONS_CONFIG} $value&quot;)</span>
+
+<span class="nc" id="L1639">      val rate = maxConnectionCreationRate(configs)</span>
+<span class="nc bnc" id="L1640" title="All 2 branches missed.">      if (rate &lt;= 0)</span>
+<span class="nc" id="L1641">        throw new ConfigException(s&quot;Invalid ${SocketServerConfigs.MAX_CONNECTION_CREATION_RATE_CONFIG} $rate&quot;)</span>
+    }
+
+    override def reconfigure(configs: util.Map[String, _]): Unit = {
+<span class="nc" id="L1645">      lock.synchronized {</span>
+<span class="nc" id="L1646">        _maxConnections = maxConnections(configs)</span>
+<span class="nc" id="L1647">        updateConnectionRateQuota(maxConnectionCreationRate(configs), ConnectionQuotaEntity.listenerQuotaEntity(listener.value))</span>
+<span class="nc" id="L1648">        lock.notifyAll()</span>
+      }
+    }
+
+    def close(): Unit = {
+<span class="nc" id="L1653">      metrics.removeSensor(connectionRateSensor.name)</span>
+<span class="nc" id="L1654">      metrics.removeSensor(listenerConnectionRateThrottleSensor.name)</span>
+<span class="nc" id="L1655">      metrics.removeSensor(ipConnectionRateThrottleSensor.name)</span>
+    }
+
+    private def maxConnections(configs: util.Map[String, _]): Int = {
+<span class="nc" id="L1659">      Option(configs.get(SocketServerConfigs.MAX_CONNECTIONS_CONFIG)).map(_.toString.toInt).getOrElse(Int.MaxValue)</span>
+    }
+
+    private def maxConnectionCreationRate(configs: util.Map[String, _]): Int = {
+<span class="nc" id="L1663">      Option(configs.get(SocketServerConfigs.MAX_CONNECTION_CREATION_RATE_CONFIG)).map(_.toString.toInt).getOrElse(Int.MaxValue)</span>
+    }
+
+    /**
+     * Creates sensor for tracking the average throttle time on this listener due to hitting broker/listener connection
+     * rate or IP connection rate quota. The average is out of all throttle times &gt; 0, which is consistent with the
+     * bandwidth and request quota throttle time metrics.
+     */
+    private def createConnectionRateThrottleSensor(throttlePrefix: String): Sensor = {
+<span class="nc bnc" id="L1672" title="All 2 branches missed.">      val sensor = metrics.sensor(s&quot;${throttlePrefix}ConnectionRateThrottleTime-${listener.value}&quot;)</span>
+<span class="nc" id="L1673">      val metricName = metrics.metricName(s&quot;${throttlePrefix}connection-accept-throttle-time&quot;,</span>
+<span class="nc" id="L1674">        JSocketServer.METRICS_GROUP,</span>
+<span class="nc" id="L1675">        &quot;Tracking average throttle-time, out of non-zero throttle times, per listener&quot;,</span>
+<span class="nc" id="L1676">        MetricsUtils.getTags(JProcessor.LISTENER_METRIC_TAG, listener.value))</span>
+<span class="nc bnc" id="L1677" title="All 2 branches missed.">      sensor.add(metricName, new Avg)</span>
+<span class="nc" id="L1678">      sensor</span>
+    }
+  }
+
+  /**
+   * Close `channel` and decrement the connection count.
+   */
+  def closeChannel(log: Logging, listenerName: ListenerName, channel: SocketChannel): Unit = {
+<span class="nc bnc" id="L1686" title="All 2 branches missed.">    if (channel != null) {</span>
+<span class="nc" id="L1687">      log.debug(s&quot;Closing connection from ${channel.socket.getRemoteSocketAddress}&quot;)</span>
+<span class="nc" id="L1688">      dec(listenerName, channel.socket.getInetAddress)</span>
+<span class="nc" id="L1689">      JSocketServer.closeSocket(channel)</span>
+    }
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

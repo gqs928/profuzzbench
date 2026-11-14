@@ -1,0 +1,857 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "array.h"
+#include "hash.h"
+#include "mail-search.h"
+
+struct mail_search_simplify_prev_arg {
+	struct {
+		enum mail_search_arg_type type;
+		enum mail_search_arg_flag search_flags;
+		enum mail_search_date_type date_type;
+		enum mail_flags mail_flags;
+		bool match_not;
+		bool fuzzy;
+	} bin_mask;
+	const char *hdr_field_name_mask;
+	const char *str_mask;
+
+	struct mail_search_arg *prev_arg;
+};
+
+struct mail_search_simplify_ctx {
+	pool_t pool;
+	/* arg mask => prev_arg */
+	HASH_TABLE(struct mail_search_simplify_prev_arg *,
+		   struct mail_search_simplify_prev_arg *) prev_args;
+	bool parent_and;
+	bool removals;
+	bool initialized;
+};
+
+static int
+mail_search_simplify_prev_arg_cmp(const struct mail_search_simplify_prev_arg *arg1,
+				  const struct mail_search_simplify_prev_arg *arg2)
+{
+	int ret;
+
+	ret = memcmp(&arg1->bin_mask, &arg2->bin_mask, sizeof(arg1->bin_mask));
+	if (ret == 0)
+		ret = null_strcmp(arg1->hdr_field_name_mask, arg2->hdr_field_name_mask);
+	if (ret == 0)
+		ret = null_strcmp(arg1->str_mask, arg2->str_mask);
+	return ret;
+}
+
+static unsigned int
+mail_search_simplify_prev_arg_hash(const struct mail_search_simplify_prev_arg *arg)
+{
+	unsigned int hash;
+
+	hash = mem_hash(&arg->bin_mask, sizeof(arg->bin_mask));
+	if (arg->hdr_field_name_mask != NULL)
+		hash ^= str_hash(arg->hdr_field_name_mask);
+	if (arg->str_mask != NULL)
+		hash ^= str_hash(arg->str_mask);
+	return hash;
+}
+
+static void mail_search_arg_get_base_mask(const struct mail_search_arg *arg,
+					  struct mail_search_simplify_prev_arg *mask_r)
+{
+	i_zero(mask_r);
+	mask_r->bin_mask.type = arg->type;
+	mask_r->bin_mask.fuzzy = arg->fuzzy;
+	mask_r->bin_mask.search_flags = arg->value.search_flags;
+}
+
+static struct mail_search_arg **
+mail_search_args_simplify_get_prev_argp(struct mail_search_simplify_ctx *ctx,
+					const struct mail_search_simplify_prev_arg *mask)
+{
+	struct mail_search_simplify_prev_arg *prev_arg;
+
+	prev_arg = hash_table_lookup(ctx->prev_args, mask);
+	if (prev_arg == NULL) {
+		prev_arg = p_new(ctx->pool, struct mail_search_simplify_prev_arg, 1);
+		prev_arg->bin_mask = mask->bin_mask;
+		prev_arg->hdr_field_name_mask =
+			p_strdup(ctx->pool, mask->hdr_field_name_mask);
+		prev_arg->str_mask =
+			p_strdup(ctx->pool, mask->str_mask);
+		hash_table_insert(ctx->prev_args, prev_arg, prev_arg);
+	}
+	return &prev_arg->prev_arg;
+}
+
+static bool
+mail_search_args_merge_mask(struct mail_search_simplify_ctx *ctx,
+			    struct mail_search_arg *args,
+			    const struct mail_search_simplify_prev_arg *mask)
+{
+	struct mail_search_arg **prev_argp;
+
+	prev_argp = mail_search_args_simplify_get_prev_argp(ctx, mask);
+	if (*prev_argp == NULL) {
+		*prev_argp = args;
+		return FALSE;
+	}
+
+	if (ctx->initialized)
+		mail_search_arg_one_deinit(args);
+
+	if ((*prev_argp)->match_not != args->match_not) {
+		/* a && !a = 0 */
+		if (ctx->initialized)
+			mail_search_arg_one_deinit(*prev_argp);
+		(*prev_argp)->type = SEARCH_ALL;
+		(*prev_argp)->match_not = ctx->parent_and;
+	}
+	/* duplicate keyword. */
+	return TRUE;
+}
+
+static bool mail_search_args_merge_flags(struct mail_search_simplify_ctx *ctx,
+					 struct mail_search_arg *args)
+{
+	struct mail_search_simplify_prev_arg mask;
+
+	mail_search_arg_get_base_mask(args, &mask);
+	mask.bin_mask.mail_flags = args->value.flags;
+	return mail_search_args_merge_mask(ctx, args, &mask);
+}
+
+static bool
+mail_search_args_merge_keywords(struct mail_search_simplify_ctx *ctx,
+				struct mail_search_arg *args)
+{
+	struct mail_search_simplify_prev_arg mask;
+
+	mail_search_arg_get_base_mask(args, &mask);
+	mask.str_mask = args->value.str;
+	return mail_search_args_merge_mask(ctx, args, &mask);
+}
+
+static void mail_search_args_simplify_set(struct mail_search_arg *args)
+{
+	const struct seq_range *seqset;
+	unsigned int count;
+
+	if (args->match_not) {
+		/* invert the set to drop the NOT. Note that (uint32_t)-1
+		   matches the last existing mail, which we don't know at this
+		   point. lib-imap/imap-seqset.c has similar code that
+		   disallows using (uint32_t)-1 as a real UID. */
+		if (seq_range_exists(&args->value.seqset, (uint32_t)-1))
+			return;
+		args->match_not = FALSE;
+		seq_range_array_invert(&args->value.seqset, 1, (uint32_t)-2);
+	}
+	seqset = array_get(&args->value.seqset, &count);
+	if (count == 1 && seqset->seq1 == 1 && seqset->seq2 >= (uint32_t)-2) {
+		/* 1:* is the same as ALL. */
+		args->type = SEARCH_ALL;
+	} else if (count == 0) {
+		/* empty set is the same as NOT ALL. this is mainly coming
+		   from mail_search_args_merge_set() intersection. */
+		args->type = SEARCH_ALL;
+		args->match_not = TRUE;
+	}
+}
+
+static bool mail_search_args_merge_set(struct mail_search_simplify_ctx *ctx,
+				       struct mail_search_arg *args)
+{
+	struct mail_search_simplify_prev_arg mask;
+	struct mail_search_arg **prev_argp;
+
+	if (args->match_not) {
+		/* "*" used - can't simplify it */
+		return FALSE;
+	}
+
+	mail_search_arg_get_base_mask(args, &mask);
+	mask.bin_mask.match_not = args->match_not;
+	prev_argp = mail_search_args_simplify_get_prev_argp(ctx, &mask);
+
+	if (*prev_argp == NULL) {
+		*prev_argp = args;
+		return FALSE;
+	} else if (ctx->parent_and) {
+		seq_range_array_intersect(&(*prev_argp)->value.seqset,
+					  &args->value.seqset);
+		return TRUE;
+	} else {
+		seq_range_array_merge(&(*prev_argp)->value.seqset,
+				      &args->value.seqset);
+		return TRUE;
+	}
+}
+
+static bool mail_search_args_merge_time(struct mail_search_simplify_ctx *ctx,
+					struct mail_search_arg *args)
+{
+	struct mail_search_simplify_prev_arg mask;
+	struct mail_search_arg **prev_argp, *prev_arg;
+	bool and_merge;
+
+	mail_search_arg_get_base_mask(args, &mask);
+	mask.bin_mask.match_not = args->match_not;
+	mask.bin_mask.date_type = args->value.date_type;
+	prev_argp = mail_search_args_simplify_get_prev_argp(ctx, &mask);
+
+	if (*prev_argp == NULL) {
+		*prev_argp = args;
+		return FALSE;
+	}
+
+	prev_arg = *prev_argp;
+	/* Both args have the same match_not, since it is part of the lookup
+	   mask. Negating both args swaps AND and OR:
+	   NOT a AND NOT b == NOT (a OR b)
+	   NOT a OR NOT b == NOT (a AND b)
+	   So the bound to keep depends on both parent_and and match_not. */
+	and_merge = ctx->parent_and != args->match_not;
+	switch (args->type) {
+	case SEARCH_BEFORE:
+		if (and_merge) {
+			if (prev_arg->value.time < args->value.time) {
+				/* prev_arg < 5 AND arg < 10 */
+			} else {
+				/* prev_arg < 10 AND arg < 5 */
+				prev_arg->value.time = args->value.time;
+			}
+		} else {
+			if (prev_arg->value.time < args->value.time) {
+				/* prev_arg < 5 OR arg < 10 */
+				prev_arg->value.time = args->value.time;
+			} else {
+				/* prev_arg < 10 OR arg < 5 */
+			}
+		}
+		return TRUE;
+	case SEARCH_ON:
+		if (prev_arg->value.time == args->value.time)
+			return TRUE;
+		return FALSE;
+	case SEARCH_SINCE:
+		if (and_merge) {
+			if (prev_arg->value.time < args->value.time) {
+				/* prev_arg >= 5 AND arg >= 10 */
+				prev_arg->value.time = args->value.time;
+			} else {
+				/* prev_arg >= 10 AND arg >= 5 */
+			}
+		} else {
+			if (prev_arg->value.time < args->value.time) {
+				/* prev_arg >= 5 OR arg >= 10 */
+			} else {
+				/* prev_arg >= 10 OR arg >= 5 */
+				prev_arg->value.time = args->value.time;
+			}
+		}
+		return TRUE;
+	default:
+		break;
+	}
+	return FALSE;
+}
+
+static bool mail_search_args_merge_size(struct mail_search_simplify_ctx *ctx,
+					struct mail_search_arg *args)
+{
+	struct mail_search_simplify_prev_arg mask;
+	struct mail_search_arg **prev_argp, *prev_arg;
+	bool and_merge;
+
+	mail_search_arg_get_base_mask(args, &mask);
+	mask.bin_mask.match_not = args->match_not;
+	prev_argp = mail_search_args_simplify_get_prev_argp(ctx, &mask);
+
+	if (*prev_argp == NULL) {
+		*prev_argp = args;
+		return FALSE;
+	}
+
+	prev_arg = *prev_argp;
+	/* Both args have the same match_not, since it is part of the lookup
+	   mask. Negating both args swaps AND and OR:
+	   NOT a AND NOT b == NOT (a OR b)
+	   NOT a OR NOT b == NOT (a AND b)
+	   So the bound to keep depends on both parent_and and match_not. */
+	and_merge = ctx->parent_and != args->match_not;
+	switch (args->type) {
+	case SEARCH_SMALLER:
+		if (and_merge) {
+			if (prev_arg->value.size < args->value.size) {
+				/* prev_arg < 5 AND arg < 10 */
+			} else {
+				/* prev_arg < 10 AND arg < 5 */
+				prev_arg->value.size = args->value.size;
+			}
+		} else {
+			if (prev_arg->value.size < args->value.size) {
+				/* prev_arg < 5 OR arg < 10 */
+				prev_arg->value.size = args->value.size;
+			} else {
+				/* prev_arg < 10 OR arg < 5 */
+			}
+		}
+		return TRUE;
+	case SEARCH_LARGER:
+		if (and_merge) {
+			if (prev_arg->value.size < args->value.size) {
+				/* prev_arg >= 5 AND arg >= 10 */
+				prev_arg->value.size = args->value.size;
+			} else {
+				/* prev_arg >= 10 AND arg >= 5 */
+			}
+		} else {
+			if (prev_arg->value.size < args->value.size) {
+				/* prev_arg >= 5 OR arg >= 10 */
+			} else {
+				/* prev_arg >= 10 OR arg >= 5 */
+				prev_arg->value.size = args->value.size;
+			}
+		}
+		return TRUE;
+	default:
+		break;
+	}
+	return FALSE;
+}
+
+static bool mail_search_args_merge_text(struct mail_search_simplify_ctx *ctx,
+					struct mail_search_arg *args)
+{
+	struct mail_search_simplify_prev_arg mask;
+
+	mail_search_arg_get_base_mask(args, &mask);
+	mask.hdr_field_name_mask = args->hdr_field_name;
+	mask.str_mask = args->value.str;
+	return mail_search_args_merge_mask(ctx, args, &mask);
+}
+
+static bool
+mail_search_args_have_equal(const struct mail_search_arg *args,
+			    const struct mail_search_arg *wanted_arg)
+{
+	const struct mail_search_arg *arg;
+
+	for (arg = args; arg != NULL; arg = arg->next) {
+		if (mail_search_arg_one_equals(arg, wanted_arg))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static bool
+mail_search_args_remove_equal(struct mail_search_args *all_args,
+			      struct mail_search_arg **argsp,
+			      const struct mail_search_arg *wanted_arg,
+			      bool check_subs)
+{
+	struct mail_search_arg **argp;
+	bool found = FALSE;
+
+	for (argp = argsp; (*argp) != NULL; ) {
+		if (mail_search_arg_one_equals(*argp, wanted_arg)) {
+			/* wanted_arg itself is only unlinked from the list -
+			   the caller keeps using it, so it must stay
+			   initialized. */
+			if (all_args->init_refcount > 0 && *argp != wanted_arg)
+				mail_search_arg_one_deinit(*argp);
+			*argp = (*argp)->next;
+			found = TRUE;
+		} else if (check_subs) {
+			i_assert((*argp)->type == SEARCH_SUB ||
+				 (*argp)->type == SEARCH_OR);
+			if (!mail_search_args_remove_equal(all_args, &(*argp)->value.subargs, wanted_arg, FALSE)) {
+				/* we already verified that this should have
+				   existed. */
+				i_unreached();
+			}
+			if ((*argp)->value.subargs == NULL)
+				*argp = (*argp)->next;
+			else
+				argp = &(*argp)->next;
+			found = TRUE;
+		} else {
+			argp = &(*argp)->next;
+		}
+	}
+	return found;
+}
+
+static bool
+mail_search_args_have_all_equal(struct mail_search_arg *parent_arg,
+				const struct mail_search_arg *wanted_args)
+{
+	const struct mail_search_arg *arg;
+
+	i_assert(parent_arg->type == SEARCH_SUB ||
+		 parent_arg->type == SEARCH_OR);
+
+	for (arg = wanted_args; arg != NULL; arg = arg->next) {
+		if (!mail_search_args_have_equal(parent_arg->value.subargs, arg))
+			return FALSE;
+	}
+	return TRUE;
+}
+
+/* Absorptive Law - This law enables a reduction in a complicated expression to
+   a simpler one by absorbing like terms.
+
+   A + (A.B) =  (A.1) + (A.B)  = A(1 + B)  = A  (OR Absorption Law)
+   A(A + B)  = (A + 0).(A + B) = A + (0.B) = A  (AND Absorption Law)
+
+   Cases with multiple shared terms (duals apply as well)
+
+   A + B + (A.C) + (B.C) = (A + (A.C)) + (B + B.C))  (apply law to sides of external sum))
+                         = A + B
+   A + B + (A.B.C) = (A + (A.(B.C))) + B 	     (X = B.C)
+                   = (A + (A.(X)) + B                (apply law to X)
+		   = A + B
+*/
+static bool
+mail_search_args_simplify_drop_redundant_args_real(struct mail_search_args *all_args,
+						   struct mail_search_arg **argsp,
+						   bool and_arg)
+{
+	struct mail_search_arg *arg, **argp;
+	enum mail_search_arg_type child_subargs_type;
+	bool changed = FALSE;
+
+	ARRAY(const struct mail_search_arg *) candidates;
+	ARRAY(const struct mail_search_arg *) dropped;
+	t_array_init(&candidates, 1);
+	t_array_init(&dropped, 1);
+
+	child_subargs_type = and_arg ? SEARCH_OR : SEARCH_SUB;
+	for (arg = *argsp; arg != NULL; arg = arg->next) {
+		if (arg->type == child_subargs_type) {
+			const struct mail_search_arg *entry = arg->value.subargs;
+			if (entry == NULL ||
+			    array_lsearch(&candidates, &entry,
+			    		  mail_search_arg_equals_p) != NULL)
+				continue;
+			array_push_back(&candidates, &entry);
+		} else {
+			struct mail_search_arg *copy = t_new(struct mail_search_arg, 1);
+			*copy = *arg;
+			copy->next = NULL;
+			const struct mail_search_arg *entry = copy;
+			array_push_back(&candidates, &entry);
+		}
+	}
+
+	const struct mail_search_arg *candidate;
+	array_foreach_elem(&candidates, candidate) {
+		if (array_lsearch_ptr(&dropped, candidate) != NULL) {
+			/* The arg that contained this candidate was itself
+			   dropped as redundant. Two args can contain each
+			   other's subargs (e.g. "(a OR b) AND (b OR a)"), so
+			   continuing here would drop all of them. */
+			continue;
+		}
+		/* if there are any args that include the candidate - EXCEPT the
+		   one that originally contained it - drop the arg, since it is
+		   redundant. (non-SUB duplicates are dropped elsewhere.) */
+		for (argp = argsp; *argp != NULL; ) {
+			if (*argp != candidate &&
+			   (*argp)->type == child_subargs_type &&
+			   (*argp)->value.subargs != candidate &&
+			   mail_search_args_have_all_equal(*argp, candidate)) {
+				const struct mail_search_arg *subargs =
+					(*argp)->value.subargs;
+
+				array_push_back(&dropped, &subargs);
+				if (all_args->init_refcount > 0)
+					mail_search_arg_one_deinit(*argp);
+				*argp = (*argp)->next;
+				changed = TRUE;
+			} else {
+				argp = &(*argp)->next;
+			}
+		}
+	}
+	return changed;
+}
+
+static bool
+mail_search_args_simplify_drop_redundant_args(struct mail_search_args *all_args,
+					      struct mail_search_arg **argsp,
+					      bool and_arg)
+{
+	if (*argsp == NULL || (*argsp)->next == NULL)
+		return FALSE;
+
+	bool ret;
+	T_BEGIN {
+		ret = mail_search_args_simplify_drop_redundant_args_real(
+			all_args, argsp, and_arg);
+	} T_END;
+	return ret;
+}
+
+static bool
+mail_search_args_simplify_extract_common(struct mail_search_args *all_args,
+					 struct mail_search_arg **argsp,
+					 pool_t pool, bool and_arg)
+{
+	/* Simple SUB example:
+	   (a AND b) OR (a AND c) -> a AND (b OR c)
+
+	   More complicated example:
+	   (c1 AND c2 AND u1 AND u2) OR (c1 AND c2 AND u3 AND u4) ->
+	   c1 AND c2 AND ((u1 AND u2) OR (u3 AND u4))
+
+	   Similarly for ORs:
+	   (a OR b) AND (a OR c) -> a OR (b AND c)
+
+	   (c1 OR c2 OR u1 OR u2) AND (c1 OR c2 OR u3 OR u4) ->
+	   c1 OR c2 OR ((u1 OR u2) AND (u3 OR u4))
+
+	*/
+	struct mail_search_arg *arg, *sub_arg, *sub_next;
+	struct mail_search_arg *new_arg, *child_arg, *common_args = NULL;
+	enum mail_search_arg_type child_subargs_type;
+
+	if (*argsp == NULL || (*argsp)->next == NULL) {
+		/* single arg, nothing to extract */
+		return FALSE;
+	}
+
+	child_subargs_type = and_arg ? SEARCH_OR : SEARCH_SUB;
+
+	/* find the first arg with child_subargs_type */
+	for (arg = *argsp; arg != NULL; arg = arg->next) {
+		if (arg->type == child_subargs_type)
+			break;
+	}
+	if (arg == NULL)
+		return FALSE;
+
+	for (sub_arg = arg->value.subargs; sub_arg != NULL; sub_arg = sub_next) {
+		bool whole_arg_matched = FALSE;
+
+		sub_next = sub_arg->next;
+
+		/* check if sub_arg is found from all the args */
+		for (arg = *argsp; arg != NULL; arg = arg->next) {
+			if (mail_search_arg_one_equals(arg, sub_arg)) {
+				/* the whole arg matches */
+				whole_arg_matched = TRUE;
+			} else if (arg->type == child_subargs_type &&
+				   mail_search_args_have_equal(arg->value.subargs, sub_arg)) {
+				/* exists as subarg */
+			} else {
+				break;
+			}
+		}
+		if (arg != NULL)
+			continue;
+
+		if (whole_arg_matched) {
+			/* One of the args is exactly sub_arg and all the other
+			   args contain it, so the remaining args reduce to
+			   sub_arg alone:
+			   (a OR b) AND a == a
+			   (a AND b) OR a == a
+			   The already extracted common args still apply:
+			   (c OR a OR b) AND (c OR a) == c OR a
+			   Stop here - extracting more args would use a list
+			   that this arg was already removed from. */
+			mail_search_args_remove_equal(all_args, argsp, sub_arg,
+						      TRUE);
+			if (all_args->init_refcount > 0)
+				mail_search_arg_deinit(*argsp);
+			*argsp = NULL;
+			sub_arg->next = common_args;
+			common_args = sub_arg;
+			break;
+		}
+
+		/* extract the arg and put it to common_args */
+		mail_search_args_remove_equal(all_args, argsp, sub_arg, TRUE);
+		sub_arg->next = common_args;
+		common_args = sub_arg;
+	}
+	if (common_args == NULL)
+		return FALSE;
+
+	/* replace all the original args with a single new SUB/OR arg */
+	new_arg = p_new(pool, struct mail_search_arg, 1);
+	new_arg->type = child_subargs_type;
+	if (*argsp == NULL) {
+		/* there are only common args */
+		new_arg->value.subargs = common_args;
+	} else {
+		/* replace OR arg with AND(OR(non_common_args), common_args)
+		   or
+		   replace AND arg with OR(AND(non_common_args), common_args) */
+		child_arg = p_new(pool, struct mail_search_arg, 1);
+		child_arg->type = and_arg ? SEARCH_SUB : SEARCH_OR;
+		child_arg->value.subargs = *argsp;
+		child_arg->next = common_args;
+		new_arg->value.subargs = child_arg;
+	}
+	*argsp = new_arg;
+	return TRUE;
+}
+
+static void mail_search_arg_simplify_not_sub(struct mail_search_arg *arg)
+{
+	struct mail_search_arg *sub;
+
+	if (!arg->match_not ||
+	    (arg->type != SEARCH_SUB && arg->type != SEARCH_OR))
+		return;
+
+	/* neg(p and q and ..) == neg(p) or neg(q) or ..
+	   neg(p or q or ..) == neg(p) and neg(q) and .. */
+	arg->type = arg->type == SEARCH_SUB ? SEARCH_OR : SEARCH_SUB;
+	arg->match_not = FALSE;
+	for (sub = arg->value.subargs; sub != NULL; sub = sub->next)
+		sub->match_not = !sub->match_not;
+}
+
+static void
+mail_search_args_simplify_keep_only(struct mail_search_simplify_ctx *ctx,
+				    struct mail_search_arg **all_argsp,
+				    struct mail_search_arg *arg)
+{
+	struct mail_search_arg *arg2;
+
+	if (ctx->initialized) {
+		for (arg2 = *all_argsp; arg2 != NULL; arg2 = arg2->next) {
+			if (arg2 != arg)
+				mail_search_arg_one_deinit(arg2);
+		}
+	}
+	*all_argsp = arg;
+	arg->next = NULL;
+	ctx->removals = TRUE;
+}
+
+static bool
+mail_search_args_simplify_sub(struct mail_search_args *all_args, pool_t pool,
+			      struct mail_search_arg **argsp, bool parent_and)
+{
+	struct mail_search_simplify_ctx ctx;
+	struct mail_search_arg *sub, **all_argsp = argsp;
+	bool merged;
+
+	i_zero(&ctx);
+	ctx.initialized = all_args->init_refcount > 0;
+	ctx.parent_and = parent_and;
+	ctx.pool = pool_alloconly_create("mail search args simplify", 1024);
+	hash_table_create(&ctx.prev_args, ctx.pool, 0,
+			  mail_search_simplify_prev_arg_hash,
+			  mail_search_simplify_prev_arg_cmp);
+
+	while (*argsp != NULL) {
+		struct mail_search_arg *args = *argsp;
+
+		mail_search_arg_simplify_not_sub(args);
+
+		if ((args->type == SEARCH_SUB && parent_and) ||
+		    (args->type == SEARCH_OR && !parent_and) ||
+		    ((args->type == SEARCH_SUB || args->type == SEARCH_OR) &&
+		     args->value.subargs->next == NULL)) {
+			/* p and (q and ..) == p and q and ..
+			   p or (q or ..) == p or q or ..
+			   (p) = p */
+			sub = args->value.subargs;
+			for (; sub->next != NULL; sub = sub->next) ;
+			sub->next = args->next;
+			*args = *args->value.subargs;
+			ctx.removals = TRUE;
+			continue;
+		}
+
+		if (args->type == SEARCH_SUB ||
+		    args->type == SEARCH_OR ||
+		    args->type == SEARCH_INTHREAD) {
+			/* Negated SUB/OR args were converted with De Morgan's
+			   law above. INTHREAD can be negated. */
+			i_assert(args->type == SEARCH_INTHREAD ||
+				 !args->match_not);
+
+			if (args->type != SEARCH_INTHREAD) {
+				bool and_arg = args->type == SEARCH_SUB;
+
+				/* Negated SUB/OR subargs must be converted
+				   before looking for redundant or common
+				   subargs. Otherwise NOT (p AND q) would be
+				   treated as (p AND q). */
+				for (sub = args->value.subargs; sub != NULL;
+				     sub = sub->next)
+					mail_search_arg_simplify_not_sub(sub);
+				if (mail_search_args_simplify_drop_redundant_args(all_args, &args->value.subargs, and_arg))
+					ctx.removals = TRUE;
+				if (mail_search_args_simplify_extract_common(all_args, &args->value.subargs, pool, and_arg))
+					ctx.removals = TRUE;
+			}
+			if (mail_search_args_simplify_sub(all_args, pool, &args->value.subargs,
+							  args->type != SEARCH_OR))
+				ctx.removals = TRUE;
+		}
+		if (args->type == SEARCH_SEQSET ||
+		    args->type == SEARCH_UIDSET)
+			mail_search_args_simplify_set(args);
+
+		/* try to merge arguments */
+		merged = FALSE;
+		switch (args->type) {
+		case SEARCH_ALL: {
+			if (*all_argsp == args && args->next == NULL) {
+				/* this arg has no siblings - no merging */
+				break;
+			}
+			if ((parent_and && !args->match_not) ||
+			    (!parent_and && args->match_not)) {
+				/* .. AND ALL ..
+				   .. OR NOT ALL ..
+				   This arg is irrelevant -> drop */
+				merged = TRUE;
+				break;
+			}
+			/* .. AND NOT ALL ..
+			   .. OR ALL ..
+			   The other args are irrelevant -> drop them */
+			mail_search_args_simplify_keep_only(&ctx, all_argsp,
+							    args);
+			break;
+		}
+		case SEARCH_FLAGS:
+			merged = mail_search_args_merge_flags(&ctx, args);
+			break;
+		case SEARCH_KEYWORDS:
+			merged = mail_search_args_merge_keywords(&ctx, args);
+			break;
+		case SEARCH_SEQSET:
+		case SEARCH_UIDSET:
+			merged = mail_search_args_merge_set(&ctx, args);
+			break;
+		case SEARCH_BEFORE:
+		case SEARCH_ON:
+		case SEARCH_SINCE:
+			merged = mail_search_args_merge_time(&ctx, args);
+			break;
+		case SEARCH_SMALLER:
+		case SEARCH_LARGER:
+			merged = mail_search_args_merge_size(&ctx, args);
+			break;
+		case SEARCH_BODY:
+		case SEARCH_TEXT:
+			if (args->value.str[0] == '\0') {
+				/* BODY "" and TEXT "" matches everything */
+				args->type = SEARCH_ALL;
+				ctx.removals = TRUE;
+				break;
+			}
+			/* fall through */
+		case SEARCH_HEADER:
+		case SEARCH_HEADER_ADDRESS:
+		case SEARCH_HEADER_COMPRESS_LWSP:
+			merged = mail_search_args_merge_text(&ctx, args);
+			break;
+		default:
+			break;
+		}
+		if (merged) {
+			*argsp = args->next;
+			ctx.removals = TRUE;
+			continue;
+		}
+
+		argsp = &args->next;
+	}
+	hash_table_destroy(&ctx.prev_args);
+	pool_unref(&ctx.pool);
+	return ctx.removals;
+}
+
+static bool
+mail_search_args_simplify_merge_flags(struct mail_search_arg **argsp,
+				      bool parent_and)
+{
+	struct mail_search_arg *prev_flags = NULL;
+	bool removals = FALSE;
+
+	while (*argsp != NULL) {
+		struct mail_search_arg *args = *argsp;
+
+		if (args->type == SEARCH_SUB ||
+		    args->type == SEARCH_OR ||
+		    args->type == SEARCH_INTHREAD) {
+			if (mail_search_args_simplify_merge_flags(&args->value.subargs,
+								  args->type != SEARCH_OR))
+				removals = TRUE;
+		} else if (args->type != SEARCH_FLAGS) {
+			/* ignore non-flags */
+		} else if (!((!args->match_not && parent_and) ||
+			   (args->match_not && !parent_and))) {
+			/* can't merge these flags args */
+		} else if (prev_flags == NULL) {
+			/* first flags arg */
+			prev_flags = args;
+		} else {
+			/* merge to previous arg */
+			prev_flags->value.flags |= args->value.flags;
+			*argsp = args->next;
+			removals = TRUE;
+			continue;
+		}
+		argsp = &args->next;
+	}
+	return removals;
+}
+
+static bool mail_search_args_have_inthreads(const struct mail_search_arg *args)
+{
+	const struct mail_search_arg *arg;
+
+	for (arg = args; arg != NULL; arg = arg->next) {
+		switch (arg->type) {
+		case SEARCH_INTHREAD:
+			return TRUE;
+		case SEARCH_SUB:
+		case SEARCH_OR:
+			if (mail_search_args_have_inthreads(arg->value.subargs))
+				return TRUE;
+			break;
+		default:
+			break;
+		}
+	}
+	return FALSE;
+}
+
+void mail_search_args_simplify(struct mail_search_args *args)
+{
+	bool removals;
+
+	args->simplified = TRUE;
+
+	removals = mail_search_args_simplify_sub(args, args->pool, &args->args, TRUE);
+	do {
+		if (mail_search_args_simplify_drop_redundant_args(args, &args->args, TRUE))
+			removals = TRUE;
+		if (mail_search_args_simplify_extract_common(args, &args->args, args->pool, TRUE))
+			removals = TRUE;
+		if (removals)
+			removals = mail_search_args_simplify_sub(args, args->pool, &args->args, TRUE);
+		/* do the flag merging into a single arg only at the end.
+		   up until then they're treated as any other search args,
+		   which simplifies their handling. after the flags merging is
+		   done, further simplifications are still possible. */
+		if (mail_search_args_simplify_merge_flags(&args->args, TRUE))
+			removals = TRUE;
+	} while (removals);
+	/* INTHREADs nested inside INTHREADs are built by the search of the
+	   outer INTHREAD, so only the top level INTHREADs matter here */
+	args->have_inthreads = mail_search_args_have_inthreads(args->args);
+}

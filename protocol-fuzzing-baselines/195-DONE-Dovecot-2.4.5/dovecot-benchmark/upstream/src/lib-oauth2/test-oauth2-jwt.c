@@ -1,0 +1,1247 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "buffer.h"
+#include "str.h"
+#include "ostream.h"
+#include "hmac.h"
+#include "sha2.h"
+#include "base64.h"
+#include "randgen.h"
+#include "array.h"
+#include "iso8601-date.h"
+#include "json-generator.h"
+#include "settings.h"
+#include "oauth2.h"
+#include "oauth2-private.h"
+#include "dcrypt-private.h"
+#include "dict.h"
+#include "dict-private.h"
+#include "test-common.h"
+#include "unlink-directory.h"
+
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#define base64url_encode_str(str, dest) \
+	base64url_encode(BASE64_ENCODE_FLAG_NO_PADDING, SIZE_MAX, (str), \
+			 strlen((str)), (dest))
+
+/**
+ * Test keypair used only for this test.
+ */
+static const char *rsa_public_key =
+"-----BEGIN PUBLIC KEY-----\n"
+"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnzyis1ZjfNB0bBgKFMSv\n"
+"vkTtwlvBsaJq7S5wA+kzeVOVpVWwkWdVha4s38XM/pa/yr47av7+z3VTmvDRyAHc\n"
+"aT92whREFpLv9cj5lTeJSibyr/Mrm/YtjCZVWgaOYIhwrXwKLqPr/11inWsAkfIy\n"
+"tvHWTxZYEcXLgAXFuUuaS3uF9gEiNQwzGTU1v0FqkqTBr4B8nW3HCN47XUu0t8Y0\n"
+"e+lf4s4OxQawWD79J9/5d3Ry0vbV3Am1FtGJiJvOwRsIfVChDpYStTcHTCMqtvWb\n"
+"V6L11BWkpzGXSW4Hv43qa+GSYOD2QU68Mb59oSk2OB+BtOLpJofmbGEGgvmwyCI9\n"
+"MwIDAQAB\n"
+"-----END PUBLIC KEY-----";
+static const char *rsa_private_key =
+"-----BEGIN PRIVATE KEY-----\n"
+"MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCfPKKzVmN80HRs\n"
+"GAoUxK++RO3CW8GxomrtLnAD6TN5U5WlVbCRZ1WFrizfxcz+lr/Kvjtq/v7PdVOa\n"
+"8NHIAdxpP3bCFEQWku/1yPmVN4lKJvKv8yub9i2MJlVaBo5giHCtfAouo+v/XWKd\n"
+"awCR8jK28dZPFlgRxcuABcW5S5pLe4X2ASI1DDMZNTW/QWqSpMGvgHydbccI3jtd\n"
+"S7S3xjR76V/izg7FBrBYPv0n3/l3dHLS9tXcCbUW0YmIm87BGwh9UKEOlhK1NwdM\n"
+"Iyq29ZtXovXUFaSnMZdJbge/jepr4ZJg4PZBTrwxvn2hKTY4H4G04ukmh+ZsYQaC\n"
+"+bDIIj0zAgMBAAECggEAKIBGrbCSW2O1yOyQW9nvDUkA5EdsS58Q7US7bvM4iWpu\n"
+"DIBwCXur7/VuKnhn/HUhURLzj/JNozynSChqYyG+CvL+ZLy82LUE3ZIBkSdv/vFL\n"
+"Ft+VvvRtf1EcsmoqenkZl7aN7HD7DJeXBoz5tyVQKuH17WW0fsi9StGtCcUl+H6K\n"
+"zV9Gif0Kj0uLQbCg3THRvKuueBTwCTdjoP0PwaNADgSWb3hJPeLMm/yII4tIMGbO\n"
+"w+xd9wJRl+ZN9nkNtQMxszFGdKjedB6goYLQuP0WRZx+YtykaVJdM75bDUvsQar4\n"
+"9Pc21Fp7UVk/CN11DX/hX3TmTJAUtqYADliVKkTbCQKBgQDLU48tBxm3g1CdDM/P\n"
+"ZIEmpA3Y/m7e9eX7M1Uo/zDh4G/S9a4kkX6GQY2dLFdCtOS8M4hR11Io7MceBKDi\n"
+"djorTZ5zJPQ8+b9Rm+1GlaucGNwRW0cQk2ltT2ksPmJnQn2xvM9T8vE+a4A/YGzw\n"
+"mZOfpoVGykWs/tbSzU2aTaOybQKBgQDIfRf6OmirGPh59l+RSuDkZtISF/51mCV/\n"
+"S1M4DltWDwhjC2Y2T+meIsb/Mjtz4aVNz0EHB8yvn0TMGr94Uwjv4uBdpVSwz+xL\n"
+"hHL7J4rpInH+i0gxa0N+rGwsPwI8wJG95wLY+Kni5KCuXQw55uX1cqnnsahpRZFZ\n"
+"EerBXhjqHwKBgBmEjiaHipm2eEqNjhMoOPFBi59dJ0sCL2/cXGa9yEPA6Cfgv49F\n"
+"V0zAM2azZuwvSbm4+fXTgTMzrDW/PPXPArPmlOk8jQ6OBY3XdOrz48q+b/gZrYyO\n"
+"A6A9ZCSyW6U7+gxxds/BYLeFxF2v21xC2f0iZ/2faykv/oQMUh34en/tAoGACqVZ\n"
+"2JexZyR0TUWf3X80YexzyzIq+OOTWicNzDQ29WLm9xtr2gZ0SUlfd72bGpQoyvDu\n"
+"awkm/UxfwtbIxALkvpg1gcN9s8XWrkviLyPyZF7H3tRWiQlBFEDjnZXa8I7pLkRO\n"
+"Cmdp3fp17cxTEeAI5feovfzZDH39MdWZuZrdh9ECgYBTEv8S7nK8wrxIC390kroV\n"
+"52eBwzckQU2mWa0thUtaGQiU1EYPCSDcjkrLXwB72ft0dW57KyWtvrB6rt1ORgOL\n"
+"eI5hFbwdGQhCHTrAR1vG3SyFPMAm+8JB+sGOD/fvjtZKx//MFNweKFNEF0C/o6Z2\n"
+"FXj90PlgF8sCQut36ZfuIQ==\n"
+"-----END PRIVATE KEY-----";
+
+static buffer_t *hs_sign_key = NULL;
+
+static struct dict *keys_dict = NULL;
+
+static bool skip_dcrypt = FALSE;
+
+static struct oauth2_validation_key_cache *key_cache = NULL;
+
+static int parse_jwt_token(struct oauth2_request *req, const char *token,
+			   bool *is_jwt_r, const char **error_r)
+{
+	struct oauth2_settings set;
+
+	i_zero(&set);
+	set.key_dict = keys_dict;
+	set.key_cache = key_cache;
+	i_zero(req);
+	req->pool = pool_datastack_create();
+	req->set = &set;
+	t_array_init(&req->fields, 8);
+	return oauth2_try_parse_jwt(&set, token, &req->fields, is_jwt_r,
+				    error_r);
+}
+
+static void test_jwt_token(const char *token)
+{
+	/* then see what the parser likes it */
+	struct oauth2_request req;
+	const char *error = NULL;
+
+	bool is_jwt;
+	test_assert(parse_jwt_token(&req, token, &is_jwt, &error) == 0);
+	test_assert(is_jwt == TRUE);
+	test_assert(error == NULL);
+
+	/* check fields */
+	test_assert(array_is_created(&req.fields));
+	if (array_is_created(&req.fields)) {
+		const struct oauth2_field *field;
+		bool got_sub = FALSE;
+		array_foreach(&req.fields, field) {
+			if (strcmp(field->name, "sub") == 0) {
+				test_assert_strcmp(field->value, "testuser");
+				got_sub = TRUE;
+			}
+		}
+		test_assert(got_sub == TRUE);
+	}
+
+	if (error != NULL)
+		i_error("%s", error);
+}
+
+static buffer_t *create_jwt_token_kid(const char *algo, const char *kid)
+{
+	/* make a token */
+	buffer_t *tokenbuf = t_buffer_create(64);
+
+	/* header */
+	base64url_encode_str(
+		t_strdup_printf(
+			"{\"alg\":\"%s\",\"typ\":\"JWT\",\"kid\":\"%s\"}",
+			algo, kid),
+		tokenbuf);
+	buffer_append(tokenbuf, ".", 1);
+
+	/* body */
+	base64url_encode_str(
+		/* decimals injected to excercise the JSON number parser */
+		t_strdup_printf("{\"sub\":\"testuser\","\
+				"\"iat\":%"PRIdTIME_T","
+				"\"exp\":%"PRIdTIME_T".000E+0}",
+				time(NULL), time(NULL)+600),
+		tokenbuf);
+	return tokenbuf;
+}
+
+static buffer_t *create_jwt_token(const char *algo)
+{
+	/* make a token */
+	buffer_t *tokenbuf = t_buffer_create(64);
+
+	/* header */
+	base64url_encode_str(
+		t_strdup_printf("{\"alg\":\"%s\",\"typ\":\"JWT\"}", algo),
+		tokenbuf);
+	buffer_append(tokenbuf, ".", 1);
+
+	/* body */
+	base64url_encode_str(
+		/* decimals injected to excercise the JSON number parser */
+		t_strdup_printf("{\"sub\":\"testuser\","\
+				"\"iat\":%"PRIdTIME_T","
+				"\"exp\":%"PRIdTIME_T".000E+0}",
+				time(NULL), time(NULL)+600),
+		tokenbuf);
+	return tokenbuf;
+}
+
+static void
+append_key_value(string_t *dest, const char *key, const char *value, bool str)
+{
+	str_append_c(dest, '"');
+	json_append_escaped(dest, key);
+	str_append(dest, "\":");
+	if (str)
+		str_append_c(dest, '"');
+	json_append_escaped(dest, value);
+	if (str)
+		str_append_c(dest, '"');
+
+}
+
+#define create_jwt_token_fields(algo, exp, iat, nbf, fields) \
+	create_jwt_token_fields_kid(algo, "default", exp, iat, nbf, fields)
+static buffer_t *
+create_jwt_token_fields_kid(const char *algo, const char *kid, time_t exp, time_t iat,
+			    time_t nbf, ARRAY_TYPE(oauth2_field) *fields)
+{
+	const struct oauth2_field *field;
+	buffer_t *tokenbuf = t_buffer_create(64);
+	string_t *hdr = t_str_new(32);
+	str_printfa(hdr, "{\"alg\":\"%s\",\"typ\":\"JWT\"", algo);
+	if (kid != NULL && *kid != '\0') {
+		str_append(hdr, ",\"kid\":\"");
+		json_append_escaped(hdr, kid);
+		str_append_c(hdr, '"');
+	}
+	str_append(hdr, "}");
+	base64url_encode_str(str_c(hdr), tokenbuf);
+	buffer_append(tokenbuf, ".", 1);
+
+	string_t *bodybuf = t_str_new(64);
+	str_append_c(bodybuf, '{');
+	if (exp > 0) {
+		append_key_value(bodybuf, "exp", dec2str(exp), FALSE);
+	}
+	if (iat > 0) {
+		if (exp > 0)
+			str_append_c(bodybuf, ',');
+		append_key_value(bodybuf, "iat", dec2str(iat), FALSE);
+	}
+	if (nbf > 0) {
+		if (exp > 0 || iat > 0)
+			str_append_c(bodybuf, ',');
+		append_key_value(bodybuf, "nbf", dec2str(nbf), FALSE);
+	}
+	array_foreach(fields, field) {
+		if (str_data(bodybuf)[bodybuf->used-1] != '{')
+			str_append_c(bodybuf, ',');
+		append_key_value(bodybuf, field->name, field->value, TRUE);
+	}
+	str_append_c(bodybuf, '}');
+	base64url_encode_str(str_c(bodybuf), tokenbuf);
+
+	return tokenbuf;
+}
+
+#define save_key(algo, key) save_key_to(algo, "default", (key))
+#define save_key_to(algo, name, key) save_key_azp_to(algo, "default", name, (key))
+static void save_key_azp_to(const char *algo, const char *azp,
+			    const char *name, const char *keydata)
+{
+	const char *error;
+	struct dict_op_settings set = {
+		.username = "testuser",
+	};
+	struct dict_transaction_context *ctx =
+		dict_transaction_begin(keys_dict, &set);
+	algo = t_str_ucase(algo);
+	dict_set(ctx, t_strconcat(DICT_PATH_SHARED, azp, "/", algo, "/",
+				  name, NULL),
+		 keydata);
+	if (dict_transaction_commit(&ctx, &error) < 0)
+		i_error("dict_set(%s) failed: %s", name, error);
+}
+
+/* Drops the cached validation key for the key saved by save_key_azp_to(). The
+   cache is keyed on the same shared/<azp>/<alg>/<kid> path as the dict
+   lookup. */
+#define evict_key(algo) evict_key_azp_to(algo, "default", "default")
+static void evict_key_azp_to(const char *algo, const char *azp,
+			     const char *name)
+{
+	const char *key = t_strconcat(DICT_PATH_SHARED, azp, "/",
+				      t_str_ucase(algo), "/", name, NULL);
+
+	(void)oauth2_validation_key_cache_evict(key_cache, key);
+}
+
+static void sign_jwt_token_hs256(buffer_t *tokenbuf, buffer_t *key)
+{
+	i_assert(key != NULL);
+	buffer_t *sig = t_hmac_buffer(&hash_method_sha256, key->data, key->used,
+				      tokenbuf);
+	buffer_append(tokenbuf, ".", 1);
+	base64url_encode(BASE64_ENCODE_FLAG_NO_PADDING, SIZE_MAX,
+			 sig->data, sig->used, tokenbuf);
+}
+
+static void sign_jwt_token_hs384(buffer_t *tokenbuf, buffer_t *key)
+{
+	i_assert(key != NULL);
+	buffer_t *sig = t_hmac_buffer(&hash_method_sha384, key->data, key->used,
+				      tokenbuf);
+	buffer_append(tokenbuf, ".", 1);
+	base64url_encode(BASE64_ENCODE_FLAG_NO_PADDING, SIZE_MAX,
+			 sig->data, sig->used, tokenbuf);
+}
+
+static void sign_jwt_token_hs512(buffer_t *tokenbuf, buffer_t *key)
+{
+	i_assert(key != NULL);
+	buffer_t *sig = t_hmac_buffer(&hash_method_sha512, key->data, key->used,
+				      tokenbuf);
+	buffer_append(tokenbuf, ".", 1);
+	base64url_encode(BASE64_ENCODE_FLAG_NO_PADDING, SIZE_MAX,
+			 sig->data, sig->used, tokenbuf);
+}
+
+static void test_jwt_hs_token(void)
+{
+	test_begin("JWT HMAC token");
+
+	buffer_t *sign_key_384 = t_buffer_create(384/8);
+	void *ptr = buffer_append_space_unsafe(sign_key_384, 384/8);
+	random_fill(ptr, 384/8);
+	buffer_t *b64_key = t_base64_encode(0, SIZE_MAX,
+					    sign_key_384->data,
+					    sign_key_384->used);
+	save_key_to("HS384", "default", str_c(b64_key));
+	buffer_t *sign_key_512 = t_buffer_create(512/8);
+	ptr = buffer_append_space_unsafe(sign_key_512, 512/8);
+	random_fill(ptr, 512/8);
+	b64_key = t_base64_encode(0, SIZE_MAX,
+				  sign_key_512->data,
+				  sign_key_512->used);
+	save_key_to("HS512", "default", str_c(b64_key));
+	/* make a token */
+	buffer_t *tokenbuf = create_jwt_token("HS256");
+	/* sign it */
+	sign_jwt_token_hs256(tokenbuf, hs_sign_key);
+	test_jwt_token(str_c(tokenbuf));
+
+	tokenbuf = create_jwt_token("HS384");
+	sign_jwt_token_hs384(tokenbuf, sign_key_384);
+	test_jwt_token(str_c(tokenbuf));
+
+	tokenbuf = create_jwt_token("HS512");
+	sign_jwt_token_hs512(tokenbuf, sign_key_512);
+	test_jwt_token(str_c(tokenbuf));
+
+	test_end();
+}
+
+static void test_jwt_token_escape(void)
+{
+	struct test_case {
+		const char *azp;
+		const char *alg;
+		const char *kid;
+		const char *esc_azp;
+		const char *esc_kid;
+	} test_cases[] = {
+		{ "", "hs256", "", "default", "default" },
+		{ "", "hs256", "test", "default", "test" },
+		{ "test", "hs256", "test", "test", "test" },
+		{
+			"http://test.unit/local%key",
+			"hs256",
+			"http://test.unit/local%key",
+			"http:%2f%2ftest.unit%2flocal%25key",
+			"http:%2f%2ftest.unit%2flocal%25key"
+		},
+		{ "../", "hs256", "../", "..%2f", "..%2f" },
+		/* a bare "." or ".." must be percent-encoded so it cannot act
+		   as a relative path component in the dict key */
+		{ "..", "hs256", "..", "%2e%2e", "%2e%2e" },
+		{ ".", "hs256", ".", "%2e", "%2e" },
+	};
+
+	test_begin("JWT token escaping");
+
+	buffer_t *b64_key =
+		t_base64_encode(0, SIZE_MAX, hs_sign_key->data, hs_sign_key->used);
+	ARRAY_TYPE(oauth2_field) fields;
+	t_array_init(&fields, 8);
+
+	for (size_t i = 0; i < N_ELEMENTS(test_cases); i++) {
+		const struct test_case *test_case = &test_cases[i];
+		array_clear(&fields);
+		struct oauth2_field *field = array_append_space(&fields);
+		field->name = "sub";
+		field->value = "testuser";
+		if (*test_case->azp != '\0') {
+			field = array_append_space(&fields);
+			field->name = "azp";
+			field->value = test_case->azp;
+		}
+		if (*test_case->kid != '\0') {
+			field = array_append_space(&fields);
+			field->name = "kid";
+			field->value = test_case->kid;
+		}
+		save_key_azp_to(test_case->alg, test_case->esc_azp, test_case->esc_kid,
+				str_c(b64_key));
+		buffer_t *token = create_jwt_token_fields_kid(test_case->alg,
+							      test_case->kid,
+							      time(NULL)+500,
+							      time(NULL)-500,
+							      0, &fields);
+		sign_jwt_token_hs256(token, hs_sign_key);
+		test_jwt_token(str_c(token));
+	}
+
+	test_end();
+}
+
+static void test_jwt_key_cache_evict(void)
+{
+	test_begin("JWT validation key cache eviction");
+
+	/* Own (azp, kid) namespace, so the cache entry under test is not shared
+	   with any other test. */
+	const char *azp = "evict", *kid = "test";
+	buffer_t *key1 = t_buffer_create(32);
+	random_fill(buffer_append_space_unsafe(key1, 32), 32);
+	buffer_t *key2 = t_buffer_create(32);
+	random_fill(buffer_append_space_unsafe(key2, 32), 32);
+	buffer_t *b64_key1 =
+		t_base64_encode(0, SIZE_MAX, key1->data, key1->used);
+	buffer_t *b64_key2 =
+		t_base64_encode(0, SIZE_MAX, key2->data, key2->used);
+
+	time_t now = time(NULL);
+	ARRAY_TYPE(oauth2_field) fields;
+	t_array_init(&fields, 8);
+	struct oauth2_field *field = array_append_space(&fields);
+	field->name = "sub";
+	field->value = "testuser";
+	field = array_append_space(&fields);
+	field->name = "azp";
+	field->value = azp;
+
+	/* Validating a token signed with key1 caches key1. */
+	save_key_azp_to("HS256", azp, kid, str_c(b64_key1));
+	buffer_t *token1 = create_jwt_token_fields_kid("HS256", kid, now+500,
+						       now-500, 0, &fields);
+	sign_jwt_token_hs256(token1, key1);
+	test_jwt_token(str_c(token1));
+
+	/* Replace the stored key. The cache still holds key1, so a token signed
+	   with the new key must not validate yet - otherwise the eviction below
+	   would pass even without evicting anything. */
+	save_key_azp_to("HS256", azp, kid, str_c(b64_key2));
+	buffer_t *token2 = create_jwt_token_fields_kid("HS256", kid, now+500,
+						       now-500, 0, &fields);
+	sign_jwt_token_hs256(token2, key2);
+
+	struct oauth2_request req;
+	const char *error = NULL;
+	bool is_jwt;
+	test_assert(parse_jwt_token(&req, str_c(token2), &is_jwt, &error) != 0);
+	test_assert(error != NULL);
+
+	/* After eviction the new key is looked up again. This fails if the
+	   eviction key does not match the key the cache was populated with. */
+	evict_key_azp_to("HS256", azp, kid);
+	test_jwt_token(str_c(token2));
+
+	test_end();
+}
+
+static void test_jwt_control_chars(void)
+{
+	const char *const control_ids[] = {
+		"test\nkid", "test\rkid", "test\tkid", "test\x01kid",
+		"test\x7fkid",
+	};
+
+	test_begin("JWT control characters in 'azp' and 'kid'");
+
+	/* Both fields end up in the dict key and in error messages that go to
+	   the authentication log, so they must be rejected before they are used
+	   for anything. No key is stored for them: the point of the test is that
+	   the specific control-character error is returned, not the generic
+	   "key not found" that a later failure would produce. */
+	time_t now = time(NULL);
+	ARRAY_TYPE(oauth2_field) fields;
+	t_array_init(&fields, 8);
+
+	for (unsigned int i = 0; i < N_ELEMENTS(control_ids); i++) {
+		struct oauth2_request req;
+		struct oauth2_field *field;
+		const char *error;
+		buffer_t *token;
+		bool is_jwt;
+
+		/* control character in 'kid' */
+		array_clear(&fields);
+		field = array_append_space(&fields);
+		field->name = "sub";
+		field->value = "testuser";
+		token = create_jwt_token_fields_kid("HS256", control_ids[i],
+						    now+500, now-500, 0, &fields);
+		sign_jwt_token_hs256(token, hs_sign_key);
+		error = NULL;
+		test_assert_idx(parse_jwt_token(&req, str_c(token), &is_jwt,
+						&error) != 0, i);
+		test_assert_idx(is_jwt == TRUE, i);
+		test_assert_strcmp_idx(error,
+			"'kid' field contains control characters", i);
+
+		/* control character in 'azp' */
+		array_clear(&fields);
+		field = array_append_space(&fields);
+		field->name = "sub";
+		field->value = "testuser";
+		field = array_append_space(&fields);
+		field->name = "azp";
+		field->value = control_ids[i];
+		token = create_jwt_token_fields_kid("HS256", "default",
+						    now+500, now-500, 0, &fields);
+		sign_jwt_token_hs256(token, hs_sign_key);
+		error = NULL;
+		test_assert_idx(parse_jwt_token(&req, str_c(token), &is_jwt,
+						&error) != 0, i);
+		test_assert_idx(is_jwt == TRUE, i);
+		test_assert_strcmp_idx(error,
+			"'azp' field contains control characters", i);
+	}
+
+	test_end();
+}
+
+static void test_jwt_cache_key_collision(void)
+{
+	test_begin("JWT validation key cache key collision");
+
+	/* Two distinct HMAC keys stored at two distinct dict paths whose
+	   (azp, alg, kid) fields differ only in where a literal '.' falls:
+	     azp="a",         kid="b.HS256.c" -> shared/a/HS256/b.HS256.c
+	     azp="a.HS256.b", kid="c"         -> shared/a.HS256.b/HS256/c
+	   A dot-joined cache key ("a.HS256.b.HS256.c") is identical for both,
+	   so caching the first namespace's key would let a forged token for the
+	   second namespace validate against the wrong (first) key. */
+	buffer_t *key1 = t_buffer_create(32);
+	random_fill(buffer_append_space_unsafe(key1, 32), 32);
+	buffer_t *key2 = t_buffer_create(32);
+	random_fill(buffer_append_space_unsafe(key2, 32), 32);
+	buffer_t *b64_key1 =
+		t_base64_encode(0, SIZE_MAX, key1->data, key1->used);
+	buffer_t *b64_key2 =
+		t_base64_encode(0, SIZE_MAX, key2->data, key2->used);
+
+	save_key_azp_to("HS256", "a", "b.HS256.c", str_c(b64_key1));
+	save_key_azp_to("HS256", "a.HS256.b", "c", str_c(b64_key2));
+
+	time_t now = time(NULL);
+	ARRAY_TYPE(oauth2_field) fields;
+	t_array_init(&fields, 8);
+	struct oauth2_field *field;
+
+	/* Token 1: azp="a", kid="b.HS256.c", correctly signed with key1.
+	   Validating it populates the validation-key cache. */
+	array_clear(&fields);
+	field = array_append_space(&fields);
+	field->name = "sub";
+	field->value = "testuser";
+	field = array_append_space(&fields);
+	field->name = "azp";
+	field->value = "a";
+	buffer_t *token1 = create_jwt_token_fields_kid("HS256", "b.HS256.c",
+						       now+500, now-500, 0,
+						       &fields);
+	sign_jwt_token_hs256(token1, key1);
+	test_jwt_token(str_c(token1));
+
+	/* Token 2: azp="a.HS256.b", kid="c", signed with key1 (the attacker's
+	   key) although the real key for this namespace is key2. It must be
+	   rejected; a colliding cache key would accept it. */
+	array_clear(&fields);
+	field = array_append_space(&fields);
+	field->name = "sub";
+	field->value = "testuser";
+	field = array_append_space(&fields);
+	field->name = "azp";
+	field->value = "a.HS256.b";
+	buffer_t *token2 = create_jwt_token_fields_kid("HS256", "c",
+						       now+500, now-500, 0,
+						       &fields);
+	sign_jwt_token_hs256(token2, key1);
+
+	struct oauth2_request req;
+	const char *error = NULL;
+	bool is_jwt;
+	test_assert(parse_jwt_token(&req, str_c(token2), &is_jwt, &error) != 0);
+	test_assert(is_jwt == TRUE);
+	test_assert(error != NULL);
+
+	test_end();
+}
+
+static void test_jwt_broken_token(void)
+{
+	struct test_cases {
+		const char *token;
+		bool is_jwt;
+	} test_cases[] = {
+		{ /* empty token */
+			.token = "",
+			.is_jwt = FALSE
+		},
+		{ /* not base64 */
+			.token = "{\"alg\":\"HS256\":\"typ\":\"JWT\"}",
+			.is_jwt = FALSE
+		},
+		{ /* not jwt */
+			.token = "aGVsbG8sIHdvcmxkCg",
+			.is_jwt = FALSE
+		},
+		{ /* no alg field */
+			.token = "eyJ0eXAiOiAiSldUIn0.e30.e30",
+			.is_jwt = FALSE
+		},
+		{ /* typ field is wrong */
+			.token = "e3R5cDogamtzLCBhbGc6IEhTMjU2fQ."
+				 "eyJhbGdvIjogIldURiIsICJ0eXAiOiAiSldUIn0."
+				 "q2wwwWWJVJxqw-J3uQ0DdlIyWfoZ7Z0QrdzvMW_B-jo",
+			.is_jwt = FALSE
+		},
+		{ /* unknown algorithm */
+			.token = "eyJ0eXAiOiAiSldUIiwgImFsZyI6ICJXVEYifQ."
+				 "eyJhbGdvIjogIldURiIsICJ0eXAiOiAiSldUIn0."
+				 "q2wwwWWJVJxqw-J3uQ0DdlIyWfoZ7Z0QrdzvMW_B-jo",
+			.is_jwt = TRUE
+		},
+		{ /* truncated base64 */
+			.token  = "yJhbGciOiJIUzI1NiIsInR5",
+			.is_jwt = FALSE
+		},
+		{ /* missing body and signature */
+			.token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+			.is_jwt = FALSE
+		},
+		{ /* empty body and signature */
+			.token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..",
+			.is_jwt = TRUE
+		},
+		{ /* empty signature */
+			.token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+				 "eyJleHAiOjE1ODEzMzA3OTN9.",
+			.is_jwt = TRUE
+		},
+		{ /* bad signature */
+			.token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+				 "eyJleHAiOjE1ODEzMzA3OTN9."
+				 "q2wwwWWJVJxqw-J3uQ0DdlIyWfoZ7Z0QrdzvMW_B-jo",
+			.is_jwt = TRUE
+		},
+		{ /* algorithm is 'none' */
+			.token = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."
+				 "eyJleHAiOjE1ODEzMzA3OTN9.",
+			.is_jwt = TRUE
+		}
+	};
+
+	test_begin("JWT broken tokens");
+
+	for (size_t i = 0; i < N_ELEMENTS(test_cases); i++) T_BEGIN {
+		struct test_cases *test_case = &test_cases[i];
+		struct oauth2_request req;
+		const char *error = NULL;
+		bool is_jwt;
+		test_assert_idx(parse_jwt_token(&req, test_case->token,
+						&is_jwt, &error) != 0, i);
+		test_assert_idx(test_case->is_jwt == is_jwt, i);
+		test_assert_idx(error != NULL, i);
+	} T_END;
+
+	test_end();
+}
+
+static void test_jwt_bad_valid_token(void)
+{
+	test_begin("JWT bad token tests");
+	time_t now = time(NULL);
+
+	struct test_cases {
+		time_t exp;
+		time_t iat;
+		time_t nbf;
+		const char *key_values[20];
+		const char *error;
+	} test_cases[] =
+	{
+		{ /* "empty" token */
+			.exp = 0,
+			.iat = 0,
+			.nbf = 0,
+			.key_values = { NULL },
+			.error = "Missing 'sub' field",
+		},
+		{ /* missing sub field */
+			.exp = now+500,
+			.iat = 0,
+			.nbf = 0,
+			.key_values = { NULL },
+			.error = "Missing 'sub' field",
+		},
+		{ /* no expiration */
+			.key_values = {
+				"sub", "testuser",
+				NULL
+			},
+			.error = "Missing 'exp' field",
+		},
+		{ /* non-ISO date as iat */
+			.exp = now+500,
+			.iat = 0,
+			.nbf = 0,
+			.key_values = { "sub", "testuser", "iat",
+					"1.1.2019 16:00", NULL },
+			.error = "Malformed 'iat' field"
+		},
+		{ /* expired token */
+			.exp = now-500,
+			.iat = 0,
+			.nbf = 0,
+			.key_values = { "sub", "testuser", NULL },
+			.error = "Token has expired",
+		},
+		{ /* future token */
+			.exp = now+1000,
+			.iat = now+500,
+			.nbf = 0,
+			.key_values = { "sub", "testuser", NULL },
+			.error = "Token is issued in future",
+		},
+		{ /* token not valid yet */
+			.exp = now+500,
+			.iat = now,
+			.nbf = now+250,
+			.key_values = { "sub", "testuser", NULL },
+			.error = "Token is not valid yet",
+		},
+	};
+
+	for (size_t i = 0; i < N_ELEMENTS(test_cases); i++) T_BEGIN {
+		const struct test_cases *test_case = &test_cases[i];
+		const char *key = NULL;
+		ARRAY_TYPE(oauth2_field) fields;
+
+		t_array_init(&fields, 8);
+		for (const char *const *value = test_case->key_values;
+		     *value != NULL; value++) {
+			if (key == NULL) {
+				key = *value;
+			} else {
+				struct oauth2_field *field =
+					array_append_space(&fields);
+				field->name = key;
+				field->value = *value;
+				key = NULL;
+			}
+		}
+
+		buffer_t *tokenbuf =
+			create_jwt_token_fields("HS256", test_case->exp,
+						test_case->iat, test_case->nbf,
+						&fields);
+		sign_jwt_token_hs256(tokenbuf, hs_sign_key);
+
+		struct oauth2_request req;
+		const char *error = NULL;
+		bool is_jwt;
+
+		test_assert_idx(parse_jwt_token(&req, str_c(tokenbuf),
+						&is_jwt, &error) != 0, i);
+		test_assert_idx(is_jwt == TRUE, i);
+		if (test_case->error != NULL) {
+			test_assert(strstr(error, test_case->error) != NULL);
+		}
+		test_assert(error != NULL);
+	} T_END;
+
+	test_end();
+}
+
+static void test_jwt_valid_token(void)
+{
+	test_begin("JWT valid token tests");
+	time_t now = time(NULL);
+
+	struct test_cases {
+		time_t exp;
+		time_t iat;
+		time_t nbf;
+		const char *key_values[20];
+	} test_cases[] = {
+	{	/* valid token */
+		.exp = now + 500,
+		.key_values = {
+			"sub", "testuser",
+			NULL
+		},
+	},
+	{
+		.exp = now + 500,
+		.nbf = now - 500,
+		.iat = now - 250,
+		.key_values = {
+			"sub", "testuser",
+			NULL
+		},
+	},
+	{	/* token issued in advance */
+		.exp = now + 500,
+		.nbf = now - 500,
+		.iat = now - 3600,
+		.key_values = {
+			"sub", "testuser",
+			NULL,
+		},
+	},
+	};
+
+	for (size_t i = 0; i < N_ELEMENTS(test_cases); i++) T_BEGIN {
+		const struct test_cases *test_case = &test_cases[i];
+		ARRAY_TYPE(oauth2_field) fields;
+
+		t_array_init(&fields, 8);
+		for (unsigned int i = 0; test_case->key_values[i] != NULL; i += 2) {
+			struct oauth2_field *field = array_append_space(&fields);
+			field->name = test_case->key_values[i];
+			field->value = test_case->key_values[i+1];
+		}
+
+		buffer_t *tokenbuf =
+			create_jwt_token_fields("HS256", test_case->exp,
+						test_case->iat, test_case->nbf,
+						&fields);
+		sign_jwt_token_hs256(tokenbuf, hs_sign_key);
+
+		struct oauth2_request req;
+		const char *error = NULL;
+		bool is_jwt;
+
+		test_assert_idx(parse_jwt_token(&req, str_c(tokenbuf),
+						&is_jwt, &error) == 0, i);
+		test_assert_idx(is_jwt == TRUE, i);
+		test_assert_idx(error == NULL, i);
+		if (error != NULL)
+			i_error("JWT validation error: %s", error);
+	} T_END;
+
+	test_end();
+}
+
+static void test_jwt_dates(void)
+{
+	test_begin("JWT Token dates");
+
+	/* simple check to make sure ISO8601 dates work too */
+	ARRAY_TYPE(oauth2_field) fields;
+	t_array_init(&fields, 8);
+	struct oauth2_field *field;
+	struct tm tm_b;
+	struct tm *tm;
+	time_t now = time(NULL);
+	time_t exp = now+500;
+	time_t nbf = now-250;
+	time_t iat = now-500;
+
+	field = array_append_space(&fields);
+	field->name = "sub";
+	field->value = "testuser";
+	field = array_append_space(&fields);
+	field->name = "exp";
+	tm = gmtime_r(&exp, &tm_b);
+	field->value = iso8601_date_create_tm(tm, INT_MAX);
+	field = array_append_space(&fields);
+	field->name = "nbf";
+	tm = gmtime_r(&nbf, &tm_b);
+	field->value = iso8601_date_create_tm(tm, INT_MAX);
+	field = array_append_space(&fields);
+	field->name = "iat";
+	tm = gmtime_r(&iat, &tm_b);
+	field->value = iso8601_date_create_tm(tm, INT_MAX);
+	buffer_t *tokenbuf = create_jwt_token_fields("HS256", 0, 0, 0, &fields);
+	sign_jwt_token_hs256(tokenbuf, hs_sign_key);
+	test_jwt_token(str_c(tokenbuf));
+
+	str_truncate(tokenbuf, 0);
+	base64url_encode_str("{\"alg\":\"HS256\",\"typ\":\"JWT\"}", tokenbuf);
+	str_append_c(tokenbuf, '.');
+	base64url_encode_str(t_strdup_printf("{\"sub\":\"testuser\","
+					     "\"nbf\":0,"
+					     "\"exp\":%"PRIdTIME_T","
+					     "\"iat\":%"PRIdTIME_T".000E+0}",
+					     exp, iat),
+			     tokenbuf);
+	sign_jwt_token_hs256(tokenbuf, hs_sign_key);
+	test_jwt_token(str_c(tokenbuf));
+
+	test_end();
+}
+
+static void test_jwt_key_files(void)
+{
+	test_begin("JWT key id");
+	/* write HMAC secrets */
+	struct oauth2_request req;
+	bool is_jwt;
+	const char *error = NULL;
+
+	buffer_t *secret = t_buffer_create(32);
+	void *ptr = buffer_append_space_unsafe(secret, 32);
+	random_fill(ptr, 32);
+	buffer_t *b64_key = t_base64_encode(0, SIZE_MAX,
+					    secret->data, secret->used);
+	save_key_to("HS256", "first", str_c(b64_key));
+	buffer_t *secret2 = t_buffer_create(32);
+	ptr = buffer_append_space_unsafe(secret2, 32);
+	random_fill(ptr, 32);
+	b64_key = t_base64_encode(0, SIZE_MAX, secret2->data, secret2->used);
+	save_key_to("HS256", "second", str_c(b64_key));
+
+	/* create and sign token */
+	buffer_t *token_1 = create_jwt_token_kid("HS256", "first");
+	buffer_t *token_2 = create_jwt_token_kid("HS256", "second");
+	buffer_t *token_3 = create_jwt_token_kid("HS256", "missing");
+	buffer_t *token_4 = create_jwt_token_kid("HS256", "");
+
+	sign_jwt_token_hs256(token_1, secret);
+	sign_jwt_token_hs256(token_2, secret2);
+	sign_jwt_token_hs256(token_3, secret);
+	sign_jwt_token_hs256(token_4, secret);
+
+	test_jwt_token(str_c(token_1));
+	test_jwt_token(str_c(token_2));
+
+	test_assert(parse_jwt_token(&req, str_c(token_3), &is_jwt, &error) != 0);
+	test_assert(is_jwt == TRUE);
+	test_assert_strcmp(error, "HS256 key 'missing' not found");
+	test_assert(parse_jwt_token(&req, str_c(token_4), &is_jwt, &error) != 0);
+	test_assert(is_jwt == TRUE);
+	test_assert_strcmp(error, "'kid' field is empty");
+
+	test_end();
+}
+
+static void test_jwt_kid_escape(void)
+{
+	test_begin("JWT kid escape");
+	/* save a token */
+	 buffer_t *secret = t_buffer_create(32);
+	 void *ptr = buffer_append_space_unsafe(secret, 32);
+	 random_fill(ptr, 32);
+	 buffer_t *b64_key = t_base64_encode(0, SIZE_MAX,
+					     secret->data, secret->used);
+	 save_key_to("HS256", "hello.world%2f%25", str_c(b64_key));
+	/* make a token */
+	buffer_t *tokenbuf = create_jwt_token_kid("HS256", "hello.world/%");
+	/* sign it */
+	sign_jwt_token_hs256(tokenbuf, secret);
+	test_jwt_token(str_c(tokenbuf));
+	test_end();
+}
+
+static void test_jwt_nested_fields(void)
+{
+	test_begin("JWT nested fields");
+
+	buffer_t *tokenbuf = t_str_new(128);
+	const char *error ATTR_UNUSED;
+	bool is_jwt;
+	time_t now = time(NULL);
+	time_t exp = now+500;
+	time_t iat = now-500;
+	time_t nbf = now-250;
+
+	base64url_encode_str("{\"alg\":\"HS256\",\"typ\":\"JWT\"}", tokenbuf);
+	str_append_c(tokenbuf, '.');
+	base64url_encode_str(t_strdup_printf("{\"sub\":\"testuser\","
+					     "\"nbf\":%"PRIdTIME_T","
+					     "\"aud\":[\"dacity\",\"iron\"],"
+					     "\"user\":{"
+					        "\"name\":\"test\","
+					        "\"features\":[\"one\",\"two\",\"tap\\tdance\"],"
+					        "\"enabled\":true,"
+					        "\"locations\":{\"shared\":true,\"private\":false}"
+					     "},"
+					     "\"borders_\":{\"_left\":\"left\","
+					        "\"right_\":{\"_ok_\":\"right\"},"
+					        "\"_both_\":\"both\","
+					        "\"middle_one\":\"middle\","
+					        "\"middle_inner\":{\"middle_two\":\"middle_in\"}"
+					     "},"
+					     "\"exp\":%"PRIdTIME_T","
+					     "\"iat\":%"PRIdTIME_T"}",
+					     nbf, exp, iat),
+			     tokenbuf);
+	sign_jwt_token_hs256(tokenbuf, hs_sign_key);
+	struct oauth2_request req;
+
+	test_assert(parse_jwt_token(&req, str_c(tokenbuf), &is_jwt, &error) == 0);
+	test_assert(is_jwt == TRUE);
+
+	const struct oauth2_field test_fields[] = {
+		{ .name = "sub", .value = "testuser" },
+		{ .name = "nbf", .value = dec2str(nbf) },
+		{ .name = "exp", .value = dec2str(exp) },
+		{ .name = "iat", .value = dec2str(iat) },
+		{ .name = "aud", .value = "dacity\tiron" },
+		{ .name = "user_name", .value = "test" },
+		{ .name = "user_enabled", .value = "true" },
+		{ .name = "borders___left", .value = "left" },
+		{ .name = "borders___both_", .value = "both" },
+		{ .name = "borders__middle_one", .value = "middle" },
+		{ .name = "user_features", .value = "one\ttwo\ttap\1tdance" },
+		{ .name = "user_locations_shared", .value = "true" },
+		{ .name = "user_locations_private", .value = "false" },
+		{ .name = "borders__right___ok_", .value = "right" },
+		{ .name = "borders__middle_inner_middle_two", .value = "middle_in" },
+		{ .name = NULL, .value = NULL }
+	};
+
+
+	/* lets see them fields */
+	const struct oauth2_field *field;
+	unsigned int i = 0;
+	array_foreach(&req.fields, field) {
+		i_assert(i < N_ELEMENTS(test_fields));
+		test_assert_strcmp_idx(field->name, test_fields[i].name, i);
+		test_assert_strcmp_idx(field->value, test_fields[i].value, i);
+		i++;
+	}
+	test_assert_ucmp(i, ==, N_ELEMENTS(test_fields) - 1);
+	test_end();
+}
+
+/* Regression test for oauth2_jwt_copy_fields(): many non-singular
+   (array/object) siblings in a row force repeated array_append_space()
+   calls on the "nodes" array while a pointer to its front element
+   ("subroot") is still held by the caller. Each such call may relocate
+   the array, so this exercises the code path where subroot needs to be
+   refreshed after the append. */
+static void test_jwt_many_siblings(void)
+{
+	test_begin("JWT many non-singular siblings");
+
+	string_t *body = t_str_new(4096);
+	str_append(body, "{\"sub\":\"testuser\"");
+	for (int i = 0; i < 64; i++) {
+		str_printfa(body, ",\"arr%d\":[\"v%d_a\",\"v%d_b\"]", i, i, i);
+	}
+	str_append(body, ",\"exp\":9999999999,\"trailing\":\"tail-value\"}");
+
+	buffer_t *tokenbuf = t_str_new(128);
+	base64url_encode_str("{\"alg\":\"HS256\",\"typ\":\"JWT\"}", tokenbuf);
+	str_append_c(tokenbuf, '.');
+	base64url_encode_str(str_c(body), tokenbuf);
+	sign_jwt_token_hs256(tokenbuf, hs_sign_key);
+
+	struct oauth2_request req;
+	const char *error = NULL;
+	bool is_jwt;
+	test_assert(parse_jwt_token(&req, str_c(tokenbuf), &is_jwt, &error) == 0);
+	test_assert(is_jwt == TRUE);
+
+	bool found_trailing = FALSE;
+	unsigned int arr_count = 0;
+	const struct oauth2_field *field;
+	array_foreach(&req.fields, field) {
+		if (strcmp(field->name, "trailing") == 0) {
+			test_assert_strcmp(field->value, "tail-value");
+			found_trailing = TRUE;
+		} else if (str_begins_with(field->name, "arr")) {
+			const char *num = field->name + 3;
+			test_assert_strcmp(
+				field->value,
+				t_strdup_printf("v%s_a\tv%s_b", num, num));
+			arr_count++;
+		}
+	}
+	test_assert(found_trailing == TRUE);
+	test_assert_ucmp(arr_count, ==, 64);
+
+	test_end();
+}
+
+static void test_jwt_rs_token(void)
+{
+	const char *error;
+
+	if (skip_dcrypt)
+		return;
+
+	test_begin("JWT RSA token");
+	/* write public key to file */
+	evict_key("RS256");
+	save_key("RS256", rsa_public_key);
+
+	buffer_t *tokenbuf = create_jwt_token("RS256");
+
+	/* sign token */
+	buffer_t *sig = t_buffer_create(64);
+	struct dcrypt_private_key *key;
+	if (!dcrypt_key_load_private(&key, rsa_private_key, NULL, NULL,
+				     &error) ||
+	    !dcrypt_sign(key, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+			 tokenbuf->data, tokenbuf->used, sig,
+			 DCRYPT_PADDING_RSA_PKCS1, &error))
+		i_fatal("dcrypt signing failed: %s", error);
+	dcrypt_key_unref_private(&key);
+
+	/* convert to base64 */
+	buffer_append(tokenbuf, ".", 1);
+	base64url_encode(BASE64_ENCODE_FLAG_NO_PADDING, SIZE_MAX,
+			 sig->data, sig->used, tokenbuf);
+
+	test_jwt_token(str_c(tokenbuf));
+
+	test_end();
+}
+
+static void test_jwt_ps_token(void)
+{
+	const char *error;
+
+	if (skip_dcrypt)
+		return;
+
+	test_begin("JWT RSAPSS token");
+	/* write public key to file */
+	evict_key("PS256");
+	save_key("PS256", rsa_public_key);
+
+	buffer_t *tokenbuf = create_jwt_token("PS256");
+
+	/* sign token */
+	buffer_t *sig = t_buffer_create(64);
+	struct dcrypt_private_key *key;
+	if (!dcrypt_key_load_private(&key, rsa_private_key, NULL, NULL,
+				     &error) ||
+	    !dcrypt_sign(key, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+			 tokenbuf->data, tokenbuf->used, sig,
+			 DCRYPT_PADDING_RSA_PKCS1_PSS, &error))
+		i_fatal("dcrypt signing failed: %s", error);
+	dcrypt_key_unref_private(&key);
+
+	/* convert to base64 */
+	buffer_append(tokenbuf, ".", 1);
+	base64url_encode(BASE64_ENCODE_FLAG_NO_PADDING, SIZE_MAX,
+			 sig->data, sig->used, tokenbuf);
+
+	test_jwt_token(str_c(tokenbuf));
+
+	test_end();
+}
+
+static void test_jwt_ec_token(void)
+{
+	const char *error;
+
+	if (skip_dcrypt)
+		return;
+
+	test_begin("JWT ECDSA token");
+	struct dcrypt_keypair pair;
+	i_zero(&pair);
+	if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0,
+				     "prime256v1", &error))
+		i_fatal("dcrypt keypair generate failed: %s", error);
+	/* export public key */
+	buffer_t *keybuf = t_buffer_create(256);
+	if (!dcrypt_key_store_public(pair.pub, DCRYPT_FORMAT_PEM, keybuf,
+				     &error))
+		i_fatal("dcrypt key store failed: %s", error);
+	evict_key("ES256");
+	save_key("ES256", str_c(keybuf));
+
+	buffer_t *tokenbuf = create_jwt_token("ES256");
+
+	/* sign token */
+	buffer_t *sig = t_buffer_create(64);
+	if (!dcrypt_sign(pair.priv, "sha256", DCRYPT_SIGNATURE_FORMAT_X962,
+			 tokenbuf->data, tokenbuf->used, sig,
+			 DCRYPT_PADDING_DEFAULT, &error))
+		i_fatal("dcrypt signing failed: %s", error);
+	dcrypt_keypair_unref(&pair);
+
+	/* convert to base64 */
+	buffer_append(tokenbuf, ".", 1);
+	base64url_encode(BASE64_ENCODE_FLAG_NO_PADDING, SIZE_MAX,
+			 sig->data, sig->used, tokenbuf);
+	test_jwt_token(str_c(tokenbuf));
+
+	test_end();
+}
+
+static void test_do_init(void)
+{
+	const char *error;
+	struct dcrypt_settings dcrypt_set = {
+	};
+	struct settings_simple set;
+	settings_simple_init(&set, (const char *const []) {
+		"dict", "file",
+		"dict/file/path", ".keys",
+		NULL,
+	});
+
+	i_unlink_if_exists(".keys");
+	dict_driver_register(&dict_driver_file);
+	if (dict_init_auto(set.event, &keys_dict, &error) <= 0)
+		i_fatal("dict_init_auto(): %s", error);
+	dcrypt_openssl_init(NULL);
+	if (!dcrypt_initialize(NULL, &dcrypt_set, &error)) {
+		i_error("No functional dcrypt backend found - "
+			"skipping some tests: %s", error);
+		skip_dcrypt = TRUE;
+	}
+	key_cache = oauth2_validation_key_cache_init();
+
+	/* write HMAC secret */
+	hs_sign_key =buffer_create_dynamic(default_pool, 32);
+	void *ptr = buffer_append_space_unsafe(hs_sign_key, 32);
+	random_fill(ptr, 32);
+	buffer_t *b64_key = t_base64_encode(0, SIZE_MAX,
+					    hs_sign_key->data,
+					    hs_sign_key->used);
+	save_key("HS256", str_c(b64_key));
+	settings_simple_deinit(&set);
+}
+
+static void test_do_deinit(void)
+{
+	dict_deinit(&keys_dict);
+	dict_driver_unregister(&dict_driver_file);
+	oauth2_validation_key_cache_deinit(&key_cache);
+	i_unlink(".keys");
+	buffer_free(&hs_sign_key);
+	dcrypt_deinitialize();
+	dcrypt_openssl_deinit();
+}
+
+int main(void)
+{
+	static void (*test_functions[])(void) = {
+		test_do_init,
+		test_jwt_hs_token,
+		test_jwt_token_escape,
+		test_jwt_cache_key_collision,
+		test_jwt_control_chars,
+		test_jwt_key_cache_evict,
+		test_jwt_valid_token,
+		test_jwt_bad_valid_token,
+		test_jwt_broken_token,
+		test_jwt_dates,
+		test_jwt_key_files,
+		test_jwt_kid_escape,
+		test_jwt_nested_fields,
+		test_jwt_many_siblings,
+		test_jwt_rs_token,
+		test_jwt_ps_token,
+		test_jwt_ec_token,
+		test_do_deinit,
+		NULL
+	};
+	int ret;
+	ret = test_run(test_functions);
+	return ret;
+}

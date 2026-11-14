@@ -1,0 +1,94 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "array.h"
+#include "str.h"
+#include "ostream.h"
+#include "doveadm.h"
+#include "doveadm-print.h"
+#include "doveadm-print-private.h"
+#include "client-connection.h"
+#include "var-expand.h"
+
+struct doveadm_print_formatted_context {
+	pool_t pool;
+	const char *format;
+	ARRAY(struct var_expand_table) headers;
+	string_t *buf;
+	string_t *vbuf;
+	unsigned int idx;
+};
+
+static struct doveadm_print_formatted_context ctx;
+
+void doveadm_print_formatted_set_format(const char *format)
+{
+        ctx.format = format;
+}
+
+static void doveadm_print_formatted_init(void)
+{
+	i_zero(&ctx);
+	ctx.pool = pool_alloconly_create("doveadm formatted print", 1024);
+	ctx.buf = str_new(ctx.pool, 256);
+	p_array_init(&ctx.headers, ctx.pool, 8);
+	ctx.idx = 0;
+}
+
+static void
+doveadm_print_formatted_header(const struct doveadm_print_header *hdr)
+{
+	struct var_expand_table entry;
+	i_zero(&entry);
+	entry.key = p_strdup(ctx.pool, hdr->key);
+	entry.value = NULL;
+	array_push_back(&ctx.headers, &entry);
+}
+
+
+static void doveadm_print_formatted_flush(void)
+{
+	o_stream_nsend(doveadm_print_ostream, str_data(ctx.buf), str_len(ctx.buf));
+	str_truncate(ctx.buf, 0);
+}
+
+static void doveadm_print_formatted_print(const char *value)
+{
+	if (ctx.format == NULL) {
+		i_fatal("formatted formatter cannot be used without a format.");
+	}
+	const char *error;
+	struct var_expand_table *entry = array_idx_modifiable(&ctx.headers, ctx.idx++);
+	entry->value = value;
+
+	if (ctx.idx >= array_count(&ctx.headers)) {
+		array_append_zero(&ctx.headers);
+		array_pop_back(&ctx.headers);
+		const struct var_expand_params params = {
+			.table = array_front(&ctx.headers),
+		};
+		if (var_expand(ctx.buf, ctx.format, &params, &error) < 0) {
+			i_error("Failed to expand print format '%s': %s",
+				ctx.format, error);
+		}
+		doveadm_print_formatted_flush();
+		ctx.idx = 0;
+	}
+
+}
+
+static void doveadm_print_formatted_deinit(void)
+{
+	pool_unref(&ctx.pool);
+}
+
+struct doveadm_print_vfuncs doveadm_print_formatted_vfuncs = {
+	.name = "formatted",
+
+	.init = doveadm_print_formatted_init,
+	.deinit = doveadm_print_formatted_deinit,
+	.header = doveadm_print_formatted_header,
+	.print = doveadm_print_formatted_print,
+	.flush = doveadm_print_formatted_flush,
+};
+

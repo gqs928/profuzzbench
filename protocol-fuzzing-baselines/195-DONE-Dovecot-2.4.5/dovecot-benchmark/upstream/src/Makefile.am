@@ -1,0 +1,86 @@
+if HAVE_LDAP
+LIB_LDAP=lib-ldap
+endif
+if HAVE_LUA
+LIB_LUA=lib-lua
+LIBSTORAGE_LUA=lib-storage-lua
+endif
+if BUILD_IMAP_HIBERNATE
+IMAP_HIBERNATE=imap-hibernate
+endif
+if HAVE_GSSAPI
+LIBDOVEOT_GSSAPI_DIR=lib-dovecot-gssapi
+endif
+
+LIBDOVECOT_SUBDIRS = \
+	lib-test \
+	lib \
+	lib-regex \
+	lib-var-expand \
+	lib-dns \
+	lib-settings \
+	lib-auth \
+	lib-dns-client \
+	lib-ssl-iostream \
+	lib-master \
+	lib-auth-client \
+	lib-login \
+	lib-charset \
+	lib-json \
+	lib-dcrypt \
+	lib-dict \
+	lib-http \
+	lib-oauth2 \
+	lib-sasl \
+	lib-fs \
+	lib-mail \
+	lib-program-client \
+	lib-smtp \
+	lib-pop3 \
+	lib-imap \
+	lib-doveadm \
+	lib-var-expand-crypt
+
+SUBDIRS = \
+	$(LIBDOVECOT_SUBDIRS) \
+	lib-dict-extra \
+	lib-dovecot \
+	$(LIBDOVEOT_GSSAPI_DIR) \
+	$(LIB_LDAP) \
+	$(LIB_LUA) \
+	lib-language \
+	lib-imap-client \
+	lib-compression \
+	lib-index \
+	lib-storage \
+	lib-imap-storage \
+	lib-dovecot-storage \
+	$(LIBSTORAGE_LUA) \
+	lib-imap-urlauth \
+	lib-sql \
+	lib-lda \
+	lib-dict-backend \
+	anvil \
+	auth \
+	dict \
+	dns \
+	indexer \
+	master \
+	login-common \
+	$(IMAP_HIBERNATE) \
+	imap-login \
+	imap \
+	imap-urlauth \
+	imap-urlauth-login \
+	pop3-login \
+	pop3 \
+	submission-login \
+	submission \
+	lda \
+	lmtp \
+	log \
+	config \
+	util \
+	doveadm \
+	stats \
+	plugins

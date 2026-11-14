@@ -1,0 +1,2478 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RemoteLogManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.log.remote.storage</a> &gt; <span class="el_source">RemoteLogManager.java</span></div><h1>RemoteLogManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server.log.remote.storage;
+
+import org.apache.kafka.common.Endpoint;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.OffsetOutOfRangeException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.internals.SecurityManagerCompatibility;
+import org.apache.kafka.common.message.AbortedTxn;
+import org.apache.kafka.common.message.FetchResponseData;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Quota;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.MetricsUtils;
+import org.apache.kafka.common.record.internal.FileRecords;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.Record;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.record.internal.RemoteLogInputStream;
+import org.apache.kafka.common.requests.FetchRequest;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.BufferSupplier;
+import org.apache.kafka.common.utils.internals.ChildFirstClassLoader;
+import org.apache.kafka.common.utils.internals.CloseableIterator;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.common.utils.internals.ThreadUtils;
+import org.apache.kafka.server.common.CheckpointFile;
+import org.apache.kafka.server.common.OffsetAndEpoch;
+import org.apache.kafka.server.common.StopPartition;
+import org.apache.kafka.server.log.remote.TopicPartitionLog;
+import org.apache.kafka.server.log.remote.metadata.storage.ClassLoaderAwareRemoteLogMetadataManager;
+import org.apache.kafka.server.log.remote.quota.RLMQuotaManager;
+import org.apache.kafka.server.log.remote.quota.RLMQuotaManagerConfig;
+import org.apache.kafka.server.log.remote.quota.RLMQuotaMetrics;
+import org.apache.kafka.server.log.remote.storage.RemoteLogSegmentMetadata.CustomMetadata;
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+import org.apache.kafka.server.purgatory.DelayedOperationPurgatory;
+import org.apache.kafka.server.purgatory.DelayedRemoteListOffsets;
+import org.apache.kafka.server.purgatory.TopicPartitionOperationKey;
+import org.apache.kafka.server.quota.QuotaType;
+import org.apache.kafka.server.storage.log.FetchIsolation;
+import org.apache.kafka.storage.internals.checkpoint.LeaderEpochCheckpointFile;
+import org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache;
+import org.apache.kafka.storage.internals.log.AsyncOffsetReadFutureHolder;
+import org.apache.kafka.storage.internals.log.AsyncOffsetReader;
+import org.apache.kafka.storage.internals.log.EpochEntry;
+import org.apache.kafka.storage.internals.log.FetchDataInfo;
+import org.apache.kafka.storage.internals.log.LogConfig;
+import org.apache.kafka.storage.internals.log.LogOffsetMetadata;
+import org.apache.kafka.storage.internals.log.LogSegment;
+import org.apache.kafka.storage.internals.log.OffsetIndex;
+import org.apache.kafka.storage.internals.log.OffsetPosition;
+import org.apache.kafka.storage.internals.log.OffsetResultHolder;
+import org.apache.kafka.storage.internals.log.RemoteIndexCache;
+import org.apache.kafka.storage.internals.log.RemoteLogReadResult;
+import org.apache.kafka.storage.internals.log.RemoteStorageFetchInfo;
+import org.apache.kafka.storage.internals.log.RemoteStorageThreadPool;
+import org.apache.kafka.storage.internals.log.TransactionIndex;
+import org.apache.kafka.storage.internals.log.TxnIndexSearchResult;
+import org.apache.kafka.storage.internals.log.UnifiedLog;
+import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
+
+import com.yammer.metrics.core.Timer;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedWriter;
+import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStreamWriter;
+import java.lang.reflect.InvocationTargetException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static org.apache.kafka.server.config.ServerLogConfigs.LOG_DIR_CONFIG;
+import static org.apache.kafka.server.log.remote.metadata.storage.TopicBasedRemoteLogMetadataManagerConfig.REMOTE_LOG_METADATA_COMMON_CLIENT_PREFIX;
+import static org.apache.kafka.server.log.remote.quota.RLMQuotaManagerConfig.INACTIVE_SENSOR_EXPIRATION_TIME_SECONDS;
+import static org.apache.kafka.server.log.remote.storage.RemoteStorageMetrics.LOCAL_RETENTION_SIZE_IN_PERCENT_METRIC;
+import static org.apache.kafka.server.log.remote.storage.RemoteStorageMetrics.REMOTE_LOG_MANAGER_TASKS_AVG_IDLE_PERCENT_METRIC;
+import static org.apache.kafka.server.log.remote.storage.RemoteStorageMetrics.REMOTE_LOG_READER_FETCH_RATE_AND_TIME_METRIC;
+import static org.apache.kafka.server.log.remote.storage.RemoteStorageMetrics.RETENTION_SIZE_IN_PERCENT_METRIC;
+
+/**
+ * This class is responsible for
+ * - initializing `RemoteStorageManager` and `RemoteLogMetadataManager` instances
+ * - receives any leader and follower replica events and partition stop events and act on them
+ * - also provides APIs to fetch indexes, metadata about remote log segments
+ * - copying log segments to the remote storage
+ * - cleaning up segments that are expired based on retention size or retention time
+ */
+public class RemoteLogManager implements Closeable, AsyncOffsetReader {
+
+<span class="nc" id="L153">    private static final Logger LOGGER = LoggerFactory.getLogger(RemoteLogManager.class);</span>
+    private static final String REMOTE_LOG_READER_THREAD_NAME_PATTERN = &quot;remote-log-reader-%d&quot;;
+    // The keys the RSM/RLMM plugins are configured with, independent of the broker configs of the same
+    // names. broker.id is deprecated and will no longer be passed from 5.0 (KIP-1232).
+    private static final String BROKER_ID = &quot;broker.id&quot;;
+    private static final String NODE_ID = &quot;node.id&quot;;
+    private final RemoteLogManagerConfig rlmConfig;
+    private final int brokerId;
+    private final String logDir;
+    private final Time time;
+    private final Function&lt;TopicPartition, Optional&lt;UnifiedLog&gt;&gt; fetchLog;
+    private final BiConsumer&lt;TopicPartition, Long&gt; updateRemoteLogStartOffset;
+    private final BrokerTopicStats brokerTopicStats;
+    private final Metrics metrics;
+
+    private final Plugin&lt;RemoteStorageManager&gt; remoteStorageManagerPlugin;
+
+    private final Plugin&lt;RemoteLogMetadataManager&gt; remoteLogMetadataManagerPlugin;
+
+<span class="nc" id="L172">    private final ReentrantLock copyQuotaManagerLock = new ReentrantLock(true);</span>
+<span class="nc" id="L173">    private final Condition copyQuotaManagerLockCondition = copyQuotaManagerLock.newCondition();</span>
+    private final RLMQuotaManager rlmCopyQuotaManager;
+    private final RLMQuotaManager rlmFetchQuotaManager;
+    private final RLMQuotaMetrics fetchQuotaMetrics;
+    private final RLMQuotaMetrics copyQuotaMetrics;
+
+    private final RemoteIndexCache indexCache;
+    private final RemoteStorageThreadPool remoteStorageReaderThreadPool;
+    private final RLMScheduledThreadPool rlmCopyThreadPool;
+    private final RLMScheduledThreadPool rlmExpirationThreadPool;
+    private final RLMScheduledThreadPool followerThreadPool;
+
+    private final long delayInMs;
+
+<span class="nc" id="L187">    private final ConcurrentHashMap&lt;TopicIdPartition, RLMTaskWithFuture&gt; leaderCopyRLMTasks = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L188">    private final ConcurrentHashMap&lt;TopicIdPartition, RLMTaskWithFuture&gt; leaderExpirationRLMTasks = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L189">    private final ConcurrentHashMap&lt;TopicIdPartition, RLMTaskWithFuture&gt; followerRLMTasks = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L190">    private final Set&lt;RemoteLogSegmentId&gt; segmentIdsBeingCopied = ConcurrentHashMap.newKeySet();</span>
+
+    // topic ids that are received on leadership changes, this map is cleared on stop partitions
+<span class="nc" id="L193">    private final ConcurrentMap&lt;TopicPartition, Uuid&gt; topicIdByPartitionMap = new ConcurrentHashMap&lt;&gt;();</span>
+    private final String clusterId;
+    // For compatibility, metrics are defined to be under the `kafka.log.remote.RemoteLogManager` class
+<span class="nc" id="L196">    private final KafkaMetricsGroup metricsGroup = new KafkaMetricsGroup(&quot;kafka.log.remote&quot;, &quot;RemoteLogManager&quot;);</span>
+
+    // The endpoint for remote log metadata manager to connect to
+    private final Optional&lt;Endpoint&gt; endpoint;
+    private final Timer remoteReadTimer;
+
+<span class="nc" id="L202">    private boolean closed = false;</span>
+
+    private volatile DelayedOperationPurgatory&lt;DelayedRemoteListOffsets&gt; delayedRemoteListOffsetsPurgatory;
+
+    /**
+     * Creates RemoteLogManager instance with the given arguments.
+     *
+     * @param rlmConfig Configuration required for remote logging subsystem(tiered storage) at the broker level.
+     * @param brokerId  id of the current broker.
+     * @param logDir    directory of Kafka log segments.
+     * @param time      Time instance.
+     * @param clusterId The cluster id.
+     * @param fetchLog  function to get UnifiedLog instance for a given topic.
+     * @param updateRemoteLogStartOffset function to update the log-start-offset for a given topic partition.
+     * @param brokerTopicStats BrokerTopicStats instance to update the respective metrics.
+     * @param metrics  Metrics instance
+     */
+    @SuppressWarnings({&quot;this-escape&quot;})
+    public RemoteLogManager(RemoteLogManagerConfig rlmConfig,
+                            int brokerId,
+                            String logDir,
+                            String clusterId,
+                            Time time,
+                            Function&lt;TopicPartition, Optional&lt;UnifiedLog&gt;&gt; fetchLog,
+                            BiConsumer&lt;TopicPartition, Long&gt; updateRemoteLogStartOffset,
+                            BrokerTopicStats brokerTopicStats,
+                            Metrics metrics,
+<span class="nc" id="L229">                            Optional&lt;Endpoint&gt; endpoint) throws IOException {</span>
+<span class="nc" id="L230">        this.rlmConfig = rlmConfig;</span>
+<span class="nc" id="L231">        this.brokerId = brokerId;</span>
+<span class="nc" id="L232">        this.logDir = logDir;</span>
+<span class="nc" id="L233">        this.clusterId = clusterId;</span>
+<span class="nc" id="L234">        this.time = time;</span>
+<span class="nc" id="L235">        this.fetchLog = fetchLog;</span>
+<span class="nc" id="L236">        this.updateRemoteLogStartOffset = updateRemoteLogStartOffset;</span>
+<span class="nc" id="L237">        this.brokerTopicStats = brokerTopicStats;</span>
+<span class="nc" id="L238">        this.metrics = metrics;</span>
+<span class="nc" id="L239">        this.endpoint = endpoint;</span>
+
+<span class="nc" id="L241">        remoteStorageManagerPlugin = configAndWrapRsmPlugin(createRemoteStorageManager());</span>
+<span class="nc" id="L242">        remoteLogMetadataManagerPlugin = configAndWrapRlmmPlugin(createRemoteLogMetadataManager());</span>
+
+<span class="nc" id="L244">        rlmCopyQuotaManager = createRLMCopyQuotaManager();</span>
+<span class="nc" id="L245">        rlmFetchQuotaManager = createRLMFetchQuotaManager();</span>
+
+<span class="nc" id="L247">        fetchQuotaMetrics = new RLMQuotaMetrics(metrics, &quot;remote-fetch-throttle-time&quot;, RemoteLogManager.class.getSimpleName(),</span>
+            &quot;The %s time in millis remote fetches was throttled by a broker&quot;, INACTIVE_SENSOR_EXPIRATION_TIME_SECONDS);
+<span class="nc" id="L249">        copyQuotaMetrics = new RLMQuotaMetrics(metrics, &quot;remote-copy-throttle-time&quot;, RemoteLogManager.class.getSimpleName(),</span>
+            &quot;The %s time in millis remote copies was throttled by a broker&quot;, INACTIVE_SENSOR_EXPIRATION_TIME_SECONDS);
+
+<span class="nc" id="L252">        indexCache = new RemoteIndexCache(</span>
+<span class="nc" id="L253">            rlmConfig.remoteLogIndexFileCacheTotalSizeBytes(),</span>
+<span class="nc" id="L254">            rlmConfig.remoteLogIndexFileCacheTtlMs(),</span>
+            false,
+<span class="nc" id="L256">            remoteStorageManagerPlugin.get(),</span>
+            logDir);
+<span class="nc" id="L258">        delayInMs = rlmConfig.remoteLogManagerTaskIntervalMs();</span>
+<span class="nc" id="L259">        rlmCopyThreadPool = new RLMScheduledThreadPool(rlmConfig.remoteLogManagerCopierThreadPoolSize(),</span>
+            &quot;RLMCopyThreadPool&quot;, &quot;kafka-rlm-copy-thread-pool-%d&quot;);
+<span class="nc" id="L261">        rlmExpirationThreadPool = new RLMScheduledThreadPool(rlmConfig.remoteLogManagerExpirationThreadPoolSize(),</span>
+            &quot;RLMExpirationThreadPool&quot;, &quot;kafka-rlm-expiration-thread-pool-%d&quot;);
+<span class="nc" id="L263">        followerThreadPool = new RLMScheduledThreadPool(rlmConfig.remoteLogManagerFollowerThreadPoolSize(),</span>
+            &quot;RLMFollowerScheduledThreadPool&quot;, &quot;kafka-rlm-follower-thread-pool-%d&quot;);
+
+<span class="nc" id="L266">        metricsGroup.newGauge(REMOTE_LOG_MANAGER_TASKS_AVG_IDLE_PERCENT_METRIC, rlmCopyThreadPool::getIdlePercent);</span>
+<span class="nc" id="L267">        remoteReadTimer = metricsGroup.newTimer(REMOTE_LOG_READER_FETCH_RATE_AND_TIME_METRIC,</span>
+                TimeUnit.MILLISECONDS, TimeUnit.SECONDS);
+
+<span class="nc" id="L270">        remoteStorageReaderThreadPool = new RemoteStorageThreadPool(</span>
+                REMOTE_LOG_READER_THREAD_NAME_PATTERN,
+<span class="nc" id="L272">                rlmConfig.remoteLogReaderThreads(),</span>
+<span class="nc" id="L273">                rlmConfig.remoteLogReaderMaxPendingTasks()</span>
+        );
+<span class="nc" id="L275">    }</span>
+
+    public void setDelayedOperationPurgatory(DelayedOperationPurgatory&lt;DelayedRemoteListOffsets&gt; delayedRemoteListOffsetsPurgatory) {
+<span class="nc" id="L278">        this.delayedRemoteListOffsetsPurgatory = delayedRemoteListOffsetsPurgatory;</span>
+<span class="nc" id="L279">    }</span>
+
+    public void resizeCacheSize(long remoteLogIndexFileCacheSize) {
+<span class="nc" id="L282">        indexCache.resizeCacheSize(remoteLogIndexFileCacheSize);</span>
+<span class="nc" id="L283">    }</span>
+
+    public void updateCopyQuota(long quota) {
+<span class="nc" id="L286">        LOGGER.info(&quot;Updating remote copy quota to {} bytes per second&quot;, quota);</span>
+<span class="nc" id="L287">        rlmCopyQuotaManager.updateQuota(new Quota(quota, true));</span>
+<span class="nc" id="L288">    }</span>
+
+    public void updateFetchQuota(long quota) {
+<span class="nc" id="L291">        LOGGER.info(&quot;Updating remote fetch quota to {} bytes per second&quot;, quota);</span>
+<span class="nc" id="L292">        rlmFetchQuotaManager.updateQuota(new Quota(quota, true));</span>
+<span class="nc" id="L293">    }</span>
+
+    public void resizeCopierThreadPool(int newSize) {
+<span class="nc" id="L296">        int currentSize = rlmCopyThreadPool.getCorePoolSize();</span>
+<span class="nc" id="L297">        LOGGER.info(&quot;Updating remote copy thread pool size from {} to {}&quot;, currentSize, newSize);</span>
+<span class="nc" id="L298">        rlmCopyThreadPool.setCorePoolSize(newSize);</span>
+<span class="nc" id="L299">    }</span>
+
+    public void resizeExpirationThreadPool(int newSize) {
+<span class="nc" id="L302">        int currentSize = rlmExpirationThreadPool.getCorePoolSize();</span>
+<span class="nc" id="L303">        LOGGER.info(&quot;Updating remote expiration thread pool size from {} to {}&quot;, currentSize, newSize);</span>
+<span class="nc" id="L304">        rlmExpirationThreadPool.setCorePoolSize(newSize);</span>
+<span class="nc" id="L305">    }</span>
+
+    public void resizeFollowerThreadPool(int newSize) {
+<span class="nc" id="L308">        int currentSize = followerThreadPool.getCorePoolSize();</span>
+<span class="nc" id="L309">        LOGGER.info(&quot;Updating remote follower thread pool size from {} to {}&quot;, currentSize, newSize);</span>
+<span class="nc" id="L310">        followerThreadPool.setCorePoolSize(newSize);</span>
+<span class="nc" id="L311">    }</span>
+
+    public void resizeReaderThreadPool(int newSize) {
+<span class="nc" id="L314">        int currentSize = remoteStorageReaderThreadPool.getCorePoolSize();</span>
+<span class="nc" id="L315">        int currentMaximumSize = remoteStorageReaderThreadPool.getMaximumPoolSize();</span>
+<span class="nc" id="L316">        LOGGER.info(&quot;Updating remote reader thread pool size from {} to {}&quot;, currentSize, newSize);</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (newSize &gt; currentMaximumSize) {</span>
+<span class="nc" id="L318">            remoteStorageReaderThreadPool.setMaximumPoolSize(newSize);</span>
+<span class="nc" id="L319">            remoteStorageReaderThreadPool.setCorePoolSize(newSize);</span>
+        } else {
+<span class="nc" id="L321">            remoteStorageReaderThreadPool.setCorePoolSize(newSize);</span>
+<span class="nc" id="L322">            remoteStorageReaderThreadPool.setMaximumPoolSize(newSize);</span>
+        }
+<span class="nc" id="L324">    }</span>
+
+    private void removeMetrics() {
+<span class="nc" id="L327">        metricsGroup.removeMetric(REMOTE_LOG_MANAGER_TASKS_AVG_IDLE_PERCENT_METRIC);</span>
+<span class="nc" id="L328">        metricsGroup.removeMetric(REMOTE_LOG_READER_FETCH_RATE_AND_TIME_METRIC);</span>
+<span class="nc" id="L329">        remoteStorageReaderThreadPool.removeMetrics();</span>
+<span class="nc" id="L330">        Utils.closeQuietly(fetchQuotaMetrics, &quot;fetchQuotaMetrics&quot;);</span>
+<span class="nc" id="L331">        Utils.closeQuietly(copyQuotaMetrics, &quot;copyQuotaMetrics&quot;);</span>
+<span class="nc" id="L332">    }</span>
+
+    // Visible for testing
+    int readerThreadPoolSize() {
+<span class="nc" id="L336">        return remoteStorageReaderThreadPool.getCorePoolSize();</span>
+    }
+
+    // Visible for testing
+    int followerThreadPoolSize() {
+<span class="nc" id="L341">        return followerThreadPool.getCorePoolSize();</span>
+    }
+
+    /**
+     * Returns the timeout for the RLM Tasks to wait for the quota to be available
+     */
+    Duration quotaTimeout() {
+<span class="nc" id="L348">        return Duration.ofSeconds(1);</span>
+    }
+
+    RLMQuotaManager createRLMCopyQuotaManager() {
+<span class="nc" id="L352">        return new RLMQuotaManager(copyQuotaManagerConfig(rlmConfig), metrics, QuotaType.RLM_COPY,</span>
+          &quot;Tracking copy byte-rate for Remote Log Manager&quot;, time);
+    }
+
+    RLMQuotaManager createRLMFetchQuotaManager() {
+<span class="nc" id="L357">        return new RLMQuotaManager(fetchQuotaManagerConfig(rlmConfig), metrics, QuotaType.RLM_FETCH,</span>
+          &quot;Tracking fetch byte-rate for Remote Log Manager&quot;, time);
+    }
+
+    public long getFetchThrottleTimeMs() {
+<span class="nc" id="L362">        return rlmFetchQuotaManager.getThrottleTimeMs();</span>
+    }
+
+    public Sensor fetchThrottleTimeSensor() {
+<span class="nc" id="L366">        return fetchQuotaMetrics.sensor();</span>
+    }
+
+    static RLMQuotaManagerConfig copyQuotaManagerConfig(RemoteLogManagerConfig rlmConfig) {
+<span class="nc" id="L370">        return new RLMQuotaManagerConfig(rlmConfig.remoteLogManagerCopyMaxBytesPerSecond(),</span>
+<span class="nc" id="L371">          rlmConfig.remoteLogManagerCopyNumQuotaSamples(),</span>
+<span class="nc" id="L372">          rlmConfig.remoteLogManagerCopyQuotaWindowSizeSeconds());</span>
+    }
+
+    static RLMQuotaManagerConfig fetchQuotaManagerConfig(RemoteLogManagerConfig rlmConfig) {
+<span class="nc" id="L376">        return new RLMQuotaManagerConfig(rlmConfig.remoteLogManagerFetchMaxBytesPerSecond(),</span>
+<span class="nc" id="L377">          rlmConfig.remoteLogManagerFetchNumQuotaSamples(),</span>
+<span class="nc" id="L378">          rlmConfig.remoteLogManagerFetchQuotaWindowSizeSeconds());</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;T&gt; T createDelegate(ClassLoader classLoader, String className) {
+        try {
+<span class="nc" id="L384">            return (T) classLoader.loadClass(className)</span>
+<span class="nc" id="L385">                    .getDeclaredConstructor().newInstance();</span>
+<span class="nc" id="L386">        } catch (InstantiationException | IllegalAccessException | InvocationTargetException | NoSuchMethodException |</span>
+                 ClassNotFoundException e) {
+<span class="nc" id="L388">            throw new KafkaException(e);</span>
+        }
+    }
+
+    RemoteStorageManager createRemoteStorageManager() {
+<span class="nc" id="L393">        return SecurityManagerCompatibility.get().doPrivileged(() -&gt; {</span>
+<span class="nc" id="L394">            final String classPath = rlmConfig.remoteStorageManagerClassPath();</span>
+<span class="nc bnc" id="L395" title="All 4 branches missed.">            if (classPath != null &amp;&amp; !classPath.trim().isEmpty()) {</span>
+<span class="nc" id="L396">                ChildFirstClassLoader classLoader = new ChildFirstClassLoader(classPath, this.getClass().getClassLoader());</span>
+<span class="nc" id="L397">                RemoteStorageManager delegate = createDelegate(classLoader, rlmConfig.remoteStorageManagerClassName());</span>
+<span class="nc" id="L398">                return (RemoteStorageManager) new ClassLoaderAwareRemoteStorageManager(delegate, classLoader);</span>
+            } else {
+<span class="nc" id="L400">                return createDelegate(this.getClass().getClassLoader(), rlmConfig.remoteStorageManagerClassName());</span>
+            }
+        });
+    }
+
+    private Plugin&lt;RemoteStorageManager&gt; configAndWrapRsmPlugin(RemoteStorageManager rsm) {
+<span class="nc" id="L406">        final Map&lt;String, Object&gt; rsmProps = new HashMap&lt;&gt;(rlmConfig.remoteStorageManagerProps());</span>
+<span class="nc" id="L407">        rsmProps.put(BROKER_ID, brokerId);</span>
+<span class="nc" id="L408">        rsmProps.put(NODE_ID, brokerId);</span>
+<span class="nc" id="L409">        rsm.configure(rsmProps);</span>
+<span class="nc" id="L410">        return Plugin.wrapInstance(rsm, metrics, RemoteLogManagerConfig.REMOTE_STORAGE_MANAGER_CLASS_NAME_PROP);</span>
+    }
+
+    RemoteLogMetadataManager createRemoteLogMetadataManager() {
+<span class="nc" id="L414">        return SecurityManagerCompatibility.get().doPrivileged(() -&gt; {</span>
+<span class="nc" id="L415">            final String classPath = rlmConfig.remoteLogMetadataManagerClassPath();</span>
+<span class="nc bnc" id="L416" title="All 4 branches missed.">            if (classPath != null &amp;&amp; !classPath.trim().isEmpty()) {</span>
+<span class="nc" id="L417">                ClassLoader classLoader = new ChildFirstClassLoader(classPath, this.getClass().getClassLoader());</span>
+<span class="nc" id="L418">                RemoteLogMetadataManager delegate = createDelegate(classLoader, rlmConfig.remoteLogMetadataManagerClassName());</span>
+<span class="nc" id="L419">                return (RemoteLogMetadataManager) new ClassLoaderAwareRemoteLogMetadataManager(delegate, classLoader);</span>
+            } else {
+<span class="nc" id="L421">                return createDelegate(this.getClass().getClassLoader(), rlmConfig.remoteLogMetadataManagerClassName());</span>
+            }
+        });
+    }
+
+    private Plugin&lt;RemoteLogMetadataManager&gt; configAndWrapRlmmPlugin(RemoteLogMetadataManager rlmm) {
+<span class="nc" id="L427">        final Map&lt;String, Object&gt; rlmmProps = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L428">        endpoint.ifPresent(e -&gt; {</span>
+<span class="nc" id="L429">            rlmmProps.put(REMOTE_LOG_METADATA_COMMON_CLIENT_PREFIX + &quot;bootstrap.servers&quot;, e.host() + &quot;:&quot; + e.port());</span>
+<span class="nc" id="L430">            rlmmProps.put(REMOTE_LOG_METADATA_COMMON_CLIENT_PREFIX + &quot;security.protocol&quot;, e.securityProtocol().name);</span>
+<span class="nc" id="L431">        });</span>
+        // update the remoteLogMetadataProps here to override endpoint config if any
+<span class="nc" id="L433">        rlmmProps.putAll(rlmConfig.remoteLogMetadataManagerProps());</span>
+
+<span class="nc" id="L435">        rlmmProps.put(BROKER_ID, brokerId);</span>
+<span class="nc" id="L436">        rlmmProps.put(NODE_ID, brokerId);</span>
+<span class="nc" id="L437">        rlmmProps.put(LOG_DIR_CONFIG, logDir);</span>
+<span class="nc" id="L438">        rlmmProps.put(&quot;cluster.id&quot;, clusterId);</span>
+
+<span class="nc" id="L440">        rlmm.configure(rlmmProps);</span>
+<span class="nc" id="L441">        return Plugin.wrapInstance(rlmm, metrics, RemoteLogManagerConfig.REMOTE_LOG_METADATA_MANAGER_CLASS_NAME_PROP);</span>
+    }
+
+    public RemoteLogMetadataManager remoteLogMetadataManager() {
+<span class="nc" id="L445">        return remoteLogMetadataManagerPlugin.get();</span>
+    }
+
+    public RemoteStorageManager storageManager() {
+<span class="nc" id="L449">        return remoteStorageManagerPlugin.get();</span>
+    }
+
+    private Stream&lt;TopicPartitionLog&gt; filterPartitions(Set&lt;TopicPartitionLog&gt; partitions) {
+        // We are not specifically checking for internal topics etc here as `log.remoteLogEnabled()` already handles that.
+<span class="nc bnc" id="L454" title="All 4 branches missed.">        return partitions.stream().filter(partition -&gt; partition.unifiedLog().isPresent() &amp;&amp; partition.unifiedLog().get().remoteLogEnabled());</span>
+    }
+
+    private void cacheTopicPartitionIds(TopicIdPartition topicIdPartition) {
+<span class="nc" id="L458">        Uuid previousTopicId = topicIdByPartitionMap.put(topicIdPartition.topicPartition(), topicIdPartition.topicId());</span>
+<span class="nc bnc" id="L459" title="All 4 branches missed.">        if (previousTopicId != null &amp;&amp; !previousTopicId.equals(topicIdPartition.topicId())) {</span>
+<span class="nc" id="L460">            LOGGER.info(&quot;Previous cached topic id {} for {} does not match updated topic id {}&quot;,</span>
+<span class="nc" id="L461">                    previousTopicId, topicIdPartition.topicPartition(), topicIdPartition.topicId());</span>
+        }
+<span class="nc" id="L463">    }</span>
+
+    /**
+     * Callback to receive any leadership changes for the topic partitions assigned to this broker. If there are no
+     * existing tasks for a given topic partition then it will assign new leader or follower task else it will convert the
+     * task to respective target state(leader or follower).
+     *
+     * @param partitionsBecomeLeader   partitions that have become leaders on this broker.
+     * @param partitionsBecomeFollower partitions that have become followers on this broker.
+     * @param topicIds                 topic name to topic id mappings.
+     */
+    public void onLeadershipChange(Set&lt;TopicPartitionLog&gt; partitionsBecomeLeader,
+                                   Set&lt;TopicPartitionLog&gt; partitionsBecomeFollower,
+                                   Map&lt;String, Uuid&gt; topicIds) {
+<span class="nc" id="L477">        LOGGER.debug(&quot;Received leadership changes for leaders: {} and followers: {}&quot;, partitionsBecomeLeader, partitionsBecomeFollower);</span>
+
+<span class="nc" id="L479">        Map&lt;TopicIdPartition, Boolean&gt; leaderPartitions = filterPartitions(partitionsBecomeLeader)</span>
+<span class="nc" id="L480">                .collect(Collectors.toMap(p -&gt; new TopicIdPartition(topicIds.get(p.topicPartition().topic()), p.topicPartition()),</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">                        p -&gt; p.unifiedLog().isPresent() ? p.unifiedLog().get().config().remoteLogCopyDisable() : false));</span>
+
+<span class="nc" id="L483">        Map&lt;TopicIdPartition, Boolean&gt; followerPartitions = filterPartitions(partitionsBecomeFollower)</span>
+<span class="nc" id="L484">                .collect(Collectors.toMap(p -&gt; new TopicIdPartition(topicIds.get(p.topicPartition().topic()), p.topicPartition()),</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">                        p -&gt; p.unifiedLog().isPresent() ? p.unifiedLog().get().config().remoteLogCopyDisable() : false));</span>
+
+<span class="nc bnc" id="L487" title="All 4 branches missed.">        if (!leaderPartitions.isEmpty() || !followerPartitions.isEmpty()) {</span>
+<span class="nc" id="L488">            LOGGER.debug(&quot;Effective topic partitions after filtering compact and internal topics, leaders: {} and followers: {}&quot;,</span>
+                    leaderPartitions, followerPartitions);
+
+<span class="nc" id="L491">            leaderPartitions.forEach((tp, __) -&gt; cacheTopicPartitionIds(tp));</span>
+<span class="nc" id="L492">            followerPartitions.forEach((tp, __) -&gt; cacheTopicPartitionIds(tp));</span>
+
+<span class="nc" id="L494">            remoteLogMetadataManagerPlugin.get().onPartitionLeadershipChanges(leaderPartitions.keySet(), followerPartitions.keySet());</span>
+<span class="nc" id="L495">            followerPartitions.forEach((tp, __) -&gt; doHandleFollowerPartition(tp));</span>
+
+            // If this node was the previous leader for the partition, then the RLMTask might be running in the
+            // background thread and might emit metrics. So, removing the metrics after marking this node as follower.
+<span class="nc" id="L499">            followerPartitions.forEach((tp, __) -&gt; removeRemoteTopicPartitionMetrics(tp));</span>
+
+<span class="nc" id="L501">            leaderPartitions.forEach(this::doHandleLeaderPartition);</span>
+        }
+<span class="nc" id="L503">    }</span>
+
+    public void stopLeaderCopyRLMTasks(Set&lt;TopicPartitionLog&gt; partitions) {
+<span class="nc bnc" id="L506" title="All 2 branches missed.">        for (TopicPartitionLog partition : partitions) {</span>
+<span class="nc" id="L507">            TopicPartition tp = partition.topicPartition();</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">            if (topicIdByPartitionMap.containsKey(tp)) {</span>
+<span class="nc" id="L509">                TopicIdPartition tpId = new TopicIdPartition(topicIdByPartitionMap.get(tp), tp);</span>
+<span class="nc" id="L510">                leaderCopyRLMTasks.computeIfPresent(tpId, (topicIdPartition, task) -&gt; {</span>
+<span class="nc" id="L511">                    LOGGER.info(&quot;Cancelling the copy RLM task for partition: {}&quot;, tpId);</span>
+<span class="nc" id="L512">                    task.cancel();</span>
+<span class="nc" id="L513">                    LOGGER.info(&quot;Resetting remote copy lag metrics for partition: {}&quot;, tpId);</span>
+<span class="nc" id="L514">                    ((RLMCopyTask) task.rlmTask).resetLagStats();</span>
+<span class="nc" id="L515">                    return null;</span>
+                });
+            }
+<span class="nc" id="L518">        }</span>
+<span class="nc" id="L519">    }</span>
+
+    /**
+     * Stop the remote-log-manager task for the given partitions. And, calls the
+     * {@link RemoteLogMetadataManager#onStopPartitions(Set)} when {@link StopPartition#deleteLocalLog} is true.
+     * Deletes the partitions from the remote storage when {@link StopPartition#deleteRemoteLog} is true.
+     *
+     * @param stopPartitions topic partitions that needs to be stopped.
+     * @param errorHandler   callback to handle any errors while stopping the partitions.
+     */
+    public void stopPartitions(Set&lt;StopPartition&gt; stopPartitions,
+                               BiConsumer&lt;TopicPartition, Throwable&gt; errorHandler) {
+<span class="nc" id="L531">        LOGGER.debug(&quot;Stop partitions: {}&quot;, stopPartitions);</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">        for (StopPartition stopPartition: stopPartitions) {</span>
+<span class="nc" id="L533">            TopicPartition tp = stopPartition.topicPartition;</span>
+            try {
+<span class="nc bnc" id="L535" title="All 2 branches missed.">                if (topicIdByPartitionMap.containsKey(tp)) {</span>
+<span class="nc" id="L536">                    TopicIdPartition tpId = new TopicIdPartition(topicIdByPartitionMap.get(tp), tp);</span>
+<span class="nc" id="L537">                    leaderCopyRLMTasks.computeIfPresent(tpId, (topicIdPartition, task) -&gt; {</span>
+<span class="nc" id="L538">                        LOGGER.info(&quot;Cancelling the copy RLM task for partition: {}&quot;, tpId);</span>
+<span class="nc" id="L539">                        task.cancel();</span>
+<span class="nc" id="L540">                        return null;</span>
+                    });
+<span class="nc" id="L542">                    leaderExpirationRLMTasks.computeIfPresent(tpId, (topicIdPartition, task) -&gt; {</span>
+<span class="nc" id="L543">                        LOGGER.info(&quot;Cancelling the expiration RLM task for partition: {}&quot;, tpId);</span>
+<span class="nc" id="L544">                        task.cancel();</span>
+<span class="nc" id="L545">                        return null;</span>
+                    });
+<span class="nc" id="L547">                    followerRLMTasks.computeIfPresent(tpId, (topicIdPartition, task) -&gt; {</span>
+<span class="nc" id="L548">                        LOGGER.info(&quot;Cancelling the follower RLM task for partition: {}&quot;, tpId);</span>
+<span class="nc" id="L549">                        task.cancel();</span>
+<span class="nc" id="L550">                        return null;</span>
+                    });
+
+<span class="nc" id="L553">                    removeRemoteTopicPartitionMetrics(tpId);</span>
+
+<span class="nc bnc" id="L555" title="All 2 branches missed.">                    if (stopPartition.deleteRemoteLog) {</span>
+<span class="nc" id="L556">                        LOGGER.info(&quot;Deleting the remote log segments task for partition: {}&quot;, tpId);</span>
+<span class="nc" id="L557">                        deleteRemoteLogPartition(tpId);</span>
+                    }
+<span class="nc" id="L559">                } else {</span>
+<span class="nc" id="L560">                    LOGGER.warn(&quot;StopPartition call is not expected for partition: {}&quot;, tp);</span>
+                }
+<span class="nc" id="L562">            } catch (Exception ex) {</span>
+<span class="nc" id="L563">                errorHandler.accept(tp, ex);</span>
+<span class="nc" id="L564">                LOGGER.error(&quot;Error while stopping the partition: {}&quot;, stopPartition, ex);</span>
+<span class="nc" id="L565">            }</span>
+<span class="nc" id="L566">        }</span>
+
+        // We want to remote topicId map and stopPartition on RLMM for deleteLocalLog or stopRLMM partitions because
+        // in both case, they all mean the topic will not be held in this broker anymore.
+<span class="nc" id="L570">        Set&lt;TopicIdPartition&gt; pendingActionsPartitions = stopPartitions.stream()</span>
+<span class="nc bnc" id="L571" title="All 6 branches missed.">                .filter(sp -&gt; (sp.stopRemoteLogMetadataManager || sp.deleteLocalLog) &amp;&amp; topicIdByPartitionMap.containsKey(sp.topicPartition))</span>
+<span class="nc" id="L572">                .map(sp -&gt; new TopicIdPartition(topicIdByPartitionMap.get(sp.topicPartition), sp.topicPartition))</span>
+<span class="nc" id="L573">                .collect(Collectors.toSet());</span>
+
+<span class="nc bnc" id="L575" title="All 2 branches missed.">        if (!pendingActionsPartitions.isEmpty()) {</span>
+<span class="nc" id="L576">            pendingActionsPartitions.forEach(tpId -&gt; topicIdByPartitionMap.remove(tpId.topicPartition()));</span>
+<span class="nc" id="L577">            remoteLogMetadataManagerPlugin.get().onStopPartitions(pendingActionsPartitions);</span>
+        }
+<span class="nc" id="L579">    }</span>
+
+    private void deleteRemoteLogPartition(TopicIdPartition partition) throws RemoteStorageException, ExecutionException, InterruptedException {
+<span class="nc" id="L582">        List&lt;RemoteLogSegmentMetadata&gt; metadataList = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L583">        remoteLogMetadataManagerPlugin.get().listRemoteLogSegments(partition).forEachRemaining(metadataList::add);</span>
+
+<span class="nc" id="L585">        List&lt;RemoteLogSegmentMetadataUpdate&gt; deleteSegmentStartedEvents = metadataList.stream()</span>
+<span class="nc" id="L586">                .map(metadata -&gt;</span>
+<span class="nc" id="L587">                        new RemoteLogSegmentMetadataUpdate(metadata.remoteLogSegmentId(), time.milliseconds(),</span>
+<span class="nc" id="L588">                                metadata.customMetadata(), RemoteLogSegmentState.DELETE_SEGMENT_STARTED, brokerId))</span>
+<span class="nc" id="L589">                .collect(Collectors.toList());</span>
+<span class="nc" id="L590">        publishEvents(deleteSegmentStartedEvents).get();</span>
+
+        // KAFKA-15313: Delete remote log segments partition asynchronously when a partition is deleted.
+<span class="nc" id="L593">        Collection&lt;Uuid&gt; deletedSegmentIds = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">        for (RemoteLogSegmentMetadata metadata: metadataList) {</span>
+<span class="nc" id="L595">            deletedSegmentIds.add(metadata.remoteLogSegmentId().id());</span>
+<span class="nc" id="L596">            remoteStorageManagerPlugin.get().deleteLogSegmentData(metadata);</span>
+<span class="nc" id="L597">        }</span>
+<span class="nc" id="L598">        indexCache.removeAll(deletedSegmentIds);</span>
+
+<span class="nc" id="L600">        List&lt;RemoteLogSegmentMetadataUpdate&gt; deleteSegmentFinishedEvents = metadataList.stream()</span>
+<span class="nc" id="L601">                .map(metadata -&gt;</span>
+<span class="nc" id="L602">                        new RemoteLogSegmentMetadataUpdate(metadata.remoteLogSegmentId(), time.milliseconds(),</span>
+<span class="nc" id="L603">                                metadata.customMetadata(), RemoteLogSegmentState.DELETE_SEGMENT_FINISHED, brokerId))</span>
+<span class="nc" id="L604">                .collect(Collectors.toList());</span>
+<span class="nc" id="L605">        publishEvents(deleteSegmentFinishedEvents).get();</span>
+<span class="nc" id="L606">    }</span>
+
+    private CompletableFuture&lt;Void&gt; publishEvents(List&lt;RemoteLogSegmentMetadataUpdate&gt; events) throws RemoteStorageException {
+<span class="nc" id="L609">        List&lt;CompletableFuture&lt;Void&gt;&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        for (RemoteLogSegmentMetadataUpdate event : events) {</span>
+<span class="nc" id="L611">            result.add(remoteLogMetadataManagerPlugin.get().updateRemoteLogSegmentMetadata(event));</span>
+<span class="nc" id="L612">        }</span>
+<span class="nc" id="L613">        return CompletableFuture.allOf(result.toArray(new CompletableFuture&lt;?&gt;[0]));</span>
+    }
+
+    public Optional&lt;RemoteLogSegmentMetadata&gt; fetchRemoteLogSegmentMetadata(TopicPartition topicPartition,
+                                                                            int epochForOffset,
+                                                                            long offset) throws RemoteStorageException {
+<span class="nc" id="L619">        Uuid topicId = topicIdByPartitionMap.get(topicPartition);</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">        if (topicId == null) {</span>
+<span class="nc" id="L621">            throw new KafkaException(&quot;No topic id registered for topic partition: &quot; + topicPartition);</span>
+        }
+<span class="nc" id="L623">        return remoteLogMetadataManagerPlugin.get().remoteLogSegmentMetadata(new TopicIdPartition(topicId, topicPartition), epochForOffset, offset);</span>
+    }
+
+    /**
+     * Returns the next segment that may contain the aborted transaction entries. The search ensures that the returned
+     * segment offsets are greater than or equal to the given offset and in the same epoch.
+     * @param topicPartition topic partition to search
+     * @param epochForOffset the epoch
+     * @param offset the offset
+     * @return The next segment that contains the transaction index in the same epoch.
+     * @throws RemoteStorageException If an error occurs while fetching the remote log segment metadata.
+     */
+    public Optional&lt;RemoteLogSegmentMetadata&gt; fetchNextSegmentWithTxnIndex(TopicPartition topicPartition,
+                                                                           int epochForOffset,
+                                                                           long offset) throws RemoteStorageException {
+<span class="nc" id="L638">        Uuid topicId = topicIdByPartitionMap.get(topicPartition);</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (topicId == null) {</span>
+<span class="nc" id="L640">            throw new KafkaException(&quot;No topic id registered for topic partition: &quot; + topicPartition);</span>
+        }
+<span class="nc" id="L642">        TopicIdPartition tpId = new TopicIdPartition(topicId, topicPartition);</span>
+<span class="nc" id="L643">        return remoteLogMetadataManagerPlugin.get().nextSegmentWithTxnIndex(tpId, epochForOffset, offset);</span>
+    }
+
+    Optional&lt;FileRecords.TimestampAndOffset&gt; lookupTimestamp(RemoteLogSegmentMetadata rlsMetadata, long timestamp, long startingOffset,
+                                                             int maxRecordBodySize) throws RemoteStorageException, IOException {
+<span class="nc" id="L648">        int startPos = indexCache.lookupTimestamp(rlsMetadata, timestamp, startingOffset);</span>
+
+<span class="nc" id="L650">        InputStream remoteSegInputStream = null;</span>
+        try {
+            // Search forward for the position of the last offset that is greater than or equal to the startingOffset
+<span class="nc" id="L653">            remoteSegInputStream = remoteStorageManagerPlugin.get().fetchLogSegment(rlsMetadata, startPos);</span>
+<span class="nc" id="L654">            RemoteLogInputStream remoteLogInputStream = new RemoteLogInputStream(remoteSegInputStream);</span>
+
+            while (true) {
+<span class="nc" id="L657">                RecordBatch batch = remoteLogInputStream.nextBatch();</span>
+<span class="nc bnc" id="L658" title="All 2 branches missed.">                if (batch == null) break;</span>
+<span class="nc bnc" id="L659" title="All 4 branches missed.">                if (batch.maxTimestamp() &gt;= timestamp &amp;&amp; batch.lastOffset() &gt;= startingOffset) {</span>
+<span class="nc" id="L660">                    try (CloseableIterator&lt;Record&gt; recordStreamingIterator = batch.streamingIterator(BufferSupplier.NO_CACHING, maxRecordBodySize)) {</span>
+<span class="nc bnc" id="L661" title="All 2 branches missed.">                        while (recordStreamingIterator.hasNext()) {</span>
+<span class="nc" id="L662">                            Record record = recordStreamingIterator.next();</span>
+<span class="nc bnc" id="L663" title="All 4 branches missed.">                            if (record.timestamp() &gt;= timestamp &amp;&amp; record.offset() &gt;= startingOffset)</span>
+<span class="nc" id="L664">                                return Optional.of(new FileRecords.TimestampAndOffset(record.timestamp(), record.offset(), maybeLeaderEpoch(batch.partitionLeaderEpoch())));</span>
+<span class="nc" id="L665">                        }</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">                    }</span>
+                }
+<span class="nc" id="L668">            }</span>
+
+<span class="nc" id="L670">            return Optional.empty();</span>
+        } finally {
+<span class="nc" id="L672">            Utils.closeQuietly(remoteSegInputStream, &quot;RemoteLogSegmentInputStream&quot;);</span>
+        }
+    }
+
+    private Optional&lt;Integer&gt; maybeLeaderEpoch(int leaderEpoch) {
+<span class="nc bnc" id="L677" title="All 2 branches missed.">        return leaderEpoch == RecordBatch.NO_PARTITION_LEADER_EPOCH ? Optional.empty() : Optional.of(leaderEpoch);</span>
+    }
+
+    @Override
+    public AsyncOffsetReadFutureHolder&lt;OffsetResultHolder.FileRecordsOrError&gt; asyncOffsetRead(
+            TopicPartition topicPartition,
+            long timestamp,
+            long startingOffset,
+            LeaderEpochFileCache leaderEpochCache,
+            TimestampAndOffsetSupplier searchLocalLog) {
+<span class="nc" id="L687">        CompletableFuture&lt;OffsetResultHolder.FileRecordsOrError&gt; taskFuture = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L688">        Future&lt;Void&gt; jobFuture = remoteStorageReaderThreadPool.submit(</span>
+                new RemoteLogOffsetReader(this, topicPartition, timestamp, startingOffset, leaderEpochCache, searchLocalLog, result -&gt; {
+<span class="nc" id="L690">                    TopicPartitionOperationKey key = new TopicPartitionOperationKey(topicPartition.topic(), topicPartition.partition());</span>
+<span class="nc" id="L691">                    taskFuture.complete(result);</span>
+<span class="nc" id="L692">                    delayedRemoteListOffsetsPurgatory.checkAndComplete(key);</span>
+<span class="nc" id="L693">                })</span>
+        );
+<span class="nc" id="L695">        return new AsyncOffsetReadFutureHolder&lt;&gt;(jobFuture, taskFuture);</span>
+    }
+
+    /**
+     * Search the message offset in the remote storage for the given timestamp and starting-offset.
+     * Once the target segment where the search to be performed is found:
+     * 1. If the target segment lies in the local storage (common segments that lies in both remote and local storage),
+     *    then the search will be performed in the local storage.
+     * 2. If the target segment is found only in the remote storage, then the search will be performed in the remote storage.
+     *
+     *  &lt;p&gt;
+     * This method returns an option of TimestampOffset. The returned value is determined using the following ordered list of rules:
+     * &lt;p&gt;
+     * - If there are no messages in the remote storage, return Empty
+     * - If all the messages in the remote storage have smaller offsets, return Empty
+     * - If all the messages in the remote storage have smaller timestamps, return Empty
+     * - Otherwise, return an option of TimestampOffset. The offset is the offset of the first message whose timestamp
+     * is greater than or equals to the target timestamp and whose offset is greater than or equals to the startingOffset.
+     *
+     * @param tp               topic partition in which the offset to be found.
+     * @param timestamp        The timestamp to search for.
+     * @param startingOffset   The starting offset to search.
+     * @param leaderEpochCache LeaderEpochFileCache of the topic partition.
+     * @return the timestamp and offset of the first message that meets the requirements. Empty will be returned if there
+     * is no such message.
+     */
+    public Optional&lt;FileRecords.TimestampAndOffset&gt; findOffsetByTimestamp(TopicPartition tp,
+                                                                          long timestamp,
+                                                                          long startingOffset,
+                                                                          LeaderEpochFileCache leaderEpochCache) throws RemoteStorageException, IOException {
+<span class="nc" id="L725">        Uuid topicId = topicIdByPartitionMap.get(tp);</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">        if (topicId == null) {</span>
+<span class="nc" id="L727">            throw new KafkaException(&quot;Topic id does not exist for topic partition: &quot; + tp);</span>
+        }
+<span class="nc" id="L729">        Optional&lt;UnifiedLog&gt; unifiedLogOptional = fetchLog.apply(tp);</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">        if (unifiedLogOptional.isEmpty()) {</span>
+<span class="nc" id="L731">            throw new KafkaException(&quot;UnifiedLog does not exist for topic partition: &quot; + tp);</span>
+        }
+<span class="nc" id="L733">        UnifiedLog unifiedLog = unifiedLogOptional.get();</span>
+<span class="nc" id="L734">        int maxRecordBodySize = unifiedLog.config().maxDecompressedMessageBytes();</span>
+
+        // Get the respective epoch in which the starting-offset exists.
+<span class="nc" id="L737">        OptionalInt maybeEpoch = leaderEpochCache.epochForOffset(startingOffset);</span>
+<span class="nc" id="L738">        TopicIdPartition topicIdPartition = new TopicIdPartition(topicId, tp);</span>
+<span class="nc" id="L739">        NavigableMap&lt;Integer, Long&gt; epochWithOffsets = buildFilteredLeaderEpochMap(leaderEpochCache.epochWithOffsets());</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">        while (maybeEpoch.isPresent()) {</span>
+<span class="nc" id="L741">            int epoch = maybeEpoch.getAsInt();</span>
+            // KAFKA-15802: Add a new API for RLMM to choose how to implement the predicate.
+            // currently, all segments are returned and then iterated, and filtered
+<span class="nc" id="L744">            Iterator&lt;RemoteLogSegmentMetadata&gt; iterator = remoteLogMetadataManagerPlugin.get().listRemoteLogSegments(topicIdPartition, epoch);</span>
+<span class="nc bnc" id="L745" title="All 2 branches missed.">            while (iterator.hasNext()) {</span>
+<span class="nc" id="L746">                RemoteLogSegmentMetadata rlsMetadata = iterator.next();</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">                if (rlsMetadata.maxTimestampMs() &gt;= timestamp</span>
+<span class="nc bnc" id="L748" title="All 2 branches missed.">                    &amp;&amp; rlsMetadata.endOffset() &gt;= startingOffset</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">                    &amp;&amp; isRemoteSegmentWithinLeaderEpochs(rlsMetadata, unifiedLog.logEndOffset(), epochWithOffsets)</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">                    &amp;&amp; rlsMetadata.state().equals(RemoteLogSegmentState.COPY_SEGMENT_FINISHED)) {</span>
+                    // cache to avoid race conditions
+<span class="nc" id="L752">                    List&lt;LogSegment&gt; segmentsCopy = unifiedLog.logSegments();</span>
+<span class="nc bnc" id="L753" title="All 4 branches missed.">                    if (segmentsCopy.isEmpty() || rlsMetadata.startOffset() &lt; segmentsCopy.get(0).baseOffset()) {</span>
+                        // search in remote-log
+<span class="nc" id="L755">                        return lookupTimestamp(rlsMetadata, timestamp, startingOffset, maxRecordBodySize);</span>
+                    } else {
+                        // search in local-log
+<span class="nc bnc" id="L758" title="All 2 branches missed.">                        for (LogSegment segment : segmentsCopy) {</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">                            if (segment.largestTimestamp() &gt;= timestamp) {</span>
+<span class="nc" id="L760">                                return segment.findOffsetByTimestamp(timestamp, startingOffset, maxRecordBodySize);</span>
+                            }
+<span class="nc" id="L762">                        }</span>
+                    }
+                }
+<span class="nc" id="L765">            }</span>
+            // Move to the next epoch if not found with the current epoch.
+<span class="nc" id="L767">            maybeEpoch = leaderEpochCache.nextEpoch(epoch);</span>
+<span class="nc" id="L768">        }</span>
+<span class="nc" id="L769">        return Optional.empty();</span>
+    }
+
+<span class="nc" id="L772">    private abstract static class CancellableRunnable implements Runnable {</span>
+<span class="nc" id="L773">        private volatile boolean cancelled = false;</span>
+
+        public void cancel() {
+<span class="nc" id="L776">            cancelled = true;</span>
+<span class="nc" id="L777">        }</span>
+
+        public boolean isCancelled() {
+<span class="nc" id="L780">            return cancelled;</span>
+        }
+    }
+
+    /**
+     * Returns the leader epoch entries within the range of the given start (inclusive) and end (exclusive) offset.
+     * &lt;p&gt;
+     * Visible for testing.
+     *
+     * @param log         The actual log from where to take the leader-epoch checkpoint
+     * @param startOffset The start offset of the epoch entries (inclusive).
+     *                    If start offset is 6, then it will retain an entry at offset 6.
+     * @param endOffset   The end offset of the epoch entries (exclusive)
+     *                    If end offset is 100, then it will remove the entries greater than or equal to 100.
+     * @return the leader epoch entries
+     */
+    List&lt;EpochEntry&gt; getLeaderEpochEntries(UnifiedLog log, long startOffset, long endOffset) {
+<span class="nc" id="L797">        return log.leaderEpochCache().epochEntriesInRange(startOffset, endOffset);</span>
+    }
+
+    // VisibleForTesting
+    RLMTask rlmCopyTask(TopicIdPartition topicIdPartition) {
+<span class="nc" id="L802">        RLMTaskWithFuture task = leaderCopyRLMTasks.get(topicIdPartition);</span>
+<span class="nc bnc" id="L803" title="All 2 branches missed.">        if (task != null) {</span>
+<span class="nc" id="L804">            return task.rlmTask;</span>
+        }
+<span class="nc" id="L806">        return null;</span>
+    }
+
+    // VisibleForTesting
+    RLMExpirationTask rlmExpirationTask(TopicIdPartition topicIdPartition) {
+<span class="nc" id="L811">        RLMTaskWithFuture task = leaderExpirationRLMTasks.get(topicIdPartition);</span>
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        if (task != null) {</span>
+<span class="nc" id="L813">            return (RLMExpirationTask) task.rlmTask;</span>
+        }
+<span class="nc" id="L815">        return null;</span>
+    }
+
+    public boolean isPartitionReady(TopicPartition partition) {
+<span class="nc" id="L819">        Uuid uuid = topicIdByPartitionMap.get(partition);</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">        if (uuid == null) {</span>
+<span class="nc" id="L821">            return false;</span>
+        }
+<span class="nc" id="L823">        TopicIdPartition topicIdPartition = new TopicIdPartition(uuid, partition);</span>
+<span class="nc" id="L824">        return remoteLogMetadataManagerPlugin.get().isReady(topicIdPartition);</span>
+    }
+
+    abstract class RLMTask extends CancellableRunnable {
+
+        protected final TopicIdPartition topicIdPartition;
+        private final Logger logger;
+
+<span class="nc" id="L832">        public RLMTask(TopicIdPartition topicIdPartition) {</span>
+<span class="nc" id="L833">            this.topicIdPartition = topicIdPartition;</span>
+<span class="nc" id="L834">            this.logger = getLogContext().logger(RLMTask.class);</span>
+<span class="nc" id="L835">        }</span>
+
+        protected LogContext getLogContext() {
+<span class="nc" id="L838">            return new LogContext(&quot;[RemoteLogManager=&quot; + brokerId + &quot; partition=&quot; + topicIdPartition + &quot;] &quot;);</span>
+        }
+
+        public void run() {
+<span class="nc bnc" id="L842" title="All 2 branches missed.">            if (isCancelled()) {</span>
+<span class="nc" id="L843">                logger.debug(&quot;Skipping the current run for partition {} as it is cancelled&quot;, topicIdPartition);</span>
+<span class="nc" id="L844">                return;</span>
+            }
+<span class="nc bnc" id="L846" title="All 2 branches missed.">            if (!remoteLogMetadataManagerPlugin.get().isReady(topicIdPartition)) {</span>
+<span class="nc" id="L847">                logger.debug(&quot;Skipping the current run for partition {} as the remote-log metadata is not ready&quot;, topicIdPartition);</span>
+<span class="nc" id="L848">                return;</span>
+            }
+
+            try {
+<span class="nc" id="L852">                Optional&lt;UnifiedLog&gt; unifiedLogOptional = fetchLog.apply(topicIdPartition.topicPartition());</span>
+
+<span class="nc bnc" id="L854" title="All 2 branches missed.">                if (unifiedLogOptional.isEmpty()) {</span>
+<span class="nc" id="L855">                    return;</span>
+                }
+
+<span class="nc" id="L858">                execute(unifiedLogOptional.get());</span>
+<span class="nc" id="L859">            } catch (InterruptedException ex) {</span>
+<span class="nc bnc" id="L860" title="All 2 branches missed.">                if (!isCancelled()) {</span>
+<span class="nc" id="L861">                    logger.warn(&quot;Current thread for partition {} is interrupted&quot;, topicIdPartition, ex);</span>
+                }
+<span class="nc" id="L863">            } catch (RetriableException | RetriableRemoteStorageException ex) {</span>
+<span class="nc" id="L864">                logger.debug(&quot;Encountered a retryable error while executing current task for partition {}&quot;, topicIdPartition, ex);</span>
+<span class="nc" id="L865">            } catch (Exception ex) {</span>
+<span class="nc bnc" id="L866" title="All 2 branches missed.">                if (!isCancelled()) {</span>
+<span class="nc" id="L867">                    logger.warn(&quot;Current task for partition {} received error but it will be scheduled&quot;, topicIdPartition, ex);</span>
+                }
+<span class="nc" id="L869">            }</span>
+<span class="nc" id="L870">        }</span>
+
+        protected abstract void execute(UnifiedLog log) throws InterruptedException, RemoteStorageException, ExecutionException;
+
+        public String toString() {
+<span class="nc" id="L875">            return this.getClass() + &quot;[&quot; + topicIdPartition + &quot;]&quot;;</span>
+        }
+    }
+
+    class RLMCopyTask extends RLMTask {
+        private final int customMetadataSizeLimit;
+        private final Logger logger;
+
+        // The copied and log-start offset is empty initially for a new RLMCopyTask, and needs to be fetched inside
+        // the task's run() method.
+<span class="nc" id="L885">        private volatile Optional&lt;OffsetAndEpoch&gt; copiedOffsetOption = Optional.empty();</span>
+<span class="nc" id="L886">        private volatile boolean isLogStartOffsetUpdated = false;</span>
+<span class="nc" id="L887">        private volatile Optional&lt;String&gt; logDirectory = Optional.empty();</span>
+
+<span class="nc" id="L889">        public RLMCopyTask(TopicIdPartition topicIdPartition, int customMetadataSizeLimit) {</span>
+<span class="nc" id="L890">            super(topicIdPartition);</span>
+<span class="nc" id="L891">            this.customMetadataSizeLimit = customMetadataSizeLimit;</span>
+<span class="nc" id="L892">            this.logger = getLogContext().logger(RLMCopyTask.class);</span>
+<span class="nc" id="L893">        }</span>
+
+        @Override
+        protected void execute(UnifiedLog log) throws InterruptedException, RetriableRemoteStorageException {
+            // In the first run after completing altering logDir within broker, we should make sure the state is reset. (KAFKA-16711)
+<span class="nc bnc" id="L898" title="All 2 branches missed.">            if (!log.parentDir().equals(logDirectory.orElse(null))) {</span>
+<span class="nc" id="L899">                copiedOffsetOption = Optional.empty();</span>
+<span class="nc" id="L900">                isLogStartOffsetUpdated = false;</span>
+<span class="nc" id="L901">                logDirectory = Optional.of(log.parentDir());</span>
+            }
+
+<span class="nc" id="L904">            copyLogSegmentsToRemote(log);</span>
+<span class="nc" id="L905">        }</span>
+
+        private void maybeUpdateLogStartOffsetOnBecomingLeader(UnifiedLog log) throws RemoteStorageException {
+<span class="nc bnc" id="L908" title="All 2 branches missed.">            if (!isLogStartOffsetUpdated) {</span>
+<span class="nc" id="L909">                long logStartOffset = findLogStartOffset(topicIdPartition, log);</span>
+<span class="nc" id="L910">                updateRemoteLogStartOffset.accept(topicIdPartition.topicPartition(), logStartOffset);</span>
+<span class="nc" id="L911">                isLogStartOffsetUpdated = true;</span>
+<span class="nc" id="L912">                logger.info(&quot;Found the logStartOffset: {} for partition: {} after becoming leader&quot;,</span>
+<span class="nc" id="L913">                        logStartOffset, topicIdPartition);</span>
+            }
+<span class="nc" id="L915">        }</span>
+
+        private void maybeUpdateCopiedOffset(UnifiedLog log) throws RemoteStorageException {
+<span class="nc bnc" id="L918" title="All 2 branches missed.">            if (copiedOffsetOption.isEmpty()) {</span>
+                // This is found by traversing from the latest leader epoch from leader epoch history and find the highest offset
+                // of a segment with that epoch copied into remote storage. If it can not find an entry then it checks for the
+                // previous leader epoch till it finds an entry, If there are no entries till the earliest leader epoch in leader
+                // epoch cache then it starts copying the segments from the earliest epoch entry's offset.
+<span class="nc" id="L923">                copiedOffsetOption = Optional.of(findHighestRemoteOffset(topicIdPartition, log));</span>
+<span class="nc" id="L924">                logger.info(&quot;Found the highest copiedRemoteOffset: {} for partition: {} after becoming leader&quot;, copiedOffsetOption, topicIdPartition);</span>
+<span class="nc" id="L925">                copiedOffsetOption.ifPresent(offsetAndEpoch -&gt;  log.updateHighestOffsetInRemoteStorage(offsetAndEpoch.offset()));</span>
+            }
+<span class="nc" id="L927">        }</span>
+
+        /**
+         *  Segments which match the following criteria are eligible for copying to remote storage:
+         *  1) Segment is not the active segment and
+         *  2) Segment end-offset is less than the last-stable-offset as remote storage should contain only
+         *     committed/acked messages
+         *  3) Segment has exceeded copy lag by time or size when configured (remote.copy.lag.ms, remote.copy.lag.bytes)
+         * @param log The log from which the segments are to be copied
+         * @param fromOffset The offset from which the segments are to be copied
+         * @param lastStableOffset The last stable offset of the log
+         * @return candidate log segments to be copied to remote storage
+         */
+        List&lt;EnrichedLogSegment&gt; candidateLogSegments(UnifiedLog log, Long fromOffset, Long lastStableOffset) {
+<span class="nc" id="L941">            List&lt;EnrichedLogSegment&gt; candidateLogSegments = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L942">            List&lt;LogSegment&gt; segments = log.logSegments(fromOffset, Long.MAX_VALUE);</span>
+<span class="nc bnc" id="L943" title="All 2 branches missed.">            if (!segments.isEmpty()) {</span>
+<span class="nc" id="L944">                long currentTimeMs = time.milliseconds();</span>
+<span class="nc" id="L945">                long totalLogSize = UnifiedLog.sizeInBytes(segments);</span>
+<span class="nc" id="L946">                long cumulativeSize = 0;</span>
+<span class="nc bnc" id="L947" title="All 2 branches missed.">                for (int idx = 1; idx &lt; segments.size(); idx++) {</span>
+<span class="nc" id="L948">                    LogSegment previousSeg = segments.get(idx - 1);</span>
+<span class="nc" id="L949">                    LogSegment currentSeg = segments.get(idx);</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">                    if (currentSeg.baseOffset() &lt;= lastStableOffset) {</span>
+<span class="nc" id="L951">                        cumulativeSize += previousSeg.size();</span>
+<span class="nc bnc" id="L952" title="All 2 branches missed.">                        if (isEligibleForUpload(log.config(), previousSeg, currentTimeMs, totalLogSize, cumulativeSize)) {</span>
+<span class="nc" id="L953">                            candidateLogSegments.add(new EnrichedLogSegment(previousSeg, currentSeg.baseOffset()));</span>
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                // Discard the last active segment
+            }
+<span class="nc" id="L961">            return candidateLogSegments;</span>
+        }
+
+        private boolean isEligibleForUpload(LogConfig logConfig, LogSegment previousSeg, long currentTimeMs, long totalLogSize, long cumulativeSize) {
+<span class="nc" id="L965">            long copyLagMs = logConfig.remoteCopyLagMs();</span>
+<span class="nc" id="L966">            long copyLagBytes = logConfig.remoteCopyLagBytes();</span>
+<span class="nc bnc" id="L967" title="All 2 branches missed.">            if (logger.isTraceEnabled()) {</span>
+<span class="nc" id="L968">                logger.trace(&quot;delayCopy check for segment {}: copyLagMs={}, copyLagBytes={}, currentTimeMs={}, totalLogSize={}, cumulativeSize={}, sizeLagBytes={}&quot;,</span>
+<span class="nc" id="L969">                        previousSeg, copyLagMs, copyLagBytes, currentTimeMs, totalLogSize, cumulativeSize, totalLogSize - cumulativeSize);</span>
+            }
+
+<span class="nc bnc" id="L972" title="All 4 branches missed.">            if (copyLagMs == 0 || copyLagBytes == 0) {</span>
+<span class="nc" id="L973">                return true;</span>
+            }
+
+<span class="nc bnc" id="L976" title="All 2 branches missed.">            boolean limitedCopyLagMsCheck =  copyLagMs &gt; 0;</span>
+<span class="nc bnc" id="L977" title="All 2 branches missed.">            boolean limitedCopyLagSizeCheck = copyLagBytes &gt; 0;</span>
+
+<span class="nc bnc" id="L979" title="All 4 branches missed.">            if (limitedCopyLagMsCheck &amp;&amp; eligibleUploadByTime(previousSeg, currentTimeMs, copyLagMs)) {</span>
+<span class="nc" id="L980">                return true;</span>
+            }
+
+<span class="nc bnc" id="L983" title="All 4 branches missed.">            return limitedCopyLagSizeCheck &amp;&amp; eligibleUploadBySize(previousSeg, totalLogSize, cumulativeSize, copyLagBytes);</span>
+        }
+
+        private boolean eligibleUploadByTime(LogSegment segment, long currentTimeMs, long copyLagMs) {
+            try {
+<span class="nc" id="L988">                long segmentAgeMs = currentTimeMs - segment.largestTimestamp();</span>
+<span class="nc bnc" id="L989" title="All 4 branches missed.">                boolean eligibleUpload = segmentAgeMs &lt; 0 || segmentAgeMs &gt;= copyLagMs;</span>
+<span class="nc bnc" id="L990" title="All 2 branches missed.">                if (logger.isTraceEnabled()) {</span>
+<span class="nc" id="L991">                    logger.trace(&quot;{} eligible for upload by time? {} (segment age {} ms, copy lag {} ms)&quot;,</span>
+<span class="nc" id="L992">                            segment, eligibleUpload, segmentAgeMs, copyLagMs);</span>
+                }
+<span class="nc" id="L994">                return eligibleUpload;</span>
+<span class="nc" id="L995">            } catch (IOException e) {</span>
+<span class="nc" id="L996">                logger.warn(&quot;Failed to get largest timestamp for segment {}, take it as eligible for upload based on time&quot;, segment, e);</span>
+<span class="nc" id="L997">                return true;</span>
+            }
+        }
+
+        private boolean eligibleUploadBySize(LogSegment segment, long totalLogSize, long cumulativeSize, long copyLagBytes) {
+<span class="nc" id="L1002">            long sizeLagBytes = totalLogSize - cumulativeSize;</span>
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">            boolean eligibleUpload = sizeLagBytes &gt;= copyLagBytes;</span>
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">            if (logger.isTraceEnabled()) {</span>
+<span class="nc" id="L1005">                logger.trace(&quot;{} eligible for upload by size? {} (size lag {} bytes, copy lag {} bytes, totalLogSize={}, cumulativeSize={})&quot;,</span>
+<span class="nc" id="L1006">                        segment, eligibleUpload, sizeLagBytes, copyLagBytes, totalLogSize, cumulativeSize);</span>
+            }
+<span class="nc" id="L1008">            return eligibleUpload;</span>
+        }
+        
+        public void copyLogSegmentsToRemote(UnifiedLog log) throws InterruptedException, RetriableRemoteStorageException {
+<span class="nc bnc" id="L1012" title="All 2 branches missed.">            if (isCancelled())</span>
+<span class="nc" id="L1013">                return;</span>
+
+            try {
+<span class="nc" id="L1016">                maybeUpdateLogStartOffsetOnBecomingLeader(log);</span>
+<span class="nc" id="L1017">                maybeUpdateCopiedOffset(log);</span>
+<span class="nc" id="L1018">                long copiedOffset = copiedOffsetOption.get().offset();</span>
+
+                // LSO indicates the offset below are ready to be consumed (high-watermark or committed)
+<span class="nc" id="L1021">                long lso = log.lastStableOffset();</span>
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">                if (lso &lt; 0) {</span>
+<span class="nc" id="L1023">                    logger.warn(&quot;lastStableOffset for partition {} is {}, which should not be negative.&quot;, topicIdPartition, lso);</span>
+<span class="nc bnc" id="L1024" title="All 4 branches missed.">                } else if (lso &gt; 0 &amp;&amp; copiedOffset &lt; lso) {</span>
+                    // log-start-offset can be ahead of the copied-offset, when:
+                    // 1) log-start-offset gets incremented via delete-records API (or)
+                    // 2) enabling the remote log for the first time
+<span class="nc" id="L1028">                    long fromOffset = Math.max(copiedOffset + 1, log.logStartOffset());</span>
+<span class="nc" id="L1029">                    List&lt;EnrichedLogSegment&gt; candidateLogSegments = candidateLogSegments(log, fromOffset, lso);</span>
+<span class="nc" id="L1030">                    logger.debug(&quot;Candidate log segments, logStartOffset: {}, copiedOffset: {}, fromOffset: {}, lso: {} &quot; +</span>
+<span class="nc" id="L1031">                            &quot;and candidateLogSegments: {}&quot;, log.logStartOffset(), copiedOffset, fromOffset, lso, candidateLogSegments);</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">                    if (candidateLogSegments.isEmpty()) {</span>
+<span class="nc" id="L1033">                        logger.debug(&quot;No segments found to be copied for partition {} with copiedOffset: {} and active segment's base-offset: {}&quot;,</span>
+<span class="nc" id="L1034">                                topicIdPartition, copiedOffset, log.activeSegment().baseOffset());</span>
+                    } else {
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">                        for (EnrichedLogSegment candidateLogSegment : candidateLogSegments) {</span>
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">                            if (isCancelled()) {</span>
+<span class="nc" id="L1038">                                logger.info(&quot;Skipping copying log segments as the current task state is changed, cancelled: {}&quot;,</span>
+<span class="nc" id="L1039">                                        isCancelled());</span>
+<span class="nc" id="L1040">                                return;</span>
+                            }
+
+<span class="nc" id="L1043">                            copyQuotaManagerLock.lock();</span>
+                            try {
+<span class="nc" id="L1045">                                long throttleTimeMs = rlmCopyQuotaManager.getThrottleTimeMs();</span>
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">                                while (throttleTimeMs &gt; 0) {</span>
+<span class="nc" id="L1047">                                    copyQuotaMetrics.sensor().record(throttleTimeMs, time.milliseconds());</span>
+<span class="nc" id="L1048">                                    logger.debug(&quot;Quota exceeded for copying log segments, waiting for the quota to be available.&quot;);</span>
+                                    // If the thread gets interrupted while waiting, the InterruptedException is thrown
+                                    // back to the caller. It's important to note that the task being executed is already
+                                    // cancelled before the executing thread is interrupted. The caller is responsible
+                                    // for handling the exception gracefully by checking if the task is already cancelled.
+                                    @SuppressWarnings(&quot;UnusedLocalVariable&quot;)
+<span class="nc" id="L1054">                                    boolean ignored = copyQuotaManagerLockCondition.await(quotaTimeout().toMillis(), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L1055">                                    throttleTimeMs = rlmCopyQuotaManager.getThrottleTimeMs();</span>
+<span class="nc" id="L1056">                                }</span>
+<span class="nc" id="L1057">                                rlmCopyQuotaManager.record(candidateLogSegment.logSegment.log().sizeInBytes());</span>
+                                // Signal waiting threads to check the quota again
+<span class="nc" id="L1059">                                copyQuotaManagerLockCondition.signalAll();</span>
+                            } finally {
+<span class="nc" id="L1061">                                copyQuotaManagerLock.unlock();</span>
+                            }
+
+<span class="nc" id="L1064">                            RemoteLogSegmentId segmentId = RemoteLogSegmentId.generateNew(topicIdPartition);</span>
+<span class="nc" id="L1065">                            segmentIdsBeingCopied.add(segmentId);</span>
+                            try {
+<span class="nc" id="L1067">                                copyLogSegment(log, candidateLogSegment.logSegment, segmentId, candidateLogSegment.nextSegmentOffset);</span>
+                            } finally {
+<span class="nc" id="L1069">                                segmentIdsBeingCopied.remove(segmentId);</span>
+                            }
+<span class="nc" id="L1071">                        }</span>
+                    }
+<span class="nc" id="L1073">                } else {</span>
+<span class="nc" id="L1074">                    logger.debug(&quot;Skipping copying segments, current read-offset:{}, and LSO:{}&quot;, copiedOffset, lso);</span>
+                }
+<span class="nc" id="L1076">            } catch (CustomMetadataSizeLimitExceededException e) {</span>
+                // Only stop this task. Logging is done where the exception is thrown.
+<span class="nc" id="L1078">                brokerTopicStats.topicStats(log.topicPartition().topic()).failedRemoteCopyRequestRate().mark();</span>
+<span class="nc" id="L1079">                brokerTopicStats.allTopicsStats().failedRemoteCopyRequestRate().mark();</span>
+<span class="nc" id="L1080">                this.cancel();</span>
+<span class="nc" id="L1081">            } catch (InterruptedException | RetriableException | RetriableRemoteStorageException ex) {</span>
+<span class="nc" id="L1082">                throw ex;</span>
+<span class="nc" id="L1083">            } catch (Exception ex) {</span>
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">                if (!isCancelled()) {</span>
+<span class="nc" id="L1085">                    brokerTopicStats.topicStats(log.topicPartition().topic()).failedRemoteCopyRequestRate().mark();</span>
+<span class="nc" id="L1086">                    brokerTopicStats.allTopicsStats().failedRemoteCopyRequestRate().mark();</span>
+<span class="nc" id="L1087">                    logger.error(&quot;Error occurred while copying log segments of partition: {}&quot;, topicIdPartition, ex);</span>
+                }
+            } finally {
+<span class="nc" id="L1090">                recordLagStats(log);</span>
+            }
+<span class="nc" id="L1092">        }</span>
+
+        private void copyLogSegment(UnifiedLog log, LogSegment segment, RemoteLogSegmentId segmentId, long nextSegmentBaseOffset)
+                throws InterruptedException, ExecutionException, RemoteStorageException, IOException,
+                CustomMetadataSizeLimitExceededException {
+<span class="nc" id="L1097">            File logFile = segment.log().file();</span>
+<span class="nc" id="L1098">            String logFileName = logFile.getName();</span>
+
+<span class="nc" id="L1100">            logger.info(&quot;Copying {} to remote storage.&quot;, logFileName);</span>
+
+<span class="nc" id="L1102">            long endOffset = nextSegmentBaseOffset - 1;</span>
+<span class="nc" id="L1103">            File producerStateSnapshotFile = log.producerStateManager().fetchSnapshot(nextSegmentBaseOffset).orElse(null);</span>
+
+<span class="nc" id="L1105">            List&lt;EpochEntry&gt; epochEntries = getLeaderEpochEntries(log, segment.baseOffset(), nextSegmentBaseOffset);</span>
+<span class="nc" id="L1106">            Map&lt;Integer, Long&gt; segmentLeaderEpochs = new HashMap&lt;&gt;(epochEntries.size());</span>
+<span class="nc" id="L1107">            epochEntries.forEach(entry -&gt; segmentLeaderEpochs.put(entry.epoch(), entry.startOffset()));</span>
+
+<span class="nc" id="L1109">            boolean isTxnIdxEmpty = segment.txnIndex().isEmpty();</span>
+<span class="nc" id="L1110">            RemoteLogSegmentMetadata copySegmentStartedRlsm = new RemoteLogSegmentMetadata(segmentId, segment.baseOffset(), endOffset,</span>
+<span class="nc" id="L1111">                    segment.largestTimestamp(), brokerId, time.milliseconds(), segment.log().sizeInBytes(),</span>
+                    segmentLeaderEpochs, isTxnIdxEmpty);
+
+<span class="nc" id="L1114">            remoteLogMetadataManagerPlugin.get().addRemoteLogSegmentMetadata(copySegmentStartedRlsm).get();</span>
+
+<span class="nc" id="L1116">            ByteBuffer leaderEpochsIndex = epochEntriesAsByteBuffer(getLeaderEpochEntries(log, -1, nextSegmentBaseOffset));</span>
+<span class="nc" id="L1117">            LogSegmentData segmentData = new LogSegmentData(logFile.toPath(), toPathIfExists(segment.offsetIndex().file()),</span>
+<span class="nc" id="L1118">                    toPathIfExists(segment.timeIndex().file()), Optional.ofNullable(toPathIfExists(segment.txnIndex().file())),</span>
+<span class="nc" id="L1119">                    producerStateSnapshotFile.toPath(), leaderEpochsIndex);</span>
+<span class="nc" id="L1120">            brokerTopicStats.topicStats(log.topicPartition().topic()).remoteCopyRequestRate().mark();</span>
+<span class="nc" id="L1121">            brokerTopicStats.allTopicsStats().remoteCopyRequestRate().mark();</span>
+            Optional&lt;CustomMetadata&gt; customMetadata;
+
+            try {
+<span class="nc" id="L1125">                customMetadata = remoteStorageManagerPlugin.get().copyLogSegmentData(copySegmentStartedRlsm, segmentData);</span>
+<span class="nc" id="L1126">            } catch (RetriableRemoteStorageException e) {</span>
+<span class="nc" id="L1127">                logger.info(&quot;Copy failed with retriable error for segment {}&quot;, copySegmentStartedRlsm.remoteLogSegmentId());</span>
+<span class="nc" id="L1128">                throw e;</span>
+<span class="nc" id="L1129">            } catch (RemoteStorageException e) {</span>
+<span class="nc" id="L1130">                logger.info(&quot;Copy failed, cleaning segment {}&quot;, copySegmentStartedRlsm.remoteLogSegmentId());</span>
+                try {
+<span class="nc bnc" id="L1132" title="All 2 branches missed.">                    deleteRemoteLogSegment(copySegmentStartedRlsm, ignored -&gt; !isCancelled());</span>
+<span class="nc" id="L1133">                    LOGGER.info(&quot;Cleanup completed for segment {}&quot;, copySegmentStartedRlsm.remoteLogSegmentId());</span>
+<span class="nc" id="L1134">                } catch (RemoteStorageException e1) {</span>
+<span class="nc" id="L1135">                    LOGGER.info(&quot;Cleanup failed, will retry later with segment {}: {}&quot;, copySegmentStartedRlsm.remoteLogSegmentId(), e1.getMessage());</span>
+<span class="nc" id="L1136">                }</span>
+<span class="nc" id="L1137">                throw e;</span>
+<span class="nc" id="L1138">            }</span>
+
+<span class="nc" id="L1140">            RemoteLogSegmentMetadataUpdate copySegmentFinishedRlsm = new RemoteLogSegmentMetadataUpdate(segmentId, time.milliseconds(),</span>
+                    customMetadata, RemoteLogSegmentState.COPY_SEGMENT_FINISHED, brokerId);
+
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">            if (customMetadata.isPresent()) {</span>
+<span class="nc" id="L1144">                long customMetadataSize = customMetadata.get().value().length;</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">                if (customMetadataSize &gt; this.customMetadataSizeLimit) {</span>
+<span class="nc" id="L1146">                    CustomMetadataSizeLimitExceededException e = new CustomMetadataSizeLimitExceededException();</span>
+<span class="nc" id="L1147">                    logger.info(&quot;Custom metadata size {} exceeds configured limit {}.&quot; +</span>
+                                    &quot; Copying will be stopped and copied segment will be attempted to clean.&quot; +
+                                    &quot; Original metadata: {}&quot;,
+<span class="nc" id="L1150">                            customMetadataSize, this.customMetadataSizeLimit, copySegmentStartedRlsm, e);</span>
+                    // For deletion, we provide back the custom metadata by creating a new metadata object from the update.
+                    // However, the update itself will not be stored in this case.
+<span class="nc" id="L1153">                    RemoteLogSegmentMetadata newMetadata = copySegmentStartedRlsm.createWithUpdates(copySegmentFinishedRlsm);</span>
+                    try {
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">                        deleteRemoteLogSegment(newMetadata, ignored -&gt; !isCancelled());</span>
+<span class="nc" id="L1156">                        LOGGER.info(&quot;Cleanup completed for segment {}&quot;, newMetadata.remoteLogSegmentId());</span>
+<span class="nc" id="L1157">                    } catch (RemoteStorageException e1) {</span>
+<span class="nc" id="L1158">                        LOGGER.info(&quot;Cleanup failed, will retry later with segment {}: {}&quot;, newMetadata.remoteLogSegmentId(), e1.getMessage());</span>
+<span class="nc" id="L1159">                    }</span>
+<span class="nc" id="L1160">                    throw e;</span>
+                }
+            }
+
+<span class="nc" id="L1164">            remoteLogMetadataManagerPlugin.get().updateRemoteLogSegmentMetadata(copySegmentFinishedRlsm).get();</span>
+<span class="nc" id="L1165">            brokerTopicStats.topicStats(log.topicPartition().topic())</span>
+<span class="nc" id="L1166">                .remoteCopyBytesRate().mark(copySegmentStartedRlsm.segmentSizeInBytes());</span>
+<span class="nc" id="L1167">            brokerTopicStats.allTopicsStats().remoteCopyBytesRate().mark(copySegmentStartedRlsm.segmentSizeInBytes());</span>
+
+            // `epochEntries` cannot be empty, there is a pre-condition validation in RemoteLogSegmentMetadata
+            // constructor
+<span class="nc" id="L1171">            int lastEpochInSegment = epochEntries.get(epochEntries.size() - 1).epoch();</span>
+<span class="nc" id="L1172">            copiedOffsetOption = Optional.of(new OffsetAndEpoch(endOffset, lastEpochInSegment));</span>
+            // Update the highest offset in remote storage for this partition's log so that the local log segments
+            // are not deleted before they are copied to remote storage.
+<span class="nc" id="L1175">            log.updateHighestOffsetInRemoteStorage(endOffset);</span>
+<span class="nc" id="L1176">            logger.info(&quot;Copied {} to remote storage with segment-id: {}&quot;,</span>
+<span class="nc" id="L1177">                    logFileName, copySegmentFinishedRlsm.remoteLogSegmentId());</span>
+<span class="nc" id="L1178">        }</span>
+
+        // VisibleForTesting
+        void recordLagStats(long bytesLag, long segmentsLag) {
+<span class="nc bnc" id="L1182" title="All 2 branches missed.">            if (!isCancelled()) {</span>
+<span class="nc" id="L1183">                String topic = topicIdPartition.topic();</span>
+<span class="nc" id="L1184">                int partition = topicIdPartition.partition();</span>
+<span class="nc" id="L1185">                brokerTopicStats.recordRemoteCopyLagBytes(topic, partition, bytesLag);</span>
+<span class="nc" id="L1186">                brokerTopicStats.recordRemoteCopyLagSegments(topic, partition, segmentsLag);</span>
+            }
+<span class="nc" id="L1188">        }</span>
+
+        void resetLagStats() {
+<span class="nc" id="L1191">            String topic = topicIdPartition.topic();</span>
+<span class="nc" id="L1192">            int partition = topicIdPartition.partition();</span>
+<span class="nc" id="L1193">            brokerTopicStats.recordRemoteCopyLagBytes(topic, partition, 0);</span>
+<span class="nc" id="L1194">            brokerTopicStats.recordRemoteCopyLagSegments(topic, partition, 0);</span>
+<span class="nc" id="L1195">        }</span>
+
+        // VisibleForTesting
+        void recordLagStats(UnifiedLog log) {
+            try {
+<span class="nc" id="L1200">                long bytesLag = Math.max(0, log.onlyLocalLogSegmentsSize() - log.activeSegment().size());</span>
+<span class="nc" id="L1201">                long segmentsLag = Math.max(0, log.onlyLocalLogSegmentsCount() - 1);</span>
+<span class="nc" id="L1202">                recordLagStats(bytesLag, segmentsLag);</span>
+<span class="nc" id="L1203">            } catch (Exception e) {</span>
+<span class="nc" id="L1204">                logger.debug(&quot;Failed to record lag stats for partition {}&quot;, topicIdPartition, e);</span>
+<span class="nc" id="L1205">            }</span>
+<span class="nc" id="L1206">        }</span>
+
+        private Path toPathIfExists(File file) {
+<span class="nc bnc" id="L1209" title="All 2 branches missed.">            return file.exists() ? file.toPath() : null;</span>
+        }
+    }
+
+    class RLMExpirationTask extends RLMTask {
+        private final Logger logger;
+<span class="nc" id="L1215">        private volatile boolean isAllSegmentsValid = false;</span>
+<span class="nc" id="L1216">        private volatile boolean metricsRegistered = false;</span>
+        private final Map&lt;String, String&gt; metricTags;
+<span class="nc" id="L1218">        private final AtomicInteger retentionSizeInPercentValue = new AtomicInteger(0);</span>
+<span class="nc" id="L1219">        private final AtomicInteger localRetentionSizeInPercentValue = new AtomicInteger(0);</span>
+
+        int retentionSizeInPercent() {
+<span class="nc" id="L1222">            return retentionSizeInPercentValue.get();</span>
+        }
+
+        int localRetentionSizeInPercent() {
+<span class="nc" id="L1226">            return localRetentionSizeInPercentValue.get();</span>
+        }
+
+<span class="nc" id="L1229">        public RLMExpirationTask(TopicIdPartition topicIdPartition) {</span>
+<span class="nc" id="L1230">            super(topicIdPartition);</span>
+<span class="nc" id="L1231">            this.logger = getLogContext().logger(RLMExpirationTask.class);</span>
+<span class="nc" id="L1232">            this.metricTags = MetricsUtils.getTags(&quot;topic&quot;, topicIdPartition.topic(),</span>
+<span class="nc" id="L1233">                    &quot;partition&quot;, Integer.toString(topicIdPartition.partition()));</span>
+<span class="nc" id="L1234">        }</span>
+
+        // Visible for testing
+        void registerMetrics() {
+<span class="nc bnc" id="L1238" title="All 4 branches missed.">            if (!metricsRegistered &amp;&amp; !isCancelled()) {</span>
+<span class="nc" id="L1239">                metricsGroup.newGauge(RETENTION_SIZE_IN_PERCENT_METRIC.getName(), retentionSizeInPercentValue::get, metricTags);</span>
+<span class="nc" id="L1240">                metricsGroup.newGauge(LOCAL_RETENTION_SIZE_IN_PERCENT_METRIC.getName(), localRetentionSizeInPercentValue::get, metricTags);</span>
+<span class="nc" id="L1241">                metricsRegistered = true;</span>
+            }
+<span class="nc" id="L1243">        }</span>
+
+        @Override
+        protected void execute(UnifiedLog log) throws InterruptedException, RemoteStorageException, ExecutionException {
+            // Register metrics on first execution (after task is safely scheduled)
+<span class="nc" id="L1248">            registerMetrics();</span>
+<span class="nc" id="L1249">            cleanupExpiredRemoteLogSegments();</span>
+<span class="nc" id="L1250">        }</span>
+
+        @Override
+        public void cancel() {
+<span class="nc" id="L1254">            isAllSegmentsValid = false;</span>
+            // Reset metrics to 0 immediately when task is cancelled to prevent stale values
+<span class="nc" id="L1256">            retentionSizeInPercentValue.set(0);</span>
+<span class="nc" id="L1257">            localRetentionSizeInPercentValue.set(0);</span>
+
+            // Remove metrics if they were registered
+<span class="nc bnc" id="L1260" title="All 2 branches missed.">            if (metricsRegistered) {</span>
+<span class="nc" id="L1261">                metricsGroup.removeMetric(RETENTION_SIZE_IN_PERCENT_METRIC.getName(), metricTags);</span>
+<span class="nc" id="L1262">                metricsGroup.removeMetric(LOCAL_RETENTION_SIZE_IN_PERCENT_METRIC.getName(), metricTags);</span>
+<span class="nc" id="L1263">                metricsRegistered = false;</span>
+            }
+<span class="nc" id="L1265">            super.cancel();</span>
+<span class="nc" id="L1266">        }</span>
+
+        boolean isAllSegmentsValid() {
+<span class="nc" id="L1269">            return isAllSegmentsValid;</span>
+        }
+
+        public void handleLogStartOffsetUpdate(TopicPartition topicPartition, long remoteLogStartOffset) {
+<span class="nc" id="L1273">            logger.debug(&quot;Updating {} with remoteLogStartOffset: {}&quot;, topicPartition, remoteLogStartOffset);</span>
+<span class="nc" id="L1274">            updateRemoteLogStartOffset.accept(topicPartition, remoteLogStartOffset);</span>
+<span class="nc" id="L1275">        }</span>
+
+        class RemoteLogRetentionHandler {
+
+            private final Optional&lt;RetentionSizeData&gt; retentionSizeData;
+            private final Optional&lt;RetentionTimeData&gt; retentionTimeData;
+
+            private long remainingBreachedSize;
+
+<span class="nc" id="L1284">            private OptionalLong logStartOffset = OptionalLong.empty();</span>
+
+<span class="nc" id="L1286">            public RemoteLogRetentionHandler(Optional&lt;RetentionSizeData&gt; retentionSizeData, Optional&lt;RetentionTimeData&gt; retentionTimeData) {</span>
+<span class="nc" id="L1287">                this.retentionSizeData = retentionSizeData;</span>
+<span class="nc" id="L1288">                this.retentionTimeData = retentionTimeData;</span>
+<span class="nc" id="L1289">                remainingBreachedSize = retentionSizeData.map(sizeData -&gt; sizeData.remainingBreachedSize).orElse(0L);</span>
+<span class="nc" id="L1290">            }</span>
+
+            private boolean isSegmentBreachedByRetentionSize(RemoteLogSegmentMetadata metadata) {
+<span class="nc" id="L1293">                boolean shouldDeleteSegment = false;</span>
+<span class="nc bnc" id="L1294" title="All 2 branches missed.">                if (retentionSizeData.isEmpty()) {</span>
+<span class="nc" id="L1295">                    return shouldDeleteSegment;</span>
+                }
+                // Assumption that segments contain size &gt;= 0
+<span class="nc bnc" id="L1298" title="All 2 branches missed.">                if (remainingBreachedSize &gt; 0) {</span>
+<span class="nc" id="L1299">                    long remainingBytes = remainingBreachedSize - metadata.segmentSizeInBytes();</span>
+<span class="nc bnc" id="L1300" title="All 2 branches missed.">                    if (remainingBytes &gt;= 0) {</span>
+<span class="nc" id="L1301">                        remainingBreachedSize = remainingBytes;</span>
+<span class="nc" id="L1302">                        shouldDeleteSegment = true;</span>
+                    }
+                }
+<span class="nc bnc" id="L1305" title="All 2 branches missed.">                if (shouldDeleteSegment) {</span>
+<span class="nc bnc" id="L1306" title="All 4 branches missed.">                    if (logStartOffset.isEmpty() || logStartOffset.getAsLong() &lt; metadata.endOffset() + 1) {</span>
+<span class="nc" id="L1307">                        logStartOffset = OptionalLong.of(metadata.endOffset() + 1);</span>
+                    }
+<span class="nc" id="L1309">                    logger.info(&quot;About to delete remote log segment {} due to retention size {} breach. Log size after deletion will be {}.&quot;,</span>
+<span class="nc" id="L1310">                            metadata.remoteLogSegmentId(), retentionSizeData.get().retentionSize, remainingBreachedSize + retentionSizeData.get().retentionSize);</span>
+                }
+<span class="nc" id="L1312">                return shouldDeleteSegment;</span>
+            }
+
+            public boolean isSegmentBreachedByRetentionTime(RemoteLogSegmentMetadata metadata) {
+<span class="nc" id="L1316">                boolean shouldDeleteSegment = false;</span>
+<span class="nc bnc" id="L1317" title="All 2 branches missed.">                if (retentionTimeData.isEmpty()) {</span>
+<span class="nc" id="L1318">                    return shouldDeleteSegment;</span>
+                }
+<span class="nc bnc" id="L1320" title="All 2 branches missed.">                shouldDeleteSegment = metadata.maxTimestampMs() &lt; retentionTimeData.get().cleanupUntilMs;</span>
+<span class="nc bnc" id="L1321" title="All 2 branches missed.">                if (shouldDeleteSegment) {</span>
+<span class="nc" id="L1322">                    remainingBreachedSize = Math.max(0, remainingBreachedSize - metadata.segmentSizeInBytes());</span>
+                    // It is fine to have logStartOffset as `metadata.endOffset() + 1` as the segment offset intervals
+                    // are ascending with in an epoch.
+<span class="nc bnc" id="L1325" title="All 4 branches missed.">                    if (logStartOffset.isEmpty() || logStartOffset.getAsLong() &lt; metadata.endOffset() + 1) {</span>
+<span class="nc" id="L1326">                        logStartOffset = OptionalLong.of(metadata.endOffset() + 1);</span>
+                    }
+<span class="nc" id="L1328">                    logger.info(&quot;About to delete remote log segment {} due to retention time {}ms breach based on the largest record timestamp in the segment&quot;,</span>
+<span class="nc" id="L1329">                            metadata.remoteLogSegmentId(), retentionTimeData.get().retentionMs);</span>
+                }
+<span class="nc" id="L1331">                return shouldDeleteSegment;</span>
+            }
+
+            private boolean isSegmentBreachByLogStartOffset(RemoteLogSegmentMetadata metadata,
+                                                            long logStartOffset,
+                                                            NavigableMap&lt;Integer, Long&gt; leaderEpochEntries) {
+<span class="nc" id="L1337">                boolean shouldDeleteSegment = false;</span>
+<span class="nc bnc" id="L1338" title="All 2 branches missed.">                if (!leaderEpochEntries.isEmpty()) {</span>
+                    // Note that `logStartOffset` and `leaderEpochEntries.firstEntry().getValue()` should be same
+<span class="nc" id="L1340">                    Integer firstEpoch = leaderEpochEntries.firstKey();</span>
+<span class="nc bnc" id="L1341" title="All 4 branches missed.">                    shouldDeleteSegment = metadata.segmentLeaderEpochs().keySet().stream().allMatch(epoch -&gt; epoch &lt;= firstEpoch)</span>
+<span class="nc bnc" id="L1342" title="All 2 branches missed.">                            &amp;&amp; metadata.endOffset() &lt; logStartOffset;</span>
+                }
+<span class="nc bnc" id="L1344" title="All 2 branches missed.">                if (shouldDeleteSegment) {</span>
+<span class="nc" id="L1345">                    logger.info(&quot;About to delete remote log segment {} due to log-start-offset {} breach. &quot; +</span>
+                            &quot;Current earliest-epoch-entry: {}, segment-end-offset: {} and segment-epochs: {}&quot;,
+<span class="nc" id="L1347">                            metadata.remoteLogSegmentId(), logStartOffset, leaderEpochEntries.firstEntry(),</span>
+<span class="nc" id="L1348">                            metadata.endOffset(), metadata.segmentLeaderEpochs());</span>
+                }
+<span class="nc" id="L1350">                return shouldDeleteSegment;</span>
+            }
+
+            // It removes the segments beyond the current leader's earliest epoch. Those segments are considered as
+            // unreferenced because they are not part of the current leader epoch lineage.
+            private boolean deleteLogSegmentsDueToLeaderEpochCacheTruncation(EpochEntry earliestEpochEntry,
+                                                                             RemoteLogSegmentMetadata metadata)
+                    throws RemoteStorageException, ExecutionException, InterruptedException {
+<span class="nc" id="L1358">                boolean isSegmentDeleted = deleteRemoteLogSegment(metadata,</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">                    ignored -&gt; metadata.segmentLeaderEpochs().keySet().stream().allMatch(epoch -&gt; epoch &lt; earliestEpochEntry.epoch()));</span>
+<span class="nc bnc" id="L1360" title="All 2 branches missed.">                if (isSegmentDeleted) {</span>
+<span class="nc" id="L1361">                    logger.info(&quot;Deleted remote log segment {} due to leader-epoch-cache truncation. &quot; +</span>
+                                    &quot;Current earliest-epoch-entry: {}, segment-end-offset: {} and segment-epochs: {}&quot;,
+<span class="nc" id="L1363">                            metadata.remoteLogSegmentId(), earliestEpochEntry, metadata.endOffset(), metadata.segmentLeaderEpochs().keySet());</span>
+                }
+                // No need to update the log-start-offset as these epochs/offsets are earlier to that value.
+<span class="nc" id="L1366">                return isSegmentDeleted;</span>
+            }
+        }
+
+        private void updateMetadataCountAndLogSizeWith(int metadataCount, long remoteLogSizeBytes) {
+<span class="nc" id="L1371">            int partition = topicIdPartition.partition();</span>
+<span class="nc" id="L1372">            String topic = topicIdPartition.topic();</span>
+<span class="nc" id="L1373">            brokerTopicStats.recordRemoteLogMetadataCount(topic, partition, metadataCount);</span>
+<span class="nc" id="L1374">            brokerTopicStats.recordRemoteLogSizeBytes(topic, partition, remoteLogSizeBytes);</span>
+<span class="nc" id="L1375">        }</span>
+
+        // VisibleForTesting
+        void updateRemoteDeleteLagWith(int segmentsLeftToDelete, long sizeOfDeletableSegmentsBytes) {
+            // Skip emitting metrics for a cancelled task. Otherwise, a task that is still running in the
+            // expiration thread pool while this replica transitions from leader to follower can re-register
+            // the delete-lag gauge after onLeadershipChange has already removed it (see removeRemoteTopicPartitionMetrics),
+            // leaving a phantom non-zero lag that never drains. This mirrors the guard on the copy path's recordLagStats.
+            // Note: the check is best-effort - it does not synchronize with cancellation, so it only narrows (does not
+            // fully close) the window where a concurrent leadership change removes the gauge between this check and the emit.
+<span class="nc bnc" id="L1385" title="All 2 branches missed.">            if (!isCancelled()) {</span>
+<span class="nc" id="L1386">                String topic = topicIdPartition.topic();</span>
+<span class="nc" id="L1387">                int partition = topicIdPartition.partition();</span>
+<span class="nc" id="L1388">                brokerTopicStats.recordRemoteDeleteLagSegments(topic, partition, segmentsLeftToDelete);</span>
+<span class="nc" id="L1389">                brokerTopicStats.recordRemoteDeleteLagBytes(topic, partition, sizeOfDeletableSegmentsBytes);</span>
+            }
+<span class="nc" id="L1391">        }</span>
+
+        private static class RemoteLogMetadataStats {
+            private final Set&lt;Integer&gt; epochsSet;
+            private final int metadataCount;
+            private final long sizeInBytes;
+            private final long copyFinishedSegmentsSizeInBytes;
+
+<span class="nc" id="L1399">            private RemoteLogMetadataStats(Set&lt;Integer&gt; epochsSet, int metadataCount, long sizeInBytes, long copyFinishedSegmentsSizeInBytes) {</span>
+<span class="nc" id="L1400">                this.epochsSet = epochsSet;</span>
+<span class="nc" id="L1401">                this.metadataCount = metadataCount;</span>
+<span class="nc" id="L1402">                this.sizeInBytes = sizeInBytes;</span>
+<span class="nc" id="L1403">                this.copyFinishedSegmentsSizeInBytes = copyFinishedSegmentsSizeInBytes;</span>
+<span class="nc" id="L1404">            }</span>
+        }
+
+        private RemoteLogMetadataStats calculateMetadataAndSize(Iterator&lt;RemoteLogSegmentMetadata&gt; segmentMetadataIter) {
+            // Good to have an API from RLMM to get the RemoteLogMetadataStats instead of going through all the segments
+            // and building it here.
+<span class="nc" id="L1410">            Set&lt;Integer&gt; epochsSet = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1411">            int metadataCount = 0;</span>
+<span class="nc" id="L1412">            long sizeInBytes = 0;</span>
+<span class="nc" id="L1413">            long copyFinishedSegmentsSizeInBytes = 0;</span>
+<span class="nc bnc" id="L1414" title="All 2 branches missed.">            while (segmentMetadataIter.hasNext()) {</span>
+<span class="nc" id="L1415">                RemoteLogSegmentMetadata segmentMetadata = segmentMetadataIter.next();</span>
+<span class="nc" id="L1416">                epochsSet.addAll(segmentMetadata.segmentLeaderEpochs().keySet());</span>
+<span class="nc" id="L1417">                metadataCount++;</span>
+<span class="nc" id="L1418">                RemoteLogSegmentState state = segmentMetadata.state();</span>
+                // COPY_SEGMENT_STARTED state is excluded from the `sizeInBytes` calculation as it can pollute the
+                // metric during the upload retries.
+<span class="nc bnc" id="L1421" title="All 2 branches missed.">                if (state == RemoteLogSegmentState.COPY_SEGMENT_FINISHED) {</span>
+<span class="nc" id="L1422">                    copyFinishedSegmentsSizeInBytes += segmentMetadata.segmentSizeInBytes();</span>
+<span class="nc" id="L1423">                    sizeInBytes += segmentMetadata.segmentSizeInBytes();</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">                } else if (state == RemoteLogSegmentState.DELETE_SEGMENT_STARTED) {</span>
+<span class="nc" id="L1425">                    sizeInBytes += segmentMetadata.segmentSizeInBytes();</span>
+                }
+<span class="nc" id="L1427">            }</span>
+<span class="nc" id="L1428">            return new RemoteLogMetadataStats(epochsSet, metadataCount, sizeInBytes, copyFinishedSegmentsSizeInBytes);</span>
+        }
+
+        // On a freshly-elected leader, highestOffsetInRemoteStorage is unseeded (-1) until RLMCopyTask /
+        // RLMFollowerTask seed it; RLMExpirationTask does not. If size-based retention runs while it is -1,
+        // UnifiedLog.onlyLocalLogSegmentsSize() (filter baseOffset &gt;= highestOffsetInRemoteStorage()) returns
+        // the whole local log -- including segments already copied to remote -- which buildRetentionSizeData
+        // then double-counts against the remote size, over-deleting in-retention data from both tiers.
+        private void maybeSeedHighestOffsetInRemoteStorage(UnifiedLog log) throws RemoteStorageException {
+<span class="nc bnc" id="L1437" title="All 2 branches missed.">            if (log.highestOffsetInRemoteStorage() == -1) {</span>
+<span class="nc" id="L1438">                OffsetAndEpoch highestRemoteOffsetAndEpoch = findHighestRemoteOffset(topicIdPartition, log);</span>
+<span class="nc bnc" id="L1439" title="All 2 branches missed.">                if (highestRemoteOffsetAndEpoch.offset() &gt;= 0) {</span>
+<span class="nc" id="L1440">                    log.updateHighestOffsetInRemoteStorage(highestRemoteOffsetAndEpoch.offset());</span>
+                }
+            }
+<span class="nc" id="L1443">        }</span>
+
+        /**
+         * Cleanup expired and dangling remote log segments.
+         */
+        void cleanupExpiredRemoteLogSegments() throws RemoteStorageException, ExecutionException, InterruptedException {
+<span class="nc bnc" id="L1449" title="All 2 branches missed.">            if (isCancelled()) {</span>
+<span class="nc" id="L1450">                logger.info(&quot;Returning from remote log segments cleanup as the task state is changed&quot;);</span>
+<span class="nc" id="L1451">                return;</span>
+            }
+
+<span class="nc" id="L1454">            final Optional&lt;UnifiedLog&gt; logOptional = fetchLog.apply(topicIdPartition.topicPartition());</span>
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">            if (logOptional.isEmpty()) {</span>
+<span class="nc" id="L1456">                logger.debug(&quot;No UnifiedLog instance available for partition: {}&quot;, topicIdPartition);</span>
+<span class="nc" id="L1457">                return;</span>
+            }
+
+<span class="nc" id="L1460">            final UnifiedLog log = logOptional.get();</span>
+
+            // Cleanup remote log segments and update the log start offset if applicable.
+<span class="nc" id="L1463">            Iterator&lt;RemoteLogSegmentMetadata&gt; segmentMetadataIter = remoteLogMetadataManagerPlugin.get().listRemoteLogSegments(topicIdPartition);</span>
+<span class="nc" id="L1464">            RemoteLogMetadataStats stats = calculateMetadataAndSize(segmentMetadataIter);</span>
+<span class="nc bnc" id="L1465" title="All 2 branches missed.">            if (stats.metadataCount == 0) {</span>
+<span class="nc" id="L1466">                updateMetadataCountAndLogSizeWith(0, 0);</span>
+<span class="nc" id="L1467">                logger.debug(&quot;No remote log segments available on remote storage for partition: {}&quot;, topicIdPartition);</span>
+<span class="nc" id="L1468">                calculateSizeInPercent(log.size(), log.config().retentionSize, log.size(), log.config().localRetentionBytes());</span>
+<span class="nc" id="L1469">                return;</span>
+            }
+<span class="nc" id="L1471">            updateMetadataCountAndLogSizeWith(stats.metadataCount, stats.sizeInBytes);</span>
+
+            // All the leader epochs in sorted order that exists in remote storage
+<span class="nc" id="L1474">            final List&lt;Integer&gt; remoteLeaderEpochs = new ArrayList&lt;&gt;(stats.epochsSet);</span>
+<span class="nc" id="L1475">            Collections.sort(remoteLeaderEpochs);</span>
+
+<span class="nc" id="L1477">            LeaderEpochFileCache leaderEpochCache = log.leaderEpochCache();</span>
+            // Build the leader epoch map by filtering the epochs that do not have any records.
+<span class="nc" id="L1479">            NavigableMap&lt;Integer, Long&gt; epochWithOffsets = buildFilteredLeaderEpochMap(leaderEpochCache.epochWithOffsets());</span>
+
+            // Seed highestOffsetInRemoteStorage before size-retention to avoid the fresh-leader double-count
+            // (no-op once RLMCopyTask/RLMFollowerTask have seeded it).
+<span class="nc" id="L1483">            maybeSeedHighestOffsetInRemoteStorage(log);</span>
+
+<span class="nc" id="L1485">            long logStartOffset = log.logStartOffset();</span>
+<span class="nc" id="L1486">            long logEndOffset = log.logEndOffset();</span>
+<span class="nc" id="L1487">            Optional&lt;RetentionSizeData&gt; retentionSizeData = buildRetentionSizeData(log.config().retentionSize,</span>
+<span class="nc" id="L1488">                    log.onlyLocalLogSegmentsSize(), log.size(), logEndOffset, epochWithOffsets, log.config().localRetentionBytes(),</span>
+                    stats.copyFinishedSegmentsSizeInBytes);
+<span class="nc" id="L1490">            Optional&lt;RetentionTimeData&gt; retentionTimeData = buildRetentionTimeData(log.config().retentionMs);</span>
+
+<span class="nc" id="L1492">            RemoteLogRetentionHandler remoteLogRetentionHandler = new RemoteLogRetentionHandler(retentionSizeData, retentionTimeData);</span>
+<span class="nc" id="L1493">            Iterator&lt;Integer&gt; epochIterator = epochWithOffsets.navigableKeySet().iterator();</span>
+<span class="nc" id="L1494">            boolean canProcess = true;</span>
+<span class="nc" id="L1495">            List&lt;RemoteLogSegmentMetadata&gt; segmentsToDelete = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1496">            long sizeOfDeletableSegmentsBytes = 0L;</span>
+<span class="nc bnc" id="L1497" title="All 4 branches missed.">            while (canProcess &amp;&amp; epochIterator.hasNext()) {</span>
+<span class="nc" id="L1498">                Integer epoch = epochIterator.next();</span>
+<span class="nc" id="L1499">                Iterator&lt;RemoteLogSegmentMetadata&gt; segmentsIterator = remoteLogMetadataManagerPlugin.get().listRemoteLogSegments(topicIdPartition, epoch);</span>
+<span class="nc bnc" id="L1500" title="All 4 branches missed.">                while (canProcess &amp;&amp; segmentsIterator.hasNext()) {</span>
+<span class="nc bnc" id="L1501" title="All 2 branches missed.">                    if (isCancelled()) {</span>
+<span class="nc" id="L1502">                        logger.info(&quot;Returning from remote log segments cleanup for the remaining segments as the task state is changed.&quot;);</span>
+<span class="nc" id="L1503">                        return;</span>
+                    }
+<span class="nc" id="L1505">                    RemoteLogSegmentMetadata metadata = segmentsIterator.next();</span>
+
+<span class="nc bnc" id="L1507" title="All 2 branches missed.">                    if (segmentIdsBeingCopied.contains(metadata.remoteLogSegmentId())) {</span>
+<span class="nc" id="L1508">                        logger.debug(&quot;Copy for the segment {} is currently in process. Skipping cleanup for it and the remaining segments&quot;,</span>
+<span class="nc" id="L1509">                                metadata.remoteLogSegmentId());</span>
+<span class="nc" id="L1510">                        canProcess = false;</span>
+<span class="nc" id="L1511">                        continue;</span>
+                    }
+                    // This works as retry mechanism for dangling remote segments that failed the deletion in previous attempts.
+                    // Rather than waiting for the retention to kick in, we cleanup early to avoid polluting the cache and possibly waste remote storage.
+<span class="nc bnc" id="L1515" title="All 2 branches missed.">                    if (RemoteLogSegmentState.DELETE_SEGMENT_STARTED.equals(metadata.state())) {</span>
+<span class="nc" id="L1516">                        segmentsToDelete.add(metadata);</span>
+<span class="nc" id="L1517">                        continue;</span>
+                    }
+<span class="nc bnc" id="L1519" title="All 2 branches missed.">                    if (RemoteLogSegmentState.DELETE_SEGMENT_FINISHED.equals(metadata.state())) {</span>
+<span class="nc" id="L1520">                        continue;</span>
+                    }
+<span class="nc bnc" id="L1522" title="All 2 branches missed.">                    if (segmentsToDelete.contains(metadata)) {</span>
+<span class="nc" id="L1523">                        continue;</span>
+                    }
+                    // When the log-start-offset is moved by the user, the leader-epoch-checkpoint file gets truncated
+                    // as per the log-start-offset. Until the rlm-cleaner-thread runs in the next iteration, those
+                    // remote log segments won't be removed. The `isRemoteSegmentWithinLeaderEpoch` validates whether
+                    // the epochs present in the segment lies in the checkpoint file. It will always return false
+                    // since the checkpoint file was already truncated.
+<span class="nc" id="L1530">                    boolean shouldDeleteSegment = remoteLogRetentionHandler.isSegmentBreachByLogStartOffset(</span>
+                            metadata, logStartOffset, epochWithOffsets);
+<span class="nc" id="L1532">                    boolean isValidSegment = false;</span>
+<span class="nc bnc" id="L1533" title="All 2 branches missed.">                    if (!shouldDeleteSegment) {</span>
+                        // check whether the segment contains the required epoch range with in the current leader epoch lineage.
+<span class="nc" id="L1535">                        isValidSegment = isRemoteSegmentWithinLeaderEpochs(metadata, logEndOffset, epochWithOffsets);</span>
+<span class="nc bnc" id="L1536" title="All 2 branches missed.">                        if (isValidSegment) {</span>
+<span class="nc" id="L1537">                            shouldDeleteSegment =</span>
+<span class="nc bnc" id="L1538" title="All 2 branches missed.">                                    remoteLogRetentionHandler.isSegmentBreachedByRetentionTime(metadata) ||</span>
+<span class="nc bnc" id="L1539" title="All 2 branches missed.">                                            remoteLogRetentionHandler.isSegmentBreachedByRetentionSize(metadata);</span>
+                        }
+                    }
+<span class="nc bnc" id="L1542" title="All 2 branches missed.">                    if (shouldDeleteSegment) {</span>
+<span class="nc" id="L1543">                        segmentsToDelete.add(metadata);</span>
+<span class="nc" id="L1544">                        sizeOfDeletableSegmentsBytes += metadata.segmentSizeInBytes();</span>
+                    }
+<span class="nc bnc" id="L1546" title="All 4 branches missed.">                    canProcess = shouldDeleteSegment || !isValidSegment;</span>
+<span class="nc" id="L1547">                }</span>
+<span class="nc" id="L1548">            }</span>
+
+            // Update log start offset with the computed value after retention cleanup is done
+<span class="nc" id="L1551">            remoteLogRetentionHandler.logStartOffset.ifPresent(offset -&gt; handleLogStartOffsetUpdate(topicIdPartition.topicPartition(), offset));</span>
+
+            // At this point in time we have updated the log start offsets, but not initiated a deletion.
+            // Either a follower has picked up the changes to the log start offset, or they have not.
+            // If the follower HAS picked up the changes, and they become the leader this replica won't successfully complete
+            // the deletion.
+            // However, the new leader will correctly pick up all breaching segments as log start offset breaching ones
+            // and delete them accordingly.
+            // If the follower HAS NOT picked up the changes, and they become the leader then they will go through this process
+            // again and delete them with the original deletion reason i.e. size, time or log start offset breach.
+<span class="nc" id="L1561">            int segmentsLeftToDelete = segmentsToDelete.size();</span>
+<span class="nc" id="L1562">            updateRemoteDeleteLagWith(segmentsLeftToDelete, sizeOfDeletableSegmentsBytes);</span>
+<span class="nc" id="L1563">            List&lt;String&gt; undeletedSegments = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1564" title="All 2 branches missed.">            for (RemoteLogSegmentMetadata segmentMetadata : segmentsToDelete) {</span>
+<span class="nc bnc" id="L1565" title="All 4 branches missed.">                if (!deleteRemoteLogSegment(segmentMetadata, ignored -&gt; !isCancelled())) {</span>
+<span class="nc" id="L1566">                    undeletedSegments.add(segmentMetadata.remoteLogSegmentId().toString());</span>
+                } else {
+<span class="nc" id="L1568">                    sizeOfDeletableSegmentsBytes -= segmentMetadata.segmentSizeInBytes();</span>
+<span class="nc" id="L1569">                    segmentsLeftToDelete--;</span>
+<span class="nc" id="L1570">                    updateRemoteDeleteLagWith(segmentsLeftToDelete, sizeOfDeletableSegmentsBytes);</span>
+                }
+<span class="nc" id="L1572">            }</span>
+<span class="nc bnc" id="L1573" title="All 2 branches missed.">            if (!undeletedSegments.isEmpty()) {</span>
+<span class="nc" id="L1574">                logger.info(&quot;The following remote segments could not be deleted: {}&quot;, String.join(&quot;,&quot;, undeletedSegments));</span>
+            }
+
+            // Remove the remote log segments whose segment-leader-epochs are less than the earliest-epoch known
+            // to the leader. This will remove the unreferenced segments in the remote storage. This is needed for
+            // unclean leader election scenarios as the remote storage can have epochs earlier to the current leader's
+            // earliest leader epoch.
+<span class="nc" id="L1581">            Optional&lt;EpochEntry&gt; earliestEpochEntryOptional = leaderEpochCache.earliestEntry();</span>
+<span class="nc bnc" id="L1582" title="All 2 branches missed.">            if (earliestEpochEntryOptional.isPresent()) {</span>
+<span class="nc" id="L1583">                EpochEntry earliestEpochEntry = earliestEpochEntryOptional.get();</span>
+<span class="nc" id="L1584">                Iterator&lt;Integer&gt; epochsToClean = remoteLeaderEpochs.stream()</span>
+<span class="nc bnc" id="L1585" title="All 2 branches missed.">                        .filter(remoteEpoch -&gt; remoteEpoch &lt; earliestEpochEntry.epoch())</span>
+<span class="nc" id="L1586">                        .iterator();</span>
+
+<span class="nc" id="L1588">                List&lt;RemoteLogSegmentMetadata&gt; listOfSegmentsToBeCleaned = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1590" title="All 2 branches missed.">                while (epochsToClean.hasNext()) {</span>
+<span class="nc" id="L1591">                    int epoch = epochsToClean.next();</span>
+<span class="nc" id="L1592">                    Iterator&lt;RemoteLogSegmentMetadata&gt; segmentsToBeCleaned = remoteLogMetadataManagerPlugin.get().listRemoteLogSegments(topicIdPartition, epoch);</span>
+<span class="nc bnc" id="L1593" title="All 2 branches missed.">                    while (segmentsToBeCleaned.hasNext()) {</span>
+<span class="nc bnc" id="L1594" title="All 2 branches missed.">                        if (!isCancelled()) {</span>
+<span class="nc" id="L1595">                            RemoteLogSegmentMetadata nextSegmentMetadata = segmentsToBeCleaned.next();</span>
+<span class="nc" id="L1596">                            sizeOfDeletableSegmentsBytes += nextSegmentMetadata.segmentSizeInBytes();</span>
+<span class="nc" id="L1597">                            listOfSegmentsToBeCleaned.add(nextSegmentMetadata);</span>
+<span class="nc" id="L1598">                        }</span>
+                    }
+<span class="nc" id="L1600">                }</span>
+
+<span class="nc" id="L1602">                segmentsLeftToDelete += listOfSegmentsToBeCleaned.size();</span>
+<span class="nc" id="L1603">                updateRemoteDeleteLagWith(segmentsLeftToDelete, sizeOfDeletableSegmentsBytes);</span>
+<span class="nc bnc" id="L1604" title="All 2 branches missed.">                for (RemoteLogSegmentMetadata segmentMetadata : listOfSegmentsToBeCleaned) {</span>
+<span class="nc bnc" id="L1605" title="All 2 branches missed.">                    if (!isCancelled()) {</span>
+                        // No need to update the log-start-offset even though the segment is deleted as these epochs/offsets are earlier to that value.
+<span class="nc bnc" id="L1607" title="All 2 branches missed.">                        if (remoteLogRetentionHandler.deleteLogSegmentsDueToLeaderEpochCacheTruncation(earliestEpochEntry, segmentMetadata)) {</span>
+<span class="nc" id="L1608">                            sizeOfDeletableSegmentsBytes -= segmentMetadata.segmentSizeInBytes();</span>
+<span class="nc" id="L1609">                            segmentsLeftToDelete--;</span>
+<span class="nc" id="L1610">                            updateRemoteDeleteLagWith(segmentsLeftToDelete, sizeOfDeletableSegmentsBytes);</span>
+                        }
+                    }
+<span class="nc" id="L1613">                }</span>
+            }
+<span class="nc" id="L1615">        }</span>
+
+        private Optional&lt;RetentionTimeData&gt; buildRetentionTimeData(long retentionMs) {
+<span class="nc" id="L1618">            long cleanupUntilMs = time.milliseconds() - retentionMs;</span>
+<span class="nc bnc" id="L1619" title="All 4 branches missed.">            return retentionMs &gt; -1 &amp;&amp; cleanupUntilMs &gt;= 0</span>
+<span class="nc" id="L1620">                    ? Optional.of(new RetentionTimeData(retentionMs, cleanupUntilMs))</span>
+<span class="nc" id="L1621">                    : Optional.empty();</span>
+        }
+
+        private void calculateSizeInPercent(long totalSize,
+                                            long retentionSize,
+                                            long localLogSegmentsSize,
+                                            long localRetentionBytes) {
+<span class="nc bnc" id="L1628" title="All 2 branches missed.">            int sizePercentage = retentionSize &gt; 0 ? (int) ((totalSize * 100) / retentionSize) : 0;</span>
+<span class="nc" id="L1629">            retentionSizeInPercentValue.set(sizePercentage);</span>
+
+            // Calculate local size percentage only if local retention is configured
+<span class="nc bnc" id="L1632" title="All 2 branches missed.">            int localSizePercentage = localRetentionBytes &gt; 0 ? (int) ((localLogSegmentsSize * 100) / localRetentionBytes) : 0;</span>
+<span class="nc" id="L1633">            localRetentionSizeInPercentValue.set(localSizePercentage);</span>
+<span class="nc" id="L1634">        }</span>
+
+        Optional&lt;RetentionSizeData&gt; buildRetentionSizeData(long retentionSize,
+                                                           long onlyLocalLogSegmentsSize,
+                                                           long localLogSegmentsSize,
+                                                           long logEndOffset,
+                                                           NavigableMap&lt;Integer, Long&gt; epochEntries,
+                                                           long localRetentionBytes,
+                                                           long fullCopyFinishedSegmentsSizeInBytes) throws RemoteStorageException {
+<span class="nc bnc" id="L1643" title="All 2 branches missed.">            if (retentionSize &lt; 0) {</span>
+<span class="nc" id="L1644">                return Optional.empty();</span>
+            }
+<span class="nc" id="L1646">            long totalEstimateSize = onlyLocalLogSegmentsSize + fullCopyFinishedSegmentsSizeInBytes;</span>
+<span class="nc bnc" id="L1647" title="All 2 branches missed.">            if (totalEstimateSize &lt;= retentionSize) {</span>
+<span class="nc" id="L1648">                calculateSizeInPercent(totalEstimateSize, retentionSize, localLogSegmentsSize, localRetentionBytes);</span>
+<span class="nc" id="L1649">                return Optional.empty();</span>
+            }
+            // compute valid remote-log size in bytes for the current partition if the size of the partition exceeds
+            // the configured limit.
+<span class="nc" id="L1653">            long startTimeMs = time.milliseconds();</span>
+<span class="nc" id="L1654">            long remoteLogSizeBytes = 0L;</span>
+<span class="nc bnc" id="L1655" title="All 2 branches missed.">            if (!isAllSegmentsValid) {</span>
+<span class="nc" id="L1656">                boolean isAllValid = true;</span>
+<span class="nc" id="L1657">                Set&lt;RemoteLogSegmentId&gt; visitedSegmentIds = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L1658" title="All 2 branches missed.">                for (Integer epoch : epochEntries.navigableKeySet()) {</span>
+                    // remoteLogSize(topicIdPartition, epochEntry.epoch) may not be completely accurate as the remote
+                    // log size may be computed for all the segments but not for segments with in the current
+                    // partition's leader epoch lineage. Better to revisit this API.
+                    // remoteLogSizeBytes += remoteLogMetadataManager.remoteLogSize(topicIdPartition, epochEntry.epoch);
+<span class="nc" id="L1663">                    Iterator&lt;RemoteLogSegmentMetadata&gt; segmentsIterator = remoteLogMetadataManagerPlugin.get().listRemoteLogSegments(topicIdPartition, epoch);</span>
+<span class="nc bnc" id="L1664" title="All 2 branches missed.">                    while (segmentsIterator.hasNext()) {</span>
+<span class="nc" id="L1665">                        RemoteLogSegmentMetadata segmentMetadata = segmentsIterator.next();</span>
+                        // Count only the size of segments in &quot;COPY_SEGMENT_FINISHED&quot; state because
+                        // &quot;COPY_SEGMENT_STARTED&quot; means copy didn't complete and we will count them later,
+                        // &quot;DELETE_SEGMENT_STARTED&quot; means deletion failed in the previous attempt and we will retry later,
+                        // &quot;DELETE_SEGMENT_FINISHED&quot; means deletion completed, so there is nothing to count.
+<span class="nc bnc" id="L1670" title="All 2 branches missed.">                        if (segmentMetadata.state().equals(RemoteLogSegmentState.COPY_SEGMENT_FINISHED)) {</span>
+<span class="nc" id="L1671">                            RemoteLogSegmentId segmentId = segmentMetadata.remoteLogSegmentId();</span>
+<span class="nc bnc" id="L1672" title="All 2 branches missed.">                            if (!visitedSegmentIds.contains(segmentId)) {</span>
+<span class="nc" id="L1673">                                visitedSegmentIds.add(segmentId);</span>
+<span class="nc" id="L1674">                                boolean isValid = isRemoteSegmentWithinLeaderEpochs(segmentMetadata, logEndOffset, epochEntries);</span>
+<span class="nc bnc" id="L1675" title="All 2 branches missed.">                                if (isValid) {</span>
+<span class="nc" id="L1676">                                    remoteLogSizeBytes += segmentMetadata.segmentSizeInBytes();</span>
+                                } else {
+<span class="nc" id="L1678">                                    isAllValid = false;</span>
+                                }
+                            }
+                        }
+<span class="nc" id="L1682">                    }</span>
+<span class="nc" id="L1683">                }</span>
+<span class="nc bnc" id="L1684" title="All 4 branches missed.">                this.isAllSegmentsValid = isAllValid &amp;&amp; fullCopyFinishedSegmentsSizeInBytes == remoteLogSizeBytes;</span>
+<span class="nc" id="L1685">            } else {</span>
+                // Once all the segments are valid, then the future segments to be uploaded by this leader are also valid.
+<span class="nc" id="L1687">                remoteLogSizeBytes = fullCopyFinishedSegmentsSizeInBytes;</span>
+            }
+<span class="nc" id="L1689">            brokerTopicStats.recordRemoteLogSizeComputationTime(topicIdPartition.topic(), topicIdPartition.partition(),</span>
+<span class="nc" id="L1690">                    time.milliseconds() - startTimeMs);</span>
+            // This is the total size of segments in local log that have their base-offset &gt; local-log-start-offset
+            // and size of the segments in remote storage which have their end-offset &lt; local-log-start-offset.
+<span class="nc" id="L1693">            long totalSize = onlyLocalLogSegmentsSize + remoteLogSizeBytes;</span>
+<span class="nc" id="L1694">            calculateSizeInPercent(totalSize, retentionSize, localLogSegmentsSize, localRetentionBytes);</span>
+<span class="nc bnc" id="L1695" title="All 2 branches missed.">            if (totalSize &gt; retentionSize) {</span>
+<span class="nc" id="L1696">                long remainingBreachedSize = totalSize - retentionSize;</span>
+<span class="nc" id="L1697">                RetentionSizeData retentionSizeData = new RetentionSizeData(retentionSize, remainingBreachedSize);</span>
+<span class="nc" id="L1698">                return Optional.of(retentionSizeData);</span>
+            }
+<span class="nc" id="L1700">            return Optional.empty();</span>
+        }
+    }
+
+    class RLMFollowerTask extends RLMTask {
+
+<span class="nc" id="L1706">        public RLMFollowerTask(TopicIdPartition topicIdPartition) {</span>
+<span class="nc" id="L1707">            super(topicIdPartition);</span>
+<span class="nc" id="L1708">        }</span>
+
+        @Override
+        protected void execute(UnifiedLog log) throws InterruptedException, RemoteStorageException, ExecutionException {
+<span class="nc" id="L1712">            OffsetAndEpoch offsetAndEpoch = findHighestRemoteOffset(topicIdPartition, log);</span>
+            // Update the highest offset in remote storage for this partition's log so that the local log segments
+            // are not deleted before they are copied to remote storage.
+<span class="nc" id="L1715">            log.updateHighestOffsetInRemoteStorage(offsetAndEpoch.offset());</span>
+<span class="nc" id="L1716">        }</span>
+    }
+
+    private boolean deleteRemoteLogSegment(
+        RemoteLogSegmentMetadata segmentMetadata,
+        Predicate&lt;RemoteLogSegmentMetadata&gt; predicate
+    ) throws RemoteStorageException, ExecutionException, InterruptedException {
+<span class="nc bnc" id="L1723" title="All 2 branches missed.">        if (predicate.test(segmentMetadata)) {</span>
+<span class="nc" id="L1724">            LOGGER.debug(&quot;Deleting remote log segment {}&quot;, segmentMetadata.remoteLogSegmentId());</span>
+<span class="nc" id="L1725">            String topic = segmentMetadata.topicIdPartition().topic();</span>
+
+            // Publish delete segment started event.
+<span class="nc" id="L1728">            remoteLogMetadataManagerPlugin.get().updateRemoteLogSegmentMetadata(</span>
+<span class="nc" id="L1729">                new RemoteLogSegmentMetadataUpdate(segmentMetadata.remoteLogSegmentId(), time.milliseconds(),</span>
+<span class="nc" id="L1730">                    segmentMetadata.customMetadata(), RemoteLogSegmentState.DELETE_SEGMENT_STARTED, brokerId)).get();</span>
+
+<span class="nc" id="L1732">            brokerTopicStats.topicStats(topic).remoteDeleteRequestRate().mark();</span>
+<span class="nc" id="L1733">            brokerTopicStats.allTopicsStats().remoteDeleteRequestRate().mark();</span>
+
+            // Delete the segment in remote storage.
+            try {
+<span class="nc" id="L1737">                remoteStorageManagerPlugin.get().deleteLogSegmentData(segmentMetadata);</span>
+<span class="nc" id="L1738">            } catch (RetriableRemoteStorageException e) {</span>
+<span class="nc" id="L1739">                throw e;</span>
+<span class="nc" id="L1740">            } catch (RemoteStorageException e) {</span>
+<span class="nc" id="L1741">                brokerTopicStats.topicStats(topic).failedRemoteDeleteRequestRate().mark();</span>
+<span class="nc" id="L1742">                brokerTopicStats.allTopicsStats().failedRemoteDeleteRequestRate().mark();</span>
+<span class="nc" id="L1743">                throw e;</span>
+<span class="nc" id="L1744">            }</span>
+
+            // Publish delete segment finished event.
+<span class="nc" id="L1747">            remoteLogMetadataManagerPlugin.get().updateRemoteLogSegmentMetadata(</span>
+<span class="nc" id="L1748">                new RemoteLogSegmentMetadataUpdate(segmentMetadata.remoteLogSegmentId(), time.milliseconds(),</span>
+<span class="nc" id="L1749">                    segmentMetadata.customMetadata(), RemoteLogSegmentState.DELETE_SEGMENT_FINISHED, brokerId)).get();</span>
+<span class="nc" id="L1750">            LOGGER.debug(&quot;Deleted remote log segment {}&quot;, segmentMetadata.remoteLogSegmentId());</span>
+<span class="nc" id="L1751">            return true;</span>
+        }
+<span class="nc" id="L1753">        return false;</span>
+    }
+
+    /**
+     * Returns true if the remote segment's epoch/offsets are within the leader epoch lineage of the partition.
+     * The constraints here are as follows:
+     * - The segment's first epoch's offset should be more than or equal to the respective leader epoch's offset in the partition leader epoch lineage.
+     * - The segment's end offset should be less than or equal to the respective leader epoch's offset in the partition leader epoch lineage.
+     * - The segment's epoch lineage(epoch and offset) should be same as leader epoch lineage((epoch and offset)) except
+     * for the first and the last epochs in the segment.
+     *
+     * @param segmentMetadata The remote segment metadata to be validated.
+     * @param logEndOffset    The log end offset of the partition.
+     * @param leaderEpochs    The leader epoch lineage of the partition by filtering the epochs containing no data.
+     * @return true if the remote segment's epoch/offsets are within the leader epoch lineage of the partition.
+     */
+    // Visible for testing
+    static boolean isRemoteSegmentWithinLeaderEpochs(RemoteLogSegmentMetadata segmentMetadata,
+                                                     long logEndOffset,
+                                                     NavigableMap&lt;Integer, Long&gt; leaderEpochs) {
+<span class="nc" id="L1773">        long segmentEndOffset = segmentMetadata.endOffset();</span>
+        // Filter epochs that does not have any messages/records associated with them.
+<span class="nc" id="L1775">        NavigableMap&lt;Integer, Long&gt; segmentLeaderEpochs = buildFilteredLeaderEpochMap(segmentMetadata.segmentLeaderEpochs());</span>
+        // Check for out of bound epochs between segment epochs and current leader epochs.
+<span class="nc" id="L1777">        Integer segmentLastEpoch = segmentLeaderEpochs.lastKey();</span>
+<span class="nc bnc" id="L1778" title="All 4 branches missed.">        if (segmentLastEpoch &lt; leaderEpochs.firstKey() || segmentLastEpoch &gt; leaderEpochs.lastKey()) {</span>
+<span class="nc" id="L1779">            LOGGER.debug(&quot;Segment {} is not within the partition leader epoch lineage. &quot; +</span>
+                            &quot;Remote segment epochs: {} and partition leader epochs: {}&quot;,
+<span class="nc" id="L1781">                    segmentMetadata.remoteLogSegmentId(), segmentLeaderEpochs, leaderEpochs);</span>
+<span class="nc" id="L1782">            return false;</span>
+        }
+        // There can be overlapping remote log segments in the remote storage. (eg)
+        // leader-epoch-file-cache: {(5, 10), (7, 15), (9, 100)}
+        // segment1: offset-range = 5-50, Broker = 0, epochs = {(5, 10), (7, 15)}
+        // segment2: offset-range = 14-150, Broker = 1, epochs = {(5, 14), (7, 15), (9, 100)}, after leader-election.
+        // When the segment1 gets deleted, then the log-start-offset = 51 and leader-epoch-file-cache gets updated to: {(7, 51), (9, 100)}.
+        // While validating the segment2, we should ensure the overlapping remote log segments case.
+<span class="nc" id="L1790">        Integer segmentFirstEpoch = segmentLeaderEpochs.ceilingKey(leaderEpochs.firstKey());</span>
+<span class="nc bnc" id="L1791" title="All 2 branches missed.">        if (segmentFirstEpoch == null) {</span>
+<span class="nc" id="L1792">            LOGGER.debug(&quot;Segment {} is not within the partition leader epoch lineage. &quot; +</span>
+                            &quot;Remote segment epochs: {} and partition leader epochs: {}&quot;,
+<span class="nc" id="L1794">                    segmentMetadata.remoteLogSegmentId(), segmentLeaderEpochs, leaderEpochs);</span>
+<span class="nc" id="L1795">            return false;</span>
+        }
+<span class="nc bnc" id="L1797" title="All 2 branches missed.">        for (Map.Entry&lt;Integer, Long&gt; entry : segmentLeaderEpochs.entrySet()) {</span>
+<span class="nc" id="L1798">            int epoch = entry.getKey();</span>
+<span class="nc" id="L1799">            long offset = entry.getValue();</span>
+<span class="nc bnc" id="L1800" title="All 2 branches missed.">            if (epoch &lt; segmentFirstEpoch) {</span>
+<span class="nc" id="L1801">                continue;</span>
+            }
+            // If segment's epoch does not exist in the leader epoch lineage then it is not a valid segment.
+<span class="nc bnc" id="L1804" title="All 2 branches missed.">            if (!leaderEpochs.containsKey(epoch)) {</span>
+<span class="nc" id="L1805">                LOGGER.debug(&quot;Segment {} epoch {} is not within the leader epoch lineage. &quot; +</span>
+                                &quot;Remote segment epochs: {} and partition leader epochs: {}&quot;,
+<span class="nc" id="L1807">                        segmentMetadata.remoteLogSegmentId(), epoch, segmentLeaderEpochs, leaderEpochs);</span>
+<span class="nc" id="L1808">                return false;</span>
+            }
+            // Two cases:
+            // case-1: When the segment-first-epoch equals to the first-epoch in the leader-epoch-lineage, then the
+            // offset value can lie anywhere between 0 to (next-epoch-start-offset - 1) is valid.
+            // case-2: When the segment-first-epoch is not equal to the first-epoch in the leader-epoch-lineage, then
+            // the offset value should be between (current-epoch-start-offset) to (next-epoch-start-offset - 1).
+<span class="nc bnc" id="L1815" title="All 6 branches missed.">            if (epoch == segmentFirstEpoch &amp;&amp; leaderEpochs.lowerKey(epoch) != null &amp;&amp; offset &lt; leaderEpochs.get(epoch)) {</span>
+<span class="nc" id="L1816">                LOGGER.debug(&quot;Segment {} first-valid epoch {} offset is less than first leader epoch offset {}.&quot; +</span>
+                                &quot;Remote segment epochs: {} and partition leader epochs: {}&quot;,
+<span class="nc" id="L1818">                        segmentMetadata.remoteLogSegmentId(), epoch, leaderEpochs.get(epoch),</span>
+                        segmentLeaderEpochs, leaderEpochs);
+<span class="nc" id="L1820">                return false;</span>
+            }
+            // Segment's end offset should be less than or equal to the respective leader epoch's offset.
+<span class="nc bnc" id="L1823" title="All 2 branches missed.">            if (epoch == segmentLastEpoch) {</span>
+<span class="nc" id="L1824">                Map.Entry&lt;Integer, Long&gt; nextEntry = leaderEpochs.higherEntry(epoch);</span>
+<span class="nc bnc" id="L1825" title="All 4 branches missed.">                if (nextEntry != null &amp;&amp; segmentEndOffset &gt; nextEntry.getValue() - 1) {</span>
+<span class="nc" id="L1826">                    LOGGER.debug(&quot;Segment {} end offset {} is more than leader epoch offset {}.&quot; +</span>
+                                    &quot;Remote segment epochs: {} and partition leader epochs: {}&quot;,
+<span class="nc" id="L1828">                            segmentMetadata.remoteLogSegmentId(), segmentEndOffset, nextEntry.getValue() - 1,</span>
+                            segmentLeaderEpochs, leaderEpochs);
+<span class="nc" id="L1830">                    return false;</span>
+                }
+            }
+            // Next segment epoch entry and next leader epoch entry should be same to ensure that the segment's epoch
+            // is within the leader epoch lineage.
+<span class="nc bnc" id="L1835" title="All 4 branches missed.">            if (epoch != segmentLastEpoch &amp;&amp; !leaderEpochs.higherEntry(epoch).equals(segmentLeaderEpochs.higherEntry(epoch))) {</span>
+<span class="nc" id="L1836">                LOGGER.debug(&quot;Segment {} epoch {} is not within the leader epoch lineage. &quot; +</span>
+                                &quot;Remote segment epochs: {} and partition leader epochs: {}&quot;,
+<span class="nc" id="L1838">                        segmentMetadata.remoteLogSegmentId(), epoch, segmentLeaderEpochs, leaderEpochs);</span>
+<span class="nc" id="L1839">                return false;</span>
+            }
+<span class="nc" id="L1841">        }</span>
+        // segment end offset should be with in the log end offset.
+<span class="nc bnc" id="L1843" title="All 2 branches missed.">        if (segmentEndOffset &gt;= logEndOffset) {</span>
+<span class="nc" id="L1844">            LOGGER.debug(&quot;Segment {} end offset {} is more than log end offset {}.&quot;,</span>
+<span class="nc" id="L1845">                    segmentMetadata.remoteLogSegmentId(), segmentEndOffset, logEndOffset);</span>
+<span class="nc" id="L1846">            return false;</span>
+        }
+<span class="nc" id="L1848">        return true;</span>
+    }
+
+    /**
+     * Returns a map containing the epoch vs start-offset for the given leader epoch map by filtering the epochs that
+     * does not contain any messages/records associated with them.
+     *
+     * @param leaderEpochs The leader epoch map to be refined.
+     * @return A map containing only the epochs and their start offsets that have associated messages/records.
+     */
+    // Visible for testing
+    static NavigableMap&lt;Integer, Long&gt; buildFilteredLeaderEpochMap(NavigableMap&lt;Integer, Long&gt; leaderEpochs) {
+<span class="nc" id="L1860">        TreeMap&lt;Integer, Long&gt; filteredLeaderEpochs = new TreeMap&lt;&gt;();</span>
+<span class="nc" id="L1861">        Map.Entry&lt;Integer, Long&gt; previousEpochAndOffset = null;</span>
+
+<span class="nc bnc" id="L1863" title="All 2 branches missed.">        for (Map.Entry&lt;Integer, Long&gt; currentEpochAndOffset : leaderEpochs.entrySet()) {</span>
+<span class="nc bnc" id="L1864" title="All 4 branches missed.">            if (previousEpochAndOffset != null &amp;&amp; !previousEpochAndOffset.getValue().equals(currentEpochAndOffset.getValue())) {</span>
+<span class="nc" id="L1865">                filteredLeaderEpochs.put(previousEpochAndOffset.getKey(), previousEpochAndOffset.getValue());</span>
+            }
+<span class="nc" id="L1867">            previousEpochAndOffset = currentEpochAndOffset;</span>
+<span class="nc" id="L1868">        }</span>
+
+<span class="nc bnc" id="L1870" title="All 2 branches missed.">        if (previousEpochAndOffset != null) {</span>
+<span class="nc" id="L1871">            filteredLeaderEpochs.put(previousEpochAndOffset.getKey(), previousEpochAndOffset.getValue());</span>
+        }
+<span class="nc" id="L1873">        return filteredLeaderEpochs;</span>
+    }
+
+    public FetchDataInfo read(RemoteStorageFetchInfo remoteStorageFetchInfo) throws RemoteStorageException, IOException {
+<span class="nc" id="L1877">        int fetchMaxBytes = remoteStorageFetchInfo.fetchMaxBytes();</span>
+<span class="nc" id="L1878">        TopicPartition tp = remoteStorageFetchInfo.topicIdPartition().topicPartition();</span>
+<span class="nc" id="L1879">        FetchRequest.PartitionData fetchInfo = remoteStorageFetchInfo.fetchInfo();</span>
+
+<span class="nc bnc" id="L1881" title="All 2 branches missed.">        boolean includeAbortedTxns = remoteStorageFetchInfo.fetchIsolation() == FetchIsolation.TXN_COMMITTED;</span>
+
+<span class="nc" id="L1883">        long offset = fetchInfo.fetchOffset;</span>
+<span class="nc" id="L1884">        int maxBytes = Math.min(fetchMaxBytes, fetchInfo.maxBytes);</span>
+
+<span class="nc" id="L1886">        Optional&lt;UnifiedLog&gt; logOptional = fetchLog.apply(tp);</span>
+<span class="nc" id="L1887">        OptionalInt epoch = OptionalInt.empty();</span>
+
+<span class="nc bnc" id="L1889" title="All 2 branches missed.">        if (logOptional.isPresent()) {</span>
+<span class="nc" id="L1890">            LeaderEpochFileCache leaderEpochCache = logOptional.get().leaderEpochCache();</span>
+<span class="nc" id="L1891">            epoch = leaderEpochCache.epochForOffset(offset);</span>
+        }
+
+<span class="nc bnc" id="L1894" title="All 2 branches missed.">        Optional&lt;RemoteLogSegmentMetadata&gt; rlsMetadataOptional = epoch.isPresent()</span>
+<span class="nc" id="L1895">                ? fetchRemoteLogSegmentMetadata(tp, epoch.getAsInt(), offset)</span>
+<span class="nc" id="L1896">                : Optional.empty();</span>
+
+<span class="nc bnc" id="L1898" title="All 2 branches missed.">        if (rlsMetadataOptional.isEmpty()) {</span>
+<span class="nc bnc" id="L1899" title="All 2 branches missed.">            String epochStr = (epoch.isPresent()) ? Integer.toString(epoch.getAsInt()) : &quot;NOT AVAILABLE&quot;;</span>
+<span class="nc" id="L1900">            throw new OffsetOutOfRangeException(&quot;Received request for offset &quot; + offset + &quot; for leader epoch &quot;</span>
+                    + epochStr + &quot; and partition &quot; + tp + &quot; which does not exist in remote tier.&quot;);
+        }
+
+<span class="nc" id="L1904">        RemoteLogSegmentMetadata remoteLogSegmentMetadata = rlsMetadataOptional.get();</span>
+<span class="nc" id="L1905">        EnrichedRecordBatch enrichedRecordBatch = new EnrichedRecordBatch(null, 0);</span>
+<span class="nc" id="L1906">        InputStream remoteSegInputStream = null;</span>
+        try {
+<span class="nc" id="L1908">            int startPos = 0;</span>
+            //  Iteration over multiple RemoteSegmentMetadata is required in case of log compaction.
+            //  It may be possible the offset is log compacted in the current RemoteLogSegmentMetadata
+            //  And we need to iterate over the next segment metadata to fetch messages higher than the given offset.
+<span class="nc bnc" id="L1912" title="All 4 branches missed.">            while (enrichedRecordBatch.batch == null &amp;&amp; rlsMetadataOptional.isPresent()) {</span>
+<span class="nc" id="L1913">                remoteLogSegmentMetadata = rlsMetadataOptional.get();</span>
+                // Search forward for the position of the last offset that is greater than or equal to the target offset
+<span class="nc" id="L1915">                startPos = lookupPositionForOffset(remoteLogSegmentMetadata, offset);</span>
+<span class="nc" id="L1916">                remoteSegInputStream = remoteStorageManagerPlugin.get().fetchLogSegment(remoteLogSegmentMetadata, startPos);</span>
+<span class="nc" id="L1917">                RemoteLogInputStream remoteLogInputStream = getRemoteLogInputStream(remoteSegInputStream);</span>
+<span class="nc" id="L1918">                enrichedRecordBatch = findFirstBatch(remoteLogInputStream, offset);</span>
+<span class="nc bnc" id="L1919" title="All 2 branches missed.">                if (enrichedRecordBatch.batch == null) {</span>
+<span class="nc" id="L1920">                    Utils.closeQuietly(remoteSegInputStream, &quot;RemoteLogSegmentInputStream&quot;);</span>
+<span class="nc" id="L1921">                    rlsMetadataOptional = findNextSegmentMetadata(rlsMetadataOptional.get(), logOptional.get().leaderEpochCache());</span>
+                }
+<span class="nc" id="L1923">            }</span>
+<span class="nc" id="L1924">            RecordBatch firstBatch = enrichedRecordBatch.batch;</span>
+<span class="nc bnc" id="L1925" title="All 2 branches missed.">            if (firstBatch == null)</span>
+<span class="nc" id="L1926">                return new FetchDataInfo(new LogOffsetMetadata(offset), MemoryRecords.EMPTY, false,</span>
+<span class="nc bnc" id="L1927" title="All 2 branches missed.">                        includeAbortedTxns ? Optional.of(List.of()) : Optional.empty());</span>
+
+<span class="nc" id="L1929">            int firstBatchSize = firstBatch.sizeInBytes();</span>
+            // An empty record is sent instead of an incomplete batch when
+            //  - there is no minimum-one-message constraint and
+            //  - the first batch size is more than maximum bytes that can be sent and
+<span class="nc bnc" id="L1933" title="All 4 branches missed.">            if (!remoteStorageFetchInfo.minOneMessage() &amp;&amp; firstBatchSize &gt; maxBytes) {</span>
+<span class="nc" id="L1934">                LOGGER.debug(&quot;Returning empty record for offset {} in partition {} because the first batch size {} &quot; +</span>
+<span class="nc" id="L1935">                        &quot;is greater than max fetch bytes {}&quot;, offset, tp, firstBatchSize, maxBytes);</span>
+<span class="nc" id="L1936">                return new FetchDataInfo(new LogOffsetMetadata(offset), MemoryRecords.EMPTY);</span>
+            }
+
+            int updatedFetchSize =
+<span class="nc bnc" id="L1940" title="All 4 branches missed.">                    remoteStorageFetchInfo.minOneMessage() &amp;&amp; firstBatchSize &gt; maxBytes ? firstBatchSize : maxBytes;</span>
+
+<span class="nc" id="L1942">            ByteBuffer buffer = ByteBuffer.allocate(updatedFetchSize);</span>
+<span class="nc" id="L1943">            int remainingBytes = updatedFetchSize;</span>
+
+<span class="nc" id="L1945">            firstBatch.writeTo(buffer);</span>
+<span class="nc" id="L1946">            remainingBytes -= firstBatchSize;</span>
+
+<span class="nc bnc" id="L1948" title="All 2 branches missed.">            if (remainingBytes &gt; 0) {</span>
+                // read the input stream until min of (EOF stream or buffer's remaining capacity).
+<span class="nc" id="L1950">                Utils.readFully(remoteSegInputStream, buffer);</span>
+            }
+<span class="nc" id="L1952">            buffer.flip();</span>
+
+<span class="nc" id="L1954">            startPos = startPos + enrichedRecordBatch.skippedBytes;</span>
+<span class="nc" id="L1955">            FetchDataInfo fetchDataInfo = new FetchDataInfo(</span>
+<span class="nc" id="L1956">                    new LogOffsetMetadata(firstBatch.baseOffset(), remoteLogSegmentMetadata.startOffset(), startPos),</span>
+<span class="nc" id="L1957">                    MemoryRecords.readableRecords(buffer));</span>
+<span class="nc bnc" id="L1958" title="All 2 branches missed.">            if (includeAbortedTxns) {</span>
+<span class="nc" id="L1959">                fetchDataInfo = addAbortedTransactions(firstBatch.baseOffset(), remoteLogSegmentMetadata, fetchDataInfo, logOptional.get());</span>
+            }
+
+<span class="nc" id="L1962">            return fetchDataInfo;</span>
+        } finally {
+<span class="nc bnc" id="L1964" title="All 2 branches missed.">            if (enrichedRecordBatch.batch != null) {</span>
+<span class="nc" id="L1965">                Utils.closeQuietly(remoteSegInputStream, &quot;RemoteLogSegmentInputStream&quot;);</span>
+            }
+        }
+    }
+    // for testing
+    RemoteLogInputStream getRemoteLogInputStream(InputStream in) {
+<span class="nc" id="L1971">        return new RemoteLogInputStream(in);</span>
+    }
+
+    // Visible for testing
+    int lookupPositionForOffset(RemoteLogSegmentMetadata remoteLogSegmentMetadata, long offset) {
+<span class="nc" id="L1976">        return indexCache.lookupOffset(remoteLogSegmentMetadata, offset);</span>
+    }
+
+    private FetchDataInfo addAbortedTransactions(long startOffset,
+                                                 RemoteLogSegmentMetadata segmentMetadata,
+                                                 FetchDataInfo fetchInfo,
+                                                 UnifiedLog log) throws RemoteStorageException {
+<span class="nc" id="L1983">        int fetchSize = fetchInfo.records.sizeInBytes();</span>
+<span class="nc" id="L1984">        OffsetPosition startOffsetPosition = new OffsetPosition(fetchInfo.fetchOffsetMetadata.messageOffset,</span>
+                fetchInfo.fetchOffsetMetadata.relativePositionInSegment);
+
+<span class="nc" id="L1987">        OffsetIndex offsetIndex = indexCache.getIndexEntry(segmentMetadata).offsetIndex();</span>
+<span class="nc" id="L1988">        long upperBoundOffset = offsetIndex.fetchUpperBoundOffset(startOffsetPosition, fetchSize)</span>
+<span class="nc" id="L1989">                .map(OffsetPosition::offset).orElse(segmentMetadata.endOffset() + 1);</span>
+
+<span class="nc" id="L1991">        final Set&lt;FetchResponseData.AbortedTransaction&gt; abortedTransactions = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L1993">        Consumer&lt;List&lt;AbortedTxn&gt;&gt; accumulator =</span>
+<span class="nc" id="L1994">                abortedTxns -&gt; abortedTransactions.addAll(abortedTxns.stream()</span>
+<span class="nc" id="L1995">                        .map(txn -&gt; new FetchResponseData.AbortedTransaction()</span>
+<span class="nc" id="L1996">                                .setProducerId(txn.producerId())</span>
+<span class="nc" id="L1997">                                .setFirstOffset(txn.firstOffset())).toList());</span>
+
+<span class="nc" id="L1999">        long startTimeNs = time.nanoseconds();</span>
+<span class="nc" id="L2000">        collectAbortedTransactions(startOffset, upperBoundOffset, segmentMetadata, accumulator, log);</span>
+<span class="nc" id="L2001">        LOGGER.debug(&quot;Time taken to collect: {} aborted transactions for {} in {} ns&quot;, abortedTransactions.size(),</span>
+<span class="nc" id="L2002">                segmentMetadata, time.nanoseconds() - startTimeNs);</span>
+
+<span class="nc" id="L2004">        return new FetchDataInfo(fetchInfo.fetchOffsetMetadata,</span>
+                fetchInfo.records,
+                fetchInfo.firstEntryIncomplete,
+<span class="nc bnc" id="L2007" title="All 2 branches missed.">                Optional.of(abortedTransactions.isEmpty() ? List.of() : new ArrayList&lt;&gt;(abortedTransactions)));</span>
+    }
+
+    /**
+     * Collects the aborted transaction entries from the current and subsequent segments until the upper bound offset.
+     * Note that the accumulated aborted transaction entries might contain duplicates as it collects the entries across
+     * segments. We are relying on the client to discard the duplicates.
+     * @param startOffset The start offset of the fetch request.
+     * @param upperBoundOffset The upper bound offset of the fetch request.
+     * @param segmentMetadata The current segment metadata.
+     * @param accumulator The accumulator to collect the aborted transactions.
+     * @param log The unified log instance.
+     * @throws RemoteStorageException If an error occurs while fetching the remote log segment metadata.
+     */
+    private void collectAbortedTransactions(long startOffset,
+                                            long upperBoundOffset,
+                                            RemoteLogSegmentMetadata segmentMetadata,
+                                            Consumer&lt;List&lt;AbortedTxn&gt;&gt; accumulator,
+                                            UnifiedLog log) throws RemoteStorageException {
+<span class="nc" id="L2026">        TopicPartition tp = segmentMetadata.topicIdPartition().topicPartition();</span>
+<span class="nc" id="L2027">        boolean isSearchComplete = false;</span>
+<span class="nc" id="L2028">        LeaderEpochFileCache leaderEpochCache = log.leaderEpochCache();</span>
+<span class="nc" id="L2029">        Optional&lt;RemoteLogSegmentMetadata&gt; currentMetadataOpt = Optional.of(segmentMetadata);</span>
+<span class="nc bnc" id="L2030" title="All 4 branches missed.">        while (!isSearchComplete &amp;&amp; currentMetadataOpt.isPresent()) {</span>
+<span class="nc" id="L2031">            RemoteLogSegmentMetadata currentMetadata = currentMetadataOpt.get();</span>
+<span class="nc" id="L2032">            Optional&lt;TransactionIndex&gt; txnIndexOpt = getTransactionIndex(currentMetadata);</span>
+<span class="nc bnc" id="L2033" title="All 2 branches missed.">            if (txnIndexOpt.isPresent()) {</span>
+<span class="nc" id="L2034">                TransactionIndex txnIndex = txnIndexOpt.get();</span>
+<span class="nc" id="L2035">                TxnIndexSearchResult searchResult = txnIndex.collectAbortedTxns(startOffset, upperBoundOffset);</span>
+<span class="nc" id="L2036">                accumulator.accept(searchResult.abortedTransactions());</span>
+<span class="nc" id="L2037">                isSearchComplete = searchResult.isComplete();</span>
+            }
+<span class="nc bnc" id="L2039" title="All 2 branches missed.">            if (!isSearchComplete) {</span>
+<span class="nc" id="L2040">                currentMetadataOpt = findNextSegmentWithTxnIndex(tp, currentMetadata.endOffset() + 1, leaderEpochCache);</span>
+            }
+<span class="nc" id="L2042">        }</span>
+        // Search in local segments
+<span class="nc bnc" id="L2044" title="All 2 branches missed.">        if (!isSearchComplete) {</span>
+<span class="nc" id="L2045">            collectAbortedTransactionInLocalSegments(startOffset, upperBoundOffset, accumulator, log.logSegments().iterator());</span>
+        }
+<span class="nc" id="L2047">    }</span>
+
+    private Optional&lt;TransactionIndex&gt; getTransactionIndex(RemoteLogSegmentMetadata currentMetadata) {
+<span class="nc bnc" id="L2050" title="All 2 branches missed.">        return !currentMetadata.isTxnIdxEmpty() ?</span>
+                // `ofNullable` is needed for backward compatibility for old events that were stored in the
+                // `__remote_log_metadata` topic. The old events will return the `txnIdxEmpty` as false, but the
+                // transaction index may not exist in the remote storage.
+<span class="nc" id="L2054">                Optional.ofNullable(indexCache.getIndexEntry(currentMetadata).txnIndex()) : Optional.empty();</span>
+    }
+
+    private void collectAbortedTransactionInLocalSegments(long startOffset,
+                                                          long upperBoundOffset,
+                                                          Consumer&lt;List&lt;AbortedTxn&gt;&gt; accumulator,
+                                                          Iterator&lt;LogSegment&gt; localLogSegments) {
+<span class="nc bnc" id="L2061" title="All 2 branches missed.">        while (localLogSegments.hasNext()) {</span>
+<span class="nc" id="L2062">            TransactionIndex txnIndex = localLogSegments.next().txnIndex();</span>
+<span class="nc bnc" id="L2063" title="All 2 branches missed.">            if (txnIndex != null) {</span>
+<span class="nc" id="L2064">                TxnIndexSearchResult searchResult = txnIndex.collectAbortedTxns(startOffset, upperBoundOffset);</span>
+<span class="nc" id="L2065">                accumulator.accept(searchResult.abortedTransactions());</span>
+<span class="nc bnc" id="L2066" title="All 2 branches missed.">                if (searchResult.isComplete()) {</span>
+<span class="nc" id="L2067">                    return;</span>
+                }
+            }
+<span class="nc" id="L2070">        }</span>
+<span class="nc" id="L2071">    }</span>
+
+    // visible for testing.
+    Optional&lt;RemoteLogSegmentMetadata&gt; findNextSegmentMetadata(RemoteLogSegmentMetadata segmentMetadata,
+                                                               LeaderEpochFileCache leaderEpochFileCacheOption) throws RemoteStorageException {
+<span class="nc" id="L2076">        long nextSegmentBaseOffset = segmentMetadata.endOffset() + 1;</span>
+<span class="nc" id="L2077">        OptionalInt epoch = leaderEpochFileCacheOption.epochForOffset(nextSegmentBaseOffset);</span>
+<span class="nc bnc" id="L2078" title="All 2 branches missed.">        return epoch.isPresent()</span>
+<span class="nc" id="L2079">                ? fetchRemoteLogSegmentMetadata(segmentMetadata.topicIdPartition().topicPartition(), epoch.getAsInt(), nextSegmentBaseOffset)</span>
+<span class="nc" id="L2080">                : Optional.empty();</span>
+    }
+
+    /**
+     * Returns the next segment metadata that contains the aborted transaction entries from the given offset.
+     * Note that the search starts from the given (offset-for-epoch, offset) pair, when there are no segments contains
+     * the transaction index in that epoch, then it proceeds to the next epoch (next-epoch, epoch-start-offset)
+     * and the search ends when the segment metadata is found or the leader epoch cache is exhausted.
+     * Note that the returned segment metadata may or may not contain the transaction index.
+     * Visible for testing
+     * @param tp The topic partition.
+     * @param offset The offset to start the search.
+     * @param leaderEpochCache The leader epoch file cache.
+     * @return The next segment metadata that contains the transaction index. The transaction index may or may not exist
+     * in that segment metadata which depends on the RLMM plugin implementation. The caller of this method should handle
+     * for both the cases.
+     * @throws RemoteStorageException If an error occurs while fetching the remote log segment metadata.
+     */
+    Optional&lt;RemoteLogSegmentMetadata&gt; findNextSegmentWithTxnIndex(TopicPartition tp,
+                                                                   long offset,
+                                                                   LeaderEpochFileCache leaderEpochCache) throws RemoteStorageException {
+<span class="nc" id="L2101">        OptionalInt initialEpochOpt = leaderEpochCache.epochForOffset(offset);</span>
+<span class="nc bnc" id="L2102" title="All 2 branches missed.">        if (initialEpochOpt.isEmpty()) {</span>
+<span class="nc" id="L2103">            return Optional.empty();</span>
+        }
+<span class="nc" id="L2105">        int initialEpoch = initialEpochOpt.getAsInt();</span>
+<span class="nc bnc" id="L2106" title="All 2 branches missed.">        for (EpochEntry epochEntry : leaderEpochCache.epochEntries()) {</span>
+<span class="nc bnc" id="L2107" title="All 2 branches missed.">            if (epochEntry.epoch() &gt;= initialEpoch) {</span>
+<span class="nc" id="L2108">                long startOffset = Math.max(epochEntry.startOffset(), offset);</span>
+<span class="nc" id="L2109">                Optional&lt;RemoteLogSegmentMetadata&gt; metadataOpt = fetchNextSegmentWithTxnIndex(tp, epochEntry.epoch(), startOffset);</span>
+<span class="nc bnc" id="L2110" title="All 2 branches missed.">                if (metadataOpt.isPresent()) {</span>
+<span class="nc" id="L2111">                    return metadataOpt;</span>
+                }
+            }
+<span class="nc" id="L2114">        }</span>
+<span class="nc" id="L2115">        return Optional.empty();</span>
+    }
+
+    // Visible for testing
+    EnrichedRecordBatch findFirstBatch(RemoteLogInputStream remoteLogInputStream, long offset) throws IOException {
+<span class="nc" id="L2120">        int skippedBytes = 0;</span>
+<span class="nc" id="L2121">        RecordBatch nextBatch = null;</span>
+        // Look for the batch which has the desired offset
+        // We will always have a batch in that segment as it is a non-compacted topic.
+        do {
+<span class="nc bnc" id="L2125" title="All 2 branches missed.">            if (nextBatch != null) {</span>
+<span class="nc" id="L2126">                skippedBytes += nextBatch.sizeInBytes();</span>
+            }
+<span class="nc" id="L2128">            nextBatch = remoteLogInputStream.nextBatch();</span>
+<span class="nc bnc" id="L2129" title="All 4 branches missed.">        } while (nextBatch != null &amp;&amp; nextBatch.lastOffset() &lt; offset);</span>
+<span class="nc" id="L2130">        return new EnrichedRecordBatch(nextBatch, skippedBytes);</span>
+    }
+
+    OffsetAndEpoch findHighestRemoteOffset(TopicIdPartition topicIdPartition, UnifiedLog log) throws RemoteStorageException {
+<span class="nc" id="L2134">        OffsetAndEpoch offsetAndEpoch = null;</span>
+<span class="nc" id="L2135">        LeaderEpochFileCache leaderEpochCache = log.leaderEpochCache();</span>
+<span class="nc" id="L2136">        Optional&lt;EpochEntry&gt; maybeEpochEntry = leaderEpochCache.latestEntry();</span>
+<span class="nc bnc" id="L2137" title="All 4 branches missed.">        while (offsetAndEpoch == null &amp;&amp; maybeEpochEntry.isPresent()) {</span>
+<span class="nc" id="L2138">            int epoch = maybeEpochEntry.get().epoch();</span>
+<span class="nc" id="L2139">            Optional&lt;Long&gt; highestRemoteOffsetOpt =</span>
+<span class="nc" id="L2140">                    remoteLogMetadataManagerPlugin.get().highestOffsetForEpoch(topicIdPartition, epoch);</span>
+<span class="nc bnc" id="L2141" title="All 2 branches missed.">            if (highestRemoteOffsetOpt.isPresent()) {</span>
+<span class="nc" id="L2142">                Map.Entry&lt;Integer, Long&gt; entry = leaderEpochCache.endOffsetFor(epoch, log.logEndOffset());</span>
+<span class="nc" id="L2143">                int requestedEpoch = entry.getKey();</span>
+<span class="nc" id="L2144">                long endOffset = entry.getValue();</span>
+<span class="nc" id="L2145">                long highestRemoteOffset = highestRemoteOffsetOpt.get();</span>
+<span class="nc bnc" id="L2146" title="All 2 branches missed.">                if (endOffset &lt;= highestRemoteOffset) {</span>
+<span class="nc" id="L2147">                    LOGGER.info(&quot;The end-offset for epoch {}: ({}, {}) is less than or equal to the &quot; +</span>
+<span class="nc" id="L2148">                            &quot;highest-remote-offset: {} for partition: {}&quot;, epoch, requestedEpoch, endOffset,</span>
+<span class="nc" id="L2149">                            highestRemoteOffset, topicIdPartition);</span>
+<span class="nc" id="L2150">                    offsetAndEpoch = new OffsetAndEpoch(endOffset - 1, requestedEpoch);</span>
+                } else {
+<span class="nc" id="L2152">                    offsetAndEpoch = new OffsetAndEpoch(highestRemoteOffset, epoch);</span>
+                }
+            }
+<span class="nc" id="L2155">            maybeEpochEntry = leaderEpochCache.previousEntry(epoch);</span>
+<span class="nc" id="L2156">        }</span>
+<span class="nc bnc" id="L2157" title="All 2 branches missed.">        if (offsetAndEpoch == null) {</span>
+<span class="nc" id="L2158">            offsetAndEpoch = new OffsetAndEpoch(-1L, RecordBatch.NO_PARTITION_LEADER_EPOCH);</span>
+        }
+<span class="nc" id="L2160">        return offsetAndEpoch;</span>
+    }
+
+    long findLogStartOffset(TopicIdPartition topicIdPartition, UnifiedLog log) throws RemoteStorageException {
+<span class="nc" id="L2164">        Optional&lt;Long&gt; logStartOffset = Optional.empty();</span>
+<span class="nc" id="L2165">        LeaderEpochFileCache leaderEpochCache = log.leaderEpochCache();</span>
+<span class="nc" id="L2166">        OptionalInt earliestEpochOpt = leaderEpochCache.earliestEntry()</span>
+<span class="nc" id="L2167">                .map(epochEntry -&gt; OptionalInt.of(epochEntry.epoch()))</span>
+<span class="nc" id="L2168">                .orElseGet(OptionalInt::empty);</span>
+<span class="nc bnc" id="L2169" title="All 4 branches missed.">        while (logStartOffset.isEmpty() &amp;&amp; earliestEpochOpt.isPresent()) {</span>
+<span class="nc" id="L2170">            Iterator&lt;RemoteLogSegmentMetadata&gt; iterator =</span>
+<span class="nc" id="L2171">                    remoteLogMetadataManagerPlugin.get().listRemoteLogSegments(topicIdPartition, earliestEpochOpt.getAsInt());</span>
+<span class="nc bnc" id="L2172" title="All 2 branches missed.">            if (iterator.hasNext()) {</span>
+<span class="nc" id="L2173">                logStartOffset = Optional.of(iterator.next().startOffset());</span>
+            }
+<span class="nc" id="L2175">            earliestEpochOpt = leaderEpochCache.nextEpoch(earliestEpochOpt.getAsInt());</span>
+<span class="nc" id="L2176">        }</span>
+<span class="nc" id="L2177">        return logStartOffset.orElseGet(log::localLogStartOffset);</span>
+    }
+
+    /**
+     * Submit a remote log read task.
+     * This method returns immediately. The read operation is executed in a thread pool.
+     * The callback will be called when the task is done.
+     *
+     * @throws java.util.concurrent.RejectedExecutionException if the task cannot be accepted for execution (task queue is full)
+     */
+    public Future&lt;Void&gt; asyncRead(RemoteStorageFetchInfo fetchInfo, Consumer&lt;RemoteLogReadResult&gt; callback) {
+<span class="nc" id="L2188">        return remoteStorageReaderThreadPool.submit(</span>
+                new RemoteLogReader(fetchInfo, this, callback, brokerTopicStats, rlmFetchQuotaManager, remoteReadTimer));
+    }
+
+    void doHandleLeaderPartition(TopicIdPartition topicPartition, Boolean remoteLogCopyDisable) {
+<span class="nc" id="L2193">        RLMTaskWithFuture followerRLMTaskWithFuture = followerRLMTasks.remove(topicPartition);</span>
+<span class="nc bnc" id="L2194" title="All 2 branches missed.">        if (followerRLMTaskWithFuture != null) {</span>
+<span class="nc" id="L2195">            LOGGER.info(&quot;Cancelling the follower task: {}&quot;, followerRLMTaskWithFuture.rlmTask);</span>
+<span class="nc" id="L2196">            followerRLMTaskWithFuture.cancel();</span>
+        }
+
+        // Only create copy task when remoteLogCopyDisable is disabled
+<span class="nc bnc" id="L2200" title="All 2 branches missed.">        if (!remoteLogCopyDisable) {</span>
+<span class="nc" id="L2201">            leaderCopyRLMTasks.computeIfAbsent(topicPartition, topicIdPartition -&gt; {</span>
+<span class="nc" id="L2202">                RLMCopyTask task = new RLMCopyTask(topicIdPartition, this.rlmConfig.remoteLogMetadataCustomMetadataMaxBytes());</span>
+                // set this upfront when it is getting initialized instead of doing it after scheduling.
+<span class="nc" id="L2204">                LOGGER.info(&quot;Created a new copy task: {} and getting scheduled&quot;, task);</span>
+<span class="nc" id="L2205">                ScheduledFuture&lt;?&gt; future = rlmCopyThreadPool.scheduleWithFixedDelay(task, 0, delayInMs, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L2206">                return new RLMTaskWithFuture(task, future);</span>
+            });
+        }
+
+<span class="nc" id="L2210">        leaderExpirationRLMTasks.computeIfAbsent(topicPartition, topicIdPartition -&gt; {</span>
+<span class="nc" id="L2211">            RLMExpirationTask task = new RLMExpirationTask(topicIdPartition);</span>
+<span class="nc" id="L2212">            LOGGER.info(&quot;Created a new expiration task: {} and getting scheduled&quot;, task);</span>
+<span class="nc" id="L2213">            ScheduledFuture&lt;?&gt; future = rlmExpirationThreadPool.scheduleWithFixedDelay(task, 0, delayInMs, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L2214">            return new RLMTaskWithFuture(task, future);</span>
+        });
+<span class="nc" id="L2216">    }</span>
+
+    void doHandleFollowerPartition(TopicIdPartition topicPartition) {
+<span class="nc" id="L2219">        RLMTaskWithFuture copyRLMTaskWithFuture = leaderCopyRLMTasks.remove(topicPartition);</span>
+<span class="nc bnc" id="L2220" title="All 2 branches missed.">        if (copyRLMTaskWithFuture != null) {</span>
+<span class="nc" id="L2221">            LOGGER.info(&quot;Cancelling the copy task: {}&quot;, copyRLMTaskWithFuture.rlmTask);</span>
+<span class="nc" id="L2222">            copyRLMTaskWithFuture.cancel();</span>
+        }
+
+<span class="nc" id="L2225">        RLMTaskWithFuture expirationRLMTaskWithFuture = leaderExpirationRLMTasks.remove(topicPartition);</span>
+<span class="nc bnc" id="L2226" title="All 2 branches missed.">        if (expirationRLMTaskWithFuture != null) {</span>
+<span class="nc" id="L2227">            LOGGER.info(&quot;Cancelling the expiration task: {}&quot;, expirationRLMTaskWithFuture.rlmTask);</span>
+<span class="nc" id="L2228">            expirationRLMTaskWithFuture.cancel();</span>
+        }
+
+<span class="nc" id="L2231">        followerRLMTasks.computeIfAbsent(topicPartition, topicIdPartition -&gt; {</span>
+<span class="nc" id="L2232">            RLMFollowerTask task = new RLMFollowerTask(topicIdPartition);</span>
+<span class="nc" id="L2233">            LOGGER.info(&quot;Created a new follower task: {} and getting scheduled&quot;, task);</span>
+<span class="nc" id="L2234">            ScheduledFuture&lt;?&gt; future = followerThreadPool.scheduleWithFixedDelay(task, 0, delayInMs, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L2235">            return new RLMTaskWithFuture(task, future);</span>
+        });
+<span class="nc" id="L2237">    }</span>
+
+    static class RLMTaskWithFuture {
+
+        private final RLMTask rlmTask;
+        private final Future&lt;?&gt; future;
+
+<span class="nc" id="L2244">        RLMTaskWithFuture(RLMTask rlmTask, Future&lt;?&gt; future) {</span>
+<span class="nc" id="L2245">            this.rlmTask = rlmTask;</span>
+<span class="nc" id="L2246">            this.future = future;</span>
+<span class="nc" id="L2247">        }</span>
+
+        public void cancel() {
+<span class="nc" id="L2250">            rlmTask.cancel();</span>
+            try {
+<span class="nc" id="L2252">                future.cancel(true);</span>
+<span class="nc" id="L2253">            } catch (Exception ex) {</span>
+<span class="nc" id="L2254">                LOGGER.error(&quot;Error occurred while canceling the task: {}&quot;, rlmTask, ex);</span>
+<span class="nc" id="L2255">            }</span>
+<span class="nc" id="L2256">        }</span>
+
+    }
+
+    /**
+     * Closes and releases all the resources like RemoterStorageManager and RemoteLogMetadataManager.
+     */
+    public void close() {
+<span class="nc" id="L2264">        synchronized (this) {</span>
+<span class="nc bnc" id="L2265" title="All 2 branches missed.">            if (!closed) {</span>
+<span class="nc" id="L2266">                leaderCopyRLMTasks.values().forEach(RLMTaskWithFuture::cancel);</span>
+<span class="nc" id="L2267">                leaderExpirationRLMTasks.values().forEach(RLMTaskWithFuture::cancel);</span>
+<span class="nc" id="L2268">                followerRLMTasks.values().forEach(RLMTaskWithFuture::cancel);</span>
+
+<span class="nc" id="L2270">                rlmCopyThreadPool.close();</span>
+<span class="nc" id="L2271">                rlmExpirationThreadPool.close();</span>
+<span class="nc" id="L2272">                followerThreadPool.close();</span>
+                try {
+<span class="nc" id="L2274">                    shutdownAndAwaitTermination(remoteStorageReaderThreadPool, &quot;RemoteStorageReaderThreadPool&quot;, 10, TimeUnit.SECONDS);</span>
+
+<span class="nc" id="L2276">                    leaderCopyRLMTasks.clear();</span>
+<span class="nc" id="L2277">                    leaderExpirationRLMTasks.clear();</span>
+<span class="nc" id="L2278">                    followerRLMTasks.clear();</span>
+
+<span class="nc" id="L2280">                    Utils.closeQuietly(indexCache, &quot;RemoteIndexCache&quot;);</span>
+<span class="nc" id="L2281">                    Utils.closeQuietly(remoteLogMetadataManagerPlugin, &quot;remoteLogMetadataManagerPlugin&quot;);</span>
+<span class="nc" id="L2282">                    Utils.closeQuietly(remoteStorageManagerPlugin, &quot;remoteStorageManagerPlugin&quot;);</span>
+<span class="nc" id="L2283">                    closed = true;</span>
+                } finally {
+<span class="nc" id="L2285">                    removeMetrics();</span>
+                }
+            }
+<span class="nc" id="L2288">        }</span>
+<span class="nc" id="L2289">    }</span>
+
+    private static void shutdownAndAwaitTermination(ExecutorService executor, String poolName, long timeout, TimeUnit timeUnit) {
+<span class="nc" id="L2292">        LOGGER.info(&quot;Shutting down {} executor&quot;, poolName);</span>
+<span class="nc" id="L2293">        ThreadUtils.shutdownExecutorServiceQuietly(executor, timeout, timeUnit);</span>
+<span class="nc" id="L2294">        LOGGER.info(&quot;{} executor shutdown completed&quot;, poolName);</span>
+<span class="nc" id="L2295">    }</span>
+
+    //Visible for testing
+    static ByteBuffer epochEntriesAsByteBuffer(List&lt;EpochEntry&gt; epochEntries) throws IOException {
+<span class="nc" id="L2299">        ByteArrayOutputStream stream = new ByteArrayOutputStream();</span>
+<span class="nc" id="L2300">        try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(stream, StandardCharsets.UTF_8))) {</span>
+<span class="nc" id="L2301">            CheckpointFile.CheckpointWriteBuffer&lt;EpochEntry&gt; writeBuffer =</span>
+                    new CheckpointFile.CheckpointWriteBuffer&lt;&gt;(writer, 0, LeaderEpochCheckpointFile.FORMATTER);
+<span class="nc" id="L2303">            writeBuffer.write(epochEntries);</span>
+<span class="nc" id="L2304">            writer.flush();</span>
+        }
+
+<span class="nc" id="L2307">        return ByteBuffer.wrap(stream.toByteArray());</span>
+    }
+
+    private void removeRemoteTopicPartitionMetrics(TopicIdPartition topicIdPartition) {
+<span class="nc" id="L2311">        String topic = topicIdPartition.topic();</span>
+<span class="nc bnc" id="L2312" title="All 2 branches missed.">        if (!brokerTopicStats.isTopicStatsExisted(topicIdPartition.topic())) {</span>
+            // The topic metrics are already removed, removing this topic key from broker-level metrics
+<span class="nc" id="L2314">            brokerTopicStats.removeBrokerLevelRemoteCopyLagBytes(topic);</span>
+<span class="nc" id="L2315">            brokerTopicStats.removeBrokerLevelRemoteCopyLagSegments(topic);</span>
+<span class="nc" id="L2316">            brokerTopicStats.removeBrokerLevelRemoteDeleteLagBytes(topic);</span>
+<span class="nc" id="L2317">            brokerTopicStats.removeBrokerLevelRemoteDeleteLagSegments(topic);</span>
+<span class="nc" id="L2318">            brokerTopicStats.removeBrokerLevelRemoteLogMetadataCount(topic);</span>
+<span class="nc" id="L2319">            brokerTopicStats.removeBrokerLevelRemoteLogSizeComputationTime(topic);</span>
+<span class="nc" id="L2320">            brokerTopicStats.removeBrokerLevelRemoteLogSizeBytes(topic);</span>
+        } else {
+<span class="nc" id="L2322">            int partition = topicIdPartition.partition();</span>
+            // remove the partition metric values and update the broker-level metrics
+<span class="nc" id="L2324">            brokerTopicStats.removeRemoteCopyLagBytes(topic, partition);</span>
+<span class="nc" id="L2325">            brokerTopicStats.removeRemoteCopyLagSegments(topic, partition);</span>
+<span class="nc" id="L2326">            brokerTopicStats.removeRemoteDeleteLagBytes(topic, partition);</span>
+<span class="nc" id="L2327">            brokerTopicStats.removeRemoteDeleteLagSegments(topic, partition);</span>
+<span class="nc" id="L2328">            brokerTopicStats.removeRemoteLogMetadataCount(topic, partition);</span>
+<span class="nc" id="L2329">            brokerTopicStats.removeRemoteLogSizeComputationTime(topic, partition);</span>
+<span class="nc" id="L2330">            brokerTopicStats.removeRemoteLogSizeBytes(topic, partition);</span>
+        }
+<span class="nc" id="L2332">    }</span>
+
+    //Visible for testing
+    RLMTaskWithFuture leaderCopyTask(TopicIdPartition partition) {
+<span class="nc" id="L2336">        return leaderCopyRLMTasks.get(partition);</span>
+    }
+    RLMTaskWithFuture leaderExpirationTask(TopicIdPartition partition) {
+<span class="nc" id="L2339">        return leaderExpirationRLMTasks.get(partition);</span>
+    }
+    RLMTaskWithFuture followerTask(TopicIdPartition partition) {
+<span class="nc" id="L2342">        return followerRLMTasks.get(partition);</span>
+    }
+
+    static class RLMScheduledThreadPool {
+
+<span class="nc" id="L2347">        private static final Logger LOGGER = LoggerFactory.getLogger(RLMScheduledThreadPool.class);</span>
+        private final String threadPoolName;
+        private final String threadNamePattern;
+        private final ScheduledThreadPoolExecutor scheduledThreadPool;
+
+<span class="nc" id="L2352">        public RLMScheduledThreadPool(int poolSize, String threadPoolName, String threadNamePattern) {</span>
+<span class="nc" id="L2353">            this.threadPoolName = threadPoolName;</span>
+<span class="nc" id="L2354">            this.threadNamePattern = threadNamePattern;</span>
+<span class="nc" id="L2355">            scheduledThreadPool = createPool(poolSize);</span>
+<span class="nc" id="L2356">        }</span>
+
+        public void setCorePoolSize(int newSize) {
+<span class="nc" id="L2359">            scheduledThreadPool.setCorePoolSize(newSize);</span>
+<span class="nc" id="L2360">        }</span>
+
+        public int getCorePoolSize() {
+<span class="nc" id="L2363">            return scheduledThreadPool.getCorePoolSize();</span>
+        }
+
+        private ScheduledThreadPoolExecutor createPool(int poolSize) {
+<span class="nc" id="L2367">            ThreadFactory threadFactory = ThreadUtils.createThreadFactory(threadNamePattern, true,</span>
+<span class="nc" id="L2368">                    (t, e) -&gt; LOGGER.error(&quot;Uncaught exception in thread '{}':&quot;, t.getName(), e));</span>
+<span class="nc" id="L2369">            ScheduledThreadPoolExecutor threadPool = new ScheduledThreadPoolExecutor(poolSize);</span>
+<span class="nc" id="L2370">            threadPool.setRemoveOnCancelPolicy(true);</span>
+<span class="nc" id="L2371">            threadPool.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);</span>
+<span class="nc" id="L2372">            threadPool.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);</span>
+<span class="nc" id="L2373">            threadPool.setThreadFactory(threadFactory);</span>
+<span class="nc" id="L2374">            return threadPool;</span>
+        }
+
+        public Double getIdlePercent() {
+<span class="nc" id="L2378">            return 1 - (double) scheduledThreadPool.getActiveCount() / (double) scheduledThreadPool.getCorePoolSize();</span>
+        }
+
+        public ScheduledFuture&lt;?&gt; scheduleWithFixedDelay(Runnable runnable, long initialDelay, long delay, TimeUnit timeUnit) {
+<span class="nc" id="L2382">            LOGGER.info(&quot;Scheduling runnable {} with initial delay: {}, fixed delay: {}&quot;, runnable, initialDelay, delay);</span>
+<span class="nc" id="L2383">            return scheduledThreadPool.scheduleWithFixedDelay(runnable, initialDelay, delay, timeUnit);</span>
+        }
+
+        public void close() {
+<span class="nc" id="L2387">            shutdownAndAwaitTermination(scheduledThreadPool, threadPoolName, 10, TimeUnit.SECONDS);</span>
+<span class="nc" id="L2388">        }</span>
+    }
+
+    // Visible for testing
+    public static class RetentionSizeData {
+        private final long retentionSize;
+        private final long remainingBreachedSize;
+
+<span class="nc" id="L2396">        public RetentionSizeData(long retentionSize, long remainingBreachedSize) {</span>
+<span class="nc bnc" id="L2397" title="All 2 branches missed.">            if (retentionSize &lt; 0)</span>
+<span class="nc" id="L2398">                throw new IllegalArgumentException(&quot;retentionSize should be non negative, but it is &quot; + retentionSize);</span>
+
+<span class="nc bnc" id="L2400" title="All 2 branches missed.">            if (remainingBreachedSize &lt;= 0) {</span>
+<span class="nc" id="L2401">                throw new IllegalArgumentException(&quot;remainingBreachedSize should be more than zero, but it is &quot; + remainingBreachedSize);</span>
+            }
+
+<span class="nc" id="L2404">            this.retentionSize = retentionSize;</span>
+<span class="nc" id="L2405">            this.remainingBreachedSize = remainingBreachedSize;</span>
+<span class="nc" id="L2406">        }</span>
+
+        long retentionSize() {
+<span class="nc" id="L2409">            return retentionSize;</span>
+        }
+
+        long remainingBreachedSize() {
+<span class="nc" id="L2413">            return remainingBreachedSize;</span>
+        }
+    }
+
+    // Visible for testing
+    public static class RetentionTimeData {
+
+        private final long retentionMs;
+        private final long cleanupUntilMs;
+
+<span class="nc" id="L2423">        public RetentionTimeData(long retentionMs, long cleanupUntilMs) {</span>
+<span class="nc bnc" id="L2424" title="All 2 branches missed.">            if (retentionMs &lt; 0)</span>
+<span class="nc" id="L2425">                throw new IllegalArgumentException(&quot;retentionMs should be non negative, but it is &quot; + retentionMs);</span>
+
+<span class="nc bnc" id="L2427" title="All 2 branches missed.">            if (cleanupUntilMs &lt; 0)</span>
+<span class="nc" id="L2428">                throw new IllegalArgumentException(&quot;cleanupUntilMs should be non negative, but it is &quot; + cleanupUntilMs);</span>
+
+<span class="nc" id="L2430">            this.retentionMs = retentionMs;</span>
+<span class="nc" id="L2431">            this.cleanupUntilMs = cleanupUntilMs;</span>
+<span class="nc" id="L2432">        }</span>
+    }
+
+    // Visible for testing
+    static class EnrichedLogSegment {
+        private final LogSegment logSegment;
+        private final long nextSegmentOffset;
+
+        public EnrichedLogSegment(LogSegment logSegment,
+<span class="nc" id="L2441">                                  long nextSegmentOffset) {</span>
+<span class="nc" id="L2442">            this.logSegment = logSegment;</span>
+<span class="nc" id="L2443">            this.nextSegmentOffset = nextSegmentOffset;</span>
+<span class="nc" id="L2444">        }</span>
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L2448" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L2449" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L2450">            EnrichedLogSegment that = (EnrichedLogSegment) o;</span>
+<span class="nc bnc" id="L2451" title="All 4 branches missed.">            return nextSegmentOffset == that.nextSegmentOffset &amp;&amp; Objects.equals(logSegment, that.logSegment);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L2456">            return Objects.hash(logSegment, nextSegmentOffset);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L2461">            return &quot;EnrichedLogSegment{&quot; +</span>
+                    &quot;logSegment=&quot; + logSegment +
+                    &quot;, nextSegmentOffset=&quot; + nextSegmentOffset +
+                    '}';
+        }
+    }
+
+    static class EnrichedRecordBatch {
+        private final RecordBatch batch;
+        private final int skippedBytes;
+
+<span class="nc" id="L2472">        public EnrichedRecordBatch(RecordBatch batch, int skippedBytes) {</span>
+<span class="nc" id="L2473">            this.batch = batch;</span>
+<span class="nc" id="L2474">            this.skippedBytes = skippedBytes;</span>
+<span class="nc" id="L2475">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

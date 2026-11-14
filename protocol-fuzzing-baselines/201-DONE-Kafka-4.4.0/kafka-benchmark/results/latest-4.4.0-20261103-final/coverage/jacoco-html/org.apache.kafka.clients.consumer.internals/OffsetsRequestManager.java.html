@@ -1,0 +1,1009 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OffsetsRequestManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">OffsetsRequestManager.java</span></div><h1>OffsetsRequestManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.ApiVersions;
+import org.apache.kafka.clients.Metadata;
+import org.apache.kafka.clients.NodeApiVersions;
+import org.apache.kafka.clients.StaleMetadataException;
+import org.apache.kafka.clients.consumer.LogTruncationException;
+import org.apache.kafka.clients.consumer.NoOffsetForPartitionException;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
+import org.apache.kafka.clients.consumer.internals.OffsetFetcherUtils.ListOffsetData;
+import org.apache.kafka.clients.consumer.internals.OffsetFetcherUtils.ListOffsetResult;
+import org.apache.kafka.common.ClusterResource;
+import org.apache.kafka.common.ClusterResourceListener;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.message.ListOffsetsRequestData;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.requests.ListOffsetsRequest;
+import org.apache.kafka.common.requests.ListOffsetsResponse;
+import org.apache.kafka.common.requests.OffsetsForLeaderEpochRequest;
+import org.apache.kafka.common.requests.OffsetsForLeaderEpochResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+
+import static java.util.Objects.requireNonNull;
+import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.maybeWrapAsKafkaException;
+import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.refreshCommittedOffsets;
+import static org.apache.kafka.clients.consumer.internals.OffsetFetcherUtils.hasUsableOffsetForLeaderEpochVersion;
+import static org.apache.kafka.clients.consumer.internals.OffsetFetcherUtils.regroupFetchPositionsByLeader;
+
+/**
+ * Manager responsible for building the following requests to retrieve partition offsets, and
+ * processing its responses.
+ * &lt;ul&gt;
+ *      &lt;li&gt;ListOffset request&lt;/li&gt;
+ *      &lt;li&gt;OffsetForLeaderEpoch request&lt;/li&gt;
+ * &lt;/ul&gt;
+ * Requests are kept in-memory ready to be sent on the next call to {@link #poll(long)}.
+ * &lt;br&gt;
+ * Partition leadership information required to build ListOffset requests is retrieved from the
+ * {@link ConsumerMetadata}, so this implements {@link ClusterResourceListener} to get notified
+ * when the cluster metadata is updated.
+ */
+public final class OffsetsRequestManager implements RequestManager, ClusterResourceListener {
+
+    private final ConsumerMetadata metadata;
+    private final IsolationLevel isolationLevel;
+    private final Logger log;
+    private final OffsetFetcherUtils offsetFetcherUtils;
+    private final SubscriptionState subscriptionState;
+
+    private final Set&lt;ListOffsetsRequestState&gt; requestsToRetry;
+    private final List&lt;NetworkClientDelegate.UnsentRequest&gt; requestsToSend;
+    private final int requestTimeoutMs;
+    private final Time time;
+    private final ApiVersions apiVersions;
+    private final NetworkClientDelegate networkClientDelegate;
+    private final CommitRequestManager commitRequestManager;
+    private final long defaultApiTimeoutMs;
+
+    /**
+     * Exception that occurred while updating positions after the triggering event had already
+     * expired. It will be propagated and cleared on the next call to update fetch positions.
+     */
+<span class="nc" id="L101">    private final AtomicReference&lt;Throwable&gt; cachedUpdatePositionsException = new AtomicReference&lt;&gt;();</span>
+
+    /**
+     * This holds the last OffsetFetch request triggered to retrieve committed offsets to update
+     * fetch positions that hasn't completed yet. When a response is received, it's used to
+     * update the fetch positions and the pendingOffsetFetchEvent is cleared. If the update fetch
+     * positions attempt runs out of time before this OffsetFetch gets a response, it will be
+     * kept to be used on the next attempt to update fetch positions (if partitions remain the same)
+     */
+    private PendingFetchCommittedRequest pendingOffsetFetchEvent;
+
+    public OffsetsRequestManager(final SubscriptionState subscriptionState,
+                                 final ConsumerMetadata metadata,
+                                 final IsolationLevel isolationLevel,
+                                 final Time time,
+                                 final long retryBackoffMs,
+                                 final int requestTimeoutMs,
+                                 final long defaultApiTimeoutMs,
+                                 final ApiVersions apiVersions,
+                                 final NetworkClientDelegate networkClientDelegate,
+                                 final CommitRequestManager commitRequestManager,
+                                 final PositionsValidator positionsValidator,
+<span class="nc" id="L123">                                 final LogContext logContext) {</span>
+<span class="nc" id="L124">        requireNonNull(subscriptionState);</span>
+<span class="nc" id="L125">        requireNonNull(metadata);</span>
+<span class="nc" id="L126">        requireNonNull(isolationLevel);</span>
+<span class="nc" id="L127">        requireNonNull(time);</span>
+<span class="nc" id="L128">        requireNonNull(apiVersions);</span>
+<span class="nc" id="L129">        requireNonNull(networkClientDelegate);</span>
+<span class="nc" id="L130">        requireNonNull(logContext);</span>
+
+<span class="nc" id="L132">        this.metadata = metadata;</span>
+<span class="nc" id="L133">        this.isolationLevel = isolationLevel;</span>
+<span class="nc" id="L134">        this.log = logContext.logger(getClass());</span>
+<span class="nc" id="L135">        this.requestsToRetry = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L136">        this.requestsToSend = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L137">        this.subscriptionState = subscriptionState;</span>
+<span class="nc" id="L138">        this.time = time;</span>
+<span class="nc" id="L139">        this.requestTimeoutMs = requestTimeoutMs;</span>
+<span class="nc" id="L140">        this.defaultApiTimeoutMs = defaultApiTimeoutMs;</span>
+<span class="nc" id="L141">        this.apiVersions = apiVersions;</span>
+<span class="nc" id="L142">        this.networkClientDelegate = networkClientDelegate;</span>
+<span class="nc" id="L143">        this.offsetFetcherUtils = new OffsetFetcherUtils(logContext, metadata, subscriptionState,</span>
+                time, retryBackoffMs, apiVersions, positionsValidator);
+        // Register the cluster metadata update callback. Note this only relies on the
+        // requestsToRetry initialized above, and won't be invoked until all managers are
+        // initialized and the network thread started.
+<span class="nc" id="L148">        this.metadata.addClusterUpdateListener(this);</span>
+<span class="nc" id="L149">        this.commitRequestManager = commitRequestManager;</span>
+<span class="nc" id="L150">    }</span>
+
+    private static class PendingFetchCommittedRequest {
+        final Set&lt;TopicPartition&gt; requestedPartitions;
+        final CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; result;
+
+        private PendingFetchCommittedRequest(final Set&lt;TopicPartition&gt; requestedPartitions,
+<span class="nc" id="L157">                                             final CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; result) {</span>
+<span class="nc" id="L158">            this.requestedPartitions = Objects.requireNonNull(requestedPartitions);</span>
+<span class="nc" id="L159">            this.result = Objects.requireNonNull(result);</span>
+<span class="nc" id="L160">        }</span>
+    }
+
+    /**
+     * Determine if there are pending fetch offsets requests to be sent and build a
+     * {@link NetworkClientDelegate.PollResult}
+     * containing it.
+     */
+    @Override
+    public NetworkClientDelegate.PollResult poll(final long currentTimeMs) {
+        // Copy the outgoing request list and clear it.
+<span class="nc" id="L171">        List&lt;NetworkClientDelegate.UnsentRequest&gt; unsentRequests = new ArrayList&lt;&gt;(requestsToSend);</span>
+<span class="nc" id="L172">        requestsToSend.clear();</span>
+<span class="nc" id="L173">        return new NetworkClientDelegate.PollResult(unsentRequests);</span>
+    }
+
+    /**
+     * Retrieve offsets for the given partitions and timestamp. For each partition, this will
+     * retrieve the offset of the first message whose timestamp is greater than or equals to the
+     * target timestamp.
+     *
+     * @param timestampsToSearch Partitions and target timestamps to get offsets for
+     * @param requireTimestamps  True if this should fail with an UnsupportedVersionException if the
+     *                           broker does not support fetching precise timestamps for offsets
+     * @return Future containing the map of {@link TopicPartition} and {@link OffsetAndTimestamp}
+     * found .The future will complete when the requests responses are received and
+     * processed, following a call to {@link #poll(long)}
+     */
+    public CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndTimestampInternal&gt;&gt; fetchOffsets(
+            Map&lt;TopicPartition, Long&gt; timestampsToSearch,
+            boolean requireTimestamps) {
+<span class="nc" id="L191">        return fetchOffsets(timestampsToSearch, requireTimestamps, false);</span>
+    }
+
+    private CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndTimestampInternal&gt;&gt; fetchOffsets(
+            Map&lt;TopicPartition, Long&gt; timestampsToSearch,
+            boolean requireTimestamps,
+            boolean oneShot) {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        if (timestampsToSearch.isEmpty()) {</span>
+<span class="nc" id="L199">            return CompletableFuture.completedFuture(Map.of());</span>
+        }
+<span class="nc" id="L201">        metadata.addTransientTopics(OffsetFetcherUtils.topicsForPartitions(timestampsToSearch.keySet()));</span>
+<span class="nc" id="L202">        ListOffsetsRequestState listOffsetsRequestState = new ListOffsetsRequestState(</span>
+                timestampsToSearch,
+                requireTimestamps,
+                offsetFetcherUtils,
+                isolationLevel,
+                oneShot);
+<span class="nc" id="L208">        listOffsetsRequestState.globalResult.whenComplete((result, error) -&gt; {</span>
+<span class="nc" id="L209">            metadata.clearTransientTopics();</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L211">                log.debug(&quot;Fetch offsets completed with error for partitions and timestamps {}.&quot;,</span>
+                        timestampsToSearch, error);
+            } else {
+<span class="nc" id="L214">                log.debug(&quot;Fetch offsets completed successfully for partitions and timestamps {}.&quot; +</span>
+                        &quot; Result {}&quot;, timestampsToSearch, result);
+            }
+<span class="nc" id="L217">        });</span>
+
+<span class="nc" id="L219">        prepareFetchOffsetsRequests(timestampsToSearch, requireTimestamps, listOffsetsRequestState);</span>
+<span class="nc" id="L220">        return listOffsetsRequestState.globalResult.thenApply(</span>
+<span class="nc" id="L221">                result -&gt; OffsetFetcherUtils.buildOffsetsForTimeInternalResult(</span>
+                        timestampsToSearch,
+                        result.fetchedOffsets));
+    }
+
+    /**
+     * Retrieve the consumer's lag on the given partition, i.e. the number of records between the consumer's
+     * position and the end of the partition (the high watermark, or the last stable offset when reading with
+     * {@link IsolationLevel#READ_COMMITTED}).
+     *
+     * &lt;p/&gt;
+     *
+     * If the end offset is not known, this issues a &lt;code&gt;LIST_OFFSETS&lt;/code&gt; request in the background so that
+     * the lag may be available on a subsequent call, and returns an empty result for now. Only one such request
+     * is allowed in flight per partition at a time; that is tracked by the 'end offset requested' flag in
+     * {@link SubscriptionState}, which is set here and cleared when the request completes, however it completes.
+     *
+     * @param topicPartition Partition to retrieve the lag for
+     * @param isolationLevel Isolation level the lag should be calculated against
+     * @return The lag, or empty if the end offset for the partition is not (yet) known
+     */
+    public OptionalLong currentLag(TopicPartition topicPartition, IsolationLevel isolationLevel) {
+<span class="nc" id="L243">        final Long lag = subscriptionState.partitionLag(topicPartition, isolationLevel);</span>
+
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if (lag == null) {</span>
+            // If the log end offset is unknown and there isn't already an in-flight list offset
+            // request, issue one with the goal that the lag will be available the next time the
+            // user calls currentLag().
+<span class="nc bnc" id="L249" title="All 2 branches missed.">            if (subscriptionState.partitionEndOffset(topicPartition, isolationLevel) == null &amp;&amp;</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">                offsetFetcherUtils.maybeSetPartitionEndOffsetRequest(topicPartition)) {</span>
+
+<span class="nc" id="L252">                Map&lt;TopicPartition, Long&gt; timestampToSearch = Map.of(</span>
+                    topicPartition,
+<span class="nc" id="L254">                    ListOffsetsRequest.LATEST_TIMESTAMP</span>
+                );
+
+                // The request is issued as 'one shot' so that it always completes rather than being retried
+                // internally on a metadata update. That keeps the 'end offset requested' flag clearing below
+                // reachable on every outcome, so a failed LIST_OFFSETS doesn't block all future lag lookups.
+                // A successful response clears the flag as a side effect of updating the subscription state,
+                // so the call below is a no-op in that case.
+<span class="nc" id="L262">                fetchOffsets(timestampToSearch, false, true).whenComplete((__, error) -&gt;</span>
+<span class="nc" id="L263">                    offsetFetcherUtils.clearPartitionEndOffsetRequests(Set.of(topicPartition)));</span>
+            }
+
+<span class="nc" id="L266">            return OptionalLong.empty();</span>
+        }
+
+<span class="nc" id="L269">        return OptionalLong.of(lag);</span>
+    }
+
+    /**
+     * Update fetch positions for assigned partitions that do not have a position. This will:
+     * &lt;ul&gt;
+     *     &lt;li&gt;check if all assigned partitions already have fetch positions and return right away if that's the case&lt;/li&gt;
+     *     &lt;li&gt;trigger an async request to validate positions (detect log truncation)&lt;/li&gt;
+     *     &lt;li&gt;fetch committed offsets if enabled, and use the response to update the positions&lt;/li&gt;
+     *     &lt;li&gt;fetch partition offsets for partitions that may still require a position, and use the response to
+     *     update the positions&lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * @param deadlineMs Time in milliseconds when the triggering application event expires. Any error received after
+     *                   this will be saved, and used to complete the result exceptionally on the next call to this
+     *                   function.
+     * @return Future that will complete with a boolean indicating if all assigned partitions have positions (based
+     * on {@link SubscriptionState#hasAllFetchPositions()}). It will complete immediately, with true, if all positions
+     * are already available. If some positions are missing, the future will complete once the offsets are retrieved and positions are updated.
+     */
+    public CompletableFuture&lt;Void&gt; updateFetchPositions(long deadlineMs) {
+<span class="nc" id="L290">        CompletableFuture&lt;Void&gt; result = new CompletableFuture&lt;&gt;();</span>
+
+        try {
+<span class="nc bnc" id="L293" title="All 2 branches missed.">            if (maybeCompleteWithPreviousException(result)) {</span>
+<span class="nc" id="L294">                return result;</span>
+            }
+
+<span class="nc" id="L297">            validatePositionsIfNeeded();</span>
+
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (subscriptionState.hasAllFetchPositions()) {</span>
+                // All positions are already available
+<span class="nc" id="L301">                result.complete(null);</span>
+<span class="nc" id="L302">                return result;</span>
+            }
+
+            // Some positions are missing, so trigger requests to fetch offsets and update them.
+<span class="nc" id="L306">            updatePositionsWithOffsets(deadlineMs).whenComplete((__, error) -&gt; {</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L308">                    result.completeExceptionally(error);</span>
+                } else {
+<span class="nc" id="L310">                    result.complete(null);</span>
+                }
+<span class="nc" id="L312">            });</span>
+
+<span class="nc" id="L314">        } catch (Exception e) {</span>
+<span class="nc" id="L315">            result.completeExceptionally(maybeWrapAsKafkaException(e));</span>
+<span class="nc" id="L316">        }</span>
+<span class="nc" id="L317">        return result;</span>
+    }
+
+    private boolean maybeCompleteWithPreviousException(CompletableFuture&lt;Void&gt; result) {
+<span class="nc" id="L321">        Throwable cachedException = cachedUpdatePositionsException.getAndSet(null);</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        if (cachedException != null) {</span>
+<span class="nc" id="L323">            result.completeExceptionally(cachedException);</span>
+<span class="nc" id="L324">            return true;</span>
+        }
+<span class="nc" id="L326">        return false;</span>
+    }
+
+    /**
+     * Generate requests to fetch offsets and update positions once a response is received. This will first attempt
+     * to use the committed offsets if available. If no committed offsets available, it will use the partition
+     * offsets retrieved from the leader.
+     */
+    private CompletableFuture&lt;Void&gt; updatePositionsWithOffsets(long deadlineMs) {
+<span class="nc" id="L335">        CompletableFuture&lt;Void&gt; result = new CompletableFuture&lt;&gt;();</span>
+
+<span class="nc" id="L337">        cacheExceptionIfEventExpired(result, deadlineMs);</span>
+
+        CompletableFuture&lt;Void&gt; updatePositions;
+<span class="nc" id="L340">        final Set&lt;TopicPartition&gt; initializingPartitions = subscriptionState.initializingPartitions();</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        if (commitRequestManager != null) {</span>
+<span class="nc" id="L342">            CompletableFuture&lt;Void&gt; refreshWithCommittedOffsets = initWithCommittedOffsetsIfNeeded(initializingPartitions, deadlineMs);</span>
+
+            // Reset positions for all partitions that may still require it (or that are awaiting reset)
+<span class="nc" id="L345">            updatePositions = refreshWithCommittedOffsets.thenCompose(__ -&gt; initWithPartitionOffsetsIfNeeded(initializingPartitions));</span>
+
+<span class="nc" id="L347">        } else {</span>
+<span class="nc" id="L348">            updatePositions = initWithPartitionOffsetsIfNeeded(initializingPartitions);</span>
+        }
+
+<span class="nc" id="L351">        updatePositions.whenComplete((__, resetError) -&gt; {</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            if (resetError == null) {</span>
+<span class="nc" id="L353">                result.complete(null);</span>
+            } else {
+<span class="nc" id="L355">                result.completeExceptionally(resetError);</span>
+            }
+<span class="nc" id="L357">        });</span>
+
+<span class="nc" id="L359">        return result;</span>
+    }
+
+    /**
+     * Save exception that may occur while updating fetch positions. Note that since the update fetch positions
+     * is triggered asynchronously, errors may be found when the triggering UpdateFetchPositionsEvent has already
+     * expired. In that case, the exception is saved in memory, to be thrown when processing the following
+     * UpdateFetchPositionsEvent.
+     *
+     * @param result     Update fetch positions future to get the exception from (if any)
+     * @param deadlineMs Deadline of the triggering application event, used to identify if the event has already
+     *                   expired when the error in the result future occurs.
+     */
+    private void cacheExceptionIfEventExpired(CompletableFuture&lt;Void&gt; result, long deadlineMs) {
+<span class="nc" id="L373">        result.whenComplete((__, error) -&gt; {</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">            boolean updatePositionsExpired = time.milliseconds() &gt;= deadlineMs;</span>
+<span class="nc bnc" id="L375" title="All 4 branches missed.">            if (error != null &amp;&amp; updatePositionsExpired) {</span>
+<span class="nc" id="L376">                cachedUpdatePositionsException.set(error);</span>
+            }
+<span class="nc" id="L378">        });</span>
+<span class="nc" id="L379">    }</span>
+
+    /**
+     * If there are partitions still needing a position and a reset policy is defined, request reset using the default policy.
+     *
+     * @param initializingPartitions Set of partitions that should be initialized. This won't reset positions for
+     *                               partitions that may have been added to the subscription state, but that are not
+     *                               included in this set.
+     * @return Future that will complete when the reset operation completes retrieving the offsets and setting
+     * positions in the subscription state using them.
+     * @throws NoOffsetForPartitionException If no reset strategy is configured.
+     */
+    private CompletableFuture&lt;Void&gt; initWithPartitionOffsetsIfNeeded(Set&lt;TopicPartition&gt; initializingPartitions) {
+<span class="nc" id="L392">        CompletableFuture&lt;Void&gt; result = new CompletableFuture&lt;&gt;();</span>
+        try {
+            // Mark partitions that need reset, using the configured reset strategy. If no
+            // strategy is defined, this will raise a NoOffsetForPartitionException exception.
+<span class="nc" id="L396">            subscriptionState.resetInitializingPositions(initializingPartitions::contains);</span>
+<span class="nc" id="L397">        } catch (Exception e) {</span>
+<span class="nc" id="L398">            result.completeExceptionally(e);</span>
+<span class="nc" id="L399">            return result;</span>
+<span class="nc" id="L400">        }</span>
+
+        // For partitions awaiting reset, generate a ListOffset request to retrieve the partition
+        // offsets according to the strategy (ex. earliest, latest), and update the positions.
+<span class="nc" id="L404">        return resetPositionsIfNeeded();</span>
+    }
+
+    /**
+     * Fetch the committed offsets for partitions that require initialization. This will trigger an OffsetFetch
+     * request and update positions in the subscription state once a response is received.
+     *
+     * @param initializingPartitions Set of partitions to update with a position. This same set will be kept
+     *                               throughout the whole process (considered when fetching committed offsets, and
+     *                               when resetting positions for partitions that may not have committed offsets).
+     * @param deadlineMs             Deadline of the application event that triggered this operation. Used to
+     *                               determine how much time to allow for the reused offset fetch to complete.
+     * @throws TimeoutException If offsets could not be retrieved within the timeout
+     */
+    private CompletableFuture&lt;Void&gt; initWithCommittedOffsetsIfNeeded(Set&lt;TopicPartition&gt; initializingPartitions,
+                                                                     long deadlineMs) {
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        if (initializingPartitions.isEmpty()) {</span>
+<span class="nc" id="L421">            return CompletableFuture.completedFuture(null);</span>
+        }
+
+<span class="nc" id="L424">        log.debug(&quot;Refreshing committed offsets for partitions {}&quot;, initializingPartitions);</span>
+<span class="nc" id="L425">        CompletableFuture&lt;Void&gt; result = new CompletableFuture&lt;&gt;();</span>
+
+        // The shorter the timeout provided to poll(), the more likely the offsets fetch will time out. To handle
+        // this case, on the first attempt to fetch the committed offsets, a FetchCommittedOffsetsEvent is created
+        // (with potentially a longer timeout) and stored. The event is used for the first attempt, but in the
+        // case it times out, subsequent attempts will also use the event in order to wait for the results.
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        if (!canReusePendingOffsetFetchEvent(initializingPartitions)) {</span>
+            // Generate a new OffsetFetch request and update positions when a response is received
+<span class="nc" id="L433">            final long fetchCommittedDeadlineMs = Math.max(deadlineMs, time.milliseconds() + defaultApiTimeoutMs);</span>
+<span class="nc" id="L434">            CompletableFuture&lt;CommitRequestManager.OffsetFetchResult&gt; fetchOffsets =</span>
+<span class="nc" id="L435">                    commitRequestManager.fetchOffsets(initializingPartitions, fetchCommittedDeadlineMs);</span>
+<span class="nc" id="L436">            CompletableFuture&lt;Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; fetchOffsetsAndRefresh =</span>
+<span class="nc" id="L437">                    fetchOffsets.thenApply(CommitRequestManager.OffsetFetchResult::toOffsetMapWithNulls)</span>
+<span class="nc" id="L438">                    .whenComplete((offsets, error) -&gt; {</span>
+<span class="nc" id="L439">                        pendingOffsetFetchEvent = null;</span>
+                        // Update positions with the retrieved offsets
+<span class="nc" id="L441">                        refreshOffsets(offsets, error, result);</span>
+<span class="nc" id="L442">                    });</span>
+<span class="nc" id="L443">            pendingOffsetFetchEvent = new PendingFetchCommittedRequest(initializingPartitions, fetchOffsetsAndRefresh);</span>
+<span class="nc" id="L444">        } else {</span>
+            // Reuse pending OffsetFetch request that will complete when positions are refreshed with the committed offsets retrieved
+<span class="nc" id="L446">            pendingOffsetFetchEvent.result.whenComplete((__, error) -&gt; {</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">                if (error == null) {</span>
+<span class="nc" id="L448">                    result.complete(null);</span>
+                } else {
+<span class="nc" id="L450">                    result.completeExceptionally(error);</span>
+                }
+<span class="nc" id="L452">            });</span>
+        }
+
+<span class="nc" id="L455">        return result;</span>
+    }
+
+    /**
+     * Use the given committed offsets to update positions for partitions that still require it.
+     *
+     * @param offsets Committed offsets to use to update positions for initializing partitions.
+     * @param error   Error received in response to the OffsetFetch request. Will be null if the request was successful.
+     * @param result  Future to complete once all positions have been updated with the given committed offsets
+     */
+    private void refreshOffsets(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets,
+                                final Throwable error,
+                                final CompletableFuture&lt;Void&gt; result) {
+<span class="nc bnc" id="L468" title="All 2 branches missed.">        if (error == null) {</span>
+
+            // Ensure we only set positions for the partitions that still require one (ex. some partitions may have
+            // been assigned a position manually)
+<span class="nc" id="L472">            Map&lt;TopicPartition, OffsetAndMetadata&gt; offsetsToApply = offsetsForInitializingPartitions(offsets);</span>
+
+<span class="nc" id="L474">            refreshCommittedOffsets(offsetsToApply, metadata, subscriptionState);</span>
+
+<span class="nc" id="L476">            result.complete(null);</span>
+
+<span class="nc" id="L478">        } else {</span>
+<span class="nc" id="L479">            log.error(&quot;Error fetching committed offsets to update positions&quot;, error);</span>
+<span class="nc" id="L480">            result.completeExceptionally(error);</span>
+        }
+<span class="nc" id="L482">    }</span>
+
+    /**
+     * Get the offsets, from the given collection, that belong to partitions that still require a position (partitions
+     * that are initializing). This is expected to be used to filter out offsets that were retrieved for partitions
+     * that do not need a position anymore.
+     *
+     * @param offsets Offsets per partition
+     * @return Subset of the offsets associated to partitions that are still initializing
+     */
+    private Map&lt;TopicPartition, OffsetAndMetadata&gt; offsetsForInitializingPartitions(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets) {
+<span class="nc" id="L493">        Set&lt;TopicPartition&gt; currentlyInitializingPartitions = subscriptionState.initializingPartitions();</span>
+<span class="nc" id="L494">        Map&lt;TopicPartition, OffsetAndMetadata&gt; result = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L495">        offsets.forEach((key, value) -&gt; {</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">            if (currentlyInitializingPartitions.contains(key)) {</span>
+<span class="nc" id="L497">                result.put(key, value);</span>
+            }
+<span class="nc" id="L499">        });</span>
+<span class="nc" id="L500">        return result;</span>
+    }
+
+    /**
+     * This determines if the {@link #pendingOffsetFetchEvent pending offset fetch event} can be reused. Reuse
+     * is only possible if all the following conditions are true:
+     *
+     * &lt;ul&gt;
+     *     &lt;li&gt;A pending offset fetch event exists&lt;/li&gt;
+     *     &lt;li&gt;The partition set of the pending offset fetch event is the same as the given partitions&lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+    private boolean canReusePendingOffsetFetchEvent(Set&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        if (pendingOffsetFetchEvent == null) {</span>
+<span class="nc" id="L514">            return false;</span>
+        }
+
+<span class="nc" id="L517">        return pendingOffsetFetchEvent.requestedPartitions.equals(partitions);</span>
+    }
+
+    /**
+     * Reset offsets for all assigned partitions that require it. Offsets will be reset
+     * with timestamps according to the reset strategy defined for each partition. This will
+     * generate ListOffsets requests for the partitions and timestamps, and enqueue them to be sent
+     * on the next call to {@link #poll(long)}.
+     * &lt;p/&gt;
+     * When a response is received, positions are updated in-memory, on the subscription state. If
+     * an error is received in the response, it will be saved to be thrown on the next call to
+     * this function (ex. {@link org.apache.kafka.common.errors.TopicAuthorizationException})
+     */
+    CompletableFuture&lt;Void&gt; resetPositionsIfNeeded() {
+        Map&lt;TopicPartition, AutoOffsetResetStrategy&gt; partitionAutoOffsetResetStrategyMap;
+
+        try {
+<span class="nc" id="L534">            partitionAutoOffsetResetStrategyMap = offsetFetcherUtils.getOffsetResetStrategyForPartitions();</span>
+<span class="nc" id="L535">        } catch (Exception e) {</span>
+<span class="nc" id="L536">            CompletableFuture&lt;Void&gt; result = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L537">            result.completeExceptionally(e);</span>
+<span class="nc" id="L538">            return result;</span>
+<span class="nc" id="L539">        }</span>
+
+<span class="nc bnc" id="L541" title="All 2 branches missed.">        if (partitionAutoOffsetResetStrategyMap.isEmpty())</span>
+<span class="nc" id="L542">            return CompletableFuture.completedFuture(null);</span>
+
+<span class="nc" id="L544">        return sendListOffsetsRequestsAndResetPositions(partitionAutoOffsetResetStrategyMap);</span>
+    }
+
+    /**
+     * Validate positions for all assigned partitions for which a leader change has been detected.
+     * This will generate OffsetsForLeaderEpoch requests for the partitions, with the known offset
+     * epoch and current leader epoch. It will enqueue the generated requests, to be sent on the
+     * next call to {@link #poll(long)}.
+     *
+     * &lt;p/&gt;
+     *
+     * When a response is received, positions are validated and, if a log truncation is detected, a
+     * {@link LogTruncationException} will be saved in memory in cachedUpdatePositionsException, to be thrown on the
+     * next call to this function.
+     */
+    void validatePositionsIfNeeded() {
+<span class="nc" id="L560">        Map&lt;TopicPartition, SubscriptionState.FetchPosition&gt; partitionsToValidate = offsetFetcherUtils.refreshAndGetPartitionsToValidate();</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">        if (partitionsToValidate.isEmpty()) {</span>
+<span class="nc" id="L562">            return;</span>
+        }
+
+<span class="nc" id="L565">        sendOffsetsForLeaderEpochRequestsAndValidatePositions(partitionsToValidate);</span>
+<span class="nc" id="L566">    }</span>
+
+    /**
+     * Generate requests for partitions with known leaders. Update the listOffsetsRequestState by adding
+     * partitions with unknown leader to the listOffsetsRequestState.remainingToSearch
+     */
+    private void prepareFetchOffsetsRequests(final Map&lt;TopicPartition, Long&gt; timestampsToSearch,
+                                             final boolean requireTimestamps,
+                                             final ListOffsetsRequestState listOffsetsRequestState) {
+        try {
+<span class="nc" id="L576">            List&lt;NetworkClientDelegate.UnsentRequest&gt; unsentRequests = buildListOffsetsRequests(</span>
+                    timestampsToSearch, requireTimestamps, listOffsetsRequestState);
+<span class="nc" id="L578">            requestsToSend.addAll(unsentRequests);</span>
+<span class="nc" id="L579">        } catch (StaleMetadataException e) {</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">            if (listOffsetsRequestState.oneShot)</span>
+<span class="nc" id="L581">                listOffsetsRequestState.completeWithResultSoFar();</span>
+            else
+<span class="nc" id="L583">                requestsToRetry.add(listOffsetsRequestState);</span>
+<span class="nc" id="L584">        }</span>
+<span class="nc" id="L585">    }</span>
+
+    @Override
+    public void onUpdate(ClusterResource clusterResource) {
+        // Retry requests that were awaiting a metadata update. Process a copy of the list to
+        // avoid errors, given that the list of requestsToRetry may be modified from the
+        // fetchOffsetsByTimes call if any of the requests being retried fails
+<span class="nc" id="L592">        List&lt;ListOffsetsRequestState&gt; requestsToProcess = new ArrayList&lt;&gt;(requestsToRetry);</span>
+<span class="nc" id="L593">        requestsToRetry.clear();</span>
+<span class="nc" id="L594">        requestsToProcess.forEach(requestState -&gt; {</span>
+<span class="nc" id="L595">            Map&lt;TopicPartition, Long&gt; timestampsToSearch =</span>
+                    new HashMap&lt;&gt;(requestState.remainingToSearch);
+<span class="nc" id="L597">            requestState.remainingToSearch.clear();</span>
+<span class="nc" id="L598">            prepareFetchOffsetsRequests(timestampsToSearch, requestState.requireTimestamps, requestState);</span>
+<span class="nc" id="L599">        });</span>
+<span class="nc" id="L600">    }</span>
+
+    /**
+     * Build ListOffsets requests to fetch offsets by target times for the specified partitions.
+     *
+     * @param timestampsToSearch the mapping between partitions and target time
+     * @param requireTimestamps  true if we should fail with an UnsupportedVersionException if the broker does
+     *                           not support fetching precise timestamps for offsets
+     * @return A list of
+     * {@link org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.UnsentRequest}
+     * that can be polled to obtain the corresponding timestamps and offsets.
+     */
+    private List&lt;NetworkClientDelegate.UnsentRequest&gt; buildListOffsetsRequests(
+            final Map&lt;TopicPartition, Long&gt; timestampsToSearch,
+            final boolean requireTimestamps,
+            final ListOffsetsRequestState listOffsetsRequestState) {
+<span class="nc" id="L616">        log.debug(&quot;Building ListOffsets request for partitions {}&quot;, timestampsToSearch);</span>
+<span class="nc" id="L617">        Map&lt;Node, Map&lt;TopicPartition, ListOffsetsRequestData.ListOffsetsPartition&gt;&gt; timestampsToSearchByNode =</span>
+<span class="nc" id="L618">                groupListOffsetRequests(timestampsToSearch, Optional.of(listOffsetsRequestState));</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">        if (timestampsToSearchByNode.isEmpty()) {</span>
+<span class="nc" id="L620">            throw new StaleMetadataException();</span>
+        }
+
+<span class="nc" id="L623">        final List&lt;NetworkClientDelegate.UnsentRequest&gt; unsentRequests = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L624">        MultiNodeRequest multiNodeRequest = new MultiNodeRequest(timestampsToSearchByNode.size());</span>
+<span class="nc" id="L625">        multiNodeRequest.onComplete((multiNodeResult, error) -&gt; {</span>
+            // Done sending request to a set of known leaders
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            if (error == null) {</span>
+<span class="nc" id="L628">                listOffsetsRequestState.fetchedOffsets.putAll(multiNodeResult.fetchedOffsets);</span>
+<span class="nc" id="L629">                listOffsetsRequestState.addPartitionsToRetry(multiNodeResult.partitionsToRetry);</span>
+<span class="nc" id="L630">                offsetFetcherUtils.updateSubscriptionState(multiNodeResult.fetchedOffsets,</span>
+                        isolationLevel);
+
+<span class="nc bnc" id="L633" title="All 4 branches missed.">                if (listOffsetsRequestState.remainingToSearch.isEmpty() || listOffsetsRequestState.oneShot) {</span>
+<span class="nc" id="L634">                    listOffsetsRequestState.completeWithResultSoFar();</span>
+                } else {
+<span class="nc" id="L636">                    requestsToRetry.add(listOffsetsRequestState);</span>
+<span class="nc" id="L637">                    metadata.requestUpdate(false);</span>
+                }
+            } else {
+<span class="nc" id="L640">                log.debug(&quot;ListOffsets request failed with error&quot;, error);</span>
+<span class="nc" id="L641">                listOffsetsRequestState.globalResult.completeExceptionally(error);</span>
+            }
+<span class="nc" id="L643">        });</span>
+
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        for (Map.Entry&lt;Node, Map&lt;TopicPartition, ListOffsetsRequestData.ListOffsetsPartition&gt;&gt; entry : timestampsToSearchByNode.entrySet()) {</span>
+<span class="nc" id="L646">            Node node = entry.getKey();</span>
+<span class="nc" id="L647">            CompletableFuture&lt;ListOffsetResult&gt; partialResult = buildListOffsetRequestToNode(</span>
+                    node,
+<span class="nc" id="L649">                    entry.getValue(),</span>
+                    requireTimestamps,
+                    unsentRequests);
+
+<span class="nc" id="L653">            partialResult.whenComplete((result, error) -&gt; {</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L655">                    multiNodeRequest.resultFuture.completeExceptionally(error);</span>
+                } else {
+<span class="nc" id="L657">                    multiNodeRequest.addPartialResult(result);</span>
+                }
+<span class="nc" id="L659">            });</span>
+<span class="nc" id="L660">        }</span>
+<span class="nc" id="L661">        return unsentRequests;</span>
+    }
+
+    /**
+     * Build ListOffsets request to send to a specific broker for the partitions and
+     * target timestamps. This also adds the request to the list of unsentRequests.
+     */
+    private CompletableFuture&lt;ListOffsetResult&gt; buildListOffsetRequestToNode(
+            Node node,
+            Map&lt;TopicPartition, ListOffsetsRequestData.ListOffsetsPartition&gt; targetTimes,
+            boolean requireTimestamps,
+            List&lt;NetworkClientDelegate.UnsentRequest&gt; unsentRequests) {
+<span class="nc" id="L673">        ListOffsetsRequest.Builder builder = ListOffsetsRequest.Builder</span>
+<span class="nc" id="L674">                .forConsumer(requireTimestamps, isolationLevel)</span>
+<span class="nc" id="L675">                .setTargetTimes(ListOffsetsRequest.toListOffsetsTopics(targetTimes))</span>
+<span class="nc" id="L676">                .setTimeoutMs(requestTimeoutMs);</span>
+
+<span class="nc" id="L678">        log.debug(&quot;Creating ListOffset request {} for broker {} to reset positions&quot;, builder,</span>
+                node);
+
+<span class="nc" id="L681">        NetworkClientDelegate.UnsentRequest unsentRequest = new NetworkClientDelegate.UnsentRequest(</span>
+                builder,
+<span class="nc" id="L683">                Optional.ofNullable(node));</span>
+<span class="nc" id="L684">        unsentRequests.add(unsentRequest);</span>
+<span class="nc" id="L685">        CompletableFuture&lt;ListOffsetResult&gt; result = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L686">        unsentRequest.whenComplete((response, error) -&gt; {</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L688">                log.debug(&quot;Sending ListOffset request {} to broker {} failed&quot;,</span>
+                        builder,
+                        node,
+                        error);
+<span class="nc" id="L692">                result.completeExceptionally(error);</span>
+            } else {
+<span class="nc" id="L694">                ListOffsetsResponse lor = (ListOffsetsResponse) response.responseBody();</span>
+<span class="nc" id="L695">                log.trace(&quot;Received ListOffsetResponse {} from broker {}&quot;, lor, node);</span>
+                try {
+<span class="nc" id="L697">                    ListOffsetResult listOffsetResult = offsetFetcherUtils.handleListOffsetResponse(lor);</span>
+<span class="nc" id="L698">                    result.complete(listOffsetResult);</span>
+<span class="nc" id="L699">                } catch (RuntimeException e) {</span>
+<span class="nc" id="L700">                    result.completeExceptionally(e);</span>
+<span class="nc" id="L701">                }</span>
+            }
+<span class="nc" id="L703">        });</span>
+<span class="nc" id="L704">        return result;</span>
+    }
+
+    /**
+     * Make asynchronous ListOffsets request to fetch offsets by target times for the specified
+     * partitions. Use the retrieved offsets to reset positions in the subscription state.
+     * This also adds the request to the list of unsentRequests.
+     *
+     * @param partitionAutoOffsetResetStrategyMap the mapping between partitions and AutoOffsetResetStrategy
+     * @return A {@link CompletableFuture} which completes when the requests are
+     * complete.
+     */
+    private CompletableFuture&lt;Void&gt; sendListOffsetsRequestsAndResetPositions(
+            final Map&lt;TopicPartition, AutoOffsetResetStrategy&gt; partitionAutoOffsetResetStrategyMap) {
+<span class="nc" id="L718">        Map&lt;TopicPartition, Long&gt; timestampsToSearch = partitionAutoOffsetResetStrategyMap.entrySet().stream()</span>
+<span class="nc" id="L719">                .collect(Collectors.toMap(Map.Entry::getKey, e -&gt; e.getValue().timestamp().get()));</span>
+<span class="nc" id="L720">        Map&lt;Node, Map&lt;TopicPartition, ListOffsetsRequestData.ListOffsetsPartition&gt;&gt; timestampsToSearchByNode =</span>
+<span class="nc" id="L721">                groupListOffsetRequests(timestampsToSearch, Optional.empty());</span>
+
+<span class="nc" id="L723">        final AtomicInteger expectedResponses = new AtomicInteger(0);</span>
+<span class="nc" id="L724">        final CompletableFuture&lt;Void&gt; globalResult = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L725">        final List&lt;NetworkClientDelegate.UnsentRequest&gt; unsentRequests = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L727">        timestampsToSearchByNode.forEach((node, resetTimestamps) -&gt; {</span>
+<span class="nc" id="L728">            subscriptionState.setNextAllowedRetry(resetTimestamps.keySet(),</span>
+<span class="nc" id="L729">                    time.milliseconds() + requestTimeoutMs);</span>
+
+<span class="nc" id="L731">            CompletableFuture&lt;ListOffsetResult&gt; partialResult = buildListOffsetRequestToNode(</span>
+                    node,
+                    resetTimestamps,
+                    false,
+                    unsentRequests);
+
+<span class="nc" id="L737">            partialResult.whenComplete((result, error) -&gt; {</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">                if (error == null) {</span>
+<span class="nc" id="L739">                    offsetFetcherUtils.onSuccessfulResponseForResettingPositions(result,</span>
+                            partitionAutoOffsetResetStrategyMap);
+                } else {
+                    RuntimeException e;
+<span class="nc bnc" id="L743" title="All 2 branches missed.">                    if (error instanceof RuntimeException) {</span>
+<span class="nc" id="L744">                        e = (RuntimeException) error;</span>
+                    } else {
+<span class="nc" id="L746">                        e = new RuntimeException(&quot;Unexpected failure in ListOffsets request for &quot; +</span>
+                                &quot;resetting positions&quot;, error);
+                    }
+<span class="nc" id="L749">                    offsetFetcherUtils.onFailedResponseForResettingPositions(resetTimestamps, e);</span>
+                }
+<span class="nc bnc" id="L751" title="All 2 branches missed.">                if (expectedResponses.decrementAndGet() == 0) {</span>
+<span class="nc" id="L752">                    globalResult.complete(null);</span>
+                }
+<span class="nc" id="L754">            });</span>
+<span class="nc" id="L755">        });</span>
+
+<span class="nc bnc" id="L757" title="All 2 branches missed.">        if (unsentRequests.isEmpty()) {</span>
+<span class="nc" id="L758">            globalResult.complete(null);</span>
+        } else {
+<span class="nc" id="L760">            expectedResponses.set(unsentRequests.size());</span>
+<span class="nc" id="L761">            requestsToSend.addAll(unsentRequests);</span>
+        }
+
+<span class="nc" id="L764">        return globalResult;</span>
+    }
+
+    /**
+     * For each partition that needs validation, make an asynchronous request to get the end-offsets
+     * for the partition with the epoch less than or equal to the epoch the partition last saw.
+     * &lt;p/&gt;
+     * Requests are grouped by Node for efficiency.
+     * This also adds the request to the list of unsentRequests.
+     *
+     * @param partitionsToValidate a map of topic-partition positions to validate
+
+     */
+    private void sendOffsetsForLeaderEpochRequestsAndValidatePositions(
+            Map&lt;TopicPartition, SubscriptionState.FetchPosition&gt; partitionsToValidate) {
+
+<span class="nc" id="L780">        final Map&lt;Node, Map&lt;TopicPartition, SubscriptionState.FetchPosition&gt;&gt; regrouped =</span>
+<span class="nc" id="L781">                regroupFetchPositionsByLeader(partitionsToValidate);</span>
+
+<span class="nc" id="L783">        long nextResetTimeMs = time.milliseconds() + requestTimeoutMs;</span>
+<span class="nc" id="L784">        final List&lt;NetworkClientDelegate.UnsentRequest&gt; unsentRequests = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L785">        regrouped.forEach((node, fetchPositions) -&gt; {</span>
+
+<span class="nc bnc" id="L787" title="All 2 branches missed.">            if (node.isEmpty()) {</span>
+<span class="nc" id="L788">                metadata.requestUpdate(true);</span>
+<span class="nc" id="L789">                return;</span>
+            }
+
+<span class="nc" id="L792">            NodeApiVersions nodeApiVersions = apiVersions.get(node.idString());</span>
+<span class="nc bnc" id="L793" title="All 2 branches missed.">            if (nodeApiVersions == null) {</span>
+<span class="nc" id="L794">                networkClientDelegate.tryConnect(node);</span>
+<span class="nc" id="L795">                return;</span>
+            }
+
+<span class="nc bnc" id="L798" title="All 2 branches missed.">            if (!hasUsableOffsetForLeaderEpochVersion(nodeApiVersions)) {</span>
+<span class="nc" id="L799">                log.debug(&quot;Skipping validation of fetch offsets for partitions {} since the broker does not &quot; +</span>
+                                &quot;support the required protocol version (introduced in Kafka 2.3)&quot;,
+<span class="nc" id="L801">                        fetchPositions.keySet());</span>
+<span class="nc bnc" id="L802" title="All 2 branches missed.">                for (TopicPartition partition : fetchPositions.keySet()) {</span>
+<span class="nc" id="L803">                    subscriptionState.completeValidation(partition);</span>
+<span class="nc" id="L804">                }</span>
+<span class="nc" id="L805">                return;</span>
+            }
+
+<span class="nc" id="L808">            subscriptionState.setNextAllowedRetry(fetchPositions.keySet(), nextResetTimeMs);</span>
+
+<span class="nc" id="L810">            CompletableFuture&lt;OffsetsForLeaderEpochUtils.OffsetForEpochResult&gt; partialResult =</span>
+<span class="nc" id="L811">                    buildOffsetsForLeaderEpochRequestToNode(node, fetchPositions, unsentRequests);</span>
+
+<span class="nc" id="L813">            partialResult.whenComplete((offsetsResult, error) -&gt; {</span>
+<span class="nc bnc" id="L814" title="All 2 branches missed.">                if (error == null) {</span>
+<span class="nc" id="L815">                    offsetFetcherUtils.onSuccessfulResponseForValidatingPositions(fetchPositions,</span>
+                            offsetsResult);
+                } else {
+                    RuntimeException e;
+<span class="nc bnc" id="L819" title="All 2 branches missed.">                    if (error instanceof RuntimeException) {</span>
+<span class="nc" id="L820">                        e = (RuntimeException) error;</span>
+                    } else {
+<span class="nc" id="L822">                        e = new RuntimeException(&quot;Unexpected failure in OffsetsForLeaderEpoch &quot; +</span>
+                                &quot;request for validating positions&quot;, error);
+                    }
+<span class="nc" id="L825">                    offsetFetcherUtils.onFailedResponseForValidatingPositions(fetchPositions, e);</span>
+                }
+<span class="nc" id="L827">            });</span>
+<span class="nc" id="L828">        });</span>
+
+<span class="nc" id="L830">        requestsToSend.addAll(unsentRequests);</span>
+<span class="nc" id="L831">    }</span>
+
+    /**
+     * Build OffsetsForLeaderEpoch request to send to a specific broker for the partitions and
+     * positions to fetch. This also adds the request to the list of unsentRequests.
+     */
+    private CompletableFuture&lt;OffsetsForLeaderEpochUtils.OffsetForEpochResult&gt; buildOffsetsForLeaderEpochRequestToNode(
+            final Node node,
+            final Map&lt;TopicPartition, SubscriptionState.FetchPosition&gt; fetchPositions,
+            List&lt;NetworkClientDelegate.UnsentRequest&gt; unsentRequests) {
+<span class="nc" id="L841">        AbstractRequest.Builder&lt;OffsetsForLeaderEpochRequest&gt; builder =</span>
+<span class="nc" id="L842">                OffsetsForLeaderEpochUtils.prepareRequest(fetchPositions);</span>
+
+<span class="nc" id="L844">        log.debug(&quot;Creating OffsetsForLeaderEpoch request request {} to broker {}&quot;, builder, node);</span>
+
+<span class="nc" id="L846">        NetworkClientDelegate.UnsentRequest unsentRequest = new NetworkClientDelegate.UnsentRequest(</span>
+                builder,
+<span class="nc" id="L848">                Optional.ofNullable(node));</span>
+<span class="nc" id="L849">        unsentRequests.add(unsentRequest);</span>
+<span class="nc" id="L850">        CompletableFuture&lt;OffsetsForLeaderEpochUtils.OffsetForEpochResult&gt; result = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L851">        unsentRequest.whenComplete((response, error) -&gt; {</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L853">                log.debug(&quot;Sending OffsetsForLeaderEpoch request {} to broker {} failed&quot;,</span>
+                        builder,
+                        node,
+                        error);
+<span class="nc" id="L857">                result.completeExceptionally(error);</span>
+            } else {
+<span class="nc" id="L859">                OffsetsForLeaderEpochResponse offsetsForLeaderEpochResponse = (OffsetsForLeaderEpochResponse) response.responseBody();</span>
+<span class="nc" id="L860">                log.trace(&quot;Received OffsetsForLeaderEpoch response {} from broker {}&quot;, offsetsForLeaderEpochResponse, node);</span>
+                try {
+<span class="nc" id="L862">                    OffsetsForLeaderEpochUtils.OffsetForEpochResult listOffsetResult =</span>
+<span class="nc" id="L863">                            OffsetsForLeaderEpochUtils.handleResponse(fetchPositions, offsetsForLeaderEpochResponse);</span>
+<span class="nc" id="L864">                    result.complete(listOffsetResult);</span>
+<span class="nc" id="L865">                } catch (RuntimeException e) {</span>
+<span class="nc" id="L866">                    result.completeExceptionally(e);</span>
+<span class="nc" id="L867">                }</span>
+            }
+<span class="nc" id="L869">        });</span>
+<span class="nc" id="L870">        return result;</span>
+    }
+
+    private static class ListOffsetsRequestState {
+
+        private final Map&lt;TopicPartition, Long&gt; timestampsToSearch;
+        private final Map&lt;TopicPartition, ListOffsetData&gt; fetchedOffsets;
+        private final Map&lt;TopicPartition, Long&gt; remainingToSearch;
+        private final CompletableFuture&lt;ListOffsetResult&gt; globalResult;
+        final boolean requireTimestamps;
+        final OffsetFetcherUtils offsetFetcherUtils;
+        final IsolationLevel isolationLevel;
+
+        /**
+         * If true, this request is never held back to be retried on a metadata update. It completes on the
+         * first attempt with whatever offsets were retrieved, leaving it to the caller to decide whether to
+         * issue another request. This is used by
+         * {@link OffsetsRequestManager#currentLag(TopicPartition, IsolationLevel)}, which relies on the
+         * request always completing in order to clear its 'end offset requested' flag.
+         */
+        final boolean oneShot;
+
+        private ListOffsetsRequestState(Map&lt;TopicPartition, Long&gt; timestampsToSearch,
+                                        boolean requireTimestamps,
+                                        OffsetFetcherUtils offsetFetcherUtils,
+                                        IsolationLevel isolationLevel,
+<span class="nc" id="L896">                                        boolean oneShot) {</span>
+<span class="nc" id="L897">            remainingToSearch = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L898">            fetchedOffsets = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L899">            globalResult = new CompletableFuture&lt;&gt;();</span>
+
+<span class="nc" id="L901">            this.timestampsToSearch = timestampsToSearch;</span>
+<span class="nc" id="L902">            this.requireTimestamps = requireTimestamps;</span>
+<span class="nc" id="L903">            this.offsetFetcherUtils = offsetFetcherUtils;</span>
+<span class="nc" id="L904">            this.isolationLevel = isolationLevel;</span>
+<span class="nc" id="L905">            this.oneShot = oneShot;</span>
+<span class="nc" id="L906">        }</span>
+
+        private void addPartitionsToRetry(Set&lt;TopicPartition&gt; partitionsToRetry) {
+<span class="nc" id="L909">            remainingToSearch.putAll(partitionsToRetry.stream()</span>
+<span class="nc" id="L910">                    .collect(Collectors.toMap(tp -&gt; tp, timestampsToSearch::get)));</span>
+<span class="nc" id="L911">        }</span>
+
+        /**
+         * Completes {@link #globalResult} with the offsets retrieved so far, reporting any partitions that
+         * are still outstanding as partitions to retry.
+         */
+        private void completeWithResultSoFar() {
+<span class="nc" id="L918">            globalResult.complete(new ListOffsetResult(fetchedOffsets, remainingToSearch.keySet()));</span>
+<span class="nc" id="L919">        }</span>
+    }
+
+    private static class MultiNodeRequest {
+        final Map&lt;TopicPartition, ListOffsetData&gt; fetchedTimestampOffsets;
+        final Set&lt;TopicPartition&gt; partitionsToRetry;
+        final AtomicInteger expectedResponses;
+        final CompletableFuture&lt;ListOffsetResult&gt; resultFuture;
+
+<span class="nc" id="L928">        private MultiNodeRequest(int nodeCount) {</span>
+<span class="nc" id="L929">            fetchedTimestampOffsets = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L930">            partitionsToRetry = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L931">            expectedResponses = new AtomicInteger(nodeCount);</span>
+<span class="nc" id="L932">            resultFuture = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L933">        }</span>
+
+        private void onComplete(BiConsumer&lt;? super ListOffsetResult, ? super Throwable&gt; action) {
+<span class="nc" id="L936">            resultFuture.whenComplete(action);</span>
+<span class="nc" id="L937">        }</span>
+
+        private void addPartialResult(ListOffsetResult partialResult) {
+            try {
+<span class="nc" id="L941">                fetchedTimestampOffsets.putAll(partialResult.fetchedOffsets);</span>
+<span class="nc" id="L942">                partitionsToRetry.addAll(partialResult.partitionsToRetry);</span>
+
+<span class="nc bnc" id="L944" title="All 2 branches missed.">                if (expectedResponses.decrementAndGet() == 0) {</span>
+<span class="nc" id="L945">                    ListOffsetResult result =</span>
+                            new ListOffsetResult(fetchedTimestampOffsets,
+                                    partitionsToRetry);
+<span class="nc" id="L948">                    resultFuture.complete(result);</span>
+                }
+<span class="nc" id="L950">            } catch (RuntimeException e) {</span>
+<span class="nc" id="L951">                resultFuture.completeExceptionally(e);</span>
+<span class="nc" id="L952">            }</span>
+<span class="nc" id="L953">        }</span>
+    }
+
+    /**
+     * Group partitions by leader. Topic partitions from `timestampsToSearch` for which
+     * the leader is not known are kept as `remainingToSearch` in the `listOffsetsRequestState`
+     *
+     * @param timestampsToSearch      The mapping from partitions to the target timestamps
+     * @param listOffsetsRequestState Optional request state that will be extended by adding to its
+     *                                `remainingToSearch` map all partitions for which the
+     *                                request cannot be performed due to unknown leader (need
+     *                                metadata update).
+     */
+    private Map&lt;Node, Map&lt;TopicPartition, ListOffsetsRequestData.ListOffsetsPartition&gt;&gt; groupListOffsetRequests(
+            final Map&lt;TopicPartition, Long&gt; timestampsToSearch,
+            final Optional&lt;ListOffsetsRequestState&gt; listOffsetsRequestState) {
+<span class="nc" id="L969">        final Map&lt;TopicPartition, ListOffsetsRequestData.ListOffsetsPartition&gt; partitionDataMap = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L970" title="All 2 branches missed.">        for (Map.Entry&lt;TopicPartition, Long&gt; entry : timestampsToSearch.entrySet()) {</span>
+<span class="nc" id="L971">            TopicPartition tp = entry.getKey();</span>
+<span class="nc" id="L972">            Long offset = entry.getValue();</span>
+<span class="nc" id="L973">            Metadata.LeaderAndEpoch leaderAndEpoch = metadata.currentLeader(tp);</span>
+
+<span class="nc bnc" id="L975" title="All 2 branches missed.">            if (leaderAndEpoch.leader.isEmpty()) {</span>
+<span class="nc" id="L976">                log.debug(&quot;Leader for partition {} is unknown for fetching offset {}&quot;, tp, offset);</span>
+<span class="nc" id="L977">                metadata.requestUpdate(true);</span>
+<span class="nc" id="L978">                listOffsetsRequestState.ifPresent(offsetsRequestState -&gt; offsetsRequestState.remainingToSearch.put(tp, offset));</span>
+            } else {
+<span class="nc" id="L980">                int currentLeaderEpoch = leaderAndEpoch.epoch.orElse(ListOffsetsResponse.UNKNOWN_EPOCH);</span>
+<span class="nc" id="L981">                partitionDataMap.put(tp, new ListOffsetsRequestData.ListOffsetsPartition()</span>
+<span class="nc" id="L982">                        .setPartitionIndex(tp.partition())</span>
+<span class="nc" id="L983">                        .setTimestamp(offset)</span>
+<span class="nc" id="L984">                        .setCurrentLeaderEpoch(currentLeaderEpoch));</span>
+            }
+<span class="nc" id="L986">        }</span>
+<span class="nc" id="L987">        Set&lt;TopicPartition&gt; partitionsSkippedInRegroup = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L988">        Map&lt;Node, Map&lt;TopicPartition, ListOffsetsRequestData.ListOffsetsPartition&gt;&gt; result =</span>
+<span class="nc" id="L989">                offsetFetcherUtils.regroupPartitionMapByNode(partitionDataMap, partitionsSkippedInRegroup);</span>
+<span class="nc bnc" id="L990" title="All 2 branches missed.">        if (!partitionsSkippedInRegroup.isEmpty()) {</span>
+<span class="nc" id="L991">            metadata.requestUpdate(false);</span>
+<span class="nc" id="L992">            listOffsetsRequestState.ifPresent(state -&gt;</span>
+<span class="nc" id="L993">                    partitionsSkippedInRegroup.forEach(tp -&gt;</span>
+<span class="nc" id="L994">                            state.remainingToSearch.put(tp, timestampsToSearch.get(tp))));</span>
+        }
+<span class="nc" id="L996">        return result;</span>
+    }
+
+    // Visible for testing
+    int requestsToRetry() {
+<span class="nc" id="L1001">        return requestsToRetry.size();</span>
+    }
+
+    // Visible for testing
+    int requestsToSend() {
+<span class="nc" id="L1006">        return requestsToSend.size();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

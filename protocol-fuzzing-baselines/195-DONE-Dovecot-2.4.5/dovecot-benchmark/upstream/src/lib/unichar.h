@@ -1,0 +1,275 @@
+#ifndef UNICHAR_H
+#define UNICHAR_H
+
+#include "unicode-break.h"
+
+/* Character used to replace invalid input. */
+#define UNICODE_REPLACEMENT_CHAR 0xfffd
+#define UNICODE_REPLACEMENT_CHAR_UTF8 "\xEF\xBF\xBD"
+#define UNICODE_REPLACEMENT_CHAR_UTF8_LEN \
+	(sizeof(UNICODE_REPLACEMENT_CHAR_UTF8) - 1)
+/* Horizontal ellipsis character ('...') */
+#define UNICODE_HORIZONTAL_ELLIPSIS_CHAR 0x2026
+#define UNICODE_HORIZONTAL_ELLIPSIS_CHAR_UTF8 "\xE2\x80\xA6"
+#define UNICODE_HORIZONTAL_ELLIPSIS_CHAR_UTF8_LEN \
+	(sizeof(UNICODE_HORIZONTAL_ELLIPSIS_CHAR_UTF8) - 1)
+
+/* Characters >= base require surrogates */
+#define UTF16_SURROGATE_BASE 0x10000
+
+#define UTF16_SURROGATE_SHIFT 10
+#define UTF16_SURROGATE_MASK 0x03ff
+#define UTF16_SURROGATE_HIGH_FIRST 0xd800
+#define UTF16_SURROGATE_HIGH_LAST 0xdbff
+#define UTF16_SURROGATE_HIGH_MAX 0xdfff
+#define UTF16_SURROGATE_LOW_FIRST 0xdc00
+#define UTF16_SURROGATE_LOW_LAST 0xdfff
+
+#define UTF16_SURROGATE_HIGH(chr) \
+	(UTF16_SURROGATE_HIGH_FIRST + \
+	 (((chr) - UTF16_SURROGATE_BASE) >> UTF16_SURROGATE_SHIFT))
+#define UTF16_SURROGATE_LOW(chr) \
+	(UTF16_SURROGATE_LOW_FIRST + \
+	 (((chr) - UTF16_SURROGATE_BASE) & UTF16_SURROGATE_MASK))
+
+/* Returns TRUE if given byte is ASCII character or the beginning of a
+   multibyte UTF-8 sequence */
+#define UTF8_IS_START_SEQ(b) \
+	(((b) & 0x80) == 0 || ((b) & 0xC0) == 0xC0)
+
+#define UTF8_REPLACEMENT_CHAR_LEN 3
+
+#define UNICHAR_T_MAX 0x10ffff
+
+#define UTF16_VALID_HIGH_SURROGATE(chr) (((chr) & 0xfffc00) == UTF16_SURROGATE_HIGH_FIRST)
+#define UTF16_VALID_LOW_SURROGATE(chr) (((chr) & 0xfffc00) == UTF16_SURROGATE_LOW_FIRST)
+
+struct unicode_transform;
+
+typedef uint32_t unichar_t;
+ARRAY_DEFINE_TYPE(unichars, unichar_t);
+
+/* Normalize UTF8 input and append it to output buffer.
+   Returns 0 if ok, -1 if input was invalid. Even if input was invalid,
+   as much as possible should be added to output. */
+typedef int normalizer_func_t(const void *input, size_t size,
+			      buffer_t *output);
+
+extern const unsigned char utf8_replacement_char[UTF8_REPLACEMENT_CHAR_LEN];
+extern const uint8_t *const uni_utf8_non1_bytes;
+
+static inline bool ATTR_PURE uni_is_valid_ucs4(unichar_t chr)
+{
+	return (!UTF16_VALID_HIGH_SURROGATE(chr) &&
+		!UTF16_VALID_LOW_SURROGATE(chr) &&
+		chr <= UNICHAR_T_MAX);
+};
+
+/* Returns number of characters in a NUL-terminated unicode string */
+unsigned int uni_strlen(const unichar_t *str) ATTR_PURE;
+/* Translates UTF-8 input to UCS-4 output. Returns 0 if ok, -1 if input was
+   invalid */
+int uni_utf8_to_ucs4(const char *input, ARRAY_TYPE(unichars) *output);
+int uni_utf8_to_ucs4_n(const unsigned char *input, size_t size,
+		       ARRAY_TYPE(unichars) *output);
+/* Translates UCS-4 input to UTF-8 output. */
+void uni_ucs4_to_utf8(const unichar_t *input, size_t len, buffer_t *output);
+void uni_ucs4_to_utf8_c(unichar_t chr, buffer_t *output);
+
+/* Return number of octets needed to encode this codepoint in UTF-8. */
+static inline unsigned int uni_ucs4_to_utf8_len(unichar_t chr)
+{
+	i_assert(uni_is_valid_ucs4(chr));
+	if (chr > 0xFFFF)
+		return 4;
+	if (chr > 0x07FF)
+		return 3;
+	if (chr > 0x007f)
+		return 2;
+	return 1;
+}
+
+/* Returns char_bytes (>0) if *chr_r is set, 0 for incomplete trailing character,
+   -1 for invalid input. */
+int uni_utf8_get_char(const char *input, unichar_t *chr_r);
+int uni_utf8_get_char_n(const void *input, size_t max_len, unichar_t *chr_r);
+int uni_utf8_get_char_buf(const void *buffer, size_t size, unichar_t *chr_r);
+/* Returns number of characters in UTF-8 string. */
+unsigned int uni_utf8_strlen(const char *input) ATTR_PURE;
+/* Returns number of characters in UTF-8 input of specified size. */
+unsigned int uni_utf8_strlen_n(const void *input, size_t size) ATTR_PURE;
+/* Same as uni_utf8_strlen_n(), but if input ends with a partial UTF-8
+   character, don't include it in the return value and set partial_pos_r to
+   where the character begins. Otherwise partial_pos_r is set to the end
+   of the input. */
+unsigned int uni_utf8_partial_strlen_n(const void *input, size_t size,
+				       size_t *partial_pos_r);
+
+/* Returns the number of bytes belonging to this UTF-8 character. The given
+   parameter is the first byte of the UTF-8 sequence. Invalid input is
+   returned with length 1. */
+static inline unsigned int ATTR_CONST
+uni_utf8_char_bytes(unsigned char chr)
+{
+	/* 0x00 .. 0x7f are ASCII. 0x80 .. 0xC1 are invalid. */
+	if (chr < (192 + 2))
+		return 1;
+	return uni_utf8_non1_bytes[chr - (192 + 2)];
+}
+
+/* Return given character in titlecase. */
+unichar_t uni_ucs4_to_titlecase(unichar_t chr) ATTR_CONST;
+
+/* Run the UTF8 string through the provided Unicode transform and write the
+   result into the buffer again encoded in UTF8. */
+int uni_utf8_run_transform(const void *_input, size_t size,
+			   struct unicode_transform *trans, buffer_t *output,
+			   const char **error_r);
+
+/* Normalize the UTF-8 input in Unicode NFD, NFKD, NFC or NFKC form and write
+   the result to the output buffer.
+
+   Refer to Unicode Standard Annex #15, Section 1.2 for more information. An
+   excerpt can be found in unicode-nf.h.
+
+   NOTE: Do not blindly use this function to write and append several values
+   together expecting the result to be NF* normalized as well. This function
+   does not check whether concatenation preserves the desired normalization nor
+   does it endeavour to achieve this result. Blind concatination works only in
+   very specific cases, so make sure you know what you are doing.
+ */
+int uni_utf8_write_nfd(const void *input, size_t size, buffer_t *output);
+int uni_utf8_write_nfkd(const void *input, size_t size, buffer_t *output);
+int uni_utf8_write_nfc(const void *input, size_t size, buffer_t *output);
+int uni_utf8_write_nfkc(const void *input, size_t size, buffer_t *output);
+
+/* Same as the write variants, but return the normalized input in the
+   output_r argument as a C string.
+ */
+int uni_utf8_to_nfd(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_nfkd(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_nfc(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_nfkc(const void *input, size_t size, const char **output_r);
+
+/* Check whether the input is normalized in the indicated form. Returns -1 if
+   the input is not even valid UTF8 or contains invalid code points. Returns 1
+   if the input adheres to the requested normalization form and 0 otherwise. */
+int uni_utf8_is_nfd(const void *input, size_t size);
+int uni_utf8_is_nfkd(const void *input, size_t size);
+int uni_utf8_is_nfc(const void *input, size_t size);
+int uni_utf8_is_nfkc(const void *input, size_t size);
+
+/* Write the input UTF8 string to the provided buffer after mapping it to the
+   requested case. */
+int uni_utf8_write_uppercase(const void *_input, size_t size, buffer_t *output);
+int uni_utf8_write_lowercase(const void *_input, size_t size, buffer_t *output);
+int uni_utf8_write_casefold(const void *_input, size_t size, buffer_t *output);
+
+int uni_utf8_to_uppercase(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_lowercase(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_casefold(const void *input, size_t size, const char **output_r);
+
+/* Convert UTF-8 input to titlecase and decompose the titlecase characters to
+   output buffer. Returns 0 if ok, -1 if input was invalid. This generates
+   output that's compatible with i;unicode-casemap comparator. Invalid input
+   is replaced with unicode replacement character (0xfffd). */
+int uni_utf8_to_decomposed_titlecase(const void *input, size_t size,
+				     buffer_t *output);
+
+/* If input contains only valid UTF-8 characters, return TRUE without updating
+   buf. If input contains invalid UTF-8 characters, replace them with unicode
+   replacement character (0xfffd), write the output to buf and return FALSE. */
+bool uni_utf8_get_valid_data(const unsigned char *input, size_t size,
+			     buffer_t *buf) ATTR_WARN_UNUSED_RESULT;
+/* Returns TRUE if string is valid UTF-8 input. */
+bool uni_utf8_str_is_valid(const char *str);
+/* Returns TRUE if data contains only valid UTF-8 input. */
+bool uni_utf8_data_is_valid(const unsigned char *data, size_t size);
+/* Returns the size of the data when truncated to be less than or equal to
+   max_new_size, making sure UTF-8 character boundaries are respected. This only
+   looks at the last character at the new boundary. */
+size_t uni_utf8_data_truncate(const unsigned char *data, size_t old_size,
+			      size_t max_new_size);
+
+/* surrogate handling */
+static inline unichar_t uni_join_surrogate(unichar_t high, unichar_t low)
+{
+	i_assert(UTF16_VALID_HIGH_SURROGATE(high) &&
+		 UTF16_VALID_LOW_SURROGATE(low));
+
+	return ((high - UTF16_SURROGATE_HIGH_FIRST)<<10) +
+		(low - UTF16_SURROGATE_LOW_FIRST) +
+		UTF16_SURROGATE_BASE;
+}
+
+static inline void uni_split_surrogate(unichar_t chr, unichar_t *high_r, unichar_t *low_r)
+{
+	i_assert(chr >= UTF16_SURROGATE_BASE && chr <= UNICHAR_T_MAX);
+	i_assert(high_r != NULL && low_r != NULL);
+	*high_r = UTF16_SURROGATE_HIGH(chr);
+	*low_r = UTF16_SURROGATE_LOW(chr);
+}
+
+/*
+ * Grapheme clusters
+ */
+
+/* The grapheme cluster scanner is used to split a Unicode string into a
+   sequence of grapheme clusters, which are in essence the Unicode characters as
+   perceived by the user. These can be longer than a single code point and by
+   consequence longer than a single octet. The Unicode standard defines what
+   constitutes a grapheme cluster in Annex #29. */
+
+struct uni_gc_scanner {
+	pool_t pool;
+	struct unicode_gc_break gcbrk;
+
+	const unsigned char *poffset, *p, *pend;
+
+	unichar_t cp;
+	int cp_size;
+};
+
+/* Initialize the scanner. */
+void uni_gc_scanner_init(struct uni_gc_scanner *gcsc,
+			 const void *input, size_t size);
+/* Shift scanner position to next grapheme cluster. Returns TRUE when scanner
+   points to a valid grapheme cluster and has not reached the end. */
+bool uni_gc_scan_shift(struct uni_gc_scanner *gcsc) ATTR_NOWARN_UNUSED_RESULT;
+
+
+/* Obtain a pointer to the current grapheme cluster the scanner points to.
+   Returns the size of the cluster in octets in size_r. */
+static inline const unsigned char *
+uni_gc_scan_get(struct uni_gc_scanner *gcsc, size_t *size_r)
+{
+	if (gcsc->poffset == NULL)
+		uni_gc_scan_shift(gcsc);
+	if (size_r != NULL)
+		*size_r = gcsc->p - gcsc->poffset;
+	return gcsc->poffset;
+}
+
+/* Convenience function for checking whether current grapheme cluster is a
+   particular (single-octet) ASCII character.  */
+static inline bool
+uni_gc_scan_ascii_equals(struct uni_gc_scanner *gcsc, unsigned int c)
+{
+	size_t gc_size;
+	const unsigned char *gc = uni_gc_scan_get(gcsc, &gc_size);
+
+	if (gc_size != 1)
+		return FALSE;
+
+	return (*gc == (unsigned char)c);
+}
+
+/* Returns TRUE when the scanner has reached the end of input. */
+static inline bool uni_gc_scan_at_end(struct uni_gc_scanner *gcsc)
+{
+	size_t gc_size;
+	(void)uni_gc_scan_get(gcsc, &gc_size);
+	return (gc_size == 0);
+}
+
+#endif

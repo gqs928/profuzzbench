@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaMetricsCollector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.telemetry.internals</a> &gt; <span class="el_source">KafkaMetricsCollector.java</span></div><h1>KafkaMetricsCollector.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.telemetry.internals;
+
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.metrics.Gauge;
+import org.apache.kafka.common.metrics.KafkaMetric;
+import org.apache.kafka.common.metrics.Measurable;
+import org.apache.kafka.common.metrics.MetricValueProvider;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.CumulativeCount;
+import org.apache.kafka.common.metrics.stats.CumulativeSum;
+import org.apache.kafka.common.metrics.stats.Frequencies;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.metrics.stats.Meter;
+import org.apache.kafka.common.metrics.stats.Min;
+import org.apache.kafka.common.metrics.stats.Percentiles;
+import org.apache.kafka.common.metrics.stats.Rate;
+import org.apache.kafka.common.metrics.stats.SimpleRate;
+import org.apache.kafka.common.metrics.stats.WindowedCount;
+import org.apache.kafka.common.telemetry.internals.LastValueTracker.InstantAndValue;
+import org.apache.kafka.common.utils.Time;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * All metrics implement the {@link MetricValueProvider} interface. They are divided into
+ * two base types:
+ *
+ * &lt;ol&gt;
+ *     &lt;li&gt;{@link Gauge}&lt;/li&gt;
+ *     &lt;li&gt;{@link Measurable}&lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ * {@link Gauge Gauges} can have any value, but we only collect metrics with number values.
+ * {@link Measurable Measurables} are divided into simple types with single values
+ * ({@link Avg}, {@link CumulativeCount}, {@link Min}, {@link Max}, {@link Rate},
+ * {@link SimpleRate}, and {@link CumulativeSum}) and compound types ({@link Frequencies},
+ * {@link Meter}, and {@link Percentiles}).
+ *
+ * &lt;p&gt;
+ *
+ * We can safely assume that a {@link CumulativeCount count} always increases in steady state. It
+ * should be a bug if a count metric decreases.
+ *
+ * &lt;p&gt;
+ *
+ * Total and Sum are treated as a monotonically increasing counter. The javadocs for Total metric type
+ * say &quot;An un-windowed cumulative total maintained over all time.&quot;. The standalone Total metrics in
+ * the codebase seem to be cumulative metrics that will always increase. The Total metric underlying
+ * Meter type is mostly a Total of a Count metric.
+ * We can assume that a Total metric always increases (but it is not guaranteed as the sample values might be both
+ * negative or positive).
+ * For now, Total is converted to CUMULATIVE_DOUBLE unless we find a valid counter-example.
+ *
+ * &lt;p&gt;
+ *
+ * The Sum as it is a sample sum which is not a cumulative metric. It is converted to GAUGE_DOUBLE.
+ *
+ * &lt;p&gt;
+ *
+ * The compound metrics are virtual metrics. They are composed of simple types or anonymous measurable types
+ * which are reported. A compound metric is never reported as-is.
+ *
+ * &lt;p&gt;
+ *
+ * A Meter metric is always created with and reported as 2 metrics: a rate and a count. For eg:
+ * org.apache.kafka.common.network.Selector has Meter metric for &quot;connection-close&quot; but it has to be
+ * created with a &quot;connection-close-rate&quot; metric of type rate and a &quot;connection-close-total&quot;
+ * metric of type total.
+ *
+ * &lt;p&gt;
+ *
+ * Frequencies is created with an array of Frequency objects. When a Frequencies metric is registered, each
+ * member Frequency object is converted into an anonymous Measurable and registered. So, a Frequencies metric
+ * is reported with a set of measurables with name = Frequency.name(). As there is no way to figure out the
+ * compound type, each component measurables is converted to a GAUGE_DOUBLE.
+ *
+ * &lt;p&gt;
+ *
+ * Percentiles work the same way as Frequencies. The only difference is that it is composed of Percentile
+ * types instead. So, we should treat the component measurable as GAUGE_DOUBLE.
+ *
+ * &lt;p&gt;
+ *
+ * Some metrics are defined as either anonymous inner classes or lambdas implementing the Measurable
+ * interface. As we do not have any information on how to treat them, we should fallback to treating
+ * them as GAUGE_DOUBLE.
+ *
+ * &lt;p&gt;
+ *
+ * OpenTelemetry mapping for measurables:
+ * Avg / Rate / Min / Max / Total / Sum -&gt; Gauge
+ * Count -&gt; Sum
+ * Meter has 2 elements :
+ *  Total -&gt; Sum
+ *  Rate -&gt; Gauge
+ * Frequencies -&gt; each component is Gauge
+ * Percentiles -&gt; each component is Gauge
+ */
+public class KafkaMetricsCollector implements MetricsCollector {
+
+<span class="nc" id="L126">    private static final Logger log = LoggerFactory.getLogger(KafkaMetricsCollector.class);</span>
+
+    private final StateLedger ledger;
+    private final Time time;
+    private final MetricNamingStrategy&lt;MetricName&gt; metricNamingStrategy;
+    private final Set&lt;String&gt; excludeLabels;
+
+    public KafkaMetricsCollector(MetricNamingStrategy&lt;MetricName&gt; metricNamingStrategy, Set&lt;String&gt; excludeLabels) {
+<span class="nc" id="L134">        this(metricNamingStrategy, Time.SYSTEM, excludeLabels);</span>
+<span class="nc" id="L135">    }</span>
+
+    // Visible for testing
+<span class="nc" id="L138">    KafkaMetricsCollector(MetricNamingStrategy&lt;MetricName&gt; metricNamingStrategy, Time time, Set&lt;String&gt; excludeLabels) {</span>
+<span class="nc" id="L139">        this.metricNamingStrategy = metricNamingStrategy;</span>
+<span class="nc" id="L140">        this.time = time;</span>
+<span class="nc" id="L141">        this.ledger = new StateLedger();</span>
+<span class="nc" id="L142">        this.excludeLabels = excludeLabels;</span>
+<span class="nc" id="L143">    }</span>
+
+    public void init(List&lt;KafkaMetric&gt; metrics) {
+<span class="nc" id="L146">        ledger.init(metrics);</span>
+<span class="nc" id="L147">    }</span>
+
+    /**
+     * This is called whenever a metric is updated or added.
+     */
+    public void metricChange(KafkaMetric metric) {
+<span class="nc" id="L153">        ledger.metricChange(metric);</span>
+<span class="nc" id="L154">    }</span>
+
+    /**
+     * This is called whenever a metric is removed.
+     */
+    public void metricRemoval(KafkaMetric metric) {
+<span class="nc" id="L160">        ledger.metricRemoval(metric);</span>
+<span class="nc" id="L161">    }</span>
+
+    /**
+     * This is called whenever temporality changes, resets the value tracker for metrics.
+     */
+    public void metricsReset() {
+<span class="nc" id="L167">        ledger.metricsStateReset();</span>
+<span class="nc" id="L168">    }</span>
+
+    // Visible for testing
+    Set&lt;MetricKey&gt; getTrackedMetrics() {
+<span class="nc" id="L172">        return ledger.metricMap.keySet();</span>
+    }
+
+    @Override
+    public void collect(MetricsEmitter metricsEmitter) {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        for (Map.Entry&lt;MetricKey, KafkaMetric&gt; entry : ledger.getMetrics()) {</span>
+<span class="nc" id="L178">            MetricKey metricKey = entry.getKey();</span>
+<span class="nc" id="L179">            KafkaMetric metric = entry.getValue();</span>
+
+            try {
+<span class="nc" id="L182">                collectMetric(metricsEmitter, metricKey, metric);</span>
+<span class="nc" id="L183">            } catch (Exception e) {</span>
+                // catch and log to continue processing remaining metrics
+<span class="nc" id="L185">                log.error(&quot;Error processing Kafka metric {}&quot;, metricKey, e);</span>
+<span class="nc" id="L186">            }</span>
+<span class="nc" id="L187">        }</span>
+<span class="nc" id="L188">    }</span>
+
+    protected void collectMetric(MetricsEmitter metricsEmitter, MetricKey metricKey, KafkaMetric metric) {
+        Object metricValue;
+
+        try {
+<span class="nc" id="L194">            metricValue = metric.metricValue();</span>
+<span class="nc" id="L195">        } catch (Exception e) {</span>
+            // If an exception occurs when retrieving value, log warning and continue to process the rest of metrics
+<span class="nc" id="L197">            log.warn(&quot;Failed to retrieve metric value {}&quot;, metricKey.name(), e);</span>
+<span class="nc" id="L198">            return;</span>
+<span class="nc" id="L199">        }</span>
+
+<span class="nc" id="L201">        Instant now = Instant.ofEpochMilli(time.milliseconds());</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        if (metric.isMeasurable()) {</span>
+<span class="nc" id="L203">            Measurable measurable = metric.measurable();</span>
+<span class="nc" id="L204">            Double value = (Double) metricValue;</span>
+
+<span class="nc bnc" id="L206" title="All 4 branches missed.">            if (measurable instanceof WindowedCount || measurable instanceof CumulativeSum) {</span>
+<span class="nc" id="L207">                collectSum(metricKey, value, metricsEmitter, now);</span>
+            } else {
+<span class="nc" id="L209">                collectGauge(metricKey, value, metricsEmitter, now);</span>
+            }
+<span class="nc" id="L211">        } else {</span>
+            // It is non-measurable Gauge metric.
+            // Collect the metric only if its value is a number.
+<span class="nc bnc" id="L214" title="All 2 branches missed.">            if (metricValue instanceof Number) {</span>
+<span class="nc" id="L215">                Number value = (Number) metricValue;</span>
+<span class="nc" id="L216">                collectGauge(metricKey, value, metricsEmitter, now);</span>
+<span class="nc" id="L217">            } else {</span>
+                // skip non-measurable metrics
+<span class="nc" id="L219">                log.debug(&quot;Skipping non-measurable gauge metric {}&quot;, metricKey.name());</span>
+            }
+        }
+<span class="nc" id="L222">    }</span>
+
+    private void collectSum(MetricKey metricKey, double value, MetricsEmitter metricsEmitter, Instant timestamp) {
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (!metricsEmitter.shouldEmitMetric(metricKey)) {</span>
+<span class="nc" id="L226">            return;</span>
+        }
+
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (metricsEmitter.shouldEmitDeltaMetrics()) {</span>
+<span class="nc" id="L230">            InstantAndValue&lt;Double&gt; instantAndValue = ledger.delta(metricKey, timestamp, value);</span>
+
+<span class="nc" id="L232">            metricsEmitter.emitMetric(</span>
+<span class="nc" id="L233">                SinglePointMetric.deltaSum(metricKey, instantAndValue.getValue(), true, timestamp,</span>
+<span class="nc" id="L234">                    instantAndValue.getIntervalStart(), excludeLabels)</span>
+            );
+<span class="nc" id="L236">        } else {</span>
+<span class="nc" id="L237">            metricsEmitter.emitMetric(</span>
+<span class="nc" id="L238">                SinglePointMetric.sum(metricKey, value, true, timestamp, ledger.instantAdded(metricKey), excludeLabels)</span>
+            );
+        }
+<span class="nc" id="L241">    }</span>
+
+    private void collectGauge(MetricKey metricKey, Number value, MetricsEmitter metricsEmitter, Instant timestamp) {
+<span class="nc bnc" id="L244" title="All 2 branches missed.">        if (!metricsEmitter.shouldEmitMetric(metricKey)) {</span>
+<span class="nc" id="L245">            return;</span>
+        }
+
+<span class="nc" id="L248">        metricsEmitter.emitMetric(</span>
+<span class="nc" id="L249">            SinglePointMetric.gauge(metricKey, value, timestamp, excludeLabels)</span>
+        );
+<span class="nc" id="L251">    }</span>
+
+    /**
+     * Keeps track of the state of metrics, e.g. when they were added, what their getAndSet value is,
+     * and clearing them out when they're removed.
+     */
+<span class="nc" id="L257">    private class StateLedger {</span>
+
+<span class="nc" id="L259">        private final Map&lt;MetricKey, KafkaMetric&gt; metricMap = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L260">        private final LastValueTracker&lt;Double&gt; doubleDeltas = new LastValueTracker&lt;&gt;();</span>
+<span class="nc" id="L261">        private final Map&lt;MetricKey, Instant&gt; metricAdded = new ConcurrentHashMap&lt;&gt;();</span>
+
+        private Instant instantAdded(MetricKey metricKey) {
+            // lookup when the metric was added to use it as the interval start. That should always
+            // exist, but if it doesn't (e.g. changed metrics temporality) then we use now.
+<span class="nc" id="L266">            return metricAdded.computeIfAbsent(metricKey, x -&gt; Instant.ofEpochMilli(time.milliseconds()));</span>
+        }
+
+        private void init(List&lt;KafkaMetric&gt; metrics) {
+<span class="nc" id="L270">            log.info(&quot;initializing Kafka metrics collector&quot;);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            for (KafkaMetric m : metrics) {</span>
+<span class="nc" id="L272">                metricMap.put(metricNamingStrategy.metricKey(m.metricName()), m);</span>
+<span class="nc" id="L273">            }</span>
+<span class="nc" id="L274">        }</span>
+
+        private void metricChange(KafkaMetric metric) {
+<span class="nc" id="L277">            MetricKey metricKey = metricNamingStrategy.metricKey(metric.metricName());</span>
+<span class="nc" id="L278">            metricMap.put(metricKey, metric);</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">            if (doubleDeltas.contains(metricKey)) {</span>
+<span class="nc" id="L280">                log.warn(&quot;Registering a new metric {} which already has a last value tracked. &quot; +</span>
+<span class="nc" id="L281">                    &quot;Removing metric from delta register.&quot;, metric.metricName(), new Exception());</span>
+
+                /*
+                 This scenario shouldn't occur while registering a metric since it should
+                 have already been cleared out on cleanup/shutdown.
+                 We remove the metric here to clear out the delta register because we are running
+                 into an issue where old metrics are being re-registered which causes us to
+                 record a negative delta
+                */
+<span class="nc" id="L290">                doubleDeltas.remove(metricKey);</span>
+            }
+<span class="nc" id="L292">            metricAdded.put(metricKey, Instant.ofEpochMilli(time.milliseconds()));</span>
+<span class="nc" id="L293">        }</span>
+
+        private void metricRemoval(KafkaMetric metric) {
+<span class="nc" id="L296">            log.debug(&quot;removing kafka metric : {}&quot;, metric.metricName());</span>
+<span class="nc" id="L297">            MetricKey metricKey = metricNamingStrategy.metricKey(metric.metricName());</span>
+<span class="nc" id="L298">            metricMap.remove(metricKey);</span>
+<span class="nc" id="L299">            doubleDeltas.remove(metricKey);</span>
+<span class="nc" id="L300">            metricAdded.remove(metricKey);</span>
+<span class="nc" id="L301">        }</span>
+
+        private Iterable&lt;? extends Entry&lt;MetricKey, KafkaMetric&gt;&gt; getMetrics() {
+<span class="nc" id="L304">            return metricMap.entrySet();</span>
+        }
+
+        private InstantAndValue&lt;Double&gt; delta(MetricKey metricKey, Instant now, Double value) {
+<span class="nc" id="L308">            Optional&lt;InstantAndValue&lt;Double&gt;&gt; lastValue = doubleDeltas.getAndSet(metricKey, now, value);</span>
+
+<span class="nc" id="L310">            return lastValue</span>
+<span class="nc" id="L311">                .map(last -&gt; new InstantAndValue&lt;&gt;(last.getIntervalStart(), value - last.getValue()))</span>
+<span class="nc" id="L312">                .orElse(new InstantAndValue&lt;&gt;(instantAdded(metricKey), value));</span>
+        }
+
+        private void metricsStateReset() {
+<span class="nc" id="L316">            metricAdded.clear();</span>
+<span class="nc" id="L317">            doubleDeltas.reset();</span>
+<span class="nc" id="L318">        }</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

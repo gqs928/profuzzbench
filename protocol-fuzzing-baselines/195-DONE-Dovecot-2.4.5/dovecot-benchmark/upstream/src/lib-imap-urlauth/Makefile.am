@@ -1,0 +1,42 @@
+include $(top_srcdir)/Makefile.test.include
+
+noinst_LTLIBRARIES = libimap-urlauth.la
+
+AM_CPPFLAGS = \
+	-I$(top_srcdir)/src/lib \
+	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-charset \
+	-I$(top_srcdir)/src/lib-dict \
+	-I$(top_srcdir)/src/lib-mail \
+	-I$(top_srcdir)/src/lib-index \
+	-I$(top_srcdir)/src/lib-auth-client \
+	-I$(top_srcdir)/src/lib-storage \
+	-I$(top_srcdir)/src/lib-imap \
+	-I$(top_srcdir)/src/lib-imap-storage \
+	-I$(top_srcdir)/src/lib-var-expand
+
+libimap_urlauth_la_SOURCES = \
+	imap-urlauth.c \
+	imap-urlauth-fetch.c \
+	imap-urlauth-backend.c \
+	imap-urlauth-connection.c
+
+headers = \
+	imap-urlauth.h \
+	imap-urlauth-private.h \
+	imap-urlauth-fetch.h \
+	imap-urlauth-backend.h \
+	imap-urlauth-connection.h
+
+test_programs = test-imap-urlauth
+
+test_imap_urlauth_SOURCES = test-imap-urlauth.c
+test_imap_urlauth_LDADD = \
+	imap-urlauth.lo \
+	../lib-dovecot/libdovecot.la \
+	../lib-test/libtest.la \
+	$(LIBDOVECOT_TEST_LIBS)
+
+pkginc_libdir=$(pkgincludedir)
+pkginc_lib_HEADERS = $(headers)
+

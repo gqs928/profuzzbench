@@ -1,0 +1,1619 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamsGroup.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.group.streams</a> &gt; <span class="el_source">StreamsGroup.java</span></div><h1>StreamsGroup.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.coordinator.group.streams;
+
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.errors.StaleMemberEpochException;
+import org.apache.kafka.common.errors.UnknownMemberIdException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.message.ListGroupsResponseData;
+import org.apache.kafka.common.message.StreamsGroupDescribeResponseData;
+import org.apache.kafka.common.message.StreamsGroupHeartbeatResponseData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.JoinGroupRequest;
+import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataImage;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorTimer;
+import org.apache.kafka.coordinator.group.CommitPartitionValidator;
+import org.apache.kafka.coordinator.group.Group;
+import org.apache.kafka.coordinator.group.GroupCoordinatorConfig;
+import org.apache.kafka.coordinator.group.OffsetExpirationCondition;
+import org.apache.kafka.coordinator.group.OffsetExpirationConditionImpl;
+import org.apache.kafka.coordinator.group.TargetAssignmentMetadata;
+import org.apache.kafka.coordinator.group.Utils;
+import org.apache.kafka.coordinator.group.generated.StreamsGroupTopologyValue;
+import org.apache.kafka.coordinator.group.streams.topics.ConfiguredTopology;
+import org.apache.kafka.coordinator.group.streams.topics.EndpointToPartitionsManager;
+import org.apache.kafka.timeline.SnapshotRegistry;
+import org.apache.kafka.timeline.TimelineHashMap;
+import org.apache.kafka.timeline.TimelineInteger;
+import org.apache.kafka.timeline.TimelineLong;
+import org.apache.kafka.timeline.TimelineObject;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+
+import static org.apache.kafka.coordinator.group.streams.StreamsGroup.StreamsGroupState.ASSIGNING;
+import static org.apache.kafka.coordinator.group.streams.StreamsGroup.StreamsGroupState.DEAD;
+import static org.apache.kafka.coordinator.group.streams.StreamsGroup.StreamsGroupState.EMPTY;
+import static org.apache.kafka.coordinator.group.streams.StreamsGroup.StreamsGroupState.NOT_READY;
+import static org.apache.kafka.coordinator.group.streams.StreamsGroup.StreamsGroupState.RECONCILING;
+import static org.apache.kafka.coordinator.group.streams.StreamsGroup.StreamsGroupState.STABLE;
+
+/**
+ * A Streams Group. All the metadata in this class are backed by records in the __consumer_offsets partitions.
+ */
+public class StreamsGroup implements Group {
+
+    /**
+     * The protocol type for streams groups. There is only one protocol type, &quot;streams&quot;.
+     */
+    private static final String PROTOCOL_TYPE = &quot;streams&quot;;
+
+    /** Stored topology epoch meaning the plugin definitely holds no topology for this group. */
+    public static final int STORED_TOPOLOGY_EPOCH_NONE = -1;
+    /**
+     * Stored topology epoch meaning the plugin may or may not hold a topology: written durably
+     * before any plugin-disturbing operation. Treated like {@link #STORED_TOPOLOGY_EPOCH_NONE}
+     * for the &quot;solicit a push&quot; decision and like a real (&gt;= 0) epoch for &quot;delete-eligible&quot;.
+     */
+    public static final int STORED_TOPOLOGY_EPOCH_UNCERTAIN = -2;
+
+    /**
+     * @return true when {@code storedEpoch} is a real, reliably-stored topology epoch — i.e. the
+     *         plugin definitely holds exactly that topology. Real epochs are non-negative; every
+     *         sentinel ({@link #STORED_TOPOLOGY_EPOCH_NONE}, {@link #STORED_TOPOLOGY_EPOCH_UNCERTAIN},
+     *         and any added later) is negative and therefore not reliably stored.
+     */
+    public static boolean isReliablyStoredTopologyEpoch(int storedEpoch) {
+<span class="nc bnc" id="L95" title="All 2 branches missed.">        return storedEpoch &gt;= 0;</span>
+    }
+
+<span class="nc" id="L98">    public enum StreamsGroupState {</span>
+<span class="nc" id="L99">        EMPTY(&quot;Empty&quot;),</span>
+<span class="nc" id="L100">        NOT_READY(&quot;NotReady&quot;),</span>
+<span class="nc" id="L101">        ASSIGNING(&quot;Assigning&quot;),</span>
+<span class="nc" id="L102">        RECONCILING(&quot;Reconciling&quot;),</span>
+<span class="nc" id="L103">        STABLE(&quot;Stable&quot;),</span>
+<span class="nc" id="L104">        DEAD(&quot;Dead&quot;);</span>
+
+        private final String name;
+
+        private final String lowerCaseName;
+
+<span class="nc" id="L110">        StreamsGroupState(String name) {</span>
+<span class="nc" id="L111">            this.name = name;</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">            if (Objects.equals(name, &quot;NotReady&quot;)) {</span>
+<span class="nc" id="L113">                this.lowerCaseName = &quot;not_ready&quot;;</span>
+            } else {
+<span class="nc" id="L115">                this.lowerCaseName = name.toLowerCase(Locale.ROOT);</span>
+            }
+<span class="nc" id="L117">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L121">            return name;</span>
+        }
+
+        public String toLowerCaseString() {
+<span class="nc" id="L125">            return lowerCaseName;</span>
+        }
+    }
+
+    public static class DeadlineAndEpoch {
+
+<span class="nc" id="L131">        static final DeadlineAndEpoch EMPTY = new DeadlineAndEpoch(0L, 0);</span>
+
+        public final long deadlineMs;
+        public final int epoch;
+
+<span class="nc" id="L136">        DeadlineAndEpoch(long deadlineMs, int epoch) {</span>
+<span class="nc" id="L137">            this.deadlineMs = deadlineMs;</span>
+<span class="nc" id="L138">            this.epoch = epoch;</span>
+<span class="nc" id="L139">        }</span>
+    }
+
+    private final Logger log;
+
+    /**
+     * The snapshot registry.
+     */
+    private final SnapshotRegistry snapshotRegistry;
+
+    /**
+     * The group ID.
+     */
+    private final String groupId;
+
+    /**
+     * The group state.
+     */
+    private final TimelineObject&lt;StreamsGroupState&gt; state;
+
+    /**
+     * The group epoch. The epoch is incremented whenever the topology, topic metadata or the set of members changes and it will trigger
+     * the computation of a new assignment for the group.
+     */
+    private final TimelineInteger groupEpoch;
+
+    /**
+     * The group members.
+     */
+    private final TimelineHashMap&lt;String, StreamsGroupMember&gt; members;
+
+    /**
+     * The static group members.
+     */
+    private final TimelineHashMap&lt;String, String&gt; staticMembers;
+
+    /**
+     * The topology epoch for which the subscribed topics identified by metadataHash are validated.
+     */
+    private final TimelineInteger validatedTopologyEpoch;
+
+    /**
+     * The broker's record of which topology the group's plugin entry holds (KIP-1331): a real epoch
+     * ({@code &gt;= 0}) when the plugin definitely holds that topology, {@link #STORED_TOPOLOGY_EPOCH_NONE}
+     * when it definitely holds nothing, or {@link #STORED_TOPOLOGY_EPOCH_UNCERTAIN} when a barrier was
+     * written before a plugin operation that may not have completed. Drives the heartbeat-side decision
+     * to set TopologyDescriptionRequired=true and the eligibility for plugin deletion.
+     */
+    private final TimelineInteger storedDescriptionTopologyEpoch;
+
+    /**
+     * The topology epoch for which the topology description plugin most recently returned a permanent failure
+     * (KIP-1331). -1 if none. Used to suppress re-soliciting a push at the same epoch.
+     */
+    private final TimelineInteger failedDescriptionTopologyEpoch;
+
+    /**
+     * The metadata hash which is computed based on the all subscribed topics.
+     */
+    protected final TimelineLong metadataHash;
+
+    /**
+     * The target assignment metadata.
+     */
+    private final TimelineObject&lt;TargetAssignmentMetadata&gt; targetAssignmentMetadata;
+
+    /**
+     * The target assignment per member ID.
+     */
+    private final TimelineHashMap&lt;String, TasksTuple&gt; targetAssignment;
+
+    /**
+     * These maps map each active/standby/warmup task to the process ID(s) of their current owner.
+     * The mapping is of the form &lt;code&gt;subtopology -&gt; partition -&gt; memberId&lt;/code&gt;.
+     * When a member revokes a partition, it removes its process ID from this map.
+     * When a member gets a partition, it adds its process ID to this map.
+     */
+    private final TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, String&gt;&gt; currentActiveTaskToProcessId;
+    private final TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, Set&lt;String&gt;&gt;&gt; currentStandbyTaskToProcessIds;
+    private final TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, Set&lt;String&gt;&gt;&gt; currentWarmupTaskToProcessIds;
+
+    /**
+     * The latest per-task changelog offsets and end-offsets reported by each member, keyed by member ID.
+     * This is transient telemetry that the assignor uses to estimate task lag for warm-up promotion. Per KIP-1071
+     * it is not persisted to the {@code __consumer_offsets} topic; it is held in memory and re-reported by members
+     * on the task-offset interval (and is therefore lost on coordinator failover until re-reported).
+     */
+<span class="nc" id="L226">    private final Map&lt;String, MemberTaskOffsets&gt; taskOffsets = new HashMap&lt;&gt;();</span>
+
+    /**
+     * The intermediate assignment the members are reconciled toward, as derived by the {@link AssignmentRefiner} from
+     * the target assignment, together with the assignment epoch it was derived for. Like {@link #taskOffsets}, this is
+     * held in memory only and never persisted; it is derived again from the persisted assignments after a coordinator
+     * failover.
+     * &lt;p&gt;
+     * Every refinement step is an assignment epoch of its own, so the intermediate assignment is derived once per
+     * epoch, when that epoch is minted, and stays fixed while the members reconcile toward it. It is therefore cached
+     * together with the epoch it belongs to, and a cached value from another epoch is never used.
+     * &lt;p&gt;
+     * Unlike {@link #taskOffsets} it is kept in a timeline container, because it is derived from state that a failed
+     * write rolls back. Rolling back restores an earlier assignment epoch, which the next epoch to be minted then
+     * reuses -- with a target assignment that may differ from the one this was derived from. Left outside the rollback,
+     * the cache would be hit for that epoch and reconcile the members toward an intermediate assignment of an
+     * assignment that no longer exists. The epoch and the assignment share one container so that a rollback can never
+     * restore one without the other.
+     */
+    private final TimelineObject&lt;RefinedAssignment&gt; refinedAssignment;
+
+    /**
+     * An intermediate assignment together with the assignment epoch it was derived for.
+     *
+     * @param assignmentEpoch The assignment epoch, or {@code -1} if nothing was derived yet.
+     * @param assignment      The intermediate assignment keyed by member ID.
+     */
+<span class="nc" id="L253">    private record RefinedAssignment(int assignmentEpoch, Map&lt;String, TasksTuple&gt; assignment) {</span>
+<span class="nc" id="L254">        private static final RefinedAssignment NONE = new RefinedAssignment(-1, Map.of());</span>
+    }
+
+    /**
+     * The Streams topology.
+     */
+    private final TimelineObject&lt;Optional&lt;StreamsTopology&gt;&gt; topology;
+
+    /**
+     * The configured topology including resolved regular expressions.
+     */
+    private final TimelineObject&lt;Optional&lt;ConfiguredTopology&gt;&gt; configuredTopology;
+
+    /**
+     * The last used assignment configurations for this streams group.
+     * This is used to determine when assignment configuration changes should trigger a rebalance.
+     */
+    private final TimelineHashMap&lt;String, String&gt; lastAssignmentConfigs;
+
+    /**
+     * The metadata refresh deadline. It consists of a timestamp in milliseconds together with the group epoch at the time of setting it.
+     * The metadata refresh time is considered as a soft state (read that it is not stored in a timeline data structure). It is like this
+     * because it is not persisted to the log. The group epoch is here to ensure that the metadata refresh deadline is invalidated if the
+     * group epoch does not correspond to the current group epoch. This can happen if the metadata refresh deadline is updated after having
+     * refreshed the metadata but the write operation failed. In this case, the time is not automatically rolled back.
+     */
+<span class="nc" id="L280">    private DeadlineAndEpoch metadataRefreshDeadline = DeadlineAndEpoch.EMPTY;</span>
+
+    /**
+     * Keeps a member ID that requested a shutdown for this group.
+     * This has no direct effect inside the group coordinator, but is propagated to old and new members of the group.
+     * It is cleared once the group is empty.
+     * This is not persisted in the log, as the shutdown request is best-effort.
+     */
+<span class="nc" id="L288">    private Optional&lt;String&gt; shutdownRequestMemberId = Optional.empty();</span>
+
+    /**
+     * The current epoch for endpoint information, this is used to determine when to send
+     * updated endpoint information to members of the group.
+     */
+<span class="nc" id="L294">    private int endpointInformationEpoch = 0;</span>
+
+    /**
+     * Cache for endpoint-to-partitions mappings, keyed by member ID.
+     * Entries are explicitly invalidated when a member's tasks change, the member is removed,
+     * or the topology changes.
+     */
+<span class="nc" id="L301">    private final Map&lt;String, StreamsGroupHeartbeatResponseData.EndpointToPartitions&gt; endpointToPartitionsCache = new HashMap&lt;&gt;();</span>
+
+    public StreamsGroup(
+        LogContext logContext,
+        SnapshotRegistry snapshotRegistry,
+        String groupId
+<span class="nc" id="L307">    ) {</span>
+<span class="nc" id="L308">        this.log = logContext.logger(StreamsGroup.class);</span>
+<span class="nc" id="L309">        this.snapshotRegistry = Objects.requireNonNull(snapshotRegistry);</span>
+<span class="nc" id="L310">        this.groupId = Objects.requireNonNull(groupId);</span>
+<span class="nc" id="L311">        this.state = new TimelineObject&lt;&gt;(snapshotRegistry, EMPTY);</span>
+<span class="nc" id="L312">        this.groupEpoch = new TimelineInteger(snapshotRegistry);</span>
+<span class="nc" id="L313">        this.groupEpoch.set(1);</span>
+<span class="nc" id="L314">        this.members = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="nc" id="L315">        this.staticMembers = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="nc" id="L316">        this.validatedTopologyEpoch = new TimelineInteger(snapshotRegistry);</span>
+        // Match the schema default (-1) so a freshly-created in-memory group is indistinguishable
+        // from a replayed one; otherwise the heartbeat's `validatedTopologyEpoch !=
+        // group.validatedTopologyEpoch()` comparison reads 0 here vs. -1 after replay.
+<span class="nc" id="L320">        this.validatedTopologyEpoch.set(-1);</span>
+<span class="nc" id="L321">        this.storedDescriptionTopologyEpoch = new TimelineInteger(snapshotRegistry);</span>
+<span class="nc" id="L322">        this.storedDescriptionTopologyEpoch.set(STORED_TOPOLOGY_EPOCH_NONE);</span>
+<span class="nc" id="L323">        this.failedDescriptionTopologyEpoch = new TimelineInteger(snapshotRegistry);</span>
+<span class="nc" id="L324">        this.failedDescriptionTopologyEpoch.set(-1);</span>
+<span class="nc" id="L325">        this.metadataHash = new TimelineLong(snapshotRegistry);</span>
+<span class="nc" id="L326">        this.targetAssignmentMetadata = new TimelineObject&lt;&gt;(snapshotRegistry, TargetAssignmentMetadata.INITIAL);</span>
+<span class="nc" id="L327">        this.targetAssignment = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="nc" id="L328">        this.currentActiveTaskToProcessId = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="nc" id="L329">        this.currentStandbyTaskToProcessIds = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="nc" id="L330">        this.currentWarmupTaskToProcessIds = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="nc" id="L331">        this.refinedAssignment = new TimelineObject&lt;&gt;(snapshotRegistry, RefinedAssignment.NONE);</span>
+<span class="nc" id="L332">        this.topology = new TimelineObject&lt;&gt;(snapshotRegistry, Optional.empty());</span>
+<span class="nc" id="L333">        this.configuredTopology = new TimelineObject&lt;&gt;(snapshotRegistry, Optional.empty());</span>
+<span class="nc" id="L334">        this.lastAssignmentConfigs = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="nc" id="L335">    }</span>
+
+    /**
+     * @return The group type (Streams).
+     */
+    @Override
+    public GroupType type() {
+<span class="nc" id="L342">        return GroupType.STREAMS;</span>
+    }
+
+    /**
+     * @return The current state as a String.
+     */
+    @Override
+    public String stateAsString() {
+<span class="nc" id="L350">        return state.get().toString();</span>
+    }
+
+    /**
+     * @return The current state as a String with given committedOffset.
+     */
+    public String stateAsString(long committedOffset) {
+<span class="nc" id="L357">        return state.get(committedOffset).toString();</span>
+    }
+
+    /**
+     * @return the group formatted as a list group response based on the committed offset.
+     */
+    public ListGroupsResponseData.ListedGroup asListedGroup(long committedOffset) {
+<span class="nc" id="L364">        return new ListGroupsResponseData.ListedGroup()</span>
+<span class="nc" id="L365">            .setGroupId(groupId)</span>
+<span class="nc" id="L366">            .setProtocolType(PROTOCOL_TYPE)</span>
+<span class="nc" id="L367">            .setGroupState(state.get(committedOffset).toString())</span>
+<span class="nc" id="L368">            .setGroupType(type().toString());</span>
+    }
+
+    public Optional&lt;ConfiguredTopology&gt; configuredTopology() {
+<span class="nc" id="L372">        return configuredTopology.get();</span>
+    }
+
+    public Optional&lt;StreamsTopology&gt; topology() {
+<span class="nc" id="L376">        return topology.get();</span>
+    }
+
+    public void setTopology(StreamsTopology topology) {
+<span class="nc" id="L380">        this.topology.set(Optional.ofNullable(topology));</span>
+<span class="nc" id="L381">        maybeUpdateGroupState();</span>
+<span class="nc" id="L382">    }</span>
+
+    public void setConfiguredTopology(ConfiguredTopology configuredTopology) {
+<span class="nc" id="L385">        this.configuredTopology.set(Optional.ofNullable(configuredTopology));</span>
+        // Clear endpoint cache since subtopology source topics may have changed
+<span class="nc" id="L387">        endpointToPartitionsCache.clear();</span>
+<span class="nc" id="L388">    }</span>
+
+    /**
+     * @return The group ID.
+     */
+    @Override
+    public String groupId() {
+<span class="nc" id="L395">        return groupId;</span>
+    }
+
+    /**
+     * @return The current state.
+     */
+    public StreamsGroupState state() {
+<span class="nc" id="L402">        return state.get();</span>
+    }
+
+    /**
+     * @return The group epoch.
+     */
+    public int groupEpoch() {
+<span class="nc" id="L409">        return groupEpoch.get();</span>
+    }
+
+    /**
+     * Sets the group epoch.
+     *
+     * @param groupEpoch The new group epoch.
+     */
+    public void setGroupEpoch(int groupEpoch) {
+<span class="nc" id="L418">        this.groupEpoch.set(groupEpoch);</span>
+<span class="nc" id="L419">        maybeUpdateGroupState();</span>
+<span class="nc" id="L420">    }</span>
+
+    /**
+     * @return The target assignment epoch.
+     */
+    public int assignmentEpoch() {
+<span class="nc" id="L426">        return targetAssignmentMetadata.get().assignmentEpoch();</span>
+    }
+
+    /**
+     * @return The time at which the target assignment calculation finished.
+     */
+    public long assignmentTimestamp() {
+<span class="nc" id="L433">        return targetAssignmentMetadata.get().assignmentTimestamp();</span>
+    }
+
+    /**
+     * Sets the assignment metadata.
+     *
+     * @param targetAssignmentEpoch The new assignment epoch.
+     * @param targetAssignmentTimestamp The time at which the assignment calculation finished.
+     */
+    public void setTargetAssignmentMetadata(int targetAssignmentEpoch, long targetAssignmentTimestamp) {
+<span class="nc" id="L443">        this.targetAssignmentMetadata.set(new TargetAssignmentMetadata(targetAssignmentEpoch, targetAssignmentTimestamp));</span>
+<span class="nc" id="L444">        maybeUpdateGroupState();</span>
+<span class="nc" id="L445">    }</span>
+
+    /**
+     * Get member ID of a static member that matches the given group instance ID.
+     *
+     * @param groupInstanceId The group instance ID.
+     * @return The member ID corresponding to the given instance ID or null if it does not exist
+     */
+    public String staticMemberId(String groupInstanceId) {
+<span class="nc" id="L454">        return staticMembers.get(groupInstanceId);</span>
+    }
+
+    /**
+     * Gets a new member or throws an exception, if the member does not exist.
+     *
+     * @param memberId The member ID.
+     * @throws UnknownMemberIdException If the member is not found.
+     * @return A StreamsGroupMember.
+     */
+    public StreamsGroupMember getMemberOrThrow(
+        String memberId
+    ) throws UnknownMemberIdException {
+<span class="nc" id="L467">        StreamsGroupMember member = members.get(memberId);</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">        if (member != null) {</span>
+<span class="nc" id="L469">            return member;</span>
+        }
+
+<span class="nc" id="L472">        throw new UnknownMemberIdException(</span>
+<span class="nc" id="L473">            String.format(&quot;Member %s is not a member of group %s.&quot;, memberId, groupId)</span>
+        );
+    }
+
+    /**
+     * Gets a member at the snapshot identified by {@code committedOffset} or throws if not present.
+     *
+     * @param memberId        The member ID.
+     * @param committedOffset A committed offset corresponding to the desired snapshot.
+     * @throws UnknownMemberIdException If the member is not found at the given snapshot.
+     * @return A StreamsGroupMember.
+     */
+    public StreamsGroupMember getMemberOrThrow(
+        String memberId,
+        long committedOffset
+    ) throws UnknownMemberIdException {
+<span class="nc" id="L489">        StreamsGroupMember member = members.get(memberId, committedOffset);</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">        if (member != null) {</span>
+<span class="nc" id="L491">            return member;</span>
+        }
+
+<span class="nc" id="L494">        throw new UnknownMemberIdException(</span>
+<span class="nc" id="L495">            String.format(&quot;Member %s is not a member of group %s.&quot;, memberId, groupId)</span>
+        );
+    }
+
+    /**
+     * Gets or creates a new member, but keeping its fields uninitialized. This is used on the replay-path.
+     * The member is not added to the group, adding a member is done via the
+     * {@link StreamsGroup#updateMember(StreamsGroupMember)} method.
+     *
+     * @param memberId          The member ID.
+     * @return A StreamsGroupMember.
+     */
+    public StreamsGroupMember getOrCreateUninitializedMember(
+        String memberId
+    ) throws UnknownMemberIdException {
+<span class="nc" id="L510">        StreamsGroupMember member = members.get(memberId);</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if (member != null) {</span>
+<span class="nc" id="L512">            return member;</span>
+        }
+
+<span class="nc" id="L515">        return new StreamsGroupMember.Builder(memberId).build();</span>
+    }
+
+    /**
+     * Gets or creates a new member, setting default values on the fields. This is used on the replay-path.
+     * The member is not added to the group, adding a member is done via the
+     * {@link StreamsGroup#updateMember(StreamsGroupMember)} method.
+     *
+     * @param memberId          The member ID.
+     * @return A StreamsGroupMember.
+     */
+    public StreamsGroupMember getOrCreateDefaultMember(
+        String memberId
+    ) throws UnknownMemberIdException {
+<span class="nc" id="L529">        StreamsGroupMember member = members.get(memberId);</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        if (member != null) {</span>
+<span class="nc" id="L531">            return member;</span>
+        }
+
+<span class="nc" id="L534">        return StreamsGroupMember.Builder.withDefaults(memberId).build();</span>
+    }
+
+    /**
+     * Gets a static member.
+     *
+     * @param instanceId The group instance ID.
+     * @return The member corresponding to the given instance ID or null if it does not exist
+     */
+    public StreamsGroupMember staticMember(String instanceId) {
+<span class="nc" id="L544">        String existingMemberId = staticMemberId(instanceId);</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">        return existingMemberId == null ? null : getMemberOrThrow(existingMemberId);</span>
+    }
+
+    /**
+     * Adds or updates the member.
+     *
+     * @param newMember The new member state.
+     */
+    public void updateMember(StreamsGroupMember newMember) {
+<span class="nc bnc" id="L554" title="All 2 branches missed.">        if (newMember == null) {</span>
+<span class="nc" id="L555">            throw new IllegalArgumentException(&quot;newMember cannot be null.&quot;);</span>
+        }
+<span class="nc" id="L557">        StreamsGroupMember oldMember = members.put(newMember.memberId(), newMember);</span>
+<span class="nc" id="L558">        maybeUpdateTaskProcessId(oldMember, newMember);</span>
+<span class="nc" id="L559">        updateStaticMember(oldMember, newMember);</span>
+<span class="nc" id="L560">        maybeUpdateGroupState();</span>
+<span class="nc" id="L561">        endpointToPartitionsCache.remove(newMember.memberId());</span>
+<span class="nc" id="L562">    }</span>
+
+    /**
+     * Updates the member ID stored against the instance ID if the member is a static member.
+     *
+     * @param oldMember The old member state.
+     * @param newMember The new member state.
+     */
+    private void updateStaticMember(StreamsGroupMember oldMember, StreamsGroupMember newMember) {
+<span class="nc bnc" id="L571" title="All 4 branches missed.">        if (oldMember != null &amp;&amp; oldMember.instanceId() != null &amp;&amp;</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">            oldMember.instanceId().isPresent()) {</span>
+<span class="nc" id="L573">            staticMembers.remove(oldMember.instanceId().get());</span>
+        }
+<span class="nc bnc" id="L575" title="All 4 branches missed.">        if (newMember.instanceId() != null &amp;&amp; newMember.instanceId().isPresent()) {</span>
+<span class="nc" id="L576">            staticMembers.put(newMember.instanceId().get(), newMember.memberId());</span>
+        }
+<span class="nc" id="L578">    }</span>
+
+    /**
+     * Remove the member from the group.
+     *
+     * @param memberId The member ID to remove.
+     */
+    public void removeMember(String memberId) {
+<span class="nc" id="L586">        StreamsGroupMember oldMember = members.remove(memberId);</span>
+<span class="nc" id="L587">        maybeRemoveTaskProcessId(oldMember);</span>
+<span class="nc" id="L588">        removeStaticMember(oldMember);</span>
+<span class="nc" id="L589">        maybeUpdateGroupState();</span>
+<span class="nc" id="L590">        endpointToPartitionsCache.remove(memberId);</span>
+<span class="nc" id="L591">        taskOffsets.remove(memberId);</span>
+<span class="nc" id="L592">    }</span>
+
+    /**
+     * Updates the latest per-task changelog offsets reported by a member. These are transient and not persisted.
+     *
+     * @param memberId        The member ID.
+     * @param memberOffsets   The reported task offsets and end-offsets.
+     */
+    public void updateTaskOffsets(String memberId, MemberTaskOffsets memberOffsets) {
+<span class="nc" id="L601">        taskOffsets.put(memberId, memberOffsets);</span>
+<span class="nc" id="L602">    }</span>
+
+    /**
+     * @return The latest per-task changelog offsets reported by the given member, or
+     *         {@link MemberTaskOffsets#EMPTY} if the member has not reported any.
+     */
+    public MemberTaskOffsets taskOffsets(String memberId) {
+<span class="nc" id="L609">        return taskOffsets.getOrDefault(memberId, MemberTaskOffsets.EMPTY);</span>
+    }
+
+    /**
+     * @return An immutable map of the latest per-task changelog offsets reported by each member, keyed by member ID.
+     */
+    public Map&lt;String, MemberTaskOffsets&gt; taskOffsets() {
+<span class="nc" id="L616">        return Collections.unmodifiableMap(taskOffsets);</span>
+    }
+
+    /**
+     * Returns the intermediate assignment that was derived for the given assignment epoch, if any. A value derived for
+     * an earlier epoch is not returned: the intermediate assignment of an epoch is fixed, but a new epoch means a new
+     * refinement step, which has to be derived anew.
+     *
+     * @param assignmentEpoch The assignment epoch to return the intermediate assignment for.
+     *
+     * @return The intermediate assignment keyed by member ID, or {@code null} if it was not derived for that epoch.
+     */
+    public Map&lt;String, TasksTuple&gt; refinedAssignment(int assignmentEpoch) {
+<span class="nc" id="L629">        final RefinedAssignment cached = refinedAssignment.get();</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">        return cached.assignmentEpoch() == assignmentEpoch ? cached.assignment() : null;</span>
+    }
+
+    /**
+     * Caches the intermediate assignment derived for the given assignment epoch. This is transient state; it must be
+     * set from the heartbeat path only, never while replaying records.
+     * &lt;p&gt;
+     * The given map is copied, so that the cached assignment is genuinely fixed for its epoch rather than tracking
+     * whatever the caller hands over: a refiner that returns the target assignment as-is would otherwise leave the
+     * cache holding a view of {@link #targetAssignment()}, which changes as records are replayed. Only the map itself
+     * is copied -- a {@link TasksTuple} already owns its task sets, so there is nothing else that could change
+     * underneath. The copy is free once the refiner returns a map it built itself, because {@link Map#copyOf} hands
+     * back an already-immutable map unchanged.
+     *
+     * @param assignmentEpoch    The assignment epoch the intermediate assignment was derived for.
+     * @param refinedAssignment  The intermediate assignment keyed by member ID.
+     */
+    public void setRefinedAssignment(int assignmentEpoch, Map&lt;String, TasksTuple&gt; refinedAssignment) {
+<span class="nc" id="L648">        this.refinedAssignment.set(new RefinedAssignment(</span>
+            assignmentEpoch,
+<span class="nc" id="L650">            Map.copyOf(Objects.requireNonNull(refinedAssignment))</span>
+        ));
+<span class="nc" id="L652">    }</span>
+
+    /**
+     * Re-keys the cached intermediate assignment from an old to a new member ID.
+     * &lt;p&gt;
+     * Replacing a static member relabels its target assignment the same way, without advancing the assignment epoch.
+     * The cached intermediate assignment is therefore still the one the other members are reconciling towards; only its
+     * key for the replaced member went stale. Re-keying it keeps the decisions of the epoch fixed, whereas dropping it
+     * would derive a new one mid-epoch, which could revise the slice of a member that already reconciled and is
+     * therefore not reconciled again within this epoch.
+     *
+     * @param oldMemberId The member ID the intermediate assignment was derived for.
+     * @param newMemberId The member ID replacing it.
+     */
+    public void relabelRefinedAssignment(String oldMemberId, String newMemberId) {
+<span class="nc" id="L667">        final RefinedAssignment cached = refinedAssignment.get();</span>
+<span class="nc" id="L668">        final TasksTuple refinedTasks = cached.assignment().get(oldMemberId);</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">        if (refinedTasks == null) {</span>
+            // Either nothing was derived for the replaced member, or the cached assignment belongs to another epoch --
+            // in which case refinedAssignment(int) does not hand it out anyway.
+<span class="nc" id="L672">            return;</span>
+        }
+<span class="nc" id="L674">        final Map&lt;String, TasksTuple&gt; relabeled = new HashMap&lt;&gt;(cached.assignment());</span>
+<span class="nc" id="L675">        relabeled.remove(oldMemberId);</span>
+<span class="nc" id="L676">        relabeled.put(newMemberId, refinedTasks);</span>
+<span class="nc" id="L677">        this.refinedAssignment.set(new RefinedAssignment(cached.assignmentEpoch(), Map.copyOf(relabeled)));</span>
+<span class="nc" id="L678">    }</span>
+
+    /**
+     * Remove the static member mapping if the removed member is static.
+     *
+     * @param oldMember The member to remove.
+     */
+    private void removeStaticMember(StreamsGroupMember oldMember) {
+<span class="nc bnc" id="L686" title="All 4 branches missed.">        if (oldMember.instanceId() != null &amp;&amp; oldMember.instanceId().isPresent()) {</span>
+<span class="nc" id="L687">            staticMembers.remove(oldMember.instanceId().get());</span>
+        }
+<span class="nc" id="L689">    }</span>
+
+    /**
+     * Returns true if the member exists.
+     *
+     * @param memberId The member ID.
+     * @return A boolean indicating whether the member exists or not.
+     */
+    public boolean hasMember(String memberId) {
+<span class="nc" id="L698">        return members.containsKey(memberId);</span>
+    }
+
+    /**
+     * @return The number of members.
+     */
+    public int numMembers() {
+<span class="nc" id="L705">        return members.size();</span>
+    }
+
+    /**
+     * @return An immutable map containing all the members keyed by their ID.
+     */
+    public Map&lt;String, StreamsGroupMember&gt; members() {
+<span class="nc" id="L712">        return Collections.unmodifiableMap(members);</span>
+    }
+
+    /**
+     * @return An immutable map containing all the static members keyed by instance ID.
+     */
+    public Map&lt;String, String&gt; staticMembers() {
+<span class="nc" id="L719">        return Collections.unmodifiableMap(staticMembers);</span>
+    }
+
+    /**
+     * Returns true if the static member exists.
+     *
+     * @param instanceId The instance id.
+     *
+     * @return A boolean indicating whether the member exists or not.
+     */
+    public boolean hasStaticMember(String instanceId) {
+<span class="nc bnc" id="L730" title="All 2 branches missed.">        if (instanceId == null) return false;</span>
+<span class="nc" id="L731">        return staticMembers.containsKey(instanceId);</span>
+    }
+    
+    /**
+     * Returns the target assignment of the member.
+     * &lt;p&gt;
+     * If {@code instanceId} is empty, the assignment is looked up by {@code memberId}.
+     * If {@code instanceId} is present, the assignment is looked up by the member ID
+     * associated with that static member instance ID.
+     *
+     * @param memberId The member id.
+     * @param instanceId The instance id.                   
+     * 
+     * @return The StreamsGroupMemberAssignment for the resolved member ID, or {@link TasksTuple#EMPTY}
+     *         if no assignment exists or no static member exists for {@code instanceId}.
+     */
+    public TasksTuple targetAssignment(String memberId, Optional&lt;String&gt; instanceId) {
+<span class="nc bnc" id="L748" title="All 2 branches missed.">        if (instanceId.isEmpty()) {</span>
+<span class="nc" id="L749">            return targetAssignment.getOrDefault(memberId, TasksTuple.EMPTY);</span>
+        } else {
+<span class="nc" id="L751">            StreamsGroupMember previousMember = staticMember(instanceId.get());</span>
+<span class="nc bnc" id="L752" title="All 2 branches missed.">            if (previousMember != null) {</span>
+<span class="nc" id="L753">                return targetAssignment.getOrDefault(previousMember.memberId(), TasksTuple.EMPTY);</span>
+            }
+        }
+<span class="nc" id="L756">        return TasksTuple.EMPTY;</span>
+    }
+
+    /**
+     * Updates the target assignment of a member.
+     *
+     * @param memberId            The member ID.
+     * @param newTargetAssignment The new target assignment.
+     */
+    public void updateTargetAssignment(String memberId, TasksTuple newTargetAssignment) {
+<span class="nc" id="L766">        targetAssignment.put(memberId, newTargetAssignment);</span>
+<span class="nc" id="L767">    }</span>
+
+    /**
+     * Removes the target assignment of a member.
+     *
+     * @param memberId The member id.
+     */
+    public void removeTargetAssignment(String memberId) {
+<span class="nc" id="L775">        targetAssignment.remove(memberId);</span>
+<span class="nc" id="L776">    }</span>
+
+    /**
+     * @return An immutable map containing all the target assignment keyed by member ID.
+     */
+    public Map&lt;String, TasksTuple&gt; targetAssignment() {
+<span class="nc" id="L782">        return Collections.unmodifiableMap(targetAssignment);</span>
+    }
+
+    /**
+     * Returns the current process ID of a task or null if the task does not have one.
+     *
+     * @param subtopologyId  The topic ID.
+     * @param taskId         The task ID.
+     * @return The process ID or null.
+     */
+    public String currentActiveTaskProcessId(
+        String subtopologyId, int taskId
+    ) {
+<span class="nc" id="L795">        Map&lt;Integer, String&gt; tasks = currentActiveTaskToProcessId.get(subtopologyId);</span>
+<span class="nc bnc" id="L796" title="All 2 branches missed.">        if (tasks == null) {</span>
+<span class="nc" id="L797">            return null;</span>
+        } else {
+<span class="nc" id="L799">            return tasks.getOrDefault(taskId, null);</span>
+        }
+    }
+
+    /**
+     * Returns the current process IDs of a task or empty set if the task does not have one.
+     *
+     * @param subtopologyId The topic ID.
+     * @param taskId        The task ID.
+     * @return The process IDs or empty set.
+     */
+    public Set&lt;String&gt; currentStandbyTaskProcessIds(
+        String subtopologyId, int taskId
+    ) {
+<span class="nc" id="L813">        Map&lt;Integer, Set&lt;String&gt;&gt; tasks = currentStandbyTaskToProcessIds.get(subtopologyId);</span>
+<span class="nc bnc" id="L814" title="All 2 branches missed.">        if (tasks == null) {</span>
+<span class="nc" id="L815">            return Set.of();</span>
+        } else {
+<span class="nc" id="L817">            return tasks.getOrDefault(taskId, Set.of());</span>
+        }
+    }
+
+    /**
+     * Returns the current process ID of a task or empty set if the task does not have one.
+     *
+     * @param subtopologyId The topic ID.
+     * @param taskId        The process ID.
+     * @return The member IDs or empty set.
+     */
+    public Set&lt;String&gt; currentWarmupTaskProcessIds(
+        String subtopologyId, int taskId
+    ) {
+<span class="nc" id="L831">        Map&lt;Integer, Set&lt;String&gt;&gt; tasks = currentWarmupTaskToProcessIds.get(subtopologyId);</span>
+<span class="nc bnc" id="L832" title="All 2 branches missed.">        if (tasks == null) {</span>
+<span class="nc" id="L833">            return Set.of();</span>
+        } else {
+<span class="nc" id="L835">            return tasks.getOrDefault(taskId, Set.of());</span>
+        }
+    }
+
+    /**
+     * @return The metadata hash.
+     */
+    public long metadataHash() {
+<span class="nc" id="L843">        return metadataHash.get();</span>
+    }
+
+    /**
+     * Updates the metadata hash.
+     *
+     * @param metadataHash The new metadata hash.
+     */
+    public void setMetadataHash(long metadataHash) {
+<span class="nc" id="L852">        this.metadataHash.set(metadataHash);</span>
+<span class="nc" id="L853">    }</span>
+
+    /**
+     * @return The validated topology epoch.
+     */
+    public int validatedTopologyEpoch() {
+<span class="nc" id="L859">        return validatedTopologyEpoch.get();</span>
+    }
+
+    /**
+     * Updates the validated topology epoch.
+     *
+     * @param validatedTopologyEpoch The validated topology epoch
+     */
+    public void setValidatedTopologyEpoch(int validatedTopologyEpoch) {
+<span class="nc" id="L868">        this.validatedTopologyEpoch.set(validatedTopologyEpoch);</span>
+<span class="nc" id="L869">        maybeUpdateGroupState();</span>
+<span class="nc" id="L870">    }</span>
+
+    /**
+     * @return The stored topology epoch: a real epoch ({@code &gt;= 0}), {@link #STORED_TOPOLOGY_EPOCH_NONE},
+     *         or {@link #STORED_TOPOLOGY_EPOCH_UNCERTAIN}.
+     */
+    public int storedDescriptionTopologyEpoch() {
+<span class="nc" id="L877">        return storedDescriptionTopologyEpoch.get();</span>
+    }
+
+    /**
+     * Defer tombstoning of an empty streams group while the broker-level topology-description
+     * cleanup cycle still has work to do for it: a plugin is configured and the persisted
+     * {@code StoredDescriptionTopologyEpoch} is not {@link #STORED_TOPOLOGY_EPOCH_NONE}. Both a
+     * real epoch and {@link #STORED_TOPOLOGY_EPOCH_UNCERTAIN} defer — an UNCERTAIN group may
+     * still hold plugin data, so it must stay reclaimable by the cycle. The cycle drives
+     * {@code plugin.deleteTopology} and clears the stored epoch; the next sweep then proceeds
+     * with tombstoning. When no plugin is configured the gate never holds, so deferring
+     * indefinitely is not possible.
+     *
+     * &lt;p&gt;Per the {@link Group#shouldExpire(GroupCoordinatorConfig)} contract this only gates the
+     * group-metadata tombstone — committed offsets are still expired by the sweep regardless of
+     * what this returns, which is what feeds the topology-cleanup cycle's eligibility check.
+     */
+    @Override
+    public boolean shouldExpire(GroupCoordinatorConfig config) {
+<span class="nc bnc" id="L896" title="All 2 branches missed.">        return !(config.isStreamsGroupTopologyDescriptionPluginConfigured()</span>
+<span class="nc bnc" id="L897" title="All 2 branches missed.">            &amp;&amp; storedDescriptionTopologyEpoch() != STORED_TOPOLOGY_EPOCH_NONE);</span>
+    }
+
+    /**
+     * @param committedOffset A committed offset corresponding to the desired snapshot.
+     * @return The stored topology epoch at the given committed offset: a real epoch ({@code &gt;= 0}),
+     *         {@link #STORED_TOPOLOGY_EPOCH_NONE}, or {@link #STORED_TOPOLOGY_EPOCH_UNCERTAIN}.
+     */
+    public int storedDescriptionTopologyEpoch(long committedOffset) {
+<span class="nc" id="L906">        return storedDescriptionTopologyEpoch.get(committedOffset);</span>
+    }
+
+    /**
+     * Updates the stored topology epoch.
+     *
+     * @param storedDescriptionTopologyEpoch The epoch most recently successfully stored by the topology description plugin.
+     */
+    public void setStoredDescriptionTopologyEpoch(int storedDescriptionTopologyEpoch) {
+<span class="nc" id="L915">        this.storedDescriptionTopologyEpoch.set(storedDescriptionTopologyEpoch);</span>
+<span class="nc" id="L916">    }</span>
+
+    /**
+     * @return The topology epoch most recently rejected by the topology description plugin with a permanent
+     *         failure, or -1 if none.
+     */
+    public int failedDescriptionTopologyEpoch() {
+<span class="nc" id="L923">        return failedDescriptionTopologyEpoch.get();</span>
+    }
+
+    /**
+     * Updates the last-failed topology epoch.
+     *
+     * @param failedDescriptionTopologyEpoch The epoch the plugin most recently rejected with a permanent failure.
+     */
+    public void setFailedDescriptionTopologyEpoch(int failedDescriptionTopologyEpoch) {
+<span class="nc" id="L932">        this.failedDescriptionTopologyEpoch.set(failedDescriptionTopologyEpoch);</span>
+<span class="nc" id="L933">    }</span>
+
+    /**
+     * @return The current topology epoch as reported by the latest pushed topology, or -1 if no topology
+     *         has been received from any member yet.
+     */
+    public int currentTopologyEpoch() {
+<span class="nc" id="L940">        return topology.get().map(StreamsTopology::topologyEpoch).orElse(-1);</span>
+    }
+
+    /**
+     * Computes the metadata hash based on the current topology and the current metadata image.
+     *
+     * @param metadataImage  The current metadata image.
+     * @param topicHashCache The cache for the topic hashes.
+     * @param topology       The current metadata for the Streams topology
+     * @return The metadata hash.
+     */
+    public long computeMetadataHash(
+        CoordinatorMetadataImage metadataImage,
+        Map&lt;String, Long&gt; topicHashCache,
+        StreamsTopology topology
+    ) {
+<span class="nc" id="L956">        Set&lt;String&gt; requiredTopicNames = topology.requiredTopics();</span>
+
+<span class="nc" id="L958">        Map&lt;String, Long&gt; topicHash = new HashMap&lt;&gt;(requiredTopicNames.size());</span>
+<span class="nc" id="L959">        requiredTopicNames.forEach(topicName -&gt; {</span>
+<span class="nc" id="L960">            metadataImage.topicMetadata(topicName).ifPresent(__ -&gt;</span>
+<span class="nc" id="L961">                topicHash.put(</span>
+                    topicName,
+<span class="nc" id="L963">                    topicHashCache.computeIfAbsent(topicName, k -&gt; Utils.computeTopicHash(topicName, metadataImage))</span>
+                ));
+<span class="nc" id="L965">        });</span>
+<span class="nc" id="L966">        return Utils.computeGroupHash(topicHash);</span>
+    }
+
+    /**
+     * Updates the metadata refresh deadline.
+     *
+     * @param deadlineMs The deadline in milliseconds.
+     * @param groupEpoch The associated group epoch.
+     */
+    public void setMetadataRefreshDeadline(
+        long deadlineMs,
+        int groupEpoch
+    ) {
+<span class="nc" id="L979">        this.metadataRefreshDeadline = new DeadlineAndEpoch(deadlineMs, groupEpoch);</span>
+<span class="nc" id="L980">    }</span>
+
+    /**
+     * Requests a metadata refresh.
+     */
+    @Override
+    public void requestMetadataRefresh() {
+<span class="nc" id="L987">        this.metadataRefreshDeadline = DeadlineAndEpoch.EMPTY;</span>
+<span class="nc" id="L988">    }</span>
+
+    /**
+     * Checks if a metadata refresh is required. A refresh is required in two cases: 1) The deadline is smaller or equal to the current
+     * time; 2) The group epoch associated with the deadline is larger than the current group epoch. This means that the operations which
+     * updated the deadline failed.
+     *
+     * @param currentTimeMs The current time in milliseconds.
+     * @return A boolean indicating whether a refresh is required or not.
+     */
+    public boolean hasMetadataExpired(long currentTimeMs) {
+<span class="nc bnc" id="L999" title="All 4 branches missed.">        return currentTimeMs &gt;= metadataRefreshDeadline.deadlineMs || groupEpoch() &lt; metadataRefreshDeadline.epoch;</span>
+    }
+
+    /**
+     * @return The metadata refresh deadline.
+     */
+    public DeadlineAndEpoch metadataRefreshDeadline() {
+<span class="nc" id="L1006">        return metadataRefreshDeadline;</span>
+    }
+
+    /**
+     * Validates the OffsetCommit request.
+     *
+     * @param memberId          The member ID.
+     * @param groupInstanceId   The group instance ID.
+     * @param memberEpoch       The member epoch.
+     * @param isTransactional   Whether the offset commit is transactional or not.
+     * @param apiVersion        The api version.
+     * @return A validator for per-partition validation.
+     * @throws UnknownMemberIdException  If the member is not found.
+     * @throws StaleMemberEpochException If the provided member epoch doesn't match the actual member epoch.
+     */
+    @Override
+    public CommitPartitionValidator validateOffsetCommit(
+        String memberId,
+        String groupInstanceId,
+        int memberEpoch,
+        boolean isTransactional,
+        int apiVersion
+    ) throws UnknownMemberIdException, StaleMemberEpochException {
+        // When the member epoch is -1, the request comes from either the admin client
+        // or a consumer which does not use the group management facility. In this case,
+        // the request can commit offsets if the group is empty.
+<span class="nc bnc" id="L1032" title="All 4 branches missed.">        if (memberEpoch &lt; 0 &amp;&amp; members().isEmpty()) return CommitPartitionValidator.NO_OP;</span>
+
+        // The TxnOffsetCommit API does not require the member ID, the generation ID and the group instance ID fields.
+        // Hence, they are only validated if any of them is provided
+<span class="nc bnc" id="L1036" title="All 4 branches missed.">        if (isTransactional &amp;&amp; memberEpoch == JoinGroupRequest.UNKNOWN_GENERATION_ID &amp;&amp;</span>
+<span class="nc bnc" id="L1037" title="All 4 branches missed.">            memberId.equals(JoinGroupRequest.UNKNOWN_MEMBER_ID) &amp;&amp; groupInstanceId == null)</span>
+<span class="nc" id="L1038">            return CommitPartitionValidator.NO_OP;</span>
+
+<span class="nc" id="L1040">        final StreamsGroupMember member = getMemberOrThrow(memberId);</span>
+
+        // If the commit is not transactional and the member uses the new streams protocol (KIP-1071),
+        // the member should be using the OffsetCommit API version &gt;= 9.
+<span class="nc bnc" id="L1044" title="All 4 branches missed.">        if (!isTransactional &amp;&amp; apiVersion &lt; 9) {</span>
+<span class="nc" id="L1045">            throw new UnsupportedVersionException(&quot;OffsetCommit version 9 or above must be used &quot; +</span>
+                &quot;by members using the streams group protocol&quot;);
+        }
+
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">        if (memberEpoch == member.memberEpoch()) {</span>
+<span class="nc" id="L1050">            return CommitPartitionValidator.NO_OP;</span>
+        }
+
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">        if (memberEpoch &gt; member.memberEpoch()) {</span>
+<span class="nc" id="L1054">            throw new StaleMemberEpochException(String.format(&quot;Received member epoch %d is newer than &quot; +</span>
+<span class="nc" id="L1055">                &quot;current member epoch %d.&quot;, memberEpoch, member.memberEpoch()));</span>
+        }
+
+        // Member epoch is older; validate against per-partition assignment epochs.
+<span class="nc" id="L1059">        return createAssignmentEpochValidator(member, memberEpoch);</span>
+    }
+
+    /**
+     * Validates the OffsetFetch request.
+     *
+     * @param memberId            The member ID for streams groups.
+     * @param memberEpoch         The member epoch for streams groups.
+     * @param lastCommittedOffset The last committed offsets in the timeline.
+     */
+    @Override
+    public void validateOffsetFetch(
+        String memberId,
+        int memberEpoch,
+        long lastCommittedOffset
+    ) throws UnknownMemberIdException, StaleMemberEpochException {
+        // When the member ID is null and the member epoch is -1, the request either comes
+        // from the admin client or from a client which does not provide them. In this case,
+        // the fetch request is accepted.
+<span class="nc bnc" id="L1078" title="All 4 branches missed.">        if (memberId == null &amp;&amp; memberEpoch &lt; 0) {</span>
+<span class="nc" id="L1079">            return;</span>
+        }
+
+<span class="nc" id="L1082">        final StreamsGroupMember member = members.get(memberId, lastCommittedOffset);</span>
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">        if (member == null) {</span>
+<span class="nc" id="L1084">            throw new UnknownMemberIdException(String.format(&quot;Member %s is not a member of group %s.&quot;,</span>
+                memberId, groupId));
+        }
+<span class="nc" id="L1087">        validateMemberEpoch(memberEpoch, member.memberEpoch());</span>
+<span class="nc" id="L1088">    }</span>
+
+    /**
+     * Validates the OffsetDelete request.
+     */
+    @Override
+    public void validateOffsetDelete() {
+<span class="nc" id="L1095">    }</span>
+
+    /**
+     * Validates the DeleteGroups request.
+     */
+    @Override
+    public void validateDeleteGroup() throws ApiException {
+<span class="nc bnc" id="L1102" title="All 2 branches missed.">        if (state() != StreamsGroupState.EMPTY) {</span>
+<span class="nc" id="L1103">            throw Errors.NON_EMPTY_GROUP.exception();</span>
+        }
+<span class="nc" id="L1105">    }</span>
+
+    @Override
+    public boolean isSubscribedToTopic(String topic) {
+<span class="nc bnc" id="L1109" title="All 4 branches missed.">        if (state.get() == EMPTY || state.get() == DEAD) {</span>
+            // No topic subscriptions if the group is empty.
+            // This allows offsets to expire for empty groups.
+<span class="nc" id="L1112">            return false;</span>
+        }
+<span class="nc" id="L1114">        Optional&lt;StreamsTopology&gt; maybeTopology = topology.get();</span>
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">        if (maybeTopology.isEmpty()) {</span>
+<span class="nc" id="L1116">            return false;</span>
+        }
+<span class="nc" id="L1118">        return maybeTopology.get().sourceTopicMap().containsKey(topic);</span>
+    }
+
+    /**
+     * Populates the list of records with tombstone(s) for deleting the group.
+     *
+     * @param records The list of records.
+     */
+    @Override
+    public void createGroupTombstoneRecords(List&lt;CoordinatorRecord&gt; records) {
+<span class="nc" id="L1128">        members().forEach((memberId, member) -&gt;</span>
+<span class="nc" id="L1129">            records.add(StreamsCoordinatorRecordHelpers.newStreamsGroupCurrentAssignmentTombstoneRecord(groupId(), memberId))</span>
+        );
+
+<span class="nc" id="L1132">        members().forEach((memberId, member) -&gt;</span>
+<span class="nc" id="L1133">            records.add(StreamsCoordinatorRecordHelpers.newStreamsGroupTargetAssignmentTombstoneRecord(groupId(), memberId))</span>
+        );
+<span class="nc" id="L1135">        records.add(StreamsCoordinatorRecordHelpers.newStreamsGroupTargetAssignmentMetadataTombstoneRecord(groupId()));</span>
+
+<span class="nc" id="L1137">        members().forEach((memberId, member) -&gt;</span>
+<span class="nc" id="L1138">            records.add(StreamsCoordinatorRecordHelpers.newStreamsGroupMemberTombstoneRecord(groupId(), memberId))</span>
+        );
+
+<span class="nc" id="L1141">        records.add(StreamsCoordinatorRecordHelpers.newStreamsGroupEpochTombstoneRecord(groupId()));</span>
+<span class="nc" id="L1142">        records.add(StreamsCoordinatorRecordHelpers.newStreamsGroupTopologyRecordTombstone(groupId()));</span>
+<span class="nc" id="L1143">    }</span>
+
+    /**
+     * Generate an initial rebalance key for the timer.
+     *
+     * @param groupId The group id.
+     * @return The initial rebalance key.
+     */
+    public static String initialRebalanceTimeoutKey(String groupId) {
+<span class="nc" id="L1152">        return &quot;initial-rebalance-timeout-&quot; + groupId;</span>
+    }
+
+    @Override
+    public void cancelTimers(CoordinatorTimer&lt;CoordinatorRecord&gt; timer) {
+<span class="nc" id="L1157">        timer.cancel(initialRebalanceTimeoutKey(groupId));</span>
+<span class="nc" id="L1158">    }</span>
+
+    @Override
+    public boolean isEmpty() {
+<span class="nc bnc" id="L1162" title="All 2 branches missed.">        return state() == StreamsGroupState.EMPTY;</span>
+    }
+
+    /**
+     * Snapshot-aware counterpart to {@link #isEmpty()}: returns whether the group was in the
+     * {@code EMPTY} state at {@code committedOffset}. Used by read operations (e.g. the
+     * topology-description cleanup eligibility scan) that must observe committed state only —
+     * a member-join write that has been committed but not yet applied to the live state, or
+     * vice versa, would otherwise widen the scan-vs-clear race window beyond what the runtime
+     * contract allows.
+     */
+    public boolean isEmpty(long committedOffset) {
+<span class="nc bnc" id="L1174" title="All 2 branches missed.">        return state.get(committedOffset) == StreamsGroupState.EMPTY;</span>
+    }
+
+    /**
+     * See {@link org.apache.kafka.coordinator.group.OffsetExpirationCondition}
+     *
+     * @return The offset expiration condition for the group or Empty if no such condition exists.
+     */
+    @Override
+    public Optional&lt;OffsetExpirationCondition&gt; offsetExpirationCondition() {
+<span class="nc" id="L1184">        return Optional.of(new OffsetExpirationConditionImpl(offsetAndMetadata -&gt; offsetAndMetadata.commitTimestampMs));</span>
+    }
+
+    @Override
+    public boolean isInStates(Set&lt;String&gt; statesFilter, long committedOffset) {
+<span class="nc" id="L1189">        return statesFilter.contains(state.get(committedOffset).toLowerCaseString());</span>
+    }
+
+    /**
+     * Throws a StaleMemberEpochException if the received member epoch does not match the expected member epoch.
+     */
+    private void validateMemberEpoch(
+        int receivedMemberEpoch,
+        int expectedMemberEpoch
+    ) throws StaleMemberEpochException {
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">        if (receivedMemberEpoch != expectedMemberEpoch) {</span>
+<span class="nc" id="L1200">            throw new StaleMemberEpochException(String.format(&quot;The received member epoch %d does not match &quot;</span>
+<span class="nc" id="L1201">                + &quot;the expected member epoch %d.&quot;, receivedMemberEpoch, expectedMemberEpoch));</span>
+        }
+<span class="nc" id="L1203">    }</span>
+
+    /**
+     * Updates the current state of the group.
+     */
+    private void maybeUpdateGroupState() {
+<span class="nc" id="L1209">        StreamsGroupState newState = STABLE;</span>
+<span class="nc bnc" id="L1210" title="All 2 branches missed.">        if (members.isEmpty()) {</span>
+<span class="nc" id="L1211">            newState = EMPTY;</span>
+<span class="nc" id="L1212">            clearShutdownRequestMemberId();</span>
+<span class="nc bnc" id="L1213" title="All 4 branches missed.">        } else if (topology().filter(t -&gt; t.topologyEpoch() == validatedTopologyEpoch.get()).isEmpty()) {</span>
+<span class="nc" id="L1214">            newState = NOT_READY;</span>
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">        } else if (groupEpoch.get() &gt; assignmentEpoch()) {</span>
+<span class="nc" id="L1216">            newState = ASSIGNING;</span>
+        } else {
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">            for (StreamsGroupMember member : members.values()) {</span>
+<span class="nc bnc" id="L1219" title="All 2 branches missed.">                if (!member.isReconciledTo(assignmentEpoch())) {</span>
+<span class="nc" id="L1220">                    newState = RECONCILING;</span>
+<span class="nc" id="L1221">                    break;</span>
+                }
+<span class="nc" id="L1223">            }</span>
+        }
+
+<span class="nc" id="L1226">        state.set(newState);</span>
+<span class="nc" id="L1227">    }</span>
+
+    /**
+     * Updates the tasks process IDs based on the old and the new member.
+     *
+     * @param oldMember The old member.
+     * @param newMember The new member.
+     */
+    private void maybeUpdateTaskProcessId(
+        StreamsGroupMember oldMember,
+        StreamsGroupMember newMember
+    ) {
+<span class="nc" id="L1239">        maybeRemoveTaskProcessId(oldMember);</span>
+<span class="nc" id="L1240">        addTaskProcessId(</span>
+<span class="nc" id="L1241">            newMember.assignedTasks(),</span>
+<span class="nc" id="L1242">            newMember.processId()</span>
+        );
+<span class="nc" id="L1244">        addTaskProcessId(</span>
+<span class="nc" id="L1245">            newMember.tasksPendingRevocation(),</span>
+<span class="nc" id="L1246">            newMember.processId()</span>
+        );
+<span class="nc" id="L1248">    }</span>
+
+    /**
+     * Removes the task process IDs for the provided member.
+     *
+     * @param oldMember The old member.
+     */
+    private void maybeRemoveTaskProcessId(
+        StreamsGroupMember oldMember
+    ) {
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">        if (oldMember != null) {</span>
+<span class="nc" id="L1259">            removeTaskProcessIds(oldMember.assignedTasks(), oldMember.processId());</span>
+<span class="nc" id="L1260">            removeTaskProcessIds(oldMember.tasksPendingRevocation(), oldMember.processId());</span>
+        }
+<span class="nc" id="L1262">    }</span>
+
+    void removeTaskProcessIds(
+        TasksTupleWithEpochs tasks,
+        String processId
+    ) {
+<span class="nc bnc" id="L1268" title="All 2 branches missed.">        if (tasks != null) {</span>
+<span class="nc" id="L1269">            removeTaskProcessIds(tasks.activeTasksWithEpochs(), currentActiveTaskToProcessId, processId);</span>
+<span class="nc" id="L1270">            removeTaskProcessIdsFromSet(tasks.standbyTasks(), currentStandbyTaskToProcessIds, processId);</span>
+<span class="nc" id="L1271">            removeTaskProcessIdsFromSet(tasks.warmupTasks(), currentWarmupTaskToProcessIds, processId);</span>
+        }
+<span class="nc" id="L1273">    }</span>
+
+    /**
+     * Removes the task process IDs based on the provided assignment.
+     *
+     * @param assignment    The assignment.
+     * @param expectedProcessId The expected process ID.
+     * package-private for testing.
+     */
+    private void removeTaskProcessIds(
+        Map&lt;String, Map&lt;Integer, Integer&gt;&gt; assignment,
+        TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, String&gt;&gt; currentTasksProcessId,
+        String expectedProcessId
+    ) {
+<span class="nc" id="L1287">        assignment.forEach((subtopologyId, assignedPartitions) -&gt; {</span>
+<span class="nc" id="L1288">            currentTasksProcessId.compute(subtopologyId, (__, partitionsOrNull) -&gt; {</span>
+<span class="nc bnc" id="L1289" title="All 2 branches missed.">                if (partitionsOrNull != null) {</span>
+<span class="nc" id="L1290">                    assignedPartitions.keySet().forEach(partitionId -&gt; {</span>
+<span class="nc" id="L1291">                        String prevValue = partitionsOrNull.get(partitionId);</span>
+<span class="nc bnc" id="L1292" title="All 2 branches missed.">                        if (Objects.equals(prevValue, expectedProcessId)) {</span>
+<span class="nc" id="L1293">                            partitionsOrNull.remove(partitionId);</span>
+                        } else {
+<span class="nc" id="L1295">                            log.debug(&quot;[GroupId {}] Cannot remove the process ID {} from task {}_{} because the partition is &quot; +</span>
+                                    &quot;still owned at a different process ID {}&quot;, groupId, expectedProcessId, subtopologyId, partitionId, prevValue);
+                        }
+<span class="nc" id="L1298">                    });</span>
+<span class="nc bnc" id="L1299" title="All 2 branches missed.">                    if (partitionsOrNull.isEmpty()) {</span>
+<span class="nc" id="L1300">                        return null;</span>
+                    } else {
+<span class="nc" id="L1302">                        return partitionsOrNull;</span>
+                    }
+                } else {
+<span class="nc" id="L1305">                    log.debug(&quot;[GroupId {}] Cannot remove the process ID {} from {} because it does not have any processId&quot;,</span>
+                            groupId, expectedProcessId, subtopologyId);
+<span class="nc" id="L1307">                    return partitionsOrNull;</span>
+                }
+            });
+<span class="nc" id="L1310">        });</span>
+<span class="nc" id="L1311">    }</span>
+
+    /**
+     * Removes the task process IDs based on the provided assignment.
+     *
+     * @param assignment    The assignment.
+     * @param processIdToRemove The expected process ID.
+     * package-private for testing.
+     */
+    private void removeTaskProcessIdsFromSet(
+        Map&lt;String, Set&lt;Integer&gt;&gt; assignment,
+        TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, Set&lt;String&gt;&gt;&gt; currentTasksProcessId,
+        String processIdToRemove
+    ) {
+<span class="nc" id="L1325">        assignment.forEach((subtopologyId, assignedPartitions) -&gt; {</span>
+<span class="nc" id="L1326">            currentTasksProcessId.compute(subtopologyId, (__, partitionsOrNull) -&gt; {</span>
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">                if (partitionsOrNull != null) {</span>
+<span class="nc" id="L1328">                    assignedPartitions.forEach(partitionId -&gt; {</span>
+<span class="nc bnc" id="L1329" title="All 4 branches missed.">                        if (!partitionsOrNull.containsKey(partitionId) || !partitionsOrNull.get(partitionId).remove(processIdToRemove)) {</span>
+<span class="nc" id="L1330">                            log.debug(&quot;[GroupId {}] Cannot remove the process ID {} from task {}_{} because the task is &quot; +</span>
+                                    &quot;not owned by this process ID&quot;, groupId, processIdToRemove, subtopologyId, partitionId);
+                        }
+<span class="nc" id="L1333">                    });</span>
+<span class="nc bnc" id="L1334" title="All 2 branches missed.">                    if (partitionsOrNull.isEmpty()) {</span>
+<span class="nc" id="L1335">                        return null;</span>
+                    } else {
+<span class="nc" id="L1337">                        return partitionsOrNull;</span>
+                    }
+                } else {
+<span class="nc" id="L1340">                    log.debug(&quot;[GroupId {}] Cannot remove the process ID {} from {} because it does not have any process ID&quot;,</span>
+                            groupId, processIdToRemove, subtopologyId);
+<span class="nc" id="L1342">                    return partitionsOrNull;</span>
+                }
+            });
+<span class="nc" id="L1345">        });</span>
+<span class="nc" id="L1346">    }</span>
+
+    /**
+     * Adds the partition epoch based on the provided assignment.
+     *
+     * @param tasks     The assigned tasks.
+     * @param processId The process ID.
+     * package-private for testing.
+     */
+    void addTaskProcessId(
+        TasksTupleWithEpochs tasks,
+        String processId
+    ) {
+<span class="nc bnc" id="L1359" title="All 4 branches missed.">        if (tasks != null &amp;&amp; processId != null) {</span>
+<span class="nc" id="L1360">            addTaskProcessIdFromActiveTasksWithEpochs(tasks.activeTasksWithEpochs(), processId, currentActiveTaskToProcessId);</span>
+<span class="nc" id="L1361">            addTaskProcessIdToSet(tasks.standbyTasks(), processId, currentStandbyTaskToProcessIds);</span>
+<span class="nc" id="L1362">            addTaskProcessIdToSet(tasks.warmupTasks(), processId, currentWarmupTaskToProcessIds);</span>
+        }
+<span class="nc" id="L1364">    }</span>
+
+    private void addTaskProcessIdFromActiveTasksWithEpochs(
+        Map&lt;String, Map&lt;Integer, Integer&gt;&gt; tasksWithEpochs,
+        String processId,
+        TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, String&gt;&gt; currentTaskProcessId
+    ) {
+<span class="nc" id="L1371">        tasksWithEpochs.forEach((subtopologyId, assignedTaskPartitionsWithEpochs) -&gt; {</span>
+<span class="nc" id="L1372">            currentTaskProcessId.compute(subtopologyId, (__, partitionsOrNull) -&gt; {</span>
+<span class="nc bnc" id="L1373" title="All 2 branches missed.">                if (partitionsOrNull == null) {</span>
+<span class="nc" id="L1374">                    partitionsOrNull = new TimelineHashMap&lt;&gt;(snapshotRegistry, assignedTaskPartitionsWithEpochs.size());</span>
+                }
+<span class="nc bnc" id="L1376" title="All 2 branches missed.">                for (Integer partitionId : assignedTaskPartitionsWithEpochs.keySet()) {</span>
+<span class="nc" id="L1377">                    String prevValue = partitionsOrNull.put(partitionId, processId);</span>
+<span class="nc bnc" id="L1378" title="All 2 branches missed.">                    if (prevValue != null) {</span>
+<span class="nc" id="L1379">                        log.debug(&quot;[GroupId {}] Setting the process ID of {}-{} to {} even though the partition is &quot; +</span>
+                            &quot;still owned by process ID {}&quot;, groupId, subtopologyId, partitionId, processId, prevValue);
+                    }
+<span class="nc" id="L1382">                }</span>
+<span class="nc" id="L1383">                return partitionsOrNull;</span>
+            });
+<span class="nc" id="L1385">        });</span>
+<span class="nc" id="L1386">    }</span>
+
+    private void addTaskProcessIdToSet(
+        Map&lt;String, Set&lt;Integer&gt;&gt; tasks,
+        String processId,
+        TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, Set&lt;String&gt;&gt;&gt; currentTaskProcessId
+    ) {
+<span class="nc" id="L1393">        tasks.forEach((subtopologyId, assignedTaskPartitions) -&gt; {</span>
+<span class="nc" id="L1394">            currentTaskProcessId.compute(subtopologyId, (__, partitionsOrNull) -&gt; {</span>
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">                if (partitionsOrNull == null) {</span>
+<span class="nc" id="L1396">                    partitionsOrNull = new TimelineHashMap&lt;&gt;(snapshotRegistry, assignedTaskPartitions.size());</span>
+                }
+<span class="nc bnc" id="L1398" title="All 2 branches missed.">                for (Integer partitionId : assignedTaskPartitions) {</span>
+<span class="nc" id="L1399">                    partitionsOrNull.computeIfAbsent(partitionId, ___ -&gt; new HashSet&lt;&gt;()).add(processId);</span>
+<span class="nc" id="L1400">                }</span>
+<span class="nc" id="L1401">                return partitionsOrNull;</span>
+            });
+<span class="nc" id="L1403">        });</span>
+<span class="nc" id="L1404">    }</span>
+
+    /**
+     * @param committedOffset The last committed offset of this shard.
+     * @param assignorName    The name of the assignor that the coordinator will use for the next assignment
+     *                        computation, already resolved against the assignors registered on this broker.
+     */
+    public StreamsGroupDescribeResponseData.DescribedGroup asDescribedGroup(
+        long committedOffset,
+        String assignorName
+    ) {
+<span class="nc" id="L1415">        StreamsGroupDescribeResponseData.DescribedGroup describedGroup = new StreamsGroupDescribeResponseData.DescribedGroup()</span>
+<span class="nc" id="L1416">            .setGroupId(groupId)</span>
+<span class="nc" id="L1417">            .setGroupEpoch(groupEpoch.get(committedOffset))</span>
+<span class="nc" id="L1418">            .setGroupState(state.get(committedOffset).toString())</span>
+<span class="nc" id="L1419">            .setAssignmentEpoch(targetAssignmentMetadata.get(committedOffset).assignmentEpoch())</span>
+<span class="nc" id="L1420">            .setAssignorName(assignorName)</span>
+<span class="nc" id="L1421">            .setTopology(</span>
+<span class="nc" id="L1422">                configuredTopology.get(committedOffset)</span>
+<span class="nc" id="L1423">                    .filter(ConfiguredTopology::isReady)</span>
+<span class="nc" id="L1424">                    .map(ConfiguredTopology::asStreamsGroupDescribeTopology)</span>
+<span class="nc" id="L1425">                    .orElse(</span>
+<span class="nc" id="L1426">                        topology.get(committedOffset)</span>
+<span class="nc" id="L1427">                            .map(StreamsTopology::asStreamsGroupDescribeTopology)</span>
+<span class="nc" id="L1428">                            .orElseThrow(() -&gt; new IllegalStateException(&quot;There should always be a topology for a streams group.&quot;))</span>
+                    )
+            );
+<span class="nc" id="L1431">        members.entrySet(committedOffset).forEach(</span>
+<span class="nc" id="L1432">            entry -&gt; describedGroup.members().add(</span>
+<span class="nc" id="L1433">                entry.getValue().asStreamsGroupDescribeMember(</span>
+<span class="nc" id="L1434">                    targetAssignment.get(entry.getValue().memberId(), committedOffset),</span>
+<span class="nc" id="L1435">                    taskOffsets(entry.getValue().memberId())</span>
+                )
+            )
+        );
+<span class="nc" id="L1439">        return describedGroup;</span>
+    }
+
+    public void setShutdownRequestMemberId(final String memberId) {
+<span class="nc bnc" id="L1443" title="All 2 branches missed.">        if (shutdownRequestMemberId.isEmpty()) {</span>
+<span class="nc" id="L1444">            log.info(&quot;[GroupId {}][MemberId {}] Shutdown requested for the streams application.&quot;, groupId, memberId);</span>
+<span class="nc" id="L1445">            shutdownRequestMemberId = Optional.of(memberId);</span>
+        }
+<span class="nc" id="L1447">    }</span>
+
+    public Optional&lt;String&gt; getShutdownRequestMemberId() {
+<span class="nc" id="L1450">        return shutdownRequestMemberId;</span>
+    }
+
+    private void clearShutdownRequestMemberId() {
+<span class="nc bnc" id="L1454" title="All 2 branches missed.">        if (shutdownRequestMemberId.isPresent()) {</span>
+<span class="nc" id="L1455">            log.info(&quot;[GroupId {}] Clearing shutdown requested for the streams application.&quot;, groupId);</span>
+<span class="nc" id="L1456">            shutdownRequestMemberId = Optional.empty();</span>
+        }
+<span class="nc" id="L1458">    }</span>
+
+    public int endpointInformationEpoch() {
+<span class="nc" id="L1461">        return endpointInformationEpoch;</span>
+    }
+
+    public void setEndpointInformationEpoch(int endpointInformationEpoch) {
+<span class="nc" id="L1465">        this.endpointInformationEpoch = endpointInformationEpoch;</span>
+<span class="nc" id="L1466">    }</span>
+
+    // Visible for testing
+    Optional&lt;StreamsGroupHeartbeatResponseData.EndpointToPartitions&gt; cachedEndpointToPartitions(
+        String memberId
+    ) {
+<span class="nc" id="L1472">        return Optional.ofNullable(endpointToPartitionsCache.get(memberId));</span>
+    }
+
+    // Visible for testing
+    void cacheEndpointToPartitions(
+        String memberId,
+        StreamsGroupHeartbeatResponseData.EndpointToPartitions endpointToPartitions
+    ) {
+<span class="nc" id="L1480">        endpointToPartitionsCache.put(memberId, endpointToPartitions);</span>
+<span class="nc" id="L1481">    }</span>
+
+    /**
+     * Invalidates the cached endpoint-to-partitions entry for the given member.
+     * This should be called when a member's assigned tasks change during reconciliation,
+     * before record replay has had a chance to call updateMember().
+     *
+     * @param memberId The member ID whose cache entry should be invalidated.
+     */
+    public void invalidateCachedEndpointToPartitions(String memberId) {
+<span class="nc" id="L1491">        endpointToPartitionsCache.remove(memberId);</span>
+<span class="nc" id="L1492">    }</span>
+
+    /**
+     * Builds the endpoint-to-partitions list for all members, using the cache where possible.
+     *
+     * @param updatedMember The member that was just updated (may have a stale entry in the members map).
+     * @param metadataImage The current metadata image for resolving topic partitions.
+     * @param maybeReplacedStaticMember The replaced static member. it can be null.
+     * @return The list of endpoint-to-partitions mappings for all members with endpoints.
+     */
+    public List&lt;StreamsGroupHeartbeatResponseData.EndpointToPartitions&gt; buildEndpointToPartitions(
+        StreamsGroupMember updatedMember,
+        CoordinatorMetadataImage metadataImage,
+        StreamsGroupMember maybeReplacedStaticMember
+    ) {
+<span class="nc" id="L1507">        List&lt;StreamsGroupHeartbeatResponseData.EndpointToPartitions&gt; endpointToPartitionsList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1508" title="All 2 branches missed.">        if (updatedMember == null) {</span>
+<span class="nc" id="L1509">            log.error(&quot;[GroupId {}] updatedMember is unexpectedly null in buildEndpointToPartitions. &quot; +</span>
+                &quot;This is a bug, please file a JIRA ticket.&quot;, groupId);
+<span class="nc" id="L1511">            return endpointToPartitionsList;</span>
+        }
+<span class="nc bnc" id="L1513" title="All 2 branches missed.">        for (Map.Entry&lt;String, StreamsGroupMember&gt; entry : members.entrySet()) {</span>
+<span class="nc bnc" id="L1514" title="All 2 branches missed.">            if (entry.getKey().equals(updatedMember.memberId())) {</span>
+<span class="nc" id="L1515">                continue;</span>
+            }
+<span class="nc bnc" id="L1517" title="All 4 branches missed.">            if (maybeReplacedStaticMember != null &amp;&amp; entry.getKey().equals(maybeReplacedStaticMember.memberId())) {</span>
+<span class="nc" id="L1518">                continue;</span>
+            }
+<span class="nc" id="L1520">            getOrComputeEndpointToPartitions(entry.getValue(), metadataImage)</span>
+<span class="nc" id="L1521">                .ifPresent(endpointToPartitionsList::add);</span>
+<span class="nc" id="L1522">        }</span>
+<span class="nc" id="L1523">        getOrComputeEndpointToPartitions(updatedMember, metadataImage)</span>
+<span class="nc" id="L1524">            .ifPresent(endpointToPartitionsList::add);</span>
+<span class="nc" id="L1525">        return endpointToPartitionsList;</span>
+    }
+
+    private Optional&lt;StreamsGroupHeartbeatResponseData.EndpointToPartitions&gt; getOrComputeEndpointToPartitions(
+        StreamsGroupMember member,
+        CoordinatorMetadataImage metadataImage
+    ) {
+<span class="nc bnc" id="L1532" title="All 2 branches missed.">        if (member.userEndpoint().isEmpty()) {</span>
+<span class="nc" id="L1533">            return Optional.empty();</span>
+        }
+
+<span class="nc" id="L1536">        String memberId = member.memberId();</span>
+
+<span class="nc" id="L1538">        StreamsGroupHeartbeatResponseData.EndpointToPartitions cached = endpointToPartitionsCache.get(memberId);</span>
+<span class="nc bnc" id="L1539" title="All 2 branches missed.">        if (cached != null) {</span>
+<span class="nc" id="L1540">            return Optional.of(cached);</span>
+        }
+
+<span class="nc" id="L1543">        Optional&lt;StreamsGroupHeartbeatResponseData.EndpointToPartitions&gt; computed =</span>
+<span class="nc" id="L1544">            EndpointToPartitionsManager.maybeEndpointToPartitions(member, this, metadataImage);</span>
+<span class="nc" id="L1545">        computed.ifPresent(endpointToPartitions -&gt;</span>
+<span class="nc" id="L1546">            endpointToPartitionsCache.put(memberId, endpointToPartitions));</span>
+<span class="nc" id="L1547">        return computed;</span>
+    }
+
+    /**
+     * @return The assignment configurations for this streams group.
+     */
+    public Map&lt;String, String&gt; lastAssignmentConfigs() {
+<span class="nc" id="L1554">        return Collections.unmodifiableMap(new TreeMap&lt;&gt;(lastAssignmentConfigs));</span>
+    }
+
+    /**
+     * Sets last assignment configurations.
+     *
+     * @param lastAssignmentConfigs The last assignment configurations to set.
+     */
+    public void setLastAssignmentConfigs(Map&lt;String, String&gt; lastAssignmentConfigs) {
+<span class="nc" id="L1563">        this.lastAssignmentConfigs.clear();</span>
+<span class="nc bnc" id="L1564" title="All 2 branches missed.">        if (lastAssignmentConfigs != null) {</span>
+<span class="nc" id="L1565">            this.lastAssignmentConfigs.putAll(lastAssignmentConfigs);</span>
+        }
+<span class="nc" id="L1567">    }</span>
+
+    /**
+     * Creates a validator that checks if the received member epoch is valid for each partition's assignment epoch.
+     *
+     * @param member The member whose assignments are being validated.
+     * @param receivedMemberEpoch The received member epoch.
+     * @return A validator for per-partition validation.
+     */
+    private CommitPartitionValidator createAssignmentEpochValidator(
+        final StreamsGroupMember member,
+        int receivedMemberEpoch
+    ) {
+        // Retrieve topology once for all partitions - not per partition!
+<span class="nc" id="L1581">        final StreamsTopology streamsTopology = topology.get().orElseThrow(() -&gt;</span>
+<span class="nc" id="L1582">            new StaleMemberEpochException(&quot;Topology is not available for offset commit validation.&quot;));</span>
+        
+<span class="nc" id="L1584">        final TasksTupleWithEpochs assignedTasks = member.assignedTasks();</span>
+<span class="nc" id="L1585">        final TasksTupleWithEpochs tasksPendingRevocation = member.tasksPendingRevocation();</span>
+
+<span class="nc" id="L1587">        return (topicName, topicId, partitionId) -&gt; {</span>
+<span class="nc" id="L1588">            final StreamsGroupTopologyValue.Subtopology subtopology = streamsTopology.sourceTopicMap().get(topicName);</span>
+<span class="nc bnc" id="L1589" title="All 2 branches missed.">            if (subtopology == null) {</span>
+<span class="nc" id="L1590">                throw new StaleMemberEpochException(&quot;Topic &quot; + topicName + &quot; is not in the topology.&quot;);</span>
+            }
+
+<span class="nc" id="L1593">            final String subtopologyId = subtopology.subtopologyId();</span>
+
+            // Search for the partition in assigned tasks, then in tasks pending revocation
+<span class="nc" id="L1596">            Integer assignmentEpoch = assignedTasks.activeTasksWithEpochs()</span>
+<span class="nc" id="L1597">                .getOrDefault(subtopologyId, Map.of())</span>
+<span class="nc" id="L1598">                .get(partitionId);</span>
+<span class="nc bnc" id="L1599" title="All 2 branches missed.">            if (assignmentEpoch == null) {</span>
+<span class="nc" id="L1600">                assignmentEpoch = tasksPendingRevocation.activeTasksWithEpochs()</span>
+<span class="nc" id="L1601">                    .getOrDefault(subtopologyId, Map.of())</span>
+<span class="nc" id="L1602">                    .get(partitionId);</span>
+            }
+
+<span class="nc bnc" id="L1605" title="All 2 branches missed.">            if (assignmentEpoch == null) {</span>
+<span class="nc" id="L1606">                throw new StaleMemberEpochException(String.format(</span>
+                    &quot;Task %s-%d is not assigned or pending revocation for member.&quot;,
+<span class="nc" id="L1608">                    subtopologyId, partitionId));</span>
+            }
+
+<span class="nc bnc" id="L1611" title="All 2 branches missed.">            if (receivedMemberEpoch &lt; assignmentEpoch) {</span>
+<span class="nc" id="L1612">                throw new StaleMemberEpochException(String.format(</span>
+                    &quot;Received member epoch %d is older than assignment epoch %d for task %s-%d.&quot;,
+<span class="nc" id="L1614">                    receivedMemberEpoch, assignmentEpoch, subtopologyId, partitionId));</span>
+            }
+<span class="nc" id="L1616">        };</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

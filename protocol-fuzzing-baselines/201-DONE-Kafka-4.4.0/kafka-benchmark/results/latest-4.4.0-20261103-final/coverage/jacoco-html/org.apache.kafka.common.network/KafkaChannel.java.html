@@ -1,0 +1,695 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaChannel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.network</a> &gt; <span class="el_source">KafkaChannel.java</span></div><h1>KafkaChannel.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.network;
+
+import org.apache.kafka.common.errors.AuthenticationException;
+import org.apache.kafka.common.errors.SslAuthenticationException;
+import org.apache.kafka.common.memory.MemoryPool;
+import org.apache.kafka.common.security.auth.KafkaPrincipal;
+import org.apache.kafka.common.security.auth.KafkaPrincipalSerde;
+import org.apache.kafka.common.utils.Utils;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.net.SocketAddress;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.SocketChannel;
+import java.util.Optional;
+import java.util.function.Supplier;
+
+/**
+ * A Kafka connection either existing on a client (which could be a broker in an
+ * inter-broker scenario) and representing the channel to a remote broker or the
+ * reverse (existing on a broker and representing the channel to a remote
+ * client, which could be a broker in an inter-broker scenario).
+ * &lt;p&gt;
+ * Each instance has the following:
+ * &lt;ul&gt;
+ * &lt;li&gt;a unique ID identifying it in the {@code KafkaClient} instance via which
+ * the connection was made on the client-side or in the instance where it was
+ * accepted on the server-side&lt;/li&gt;
+ * &lt;li&gt;a reference to the underlying {@link TransportLayer} to allow reading and
+ * writing&lt;/li&gt;
+ * &lt;li&gt;an {@link Authenticator} that performs the authentication (or
+ * re-authentication, if that feature is enabled and it applies to this
+ * connection) by reading and writing directly from/to the same
+ * {@link TransportLayer}.&lt;/li&gt;
+ * &lt;li&gt;a {@link MemoryPool} into which responses are read (typically the JVM
+ * heap for clients, though smaller pools can be used for brokers and for
+ * testing out-of-memory scenarios)&lt;/li&gt;
+ * &lt;li&gt;a {@link NetworkReceive} representing the current incomplete/in-progress
+ * request (from the server-side perspective) or response (from the client-side
+ * perspective) being read, if applicable; or a non-null value that has had no
+ * data read into it yet or a null value if there is no in-progress
+ * request/response (either could be the case)&lt;/li&gt;
+ * &lt;li&gt;a {@link Send} representing the current request (from the client-side
+ * perspective) or response (from the server-side perspective) that is either
+ * waiting to be sent or partially sent, if applicable, or null&lt;/li&gt;
+ * &lt;li&gt;a {@link ChannelMuteState} to document if the channel has been muted due
+ * to memory pressure or other reasons&lt;/li&gt;
+ * &lt;/ul&gt;
+ */
+public class KafkaChannel implements AutoCloseable {
+    private static final long MIN_REAUTH_INTERVAL_ONE_SECOND_NANOS = 1000 * 1000 * 1000;
+
+    /**
+     * Mute States for KafkaChannel:
+     * &lt;ul&gt;
+     *   &lt;li&gt; NOT_MUTED: Channel is not muted. This is the default state. &lt;/li&gt;
+     *   &lt;li&gt; MUTED: Channel is muted. Channel must be in this state to be unmuted. &lt;/li&gt;
+     *   &lt;li&gt; MUTED_AND_RESPONSE_PENDING: (SocketServer only) Channel is muted and SocketServer has not sent a response
+     *                                    back to the client yet (acks != 0) or is currently waiting to receive a
+     *                                    response from the API layer (acks == 0). &lt;/li&gt;
+     *   &lt;li&gt; MUTED_AND_THROTTLED: (SocketServer only) Channel is muted and throttling is in progress due to quota
+     *                             violation. &lt;/li&gt;
+     *   &lt;li&gt; MUTED_AND_THROTTLED_AND_RESPONSE_PENDING: (SocketServer only) Channel is muted, throttling is in progress,
+     *                                                  and a response is currently pending. &lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+<span class="nc" id="L84">    public enum ChannelMuteState {</span>
+<span class="nc" id="L85">        NOT_MUTED,</span>
+<span class="nc" id="L86">        MUTED,</span>
+<span class="nc" id="L87">        MUTED_AND_RESPONSE_PENDING,</span>
+<span class="nc" id="L88">        MUTED_AND_THROTTLED,</span>
+<span class="nc" id="L89">        MUTED_AND_THROTTLED_AND_RESPONSE_PENDING</span>
+    }
+
+    /** Socket server events that will change the mute state:
+     * &lt;ul&gt;
+     *   &lt;li&gt; REQUEST_RECEIVED: A request has been received from the client. &lt;/li&gt;
+     *   &lt;li&gt; RESPONSE_SENT: A response has been sent out to the client (ack != 0) or SocketServer has heard back from
+     *                       the API layer (acks = 0) &lt;/li&gt;
+     *   &lt;li&gt; THROTTLE_STARTED: Throttling started due to quota violation. &lt;/li&gt;
+     *   &lt;li&gt; THROTTLE_ENDED: Throttling ended. &lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * Valid transitions on each event are:
+     * &lt;ul&gt;
+     *   &lt;li&gt; REQUEST_RECEIVED: MUTED =&gt; MUTED_AND_RESPONSE_PENDING &lt;/li&gt;
+     *   &lt;li&gt; RESPONSE_SENT:    MUTED_AND_RESPONSE_PENDING =&gt; MUTED, MUTED_AND_THROTTLED_AND_RESPONSE_PENDING =&gt; MUTED_AND_THROTTLED &lt;/li&gt;
+     *   &lt;li&gt; THROTTLE_STARTED: MUTED_AND_RESPONSE_PENDING =&gt; MUTED_AND_THROTTLED_AND_RESPONSE_PENDING &lt;/li&gt;
+     *   &lt;li&gt; THROTTLE_ENDED:   MUTED_AND_THROTTLED =&gt; MUTED, MUTED_AND_THROTTLED_AND_RESPONSE_PENDING =&gt; MUTED_AND_RESPONSE_PENDING &lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+<span class="nc" id="L109">    public enum ChannelMuteEvent {</span>
+<span class="nc" id="L110">        REQUEST_RECEIVED,</span>
+<span class="nc" id="L111">        RESPONSE_SENT,</span>
+<span class="nc" id="L112">        THROTTLE_STARTED,</span>
+<span class="nc" id="L113">        THROTTLE_ENDED</span>
+    }
+
+    private final String id;
+    private final TransportLayer transportLayer;
+    private final Supplier&lt;Authenticator&gt; authenticatorCreator;
+    private Authenticator authenticator;
+    // Tracks accumulated network thread time. This is updated on the network thread.
+    // The values are read and reset after each response is sent.
+    private long networkThreadTimeNanos;
+    private final int maxReceiveSize;
+    private final MemoryPool memoryPool;
+    private final ChannelMetadataRegistry metadataRegistry;
+    private NetworkReceive receive;
+    private NetworkSend send;
+    // Track connection and mute state of channels to enable outstanding requests on channels to be
+    // processed after the channel is disconnected.
+    private boolean disconnected;
+    private ChannelMuteState muteState;
+    private ChannelState state;
+    private SocketAddress remoteAddress;
+    private int successfulAuthentications;
+    private boolean midWrite;
+    private long lastReauthenticationStartNanos;
+
+    public KafkaChannel(String id, TransportLayer transportLayer, Supplier&lt;Authenticator&gt; authenticatorCreator,
+<span class="nc" id="L139">                        int maxReceiveSize, MemoryPool memoryPool, ChannelMetadataRegistry metadataRegistry) {</span>
+<span class="nc" id="L140">        this.id = id;</span>
+<span class="nc" id="L141">        this.transportLayer = transportLayer;</span>
+<span class="nc" id="L142">        this.authenticatorCreator = authenticatorCreator;</span>
+<span class="nc" id="L143">        this.authenticator = authenticatorCreator.get();</span>
+<span class="nc" id="L144">        this.networkThreadTimeNanos = 0L;</span>
+<span class="nc" id="L145">        this.maxReceiveSize = maxReceiveSize;</span>
+<span class="nc" id="L146">        this.memoryPool = memoryPool;</span>
+<span class="nc" id="L147">        this.metadataRegistry = metadataRegistry;</span>
+<span class="nc" id="L148">        this.disconnected = false;</span>
+<span class="nc" id="L149">        this.muteState = ChannelMuteState.NOT_MUTED;</span>
+<span class="nc" id="L150">        this.state = ChannelState.NOT_CONNECTED;</span>
+<span class="nc" id="L151">    }</span>
+
+    public void close() throws IOException {
+<span class="nc" id="L154">        this.disconnected = true;</span>
+<span class="nc" id="L155">        Utils.closeAll(transportLayer, authenticator, receive, metadataRegistry);</span>
+<span class="nc" id="L156">    }</span>
+
+    /**
+     * Returns the principal returned by `authenticator.principal()`.
+     */
+    public KafkaPrincipal principal() {
+<span class="nc" id="L162">        return authenticator.principal();</span>
+    }
+
+    public Optional&lt;KafkaPrincipalSerde&gt; principalSerde() {
+<span class="nc" id="L166">        return authenticator.principalSerde();</span>
+    }
+
+    /**
+     * Does handshake of transportLayer and authentication using configured authenticator.
+     * For SSL with client authentication enabled, {@link TransportLayer#handshake()} performs
+     * authentication. For SASL, authentication is performed by {@link Authenticator#authenticate()}.
+     */
+    public void prepare() throws AuthenticationException, IOException {
+<span class="nc" id="L175">        boolean authenticating = false;</span>
+        try {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">            if (!transportLayer.ready())</span>
+<span class="nc" id="L178">                transportLayer.handshake();</span>
+<span class="nc bnc" id="L179" title="All 4 branches missed.">            if (transportLayer.ready() &amp;&amp; !authenticator.complete()) {</span>
+<span class="nc" id="L180">                authenticating = true;</span>
+<span class="nc" id="L181">                authenticator.authenticate();</span>
+            }
+<span class="nc" id="L183">        } catch (AuthenticationException e) {</span>
+            // Clients are notified of authentication exceptions to enable operations to be terminated
+            // without retries. Other errors are handled as network exceptions in Selector.
+<span class="nc bnc" id="L186" title="All 2 branches missed.">            String remoteDesc = remoteAddress != null ? remoteAddress.toString() : null;</span>
+<span class="nc" id="L187">            state = new ChannelState(ChannelState.State.AUTHENTICATION_FAILED, e, remoteDesc);</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">            if (authenticating) {</span>
+<span class="nc" id="L189">                delayCloseOnAuthenticationFailure();</span>
+<span class="nc" id="L190">                throw new DelayedResponseAuthenticationException(e);</span>
+            }
+<span class="nc" id="L192">            throw e;</span>
+<span class="nc" id="L193">        }</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (ready()) {</span>
+<span class="nc" id="L195">            ++successfulAuthentications;</span>
+<span class="nc" id="L196">            state = ChannelState.READY;</span>
+        }
+<span class="nc" id="L198">    }</span>
+
+    public void disconnect() {
+<span class="nc" id="L201">        disconnected = true;</span>
+<span class="nc bnc" id="L202" title="All 4 branches missed.">        if (state == ChannelState.NOT_CONNECTED &amp;&amp; remoteAddress != null) {</span>
+            //if we captured the remote address we can provide more information
+<span class="nc" id="L204">            state = new ChannelState(ChannelState.State.NOT_CONNECTED, remoteAddress.toString());</span>
+        }
+<span class="nc" id="L206">        transportLayer.disconnect();</span>
+<span class="nc" id="L207">    }</span>
+
+    public void state(ChannelState state) {
+<span class="nc" id="L210">        this.state = state;</span>
+<span class="nc" id="L211">    }</span>
+
+    public ChannelState state() {
+<span class="nc" id="L214">        return this.state;</span>
+    }
+
+    public boolean finishConnect() throws IOException {
+        //we need to grab remoteAddr before finishConnect() is called otherwise
+        //it becomes inaccessible if the connection was refused.
+<span class="nc" id="L220">        SocketChannel socketChannel = transportLayer.socketChannel();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (socketChannel != null) {</span>
+<span class="nc" id="L222">            remoteAddress = socketChannel.getRemoteAddress();</span>
+        }
+<span class="nc" id="L224">        boolean connected = transportLayer.finishConnect();</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (connected) {</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (ready()) {</span>
+<span class="nc" id="L227">                state = ChannelState.READY;</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">            } else if (remoteAddress != null) {</span>
+<span class="nc" id="L229">                state = new ChannelState(ChannelState.State.AUTHENTICATE, remoteAddress.toString());</span>
+            } else {
+<span class="nc" id="L231">                state = ChannelState.AUTHENTICATE;</span>
+            }
+        }
+<span class="nc" id="L234">        return connected;</span>
+    }
+
+    public boolean isConnected() {
+<span class="nc" id="L238">        return transportLayer.isConnected();</span>
+    }
+
+    public String id() {
+<span class="nc" id="L242">        return id;</span>
+    }
+
+    public SelectionKey selectionKey() {
+<span class="nc" id="L246">        return transportLayer.selectionKey();</span>
+    }
+
+    /**
+     * externally muting a channel should be done via selector to ensure proper state handling
+     */
+    void mute() {
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        if (muteState == ChannelMuteState.NOT_MUTED) {</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">            if (!disconnected) transportLayer.removeInterestOps(SelectionKey.OP_READ);</span>
+<span class="nc" id="L255">            muteState = ChannelMuteState.MUTED;</span>
+        }
+<span class="nc" id="L257">    }</span>
+
+    /**
+     * Unmute the channel. The channel can be unmuted only if it is in the MUTED state. For other muted states
+     * (MUTED_AND_*), this is a no-op.
+     *
+     * @return Whether or not the channel is in the NOT_MUTED state after the call
+     */
+    boolean maybeUnmute() {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (muteState == ChannelMuteState.MUTED) {</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            if (!disconnected) transportLayer.addInterestOps(SelectionKey.OP_READ);</span>
+<span class="nc" id="L268">            muteState = ChannelMuteState.NOT_MUTED;</span>
+        }
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        return muteState == ChannelMuteState.NOT_MUTED;</span>
+    }
+
+    // Handle the specified channel mute-related event and transition the mute state according to the state machine.
+    public void handleChannelMuteEvent(ChannelMuteEvent event) {
+<span class="nc" id="L275">        boolean stateChanged = false;</span>
+<span class="nc bnc" id="L276" title="All 5 branches missed.">        switch (event) {</span>
+            case REQUEST_RECEIVED:
+<span class="nc bnc" id="L278" title="All 2 branches missed.">                if (muteState == ChannelMuteState.MUTED) {</span>
+<span class="nc" id="L279">                    muteState = ChannelMuteState.MUTED_AND_RESPONSE_PENDING;</span>
+<span class="nc" id="L280">                    stateChanged = true;</span>
+                }
+                break;
+            case RESPONSE_SENT:
+<span class="nc bnc" id="L284" title="All 2 branches missed.">                if (muteState == ChannelMuteState.MUTED_AND_RESPONSE_PENDING) {</span>
+<span class="nc" id="L285">                    muteState = ChannelMuteState.MUTED;</span>
+<span class="nc" id="L286">                    stateChanged = true;</span>
+                }
+<span class="nc bnc" id="L288" title="All 2 branches missed.">                if (muteState == ChannelMuteState.MUTED_AND_THROTTLED_AND_RESPONSE_PENDING) {</span>
+<span class="nc" id="L289">                    muteState = ChannelMuteState.MUTED_AND_THROTTLED;</span>
+<span class="nc" id="L290">                    stateChanged = true;</span>
+                }
+                break;
+            case THROTTLE_STARTED:
+<span class="nc bnc" id="L294" title="All 2 branches missed.">                if (muteState == ChannelMuteState.MUTED_AND_RESPONSE_PENDING) {</span>
+<span class="nc" id="L295">                    muteState = ChannelMuteState.MUTED_AND_THROTTLED_AND_RESPONSE_PENDING;</span>
+<span class="nc" id="L296">                    stateChanged = true;</span>
+                }
+                break;
+            case THROTTLE_ENDED:
+<span class="nc bnc" id="L300" title="All 2 branches missed.">                if (muteState == ChannelMuteState.MUTED_AND_THROTTLED) {</span>
+<span class="nc" id="L301">                    muteState = ChannelMuteState.MUTED;</span>
+<span class="nc" id="L302">                    stateChanged = true;</span>
+                }
+<span class="nc bnc" id="L304" title="All 2 branches missed.">                if (muteState == ChannelMuteState.MUTED_AND_THROTTLED_AND_RESPONSE_PENDING) {</span>
+<span class="nc" id="L305">                    muteState = ChannelMuteState.MUTED_AND_RESPONSE_PENDING;</span>
+<span class="nc" id="L306">                    stateChanged = true;</span>
+                }
+        }
+<span class="nc bnc" id="L309" title="All 2 branches missed.">        if (!stateChanged) {</span>
+<span class="nc" id="L310">            throw new IllegalStateException(&quot;Cannot transition from &quot; + muteState.name() + &quot; for &quot; + event.name());</span>
+        }
+<span class="nc" id="L312">    }</span>
+
+    public ChannelMuteState muteState() {
+<span class="nc" id="L315">        return muteState;</span>
+    }
+
+    /**
+     * Delay channel close on authentication failure. This will remove all read/write operations from the channel until
+     * {@link #completeCloseOnAuthenticationFailure()} is called to finish up the channel close.
+     */
+    private void delayCloseOnAuthenticationFailure() {
+<span class="nc" id="L323">        transportLayer.removeInterestOps(SelectionKey.OP_WRITE);</span>
+<span class="nc" id="L324">    }</span>
+
+    /**
+     * Finish up any processing on {@link #prepare()} failure.
+     * @throws IOException
+     */
+    void completeCloseOnAuthenticationFailure() throws IOException {
+<span class="nc" id="L331">        transportLayer.addInterestOps(SelectionKey.OP_WRITE);</span>
+        // Invoke the underlying handler to finish up any processing on authentication failure
+<span class="nc" id="L333">        authenticator.handleAuthenticationFailure();</span>
+<span class="nc" id="L334">    }</span>
+
+    /**
+     * Returns true if this channel has been explicitly muted using {@link KafkaChannel#mute()}
+     */
+    public boolean isMuted() {
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        return muteState != ChannelMuteState.NOT_MUTED;</span>
+    }
+
+    public boolean isInMutableState() {
+        // Some requests do not require memory, so if we do not know what the current (or future) request is
+        // (receive == null) we don't mute. We also don't mute if whatever memory required has already been
+        // successfully allocated (if none is required for the currently-being-read request
+        // receive.memoryAllocated() is expected to return true)
+<span class="nc bnc" id="L348" title="All 4 branches missed.">        if (receive == null || receive.memoryAllocated())</span>
+<span class="nc" id="L349">            return false;</span>
+        // also cannot mute if underlying transport is not in the ready state
+<span class="nc" id="L351">        return transportLayer.ready();</span>
+    }
+
+    public boolean ready() {
+<span class="nc bnc" id="L355" title="All 4 branches missed.">        return transportLayer.ready() &amp;&amp; authenticator.complete();</span>
+    }
+
+    public boolean hasSend() {
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        return send != null;</span>
+    }
+
+    /**
+     * Returns the address to which this channel's socket is connected or `null` if the socket has never been connected.
+     *
+     * If the socket was connected prior to being closed, then this method will continue to return the
+     * connected address after the socket is closed.
+     */
+    public InetAddress socketAddress() {
+<span class="nc" id="L369">        return transportLayer.socketChannel().socket().getInetAddress();</span>
+    }
+
+    /**
+     * Returns the port to which this channel's socket is connected or 0 if the socket has never been connected.
+     *
+     * If the socket was connected prior to being closed, then this method will continue to return the
+     * connected port number after the socket is closed.
+     */
+    public int socketPort() {
+<span class="nc" id="L379">        return transportLayer.socketChannel().socket().getPort();</span>
+    }
+
+    public String socketDescription() {
+<span class="nc" id="L383">        Socket socket = transportLayer.socketChannel().socket();</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">        if (socket.getInetAddress() == null)</span>
+<span class="nc" id="L385">            return socket.getLocalAddress().toString();</span>
+<span class="nc" id="L386">        return socket.getInetAddress().toString();</span>
+    }
+
+    public void setSend(NetworkSend send) {
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (this.send != null)</span>
+<span class="nc" id="L391">            throw new IllegalStateException(&quot;Attempt to begin a send operation with prior send operation still in progress, connection id is &quot; + id);</span>
+<span class="nc" id="L392">        this.send = send;</span>
+<span class="nc" id="L393">        this.transportLayer.addInterestOps(SelectionKey.OP_WRITE);</span>
+<span class="nc" id="L394">    }</span>
+
+    public NetworkSend maybeCompleteSend() {
+<span class="nc bnc" id="L397" title="All 4 branches missed.">        if (send != null &amp;&amp; send.completed()) {</span>
+<span class="nc" id="L398">            midWrite = false;</span>
+<span class="nc" id="L399">            transportLayer.removeInterestOps(SelectionKey.OP_WRITE);</span>
+<span class="nc" id="L400">            NetworkSend result = send;</span>
+<span class="nc" id="L401">            send = null;</span>
+<span class="nc" id="L402">            return result;</span>
+        }
+<span class="nc" id="L404">        return null;</span>
+    }
+
+    public long read() throws IOException {
+<span class="nc bnc" id="L408" title="All 2 branches missed.">        if (receive == null) {</span>
+<span class="nc" id="L409">            receive = new NetworkReceive(maxReceiveSize, id, memoryPool);</span>
+        }
+
+<span class="nc" id="L412">        long bytesReceived = receive(this.receive);</span>
+
+<span class="nc bnc" id="L414" title="All 6 branches missed.">        if (this.receive.requiredMemoryAmountKnown() &amp;&amp; !this.receive.memoryAllocated() &amp;&amp; isInMutableState()) {</span>
+            //pool must be out of memory, mute ourselves.
+<span class="nc" id="L416">            mute();</span>
+        }
+<span class="nc" id="L418">        return bytesReceived;</span>
+    }
+
+    public NetworkReceive currentReceive() {
+<span class="nc" id="L422">        return receive;</span>
+    }
+
+    public NetworkReceive maybeCompleteReceive() {
+<span class="nc bnc" id="L426" title="All 4 branches missed.">        if (receive != null &amp;&amp; receive.complete()) {</span>
+<span class="nc" id="L427">            receive.payload().rewind();</span>
+<span class="nc" id="L428">            NetworkReceive result = receive;</span>
+<span class="nc" id="L429">            receive = null;</span>
+<span class="nc" id="L430">            return result;</span>
+        }
+<span class="nc" id="L432">        return null;</span>
+    }
+
+    public long write() throws IOException {
+<span class="nc bnc" id="L436" title="All 2 branches missed.">        if (send == null)</span>
+<span class="nc" id="L437">            return 0;</span>
+
+<span class="nc" id="L439">        midWrite = true;</span>
+<span class="nc" id="L440">        return send.writeTo(transportLayer);</span>
+    }
+
+    /**
+     * Accumulates network thread time for this channel.
+     */
+    public void addNetworkThreadTimeNanos(long nanos) {
+<span class="nc" id="L447">        networkThreadTimeNanos += nanos;</span>
+<span class="nc" id="L448">    }</span>
+
+    /**
+     * Returns accumulated network thread time for this channel and resets
+     * the value to zero.
+     */
+    public long getAndResetNetworkThreadTimeNanos() {
+<span class="nc" id="L455">        long current = networkThreadTimeNanos;</span>
+<span class="nc" id="L456">        networkThreadTimeNanos = 0;</span>
+<span class="nc" id="L457">        return current;</span>
+    }
+
+    private long receive(NetworkReceive receive) throws IOException {
+        try {
+<span class="nc" id="L462">            return receive.readFrom(transportLayer);</span>
+<span class="nc" id="L463">        } catch (SslAuthenticationException e) {</span>
+            // With TLSv1.3, post-handshake messages may throw SSLExceptions, which are
+            // handled as authentication failures
+<span class="nc bnc" id="L466" title="All 2 branches missed.">            String remoteDesc = remoteAddress != null ? remoteAddress.toString() : null;</span>
+<span class="nc" id="L467">            state = new ChannelState(ChannelState.State.AUTHENTICATION_FAILED, e, remoteDesc);</span>
+<span class="nc" id="L468">            throw e;</span>
+        }
+    }
+
+    /**
+     * @return true if underlying transport has bytes remaining to be read from any underlying intermediate buffers.
+     */
+    public boolean hasBytesBuffered() {
+<span class="nc" id="L476">        return transportLayer.hasBytesBuffered();</span>
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        if (this == o) {</span>
+<span class="nc" id="L482">            return true;</span>
+        }
+<span class="nc bnc" id="L484" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L485">            return false;</span>
+        }
+<span class="nc" id="L487">        KafkaChannel that = (KafkaChannel) o;</span>
+<span class="nc" id="L488">        return id.equals(that.id);</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc" id="L493">        return id.hashCode();</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L498">        return super.toString() + &quot; id=&quot; + id;</span>
+    }
+    
+    /**
+     * Return the number of times this instance has successfully authenticated. This
+     * value can only exceed 1 when re-authentication is enabled and it has
+     * succeeded at least once.
+     * 
+     * @return the number of times this instance has successfully authenticated
+     */
+    public int successfulAuthentications() {
+<span class="nc" id="L509">        return successfulAuthentications;</span>
+    }
+
+    /**
+     * If this is a server-side connection that has an expiration time and at least
+     * 1 second has passed since the prior re-authentication (if any) started then
+     * begin the process of re-authenticating the connection and return true,
+     * otherwise return false
+     * 
+     * @param saslHandshakeNetworkReceive
+     *            the mandatory {@link NetworkReceive} containing the
+     *            {@code SaslHandshakeRequest} that has been received on the server
+     *            and that initiates re-authentication.
+     * @param nowNanosSupplier
+     *            {@code Supplier} of the current time. The value must be in
+     *            nanoseconds as per {@code System.nanoTime()} and is therefore only
+     *            useful when compared to such a value -- it's absolute value is
+     *            meaningless.
+     * 
+     * @return true if this is a server-side connection that has an expiration time
+     *         and at least 1 second has passed since the prior re-authentication
+     *         (if any) started to indicate that the re-authentication process has
+     *         begun, otherwise false
+     * @throws AuthenticationException
+     *             if re-authentication fails due to invalid credentials or other
+     *             security configuration errors
+     * @throws IOException
+     *             if read/write fails due to an I/O error
+     * @throws IllegalStateException
+     *             if this channel is not &quot;ready&quot;
+     */
+    public boolean maybeBeginServerReauthentication(NetworkReceive saslHandshakeNetworkReceive,
+            Supplier&lt;Long&gt; nowNanosSupplier) throws AuthenticationException, IOException {
+<span class="nc bnc" id="L542" title="All 2 branches missed.">        if (!ready())</span>
+<span class="nc" id="L543">            throw new IllegalStateException(</span>
+                    &quot;KafkaChannel should be \&quot;ready\&quot; when processing SASL Handshake for potential re-authentication&quot;);
+        /*
+         * Re-authentication is disabled if there is no session expiration time, in
+         * which case the SASL handshake network receive will be processed normally,
+         * which results in a failure result being sent to the client. Also, no need to
+         * check if we are muted since we are processing a received packet when we invoke
+         * this.
+         */
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        if (authenticator.serverSessionExpirationTimeNanos() == null)</span>
+<span class="nc" id="L553">            return false;</span>
+        /*
+         * We've delayed getting the time as long as possible in case we don't need it,
+         * but at this point we need it -- so get it now.
+         */
+<span class="nc" id="L558">        long nowNanos = nowNanosSupplier.get();</span>
+        /*
+         * Cannot re-authenticate more than once every second; an attempt to do so will
+         * result in the SASL handshake network receive being processed normally, which
+         * results in a failure result being sent to the client.
+         */
+<span class="nc bnc" id="L564" title="All 4 branches missed.">        if (lastReauthenticationStartNanos != 0</span>
+                &amp;&amp; nowNanos - lastReauthenticationStartNanos &lt; MIN_REAUTH_INTERVAL_ONE_SECOND_NANOS)
+<span class="nc" id="L566">            return false;</span>
+<span class="nc" id="L567">        lastReauthenticationStartNanos = nowNanos;</span>
+<span class="nc" id="L568">        swapAuthenticatorsAndBeginReauthentication(</span>
+                new ReauthenticationContext(authenticator, saslHandshakeNetworkReceive, nowNanos));
+<span class="nc" id="L570">        return true;</span>
+    }
+
+    /**
+     * If this is a client-side connection that is not muted, there is no
+     * in-progress write, and there is a session expiration time defined that has
+     * past then begin the process of re-authenticating the connection and return
+     * true, otherwise return false
+     * 
+     * @param nowNanosSupplier
+     *            {@code Supplier} of the current time. The value must be in
+     *            nanoseconds as per {@code System.nanoTime()} and is therefore only
+     *            useful when compared to such a value -- it's absolute value is
+     *            meaningless.
+     * 
+     * @return true if this is a client-side connection that is not muted, there is
+     *         no in-progress write, and there is a session expiration time defined
+     *         that has past to indicate that the re-authentication process has
+     *         begun, otherwise false
+     * @throws AuthenticationException
+     *             if re-authentication fails due to invalid credentials or other
+     *             security configuration errors
+     * @throws IOException
+     *             if read/write fails due to an I/O error
+     * @throws IllegalStateException
+     *             if this channel is not &quot;ready&quot;
+     */
+    public boolean maybeBeginClientReauthentication(Supplier&lt;Long&gt; nowNanosSupplier)
+            throws AuthenticationException, IOException {
+<span class="nc bnc" id="L599" title="All 2 branches missed.">        if (!ready())</span>
+<span class="nc" id="L600">            throw new IllegalStateException(</span>
+                    &quot;KafkaChannel should always be \&quot;ready\&quot; when it is checked for possible re-authentication&quot;);
+<span class="nc bnc" id="L602" title="All 4 branches missed.">        if (muteState != ChannelMuteState.NOT_MUTED || midWrite</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">                || authenticator.clientSessionReauthenticationTimeNanos() == null)</span>
+<span class="nc" id="L604">            return false;</span>
+        /*
+         * We've delayed getting the time as long as possible in case we don't need it,
+         * but at this point we need it -- so get it now.
+         */
+<span class="nc" id="L609">        long nowNanos = nowNanosSupplier.get();</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        if (nowNanos &lt; authenticator.clientSessionReauthenticationTimeNanos())</span>
+<span class="nc" id="L611">            return false;</span>
+<span class="nc" id="L612">        swapAuthenticatorsAndBeginReauthentication(new ReauthenticationContext(authenticator, receive, nowNanos));</span>
+<span class="nc" id="L613">        receive = null;</span>
+<span class="nc" id="L614">        return true;</span>
+    }
+    
+    /**
+     * Return the number of milliseconds that elapsed while re-authenticating this
+     * session from the perspective of this instance, if applicable, otherwise null.
+     * The server-side perspective will yield a lower value than the client-side
+     * perspective of the same re-authentication because the client-side observes an
+     * additional network round-trip.
+     * 
+     * @return the number of milliseconds that elapsed while re-authenticating this
+     *         session from the perspective of this instance, if applicable,
+     *         otherwise null
+     */
+    public Long reauthenticationLatencyMs() {
+<span class="nc" id="L629">        return authenticator.reauthenticationLatencyMs();</span>
+    }
+
+    /**
+     * Return true if this is a server-side channel and the given time is past the
+     * session expiration time, if any, otherwise false
+     * 
+     * @param nowNanos
+     *            the current time in nanoseconds as per {@code System.nanoTime()}
+     * @return true if this is a server-side channel and the given time is past the
+     *         session expiration time, if any, otherwise false
+     */
+    public boolean serverAuthenticationSessionExpired(long nowNanos) {
+<span class="nc" id="L642">        Long serverSessionExpirationTimeNanos = authenticator.serverSessionExpirationTimeNanos();</span>
+<span class="nc bnc" id="L643" title="All 4 branches missed.">        return serverSessionExpirationTimeNanos != null &amp;&amp; nowNanos - serverSessionExpirationTimeNanos &gt; 0;</span>
+    }
+    
+    /**
+     * Return the (always non-null but possibly empty) client-side
+     * {@link NetworkReceive} response that arrived during re-authentication but
+     * is unrelated to re-authentication. This corresponds to a request sent
+     * prior to the beginning of re-authentication; the request was made when the
+     * channel was successfully authenticated, and the response arrived during the
+     * re-authentication process.
+     * 
+     * @return client-side {@link NetworkReceive} response that arrived during
+     *         re-authentication that is unrelated to re-authentication. This may
+     *         be empty.
+     */
+    public Optional&lt;NetworkReceive&gt; pollResponseReceivedDuringReauthentication() {
+<span class="nc" id="L659">        return authenticator.pollResponseReceivedDuringReauthentication();</span>
+    }
+    
+    /**
+     * Return true if this is a server-side channel and the connected client has
+     * indicated that it supports re-authentication, otherwise false
+     * 
+     * @return true if this is a server-side channel and the connected client has
+     *         indicated that it supports re-authentication, otherwise false
+     */
+    boolean connectedClientSupportsReauthentication() {
+<span class="nc" id="L670">        return authenticator.connectedClientSupportsReauthentication();</span>
+    }
+
+    private void swapAuthenticatorsAndBeginReauthentication(ReauthenticationContext reauthenticationContext)
+            throws IOException {
+        // it is up to the new authenticator to close the old one
+        // replace with a new one and begin the process of re-authenticating
+<span class="nc" id="L677">        authenticator = authenticatorCreator.get();</span>
+<span class="nc" id="L678">        authenticator.reauthenticate(reauthenticationContext);</span>
+<span class="nc" id="L679">    }</span>
+
+    public ChannelMetadataRegistry channelMetadataRegistry() {
+<span class="nc" id="L682">        return metadataRegistry;</span>
+    }
+
+
+    /**
+     * Maybe add write interest after re-authentication. This is to ensure that any pending write operation
+     * is resumed.
+     */
+    public void maybeAddWriteInterestAfterReauth() {
+<span class="nc bnc" id="L691" title="All 2 branches missed.">        if (send != null)</span>
+<span class="nc" id="L692">            this.transportLayer.addInterestOps(SelectionKey.OP_WRITE);</span>
+<span class="nc" id="L693">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

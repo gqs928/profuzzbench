@@ -1,0 +1,30 @@
+include $(top_srcdir)/Makefile.test.include
+
+noinst_LTLIBRARIES = libcharset.la
+
+AM_CPPFLAGS = \
+	-I$(top_srcdir)/src/lib \
+	-I$(top_srcdir)/src/lib-test
+
+libcharset_la_SOURCES = \
+	charset-iconv.c \
+	charset-utf8.c
+
+headers = \
+	charset-utf8.h \
+	charset-utf8-private.h
+
+pkginc_libdir=$(pkgincludedir)
+pkginc_lib_HEADERS = $(headers)
+
+test_programs = \
+	test-charset
+
+test_libs = \
+	../lib-test/libtest.la \
+	../lib/liblib.la
+test_deps = $(noinst_LTLIBRARIES) $(test_libs)
+
+test_charset_SOURCES = test-charset.c
+test_charset_LDADD = libcharset.la $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+test_charset_DEPENDENCIES = libcharset.la $(test_deps)

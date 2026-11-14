@@ -1,0 +1,123 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "stats-common.h"
+#include "restrict-access.h"
+#include "ioloop.h"
+#include "settings.h"
+#include "master-service.h"
+#include "master-service-settings.h"
+#include "ssl-settings.h"
+#include "stats-settings.h"
+#include "stats-event-category.h"
+#include "stats-metrics.h"
+#include "stats-service.h"
+#include "client-writer.h"
+#include "client-reader.h"
+#include "client-http.h"
+
+struct stats_metrics *stats_metrics;
+time_t stats_startup_time;
+
+static const struct stats_settings *stats_settings;
+
+static void client_connected(struct master_service_connection *conn)
+{
+	const char *type = master_service_connection_get_type(conn);
+
+	if (strcmp(type, "http") == 0)
+		client_http_create(conn);
+	else if (strcmp(type, "writer") == 0)
+		client_writer_create(conn->fd);
+	else
+		client_reader_create(conn->fd);
+	master_service_client_connection_accept(conn);
+}
+
+static void stats_die(void)
+{
+	/* Every Dovecot process keeps a writer connection open for as long as
+	   it runs, so waiting for all of them would keep this process around
+	   for as long as the oldest process it serves - and all of their
+	   events would be invisible to the new stats process until then.
+
+	   So just tell them that we're stopping: the ones that keep running
+	   switch to the stats process that replaces us right away, without
+	   losing any events in between, and disconnect us as they go. The
+	   ones that the same reload is replacing are already deinitializing
+	   and never read the command, so keep serving them - the events they
+	   log on the way out would be lost otherwise. They disconnect when
+	   they exit.
+
+	   The reader and HTTP clients are single requests, so just wait for
+	   them to finish. The die timeout stops us in case somebody doesn't
+	   disconnect. */
+	client_writers_send_reconnect();
+}
+
+static void main_preinit(void)
+{
+	restrict_access_by_env(RESTRICT_ACCESS_FLAG_ALLOW_ROOT, NULL);
+	restrict_access_allow_coredumps(TRUE);
+}
+
+static void main_init(void)
+{
+	const char *error;
+
+	stats_settings =
+		settings_get_or_fatal(master_service_get_event(master_service),
+				      &stats_setting_parser_info);
+
+	stats_startup_time = ioloop_time;
+	if (stats_metrics_init(master_service_get_event(master_service),
+			       stats_settings, &stats_metrics, &error) < 0)
+		i_fatal("%s", error);
+	stats_event_categories_init();
+	client_readers_init();
+	client_writers_init();
+	client_http_init(master_service_get_event(master_service));
+	stats_services_init();
+}
+
+static void main_deinit(void)
+{
+	stats_services_deinit();
+	client_readers_deinit();
+	client_writers_deinit();
+	client_http_deinit();
+	stats_event_categories_deinit();
+	stats_metrics_deinit(&stats_metrics);
+	settings_free(stats_settings);
+}
+
+int main(int argc, char *argv[])
+{
+	const enum master_service_flags service_flags =
+		MASTER_SERVICE_FLAG_NO_SSL_INIT |
+		MASTER_SERVICE_FLAG_DONT_SEND_STATS |
+		MASTER_SERVICE_FLAG_NO_IDLE_DIE |
+		MASTER_SERVICE_FLAG_UPDATE_PROCTITLE;
+	const char *error;
+
+	master_service = master_service_init("stats", service_flags,
+					     &argc, &argv, "");
+	if (master_getopt(master_service) > 0)
+		return FATAL_DEFAULT;
+
+	if (master_service_settings_read_simple(master_service, &error) < 0)
+		i_fatal("%s", error);
+	master_service_init_log(master_service);
+	/* Don't keep serving the existing clients for as long as they live
+	   after the master tells us to stop - see stats_die(). */
+	master_service_set_die_with_master(master_service, TRUE);
+	master_service_set_die_callback(master_service, stats_die);
+
+	main_preinit();
+
+	main_init();
+	master_service_init_finish(master_service);
+	master_service_run(master_service, client_connected);
+	main_deinit();
+	master_service_deinit(&master_service);
+        return 0;
+}

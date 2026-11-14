@@ -1,0 +1,335 @@
+#ifndef CONNECTION_H
+#define CONNECTION_H
+
+#include "net.h"
+
+struct ioloop;
+struct connection;
+
+enum connection_behavior {
+	CONNECTION_BEHAVIOR_DESTROY = 0,
+	CONNECTION_BEHAVIOR_ALLOW
+};
+
+enum connection_disconnect_reason {
+	/* not disconnected yet */
+	CONNECTION_DISCONNECT_NOT = 0,
+	/* normal requested disconnection */
+	CONNECTION_DISCONNECT_DEINIT,
+	/* input buffer full */
+	CONNECTION_DISCONNECT_BUFFER_FULL,
+	/* connection got disconnected */
+	CONNECTION_DISCONNECT_CONN_CLOSED,
+	/* connect() timed out */
+	CONNECTION_DISCONNECT_CONNECT_TIMEOUT,
+	/* remote didn't send input */
+	CONNECTION_DISCONNECT_IDLE_TIMEOUT,
+	/* handshake failed */
+	CONNECTION_DISCONNECT_HANDSHAKE_FAILED,
+};
+
+struct connection_vfuncs {
+	void (*init)(struct connection *conn);
+	void (*destroy)(struct connection *conn);
+	/* For UNIX socket clients this gets called immediately (unless
+	   delayed_unix_client_connected_callback=TRUE) with success=TRUE,
+	   for IP connections it gets called later:
+
+	   If connect() fails, sets success=FALSE and errno. Streams aren't
+	   initialized in that situation either. destroy() is called after
+	   the callback. */
+	void (*client_connected)(struct connection *conn, bool success);
+
+	/* implement one of the input*() methods.
+	   They return 1 = ok, continue. 0 = ok, but stop processing more
+	   lines, -1 = error, disconnect the client. */
+	void (*input)(struct connection *conn);
+	int (*input_line)(struct connection *conn, const char *line);
+	int (*input_args)(struct connection *conn, const char *const *args);
+
+	/* handshake functions. Defaults to version checking.
+	   must return 1 when handshake is completed, otherwise return 0.
+	   return -1 to indicate error and disconnect client.
+
+	   if you implement this, remember to call connection_verify_version
+	   yourself, otherwise you end up with assert crash.
+
+	   these will not be called if you implement `input` virtual function.
+	*/
+	int (*handshake)(struct connection *conn);
+	int (*handshake_line)(struct connection *conn, const char *line);
+	int (*handshake_args)(struct connection *conn, const char *const *args);
+
+	/* Called when the connection handshake is ready. */
+	void (*handshake_ready)(struct connection *conn);
+
+	/* Called when input_idle_timeout_secs is reached, defaults to disconnect */
+	void (*idle_timeout)(struct connection *conn);
+	/* Called when client_connect_timeout_msecs is reached, defaults to disconnect */
+	void (*connect_timeout)(struct connection *conn);
+};
+
+struct connection_settings {
+	const char *service_name_in;
+	const char *service_name_out;
+	unsigned int major_version, minor_version;
+
+	unsigned int client_connect_timeout_msecs;
+	unsigned int input_idle_timeout_secs;
+
+	/* These need to be non-zero for corresponding stream to
+	   be created. */
+	size_t input_max_size;
+	size_t output_max_size;
+	/* Stop accepting input if output size reaches this. */
+	size_t output_throttle_size;
+	enum connection_behavior input_full_behavior;
+
+	/* Set to TRUE if this is a client */
+	bool client;
+
+	/* Set to TRUE if version should not be sent */
+	bool dont_send_version;
+	/* By default when only input_args() is used, or when
+	   connection_input_line_default() is used, empty lines aren't allowed
+	   since it would result in additional args[0] == NULL check. Setting
+	   this to TRUE passes it through instead of logging an error. */
+	bool allow_empty_args_input;
+	/* Don't call client_connected() immediately on
+	   connection_client_connect() with UNIX sockets. This is mainly
+	   to make the functionality identical with inet sockets, which may
+	   simplify the calling code. */
+	bool delayed_unix_client_connected_callback;
+	/* Put the connection id in the log prefix */
+	bool log_connection_id;
+	/* If connect() to UNIX socket fails with EAGAIN, retry for this many
+	   milliseconds before giving up (0 = try once) */
+	unsigned int unix_client_connect_msecs;
+	/* Turn on debug logging */
+	bool debug;
+};
+
+struct connection {
+	struct connection *prev, *next;
+	struct connection_list *list;
+
+	/* The name for the connection provided by the application. This is
+	   usually a host name or a unix socket path. This may be NULL if the
+	   application provides none. */
+	char *base_name;
+	/* The name of the connection determined by the connection API. It is
+	   equal to base_name when that is available and otherwise it is
+	   composed from the connection properties; e.g., "ip:port". */
+	const char *name;
+
+	/* Label for the connection, formed from base_name,
+	 * property_label, id and file descriptors. */
+	char *label;
+	/* Property part of the label (pid, uid, etc.) */
+	char *property_label;
+	/* Connection ID. Incremented each time connection is formed. */
+	unsigned int id;
+
+	/* Connection file descriptors. */
+	int fd_in, fd_out;
+	/* Associated ioloop. */
+	struct ioloop *ioloop;
+	/* Input handler (removed when connection is halted). */
+	struct io *io;
+	/* IO streams. These are immediately non-NULL after connection_init().
+	   If a client connection hasn't finished yet, they point to error
+	   iostreams. After a disconnection the streams still exist in closed
+	   state. They won't be NULL until connection_deinit(). */
+	struct istream *input;
+	struct ostream *output;
+
+	/* How long to wait until disconnecting with no input.
+	   0 = unlimited. connection_init*() copies it from
+	   connection_list. */
+	unsigned int input_idle_timeout_secs;
+	struct timeout *to;
+	/* Last input timestamps. */
+	time_t last_input;
+	struct timeval last_input_tv;
+
+	/* Client has started to connect. This is client-only
+	   value. */
+	struct timeval connect_started;
+	/* Timestamp when client has finished handshake successfully. */
+	struct timeval handshake_finished;
+	/* Client has finished connecting. This is recorded for
+	   both server and client. */
+	struct timeval connect_finished;
+
+	/* Set to parent event before calling init. */
+	struct event *event_parent;
+	struct event *event;
+
+	/* Local and remote IP for TCP connections. */
+	struct ip_addr local_ip, remote_ip;
+	/* Local and remote port for TCP connections. */
+	in_port_t local_port, remote_port;
+	/* Remote pid, UNIX socket only. */
+	pid_t remote_pid;
+	/* Remote user id, UNIX socket only. */
+	uid_t remote_uid;
+	/* Remote group id, UNIX socket only. */
+	gid_t remote_gid;
+
+	/* received minor version */
+	unsigned int minor_version;
+
+	/* handlers */
+	struct connection_vfuncs v;
+
+	/* original ostream flush callback */
+	void *flush_callback;
+	void *flush_context;
+
+	/* Errno for connect() failure. */
+	int connect_failed_errno;
+	/* Reason for disconnection */
+	enum connection_disconnect_reason disconnect_reason;
+
+	/* Client connect() succeeded. */
+	bool client_connect_succeeded:1;
+	/* We have received a version from remote end. */
+	bool version_received:1;
+	/* Set if this is a unix socket. */
+	bool unix_socket:1;
+	/* Unix peer credentials have been attempted to look up. */
+	bool unix_peer_checked:1;
+	/* Unix peer credentials were successfully looked up. */
+	bool have_unix_credentials:1;
+	/* Connection is disconnected. */
+	bool disconnected:1;
+};
+
+struct connection_list {
+	struct connection *connections;
+	unsigned int connections_count;
+
+	unsigned int id_counter;
+
+	struct connection_settings set;
+	struct connection_vfuncs v;
+};
+
+void connection_init(struct connection_list *list, struct connection *conn,
+		     const char *name) ATTR_NULL(3);
+void connection_init_server(struct connection_list *list,
+			    struct connection *conn, const char *name,
+			    int fd_in, int fd_out) ATTR_NULL(3);
+void connection_init_server_ip(struct connection_list *list,
+			       struct connection *conn, const char *name,
+			       int fd_in, int fd_out,
+			       const struct ip_addr *remote_ip,
+			       in_port_t remote_port) ATTR_NULL(3, 6);
+void connection_init_client_ip(struct connection_list *list,
+			       struct connection *conn, const char *hostname,
+			       const struct ip_addr *ip, in_port_t port)
+			       ATTR_NULL(3);
+void connection_init_client_ip_from(struct connection_list *list,
+				    struct connection *conn,
+				    const char *hostname,
+				    const struct ip_addr *ip, in_port_t port,
+				    const struct ip_addr *my_ip) ATTR_NULL(3,6);
+void connection_init_client_unix(struct connection_list *list,
+				 struct connection *conn, const char *path);
+void connection_init_client_fd(struct connection_list *list,
+			       struct connection *conn, const char *name,
+			       int fd_int, int fd_out) ATTR_NULL(3);
+void connection_init_from_streams(struct connection_list *list,
+				  struct connection *conn, const char *name,
+				  struct istream *input,
+				  struct ostream *output) ATTR_NULL(3);
+
+/* connect() to the server. If the connect() fails immediately, return -1. */
+int connection_client_connect(struct connection *conn);
+/* connect() to the server. If the connect() fails immediately, call the
+   client_connected() and destroy() asynchronously from a timeout. This
+   simulates what happens on a delayed connect() failure. */
+int connection_client_connect_async(struct connection *conn);
+/* Connect to UNIX socket. If it fails, try it up to msecs is reached.
+   Overrides connection_settings.unix_client_connect_msecs. */
+int connection_client_connect_with_retries(struct connection *conn,
+					   unsigned int msecs);
+
+/* Disconnects a connection. The input/output streams are closed, but not
+   destroyed. */
+void connection_disconnect(struct connection *conn);
+
+/* Deinitializes a connection, calls disconnect */
+void connection_deinit(struct connection *conn);
+
+void connection_input_halt(struct connection *conn);
+/* Resume connection handling. If a new IO was added, it's marked as having
+   pending input. */
+void connection_input_resume(struct connection *conn);
+
+/* Update event fields and log prefix based on connection properties. */
+void connection_update_event(struct connection *conn);
+
+/* Update connection properties and labels */
+void connection_update_properties(struct connection *conn);
+
+/* Update byte counters in event */
+void connection_update_counters(struct connection *conn);
+
+/* This needs to be called if the input/output streams are changed */
+void connection_streams_changed(struct connection *conn);
+
+/* This function must be called if handshaking is handled without
+   connection API. This is automatically called once handshake
+   vfunctions return success and will call the handshake_ready() vfunction. */
+void connection_set_handshake_ready(struct connection *conn);
+
+/* Returns TRUE if handshake has been done */
+bool connection_handshake_received(struct connection *conn);
+
+/* Returns -1 = disconnected, 0 = nothing new, 1 = something new.
+   If input_full_behavior is ALLOW, may return also -2 = buffer full. */
+int connection_input_read(struct connection *conn);
+/* Same as connection_input_read(), but read from a different input stream.
+   On failures, copy the error to the main istream. This is mainly intended
+   to be used with multiplex istream. */
+int connection_input_read_stream(struct connection *conn,
+				 struct istream *input);
+/* Verify that VERSION input matches what we expect. */
+int connection_verify_version(struct connection *conn,
+			      const char *service_name,
+			      unsigned int major_version,
+			      unsigned int minor_version);
+
+int connection_handshake_args_default(struct connection *conn,
+				      const char *const *args);
+
+/* Returns human-readable reason for why connection was disconnected. */
+const char *connection_disconnect_reason(struct connection *conn);
+/* Returns human-readable reason for why connection timed out,
+   e.g. "No input for 10.023 secs". */
+const char *connection_input_timeout_reason(struct connection *conn);
+
+void connection_switch_ioloop_to(struct connection *conn,
+				 struct ioloop *ioloop);
+void connection_switch_ioloop(struct connection *conn);
+
+struct connection_list *
+connection_list_init(const struct connection_settings *set,
+		     const struct connection_vfuncs *vfuncs);
+void connection_list_deinit(struct connection_list **list);
+
+void connection_input_default(struct connection *conn);
+int connection_input_line_default(struct connection *conn, const char *line);
+
+/* Change handlers, calls connection_input_halt and connection_input_resume */
+void connection_set_handlers(struct connection *conn, const struct connection_vfuncs *vfuncs);
+void connection_set_default_handlers(struct connection *conn);
+
+/* Checks if the given name is a valid DNS servername as per RFC1123 section 1.2,
+   RFC8591 section 4.2.1 and for practicality, the '_' character.
+   IP address like values are also accepted.
+*/
+bool connection_is_valid_dns_name(const char *name);
+
+#endif

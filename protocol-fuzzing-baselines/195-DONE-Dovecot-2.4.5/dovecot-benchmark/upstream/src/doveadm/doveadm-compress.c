@@ -1,0 +1,404 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "net.h"
+#include "istream.h"
+#include "ostream.h"
+#include "istream-zlib.h"
+#include "ostream-zlib.h"
+#include "iostream-ssl.h"
+#include "module-dir.h"
+#include "master-service.h"
+#include "compression.h"
+#include "doveadm-dump.h"
+
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+enum server_input_line_type {
+	SERVER_INPUT_LINE_TYPE_DEFAULT,
+	SERVER_INPUT_LINE_TYPE_STARTTLS,
+	SERVER_INPUT_LINE_TYPE_COMPRESS,
+	SERVER_INPUT_LINE_TYPE_COMPRESS_FAILED,
+};
+
+struct client {
+	int fd;
+	const char *host;
+	struct event *event;
+	struct io *io_client, *io_server;
+	struct istream *input, *stdin_input;
+	struct ostream *output, *stdout_output;
+	struct ssl_iostream *ssl_iostream;
+	const struct compression_handler *handler;
+	char *algorithm;
+	char *compress_tag;
+	bool tls;
+	bool compressed;
+	bool compress_waiting;
+};
+
+static void server_input(struct client *client);
+
+static bool test_dump_imap_compress(struct doveadm_cmd_context *cctx ATTR_UNUSED,
+				    const char *path)
+{
+	const char *p;
+	char buf[4096];
+	int fd, ret;
+	bool match = FALSE;
+
+	p = strrchr(path, '.');
+	if (p == NULL || (strcmp(p, ".in") != 0 && strcmp(p, ".out") != 0))
+		return FALSE;
+
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		return FALSE;
+
+	ret = read(fd, buf, sizeof(buf)-1);
+	if (ret > 0) {
+		buf[ret] = '\0';
+		(void)str_lcase(buf);
+		match = strstr(buf, " ok begin compression.") != NULL ||
+			strstr(buf, " compress deflate") != NULL;
+	}
+	i_close_fd(&fd);
+	return match;
+}
+
+static void
+cmd_dump_imap_compress(struct doveadm_cmd_context *cctx,
+		       const char *path, const char *const *args ATTR_UNUSED)
+{
+	struct istream *input, *input2;
+	const unsigned char *data;
+	size_t size;
+	const char *line;
+	int fd;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		i_fatal("open(%s) failed: %m", path);
+	input = i_stream_create_fd_autoclose(&fd, 1024*32);
+	while ((line = i_stream_read_next_line(input)) != NULL) {
+		/* skip tag */
+		printf("%s\r\n", line);
+		while (*line != ' ' && *line != '\0') line++;
+		if (*line == '\0')
+			continue;
+		line++;
+
+		if (str_begins_with(line, "OK Begin compression") ||
+		    strcasecmp(line, "COMPRESS DEFLATE") == 0)
+			break;
+	}
+
+	input2 = i_stream_create_deflate(input);
+	i_stream_unref(&input);
+
+	while (i_stream_read_more(input2, &data, &size) != -1) {
+		if (fwrite(data, 1, size, stdout) != size)
+			break;
+		i_stream_skip(input2, size);
+	}
+	if (input2->stream_errno != 0)
+		e_error(cctx->event,
+			"read(%s) failed: %s", path, i_stream_get_error(input2));
+	i_stream_unref(&input2);
+	fflush(stdout);
+}
+
+static bool
+client_input_get_compress_algorithm(struct client *client, const char *line)
+{
+	const char *algorithm, *tag = line;
+	size_t tag_len;
+
+	/* skip tag */
+	while (*line != ' ' && *line != '\0')
+		line++;
+	tag_len = line - tag;
+	if (!str_begins_icase(line, " COMPRESS ", &algorithm))
+		return FALSE;
+
+	/* Look up the local handler needed to (de)compress the stream once the
+	   server accepts. Don't fail here if the mechanism is unknown or not
+	   compiled in: the server may reject it, and this client must still send
+	   the command to let the server do so. If the server unexpectedly
+	   accepts a mechanism we can't handle, we fail then (see server_input()). */
+	if (compression_lookup_handler(t_str_lcase(algorithm),
+				       &client->handler) <= 0)
+		client->handler = NULL;
+	/* Remember the tag so we can tell whether the server accepted or
+	   rejected this COMPRESS command. */
+	i_free(client->compress_tag);
+	client->compress_tag = i_strndup(tag, tag_len);
+	return TRUE;
+}
+
+static bool client_input_uncompressed(struct client *client)
+{
+	const char *line;
+
+	if (client->compress_waiting) {
+		/* just read all the pipelined input for now */
+		(void)i_stream_read(client->stdin_input);
+		return TRUE;
+	}
+
+	while ((line = i_stream_read_next_line(client->stdin_input)) != NULL) {
+		o_stream_nsend_str(client->output, line);
+		o_stream_nsend(client->output, "\n", 1);
+		if (client_input_get_compress_algorithm(client, line))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static void client_input(struct client *client)
+{
+	const unsigned char *data;
+	size_t size;
+
+	if (!client->compressed &&
+	    client_input_uncompressed(client)) {
+		/* stop until server has sent reply to COMPRESS command. */
+		client->compress_waiting = TRUE;
+		return;
+	}
+	if (client->compressed) {
+		if (i_stream_read_more(client->stdin_input, &data, &size) > 0) {
+			o_stream_nsend(client->output, data, size);
+			i_stream_skip(client->stdin_input, size);
+		}
+		if (o_stream_flush(client->output) < 0) {
+			i_fatal("write() failed: %s",
+				o_stream_get_error(client->output));
+		}
+	}
+	if (client->stdin_input->eof) {
+		if (client->stdin_input->stream_errno != 0) {
+			i_fatal("read(stdin) failed: %s",
+				i_stream_get_error(client->stdin_input));
+		}
+		master_service_stop(master_service);
+	}
+}
+
+static bool server_input_is_starttls_reply(const char *line)
+{
+	/* skip tag */
+	while (*line != ' ' && *line != '\0')
+		line++;
+	return str_begins_with(line, " OK Begin TLS negotiation now");
+}
+
+static bool server_input_is_compress_reply(const char *line)
+{
+	/* skip tag */
+	while (*line != ' ' && *line != '\0')
+		line++;
+	return str_begins_with(line, " OK Begin compression");
+}
+
+static bool server_input_is_reply_to_tag(const char *line, const char *tag)
+{
+	size_t tag_len = strlen(tag);
+
+	return strncmp(line, tag, tag_len) == 0 && line[tag_len] == ' ';
+}
+
+static enum server_input_line_type
+server_input_line_type(struct client *client, const char *line)
+{
+	if (!client->tls && server_input_is_starttls_reply(line))
+		return SERVER_INPUT_LINE_TYPE_STARTTLS;
+	if (!client->compressed && server_input_is_compress_reply(line))
+		return SERVER_INPUT_LINE_TYPE_COMPRESS;
+	/* The server can reject COMPRESS (e.g. an unsupported mechanism). If we
+	   are waiting for its reply, a tagged reply that isn't the "OK Begin
+	   compression" above means the command failed - resume sending the
+	   pipelined input instead of waiting forever. */
+	if (client->compress_waiting && client->compress_tag != NULL &&
+	    server_input_is_reply_to_tag(line, client->compress_tag))
+		return SERVER_INPUT_LINE_TYPE_COMPRESS_FAILED;
+	return SERVER_INPUT_LINE_TYPE_DEFAULT;
+}
+
+static void client_init_ssl(struct client *client)
+{
+	const char *error;
+
+	io_remove(&client->io_server);
+
+	const struct ssl_iostream_client_autocreate_parameters parameters = {
+		.event_parent = client->event,
+		.host = client->host,
+		.flags = 0,
+	};
+	if (io_stream_autocreate_ssl_client(&parameters,
+					    &client->input, &client->output,
+					    &client->ssl_iostream, &error) < 0)
+		i_fatal("STARTTLS failed: %s", error);
+	client->io_server = io_add_istream(client->input, server_input, client);
+
+	if (ssl_iostream_handshake(client->ssl_iostream) < 0) {
+		i_fatal("SSL handshake failed: %s",
+			ssl_iostream_get_last_error(client->ssl_iostream));
+	}
+}
+
+static void server_input(struct client *client)
+{
+	const unsigned char *data;
+	size_t size;
+	const char *line;
+
+	if (i_stream_read(client->input) == -1) {
+		if (client->input->stream_errno != 0) {
+			i_fatal("read(server) failed: %s",
+				i_stream_get_error(client->input));
+		}
+
+		e_info(client->event, "Server disconnected");
+		master_service_stop(master_service);
+		return;
+	}
+
+	while ((line = i_stream_next_line(client->input)) != NULL) {
+		o_stream_nsend_str(client->stdout_output, line);
+		o_stream_nsend_str(client->stdout_output, "\n");
+
+		switch (server_input_line_type(client, line)) {
+		case SERVER_INPUT_LINE_TYPE_STARTTLS:
+			/* start TLS */
+			client_init_ssl(client);
+			client->tls = TRUE;
+			i_stream_set_input_pending(client->stdin_input, TRUE);
+			e_info(client->event, "<TLS started>");
+			break;
+		case SERVER_INPUT_LINE_TYPE_COMPRESS: {
+			/* start compression */
+			struct istream *input;
+			struct ostream *output;
+
+			if (client->handler == NULL)
+				i_fatal("Server accepted unsupported compression mechanism");
+			e_info(client->event, "<Compression started>");
+			input = client->handler->create_istream(client->input);
+			output = client->handler->
+				create_ostream_auto(client->output, client->event);
+			i_stream_unref(&client->input);
+			o_stream_unref(&client->output);
+			client->input = input;
+			client->output = output;
+			client->compressed = TRUE;
+			client->compress_waiting = FALSE;
+			i_free_and_null(client->compress_tag);
+			i_stream_set_input_pending(client->stdin_input, TRUE);
+			break;
+		}
+		case SERVER_INPUT_LINE_TYPE_COMPRESS_FAILED:
+			/* Server rejected COMPRESS. Resume sending input. */
+			e_info(client->event, "<Compression rejected>");
+			client->handler = NULL;
+			client->compress_waiting = FALSE;
+			i_free_and_null(client->compress_tag);
+			i_stream_set_input_pending(client->stdin_input, TRUE);
+			break;
+		case SERVER_INPUT_LINE_TYPE_DEFAULT:
+			break;
+		}
+	}
+
+	data = i_stream_get_data(client->input, &size);
+	o_stream_nsend(client->stdout_output, data, size);
+	i_stream_skip(client->input, size);
+
+	if (o_stream_flush(client->stdout_output) < 0) {
+		i_fatal("write(stdout) failed: %s",
+			o_stream_get_error(client->stdout_output));
+	}
+}
+
+static void cmd_compress_connect(struct doveadm_cmd_context *cctx)
+{
+	struct client client;
+	const char *host;
+	struct ip_addr *ips;
+	unsigned int ips_count;
+	int64_t port_int64;
+	in_port_t port = 143;
+	int fd, ret;
+
+	if (!doveadm_cmd_param_str(cctx, "host", &host))
+		help_ver2(&doveadm_cmd_compress_connect);
+	if (doveadm_cmd_param_int64(cctx, "port", &port_int64)) {
+		if (port_int64 == 0 || port_int64 > 65535)
+			i_fatal("Invalid port: %"PRId64, port_int64);
+		port = (in_port_t)port_int64;
+	}
+
+	ret = net_gethostbyname(host, &ips, &ips_count);
+	if (ret != 0) {
+		i_fatal("Host %s lookup failed: %s", host,
+			net_gethosterror(ret));
+	}
+
+	if ((fd = net_connect_ip(&ips[0], port, NULL)) == -1)
+		i_fatal("connect(%s, %u) failed: %m", host, port);
+
+	e_info(cctx->event, "Connected to %s port %u.", net_ip2addr(&ips[0]), port);
+
+	i_zero(&client);
+	client.host = host;
+	client.event = event_create(cctx->event);
+	client.fd = fd;
+	fd_set_nonblock(STDIN_FILENO, TRUE);
+	client.stdin_input = i_stream_create_fd(STDIN_FILENO, SIZE_MAX);
+	/* stdin and stdout may point to the same file description (e.g. a
+	   pty), in which case stdout is now also non-blocking. Buffer stdout
+	   writes and retry them from the ioloop on EAGAIN. */
+	client.stdout_output = o_stream_create_fd(STDOUT_FILENO, SIZE_MAX);
+	client.input = i_stream_create_fd(fd, SIZE_MAX);
+	client.output = o_stream_create_fd(fd, 0);
+	o_stream_set_no_error_handling(client.output, TRUE);
+	client.io_client = io_add_istream(client.stdin_input, client_input, &client);
+	client.io_server = io_add_istream(client.input, server_input, &client);
+	master_service_run(master_service, NULL);
+	io_remove(&client.io_client);
+	io_remove(&client.io_server);
+	/* switch stdout back to blocking for the final flush */
+	fd_set_nonblock(STDOUT_FILENO, FALSE);
+	if (o_stream_finish(client.stdout_output) < 0) {
+		i_fatal("write(stdout) failed: %s",
+			o_stream_get_error(client.stdout_output));
+	}
+	ssl_iostream_destroy(&client.ssl_iostream);
+	i_stream_unref(&client.stdin_input);
+	i_stream_unref(&client.input);
+	o_stream_unref(&client.output);
+	o_stream_unref(&client.stdout_output);
+	i_free(client.compress_tag);
+	event_unref(&client.event);
+	if (close(fd) < 0)
+		i_fatal("close() failed: %m");
+}
+
+struct doveadm_cmd_dump doveadm_cmd_dump_imap_compress = {
+	"imap-compress",
+	test_dump_imap_compress,
+	cmd_dump_imap_compress
+};
+
+struct doveadm_cmd_ver2 doveadm_cmd_compress_connect = {
+	.name = "compress-connect",
+	.cmd = cmd_compress_connect,
+	.usage = "<host> [<port>]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAM('\0', "host", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "port", CMD_PARAM_INT64, CMD_PARAM_FLAG_POSITIONAL|CMD_PARAM_FLAG_UNSIGNED)
+DOVEADM_CMD_PARAMS_END
+};

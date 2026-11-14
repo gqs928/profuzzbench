@@ -1,0 +1,306 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "test-lib.h"
+#include "fd-util.h"
+#include "ioloop.h"
+#include "net.h"
+#include "str.h"
+#include "randgen.h"
+#include "istream.h"
+#include "ostream.h"
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#define MAX_BUFSIZE 256
+
+static void test_ostream_file_random_once(void)
+{
+	struct ostream *output;
+	char buf[MAX_BUFSIZE*4], buf2[MAX_BUFSIZE*4], randbuf[MAX_BUFSIZE];
+	unsigned int i, offset, size;
+	ssize_t ret;
+	int fd;
+
+	memset(buf, 0, sizeof(buf));
+	fd = test_create_temp_fd();
+	output = o_stream_create_fd(fd, MAX_BUFSIZE);
+	o_stream_cork(output);
+
+	size = i_rand_minmax(1, MAX_BUFSIZE);
+	random_fill(randbuf, size);
+	memcpy(buf, randbuf, size);
+	test_assert(o_stream_send(output, buf, size) > 0);
+
+	for (i = 0; i < 10; i++) {
+		offset = i_rand_limit(MAX_BUFSIZE * 3);
+		size = i_rand_minmax(1, MAX_BUFSIZE);
+		random_fill(randbuf, size);
+		memcpy(buf + offset, randbuf, size);
+		test_assert(o_stream_pwrite(output, randbuf, size, offset) == 0);
+		if (i_rand_limit(10) == 0)
+			test_assert(o_stream_flush(output) > 0);
+	}
+
+	o_stream_uncork(output);
+	test_assert(o_stream_finish(output) > 0);
+	ret = pread(fd, buf2, sizeof(buf2), 0);
+	if (ret < 0)
+		i_fatal("pread() failed: %m");
+	else {
+		i_assert(ret > 0);
+		test_assert(memcmp(buf, buf2, ret) == 0);
+	}
+	o_stream_unref(&output);
+	i_close_fd(&fd);
+}
+
+static void test_ostream_file_random(void)
+{
+	unsigned int i;
+
+	test_begin("ostream pwrite random");
+	for (i = 0; i < 100; i++) T_BEGIN {
+		test_ostream_file_random_once();
+	} T_END;
+	test_end();
+}
+
+static void test_ostream_file_send_istream_file(void)
+{
+	struct istream *input, *input2;
+	struct ostream *output;
+	const char *ipath, *opath;
+	char buf[10];
+	int fd;
+
+	test_begin("ostream file send istream file");
+
+	/* temp file istream */
+	ipath = test_dir_prepend(".temp1.istream");
+	fd = open(ipath, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (fd == -1)
+		i_fatal("creat(%s) failed: %m", ipath);
+	test_assert(write(fd, "1234567890", 10) == 10);
+	test_assert(lseek(fd, 0, SEEK_SET) == 0);
+	input = i_stream_create_fd_autoclose(&fd, 1024);
+
+	/* temp file ostream */
+	opath = test_dir_prepend(".temp1.ostream");
+	fd = open(opath, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (fd == -1)
+		i_fatal("creat(%s) failed: %m", opath);
+	output = o_stream_create_fd(fd, 0);
+
+	/* test that writing works between two files */
+	i_stream_seek(input, 3);
+	input2 = i_stream_create_limit(input, 4);
+	test_assert(o_stream_send_istream(output, input2) == OSTREAM_SEND_ISTREAM_RESULT_FINISHED);
+	test_assert(output->offset == 4);
+	test_assert(pread(fd, buf, sizeof(buf), 0) == 4 &&
+		    memcmp(buf, "4567", 4) == 0);
+	i_stream_unref(&input2);
+
+	/* test that writing works within the same file */
+	i_stream_destroy(&input);
+
+	input = i_stream_create_fd(fd, 1024);
+	/* forwards: 4567 -> 4677 */
+	o_stream_seek(output, 1);
+	i_stream_seek(input, 2);
+	input2 = i_stream_create_limit(input, 2);
+	test_assert(o_stream_send_istream(output, input2) == OSTREAM_SEND_ISTREAM_RESULT_FINISHED);
+	test_assert(output->offset == 3);
+	test_assert(pread(fd, buf, sizeof(buf), 0) == 4 &&
+		    memcmp(buf, "4677", 4) == 0);
+	i_stream_destroy(&input2);
+	i_stream_destroy(&input);
+
+	/* backwards: 1234 -> 11234 */
+	memcpy(buf, "1234", 4);
+	test_assert(pwrite(fd, buf, 4, 0) == 4);
+	input = i_stream_create_fd(fd, 1024);
+	o_stream_seek(output, 1);
+	test_assert(o_stream_send_istream(output, input) == OSTREAM_SEND_ISTREAM_RESULT_FINISHED);
+	test_assert(output->offset == 5);
+	test_assert(pread(fd, buf, sizeof(buf), 0) == 5 &&
+		    memcmp(buf, "11234", 5) == 0);
+	i_stream_destroy(&input);
+
+	o_stream_destroy(&output);
+	i_close_fd(&fd);
+
+	i_unlink(ipath);
+	i_unlink(opath);
+	test_end();
+}
+
+static void test_ostream_file_send_istream_sendfile(void)
+{
+	struct istream *input, *input2;
+	struct ostream *output;
+	const char *path;
+	char buf[10];
+	int fd, sock_fd[2];
+
+	test_begin("ostream file send istream sendfile()");
+
+	/* temp file istream */
+	path = test_dir_prepend(".temp2.istream");
+	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (fd == -1)
+		i_fatal("creat(%s) failed: %m", path);
+	test_assert(write(fd, "abcdefghij", 10) == 10);
+	test_assert(lseek(fd, 0, SEEK_SET) == 0);
+	input = i_stream_create_fd_autoclose(&fd, 1024);
+
+	/* temp socket ostream */
+	i_assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fd) == 0);
+	output = o_stream_create_fd_autoclose(sock_fd, 0);
+
+	/* test that sendfile() works */
+	i_stream_seek(input, 3);
+	input2 = i_stream_create_limit(input, 4);
+	test_assert(o_stream_send_istream(output, input2) == OSTREAM_SEND_ISTREAM_RESULT_FINISHED);
+	test_assert(output->offset == 4);
+	test_assert(read(sock_fd[1], buf, sizeof(buf)) == 4 &&
+		    memcmp(buf, "defg", 4) == 0);
+	i_stream_unref(&input2);
+
+	/* test reading past EOF */
+	i_stream_seek(input, 0);
+	input2 = i_stream_create_limit(input, 20);
+	test_assert(o_stream_send_istream(output, input2) == OSTREAM_SEND_ISTREAM_RESULT_FINISHED);
+	test_assert(input2->v_offset == 10);
+	test_assert(output->offset == 14);
+	i_stream_unref(&input2);
+
+	i_stream_unref(&input);
+	o_stream_destroy(&output);
+	i_close_fd(&sock_fd[1]);
+
+	i_unlink(path);
+	test_end();
+}
+
+static void test_ostream_file_send_over_iov_max(void)
+{
+	test_begin("ostream file send over IOV_MAX");
+
+	const char *path = test_dir_prepend(".temp3.istream");
+	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (fd == -1)
+		i_fatal("creat(%s) failed: %m", path);
+	struct ostream *output = o_stream_create_fd(fd, 0);
+
+	struct const_iovec iov[IOV_MAX*3];
+	unsigned int input[N_ELEMENTS(iov)];
+	for (unsigned int i = 0; i < N_ELEMENTS(iov); i++) {
+		input[i] = i;
+		iov[i].iov_base = &input[i];
+		iov[i].iov_len = sizeof(input[i]);
+	}
+	ssize_t ret = o_stream_sendv(output, iov, IOV_MAX * 2);
+	test_assert(ret == sizeof(input[0]) * IOV_MAX * 2);
+	ret = o_stream_sendv(output, iov + IOV_MAX * 2, IOV_MAX);
+	test_assert(ret == sizeof(input[0]) * IOV_MAX);
+	o_stream_destroy(&output);
+
+	unsigned int readbuf[N_ELEMENTS(iov) + 1];
+	ret = pread(fd, readbuf, sizeof(readbuf), 0);
+	test_assert(ret == sizeof(input));
+	test_assert(memcmp(input, readbuf, sizeof(input)) == 0);
+	i_close_fd(&fd);
+
+	i_unlink(path);
+	test_end();
+}
+
+static void test_ostream_file_max_buffer_size_zero(void)
+{
+	int fd[2];
+	char buf[4096];
+
+	test_begin("ostream file (max_buffer_size=0)");
+	struct ioloop *ioloop = io_loop_create();
+	test_assert(pipe(fd) == 0);
+	fd_set_nonblock(fd[0], TRUE);
+	fd_set_nonblock(fd[1], TRUE);
+
+	/* Fill the pipe so the next write would block. */
+	memset(buf, 'x', sizeof(buf));
+	while (write(fd[1], buf, sizeof(buf)) > 0)
+		;
+	test_assert(errno == EAGAIN);
+
+	/* o_stream_create_fd() replaces a creation-time buffer size of 0
+	   with optimal_block_size, so max_buffer_size=0 is only reachable
+	   via o_stream_set_max_buffer_size(). A stream that has never
+	   buffered anything has no buffer allocated at all, because
+	   o_stream_grow_buffer() caps the allocation to max_buffer_size.
+	   Writing to the blocked fd must return 0 (would block) instead
+	   of trying to buffer into the NULL buffer. */
+	struct ostream *output = o_stream_create_fd(fd[1], 1024);
+	o_stream_set_max_buffer_size(output, 0);
+	o_stream_set_no_error_handling(output, TRUE);
+	test_assert(o_stream_send(output, "x", 1) == 0);
+	test_assert(output->stream_errno == 0);
+	test_assert(o_stream_get_buffer_used_size(output) == 0);
+
+	/* Draining the pipe makes the write go through again. */
+	while (read(fd[0], buf, sizeof(buf)) > 0)
+		;
+	test_assert(o_stream_send(output, "y", 1) == 1);
+
+	/* Buffer the next write, so the buffer gets allocated. Uncorking
+	   flushes it out again, but keeps the buffer allocated. */
+	o_stream_set_max_buffer_size(output, sizeof(buf));
+	o_stream_cork(output);
+	test_assert(o_stream_send(output, "z", 1) == 1);
+	o_stream_uncork(output);
+	test_assert(o_stream_get_buffer_used_size(output) == 0);
+
+	/* Once the buffer is allocated, max_buffer_size=0 no longer
+	   prevents buffering, since o_stream_add() is limited by the
+	   already allocated buffer_size. This is what the current
+	   max_buffer_size=0 callers end up doing. */
+	while (write(fd[1], buf, sizeof(buf)) > 0)
+		;
+	test_assert(errno == EAGAIN);
+	o_stream_set_max_buffer_size(output, 0);
+	test_assert(o_stream_send(output, "q", 1) == 1);
+	test_assert(o_stream_get_buffer_used_size(output) == 1);
+
+	o_stream_unref(&output);
+	i_close_fd(&fd[0]);
+	i_close_fd(&fd[1]);
+	io_loop_destroy(&ioloop);
+	test_end();
+}
+
+void test_ostream_file(void)
+{
+	test_ostream_file_random();
+	test_ostream_file_send_istream_file();
+	test_ostream_file_send_istream_sendfile();
+	test_ostream_file_send_over_iov_max();
+	test_ostream_file_max_buffer_size_zero();
+}
+
+enum fatal_test_state fatal_ostream_file(unsigned int stage)
+{
+	struct ostream *output;
+
+	switch (stage) {
+	case 0:
+		test_begin("ostream file missing error handling");
+		output = o_stream_create_fd(dev_null_fd, 0);
+		o_stream_set_name(output, "stdout");
+		o_stream_nsend_str(output, "test\n");
+		test_expect_fatal_string("output stream stdout is missing error handling");
+		o_stream_destroy(&output);
+		return FATAL_TEST_FAILURE;
+	}
+	test_end();
+	return FATAL_TEST_FINISHED;
+}

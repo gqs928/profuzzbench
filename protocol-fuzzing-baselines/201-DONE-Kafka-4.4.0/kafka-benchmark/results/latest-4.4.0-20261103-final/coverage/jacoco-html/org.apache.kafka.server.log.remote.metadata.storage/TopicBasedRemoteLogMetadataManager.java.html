@@ -1,0 +1,531 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TopicBasedRemoteLogMetadataManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.log.remote.metadata.storage</a> &gt; <span class="el_source">TopicBasedRemoteLogMetadataManager.java</span></div><h1>TopicBasedRemoteLogMetadataManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server.log.remote.metadata.storage;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.CreateTopicsResult;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.TopicDescription;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.TopicExistsException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.Exit;
+import org.apache.kafka.common.utils.internals.KafkaThread;
+import org.apache.kafka.server.log.remote.storage.RemoteLogMetadata;
+import org.apache.kafka.server.log.remote.storage.RemoteLogMetadataManager;
+import org.apache.kafka.server.log.remote.storage.RemoteLogSegmentMetadata;
+import org.apache.kafka.server.log.remote.storage.RemoteLogSegmentMetadataUpdate;
+import org.apache.kafka.server.log.remote.storage.RemoteLogSegmentState;
+import org.apache.kafka.server.log.remote.storage.RemotePartitionDeleteMetadata;
+import org.apache.kafka.server.log.remote.storage.RemoteStorageException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+/**
+ * This is the {@link RemoteLogMetadataManager} implementation with storage as an internal topic with name
+ * {@link TopicBasedRemoteLogMetadataManagerConfig#REMOTE_LOG_METADATA_TOPIC_NAME}.
+ * This is used to publish and fetch {@link RemoteLogMetadata} for the registered user topic partitions with
+ * {@link #onPartitionLeadershipChanges(Set, Set)}. Each broker will have an instance of this class, and it subscribes
+ * to metadata updates for the registered user topic partitions.
+ */
+public class TopicBasedRemoteLogMetadataManager implements BrokerReadyCallback, RemoteLogMetadataManager {
+<span class="nc" id="L72">    private static final Logger log = LoggerFactory.getLogger(TopicBasedRemoteLogMetadataManager.class);</span>
+<span class="nc" id="L73">    private final Time time = Time.SYSTEM;</span>
+
+<span class="nc" id="L75">    private final AtomicBoolean configured = new AtomicBoolean(false);</span>
+<span class="nc" id="L76">    private final AtomicBoolean closing = new AtomicBoolean(false);</span>
+<span class="nc" id="L77">    private final AtomicBoolean initialized = new AtomicBoolean(false);</span>
+
+    private Thread initializationThread;
+    private volatile ProducerManager producerManager;
+    private volatile ConsumerManager consumerManager;
+
+    // This allows to gracefully close this instance using {@link #close()} method while there are some pending or new
+    // requests calling different methods which use the resources like producer/consumer managers.
+<span class="nc" id="L85">    private final ReadWriteLock lock = new ReentrantReadWriteLock();</span>
+    private final RemotePartitionMetadataStore remotePartitionMetadataStore;
+<span class="nc" id="L87">    private final Set&lt;TopicIdPartition&gt; pendingAssignPartitions = Collections.synchronizedSet(new HashSet&lt;&gt;());</span>
+    private final Function&lt;Integer, RemoteLogMetadataTopicPartitioner&gt; partitionerFunction;
+
+    public TopicBasedRemoteLogMetadataManager() {
+<span class="nc" id="L91">        this(RemoteLogMetadataTopicPartitioner::new, RemotePartitionMetadataStore::new);</span>
+<span class="nc" id="L92">    }</span>
+
+    TopicBasedRemoteLogMetadataManager(Function&lt;Integer, RemoteLogMetadataTopicPartitioner&gt; partitionerFunction,
+<span class="nc" id="L95">                                       Supplier&lt;RemotePartitionMetadataStore&gt; metadataStoreSupplier) {</span>
+<span class="nc" id="L96">        this.partitionerFunction = partitionerFunction;</span>
+<span class="nc" id="L97">        this.remotePartitionMetadataStore = metadataStoreSupplier.get();</span>
+<span class="nc" id="L98">    }</span>
+
+    /**
+     * Adds metadata for a remote log segment to the metadata store.
+     * The provided metadata must have the state {@code COPY_SEGMENT_STARTED}.
+     *
+     * @param remoteLogSegmentMetadata the metadata of the remote log segment to be added; must not be null
+     * @return a {@link CompletableFuture} that completes once the metadata has been published to the topic
+     * @throws RemoteStorageException   if an error occurs while storing the metadata
+     * @throws IllegalArgumentException if the state of the provided metadata is not {@code COPY_SEGMENT_STARTED}
+     */
+    @Override
+    public CompletableFuture&lt;Void&gt; addRemoteLogSegmentMetadata(RemoteLogSegmentMetadata remoteLogSegmentMetadata)
+            throws RemoteStorageException {
+<span class="nc" id="L112">        Objects.requireNonNull(remoteLogSegmentMetadata, &quot;remoteLogSegmentMetadata can not be null&quot;);</span>
+<span class="nc" id="L113">        return withReadLockAndEnsureInitialized(() -&gt; {</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">            if (remoteLogSegmentMetadata.state() != RemoteLogSegmentState.COPY_SEGMENT_STARTED) {</span>
+<span class="nc" id="L115">                throw new IllegalArgumentException(</span>
+                        &quot;Given remoteLogSegmentMetadata should have state as &quot; + RemoteLogSegmentState.COPY_SEGMENT_STARTED
+<span class="nc" id="L117">                                + &quot; but it contains state as: &quot; + remoteLogSegmentMetadata.state());</span>
+            }
+<span class="nc" id="L119">            return storeRemoteLogMetadata(remoteLogSegmentMetadata);</span>
+        });
+    }
+
+    @Override
+    public CompletableFuture&lt;Void&gt; updateRemoteLogSegmentMetadata(RemoteLogSegmentMetadataUpdate metadataUpdate)
+            throws RemoteStorageException {
+<span class="nc" id="L126">        Objects.requireNonNull(metadataUpdate, &quot;metadataUpdate can not be null&quot;);</span>
+<span class="nc" id="L127">        return withReadLockAndEnsureInitialized(() -&gt; {</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (metadataUpdate.state() == RemoteLogSegmentState.COPY_SEGMENT_STARTED) {</span>
+<span class="nc" id="L129">                throw new IllegalArgumentException(&quot;Given remoteLogSegmentMetadataUpdate should not have the state as: &quot;</span>
+                        + RemoteLogSegmentState.COPY_SEGMENT_STARTED);
+            }
+<span class="nc" id="L132">            return storeRemoteLogMetadata(metadataUpdate);</span>
+        });
+    }
+
+    @Override
+    public CompletableFuture&lt;Void&gt; putRemotePartitionDeleteMetadata(RemotePartitionDeleteMetadata deleteMetadata)
+            throws RemoteStorageException {
+<span class="nc" id="L139">        Objects.requireNonNull(deleteMetadata, &quot;deleteMetadata can not be null&quot;);</span>
+<span class="nc" id="L140">        return withReadLockAndEnsureInitialized(</span>
+<span class="nc" id="L141">                () -&gt; storeRemoteLogMetadata(deleteMetadata));</span>
+    }
+
+    /**
+     * Returns {@link CompletableFuture} which will complete only after publishing of the given {@code remoteLogMetadata} into
+     * the remote log metadata topic and the internal consumer is caught up until the produced record's offset.
+     *
+     *  @param remoteLogMetadata RemoteLogMetadata to be stored.
+     * @return a future with acknowledge and potentially waiting also for consumer to catch up.
+     * This ensures cache is synchronized with backing topic.
+     * @throws RemoteStorageException if there are any storage errors occur.
+     */
+    private CompletableFuture&lt;Void&gt; storeRemoteLogMetadata(RemoteLogMetadata remoteLogMetadata) throws RemoteStorageException {
+<span class="nc" id="L154">        log.debug(&quot;Storing the partition: {} metadata: {}&quot;, remoteLogMetadata.topicIdPartition(), remoteLogMetadata);</span>
+        try {
+            // Publish the message to the metadata topic.
+<span class="nc" id="L157">            CompletableFuture&lt;RecordMetadata&gt; produceFuture = producerManager.publishMessage(remoteLogMetadata);</span>
+            // Create and return a `CompletableFuture` instance which completes when the consumer is caught up with the produced record's offset.
+<span class="nc" id="L159">            return produceFuture.thenAcceptAsync(recordMetadata -&gt; {</span>
+                try {
+<span class="nc" id="L161">                    consumerManager.waitTillConsumptionCatchesUp(recordMetadata);</span>
+<span class="nc" id="L162">                } catch (TimeoutException e) {</span>
+<span class="nc" id="L163">                    throw new KafkaException(e);</span>
+<span class="nc" id="L164">                }</span>
+<span class="nc" id="L165">            });</span>
+<span class="nc" id="L166">        } catch (KafkaException e) {</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            if (e instanceof RetriableException) {</span>
+<span class="nc" id="L168">                throw e;</span>
+            } else {
+<span class="nc" id="L170">                throw new RemoteStorageException(e);</span>
+            }
+        }
+    }
+
+    @Override
+    public Optional&lt;RemoteLogSegmentMetadata&gt; remoteLogSegmentMetadata(TopicIdPartition topicIdPartition,
+                                                                       int epochForOffset,
+                                                                       long offset) throws RemoteStorageException {
+<span class="nc" id="L179">        return withReadLockAndEnsureInitialized(</span>
+<span class="nc" id="L180">                () -&gt; remotePartitionMetadataStore.remoteLogSegmentMetadata(topicIdPartition, offset, epochForOffset));</span>
+    }
+
+    @Override
+    public Optional&lt;Long&gt; highestOffsetForEpoch(TopicIdPartition topicIdPartition,
+                                                int leaderEpoch)
+            throws RemoteStorageException {
+<span class="nc" id="L187">        return withReadLockAndEnsureInitialized(</span>
+<span class="nc" id="L188">                () -&gt; remotePartitionMetadataStore.highestLogOffset(topicIdPartition, leaderEpoch));</span>
+    }
+
+    @Override
+    public Iterator&lt;RemoteLogSegmentMetadata&gt; listRemoteLogSegments(TopicIdPartition topicIdPartition)
+            throws RemoteStorageException {
+<span class="nc" id="L194">        Objects.requireNonNull(topicIdPartition, &quot;topicIdPartition can not be null&quot;);</span>
+<span class="nc" id="L195">        return withReadLockAndEnsureInitialized(</span>
+<span class="nc" id="L196">                () -&gt; remotePartitionMetadataStore.listRemoteLogSegments(topicIdPartition));</span>
+    }
+
+    @Override
+    public Iterator&lt;RemoteLogSegmentMetadata&gt; listRemoteLogSegments(TopicIdPartition topicIdPartition, int leaderEpoch)
+            throws RemoteStorageException {
+<span class="nc" id="L202">        Objects.requireNonNull(topicIdPartition, &quot;topicIdPartition can not be null&quot;);</span>
+<span class="nc" id="L203">        return withReadLockAndEnsureInitialized(</span>
+<span class="nc" id="L204">                () -&gt; remotePartitionMetadataStore.listRemoteLogSegments(topicIdPartition, leaderEpoch));</span>
+    }
+
+    @Override
+    public void onPartitionLeadershipChanges(Set&lt;TopicIdPartition&gt; leaderPartitions,
+                                             Set&lt;TopicIdPartition&gt; followerPartitions) {
+<span class="nc" id="L210">        Objects.requireNonNull(leaderPartitions, &quot;leaderPartitions can not be null&quot;);</span>
+<span class="nc" id="L211">        Objects.requireNonNull(followerPartitions, &quot;followerPartitions can not be null&quot;);</span>
+<span class="nc" id="L212">        log.info(&quot;Received leadership notifications with leader partitions {} and follower partitions {}&quot;,</span>
+                 leaderPartitions, followerPartitions);
+<span class="nc" id="L214">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            if (closing.get()) {</span>
+<span class="nc" id="L217">                throw new IllegalStateException(&quot;This instance is in closing state&quot;);</span>
+            }
+<span class="nc" id="L219">            Set&lt;TopicIdPartition&gt; allPartitions = new HashSet&lt;&gt;(leaderPartitions);</span>
+<span class="nc" id="L220">            allPartitions.addAll(followerPartitions);</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            if (!initialized.get()) {</span>
+                // If it is not yet initialized, then keep them as pending partitions and assign them
+                // when it is initialized successfully in initializeResources().
+<span class="nc" id="L224">                this.pendingAssignPartitions.addAll(allPartitions);</span>
+            } else {
+<span class="nc" id="L226">                assignPartitions(allPartitions);</span>
+            }
+        } finally {
+<span class="nc" id="L229">            lock.readLock().unlock();</span>
+        }
+<span class="nc" id="L231">    }</span>
+
+    private void assignPartitions(Set&lt;TopicIdPartition&gt; allPartitions) {
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        for (TopicIdPartition partition : allPartitions) {</span>
+<span class="nc" id="L235">            remotePartitionMetadataStore.maybeLoadPartition(partition);</span>
+<span class="nc" id="L236">        }</span>
+<span class="nc" id="L237">        consumerManager.addAssignmentsForPartitions(allPartitions);</span>
+<span class="nc" id="L238">    }</span>
+
+    @Override
+    public void onStopPartitions(Set&lt;TopicIdPartition&gt; partitions) {
+<span class="nc" id="L242">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L244" title="All 2 branches missed.">            if (closing.get()) {</span>
+<span class="nc" id="L245">                throw new IllegalStateException(&quot;This instance is in closing state&quot;);</span>
+            }
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (!initialized.get()) {</span>
+                // If it is not yet initialized, then remove them from the pending partitions if any.
+<span class="nc bnc" id="L249" title="All 2 branches missed.">                if (!pendingAssignPartitions.isEmpty()) {</span>
+<span class="nc" id="L250">                    pendingAssignPartitions.removeAll(partitions);</span>
+                }
+            } else {
+<span class="nc" id="L253">                consumerManager.removeAssignmentsForPartitions(partitions);</span>
+            }
+        } finally {
+<span class="nc" id="L256">            lock.readLock().unlock();</span>
+        }
+<span class="nc" id="L258">    }</span>
+
+    @Override
+    public long remoteLogSize(TopicIdPartition topicIdPartition, int leaderEpoch) throws RemoteStorageException {
+<span class="nc" id="L262">        long remoteLogSize = 0L;</span>
+        // This is a simple-to-understand but not the most optimal solution.
+        // The TopicBasedRemoteLogMetadataManager's remote metadata store is file-based. During design discussions
+        // at https://lists.apache.org/thread/kxd6fffq02thbpd0p5y4mfbs062g7jr6
+        // we reached a consensus that sequential iteration over files on the local file system is performant enough.
+        // Should this stop being the case, the remote log size could be calculated by incrementing/decrementing
+        // counters during API calls for a more performant implementation.
+<span class="nc" id="L269">        Iterator&lt;RemoteLogSegmentMetadata&gt; remoteLogSegmentMetadataIterator =</span>
+<span class="nc" id="L270">                remotePartitionMetadataStore.listRemoteLogSegments(topicIdPartition, leaderEpoch);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        while (remoteLogSegmentMetadataIterator.hasNext()) {</span>
+<span class="nc" id="L272">            RemoteLogSegmentMetadata remoteLogSegmentMetadata = remoteLogSegmentMetadataIterator.next();</span>
+<span class="nc" id="L273">            remoteLogSize += remoteLogSegmentMetadata.segmentSizeInBytes();</span>
+<span class="nc" id="L274">        }</span>
+<span class="nc" id="L275">        return remoteLogSize;</span>
+    }
+
+    @Override
+    public Optional&lt;RemoteLogSegmentMetadata&gt; nextSegmentWithTxnIndex(TopicIdPartition topicIdPartition,
+                                                                      int epoch,
+                                                                      long offset) throws RemoteStorageException {
+<span class="nc" id="L282">        return withReadLockAndEnsureInitialized(</span>
+<span class="nc" id="L283">                () -&gt; remotePartitionMetadataStore.nextSegmentWithTxnIndex(topicIdPartition, epoch, offset));</span>
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {
+<span class="nc" id="L288">        Objects.requireNonNull(configs, &quot;configs can not be null.&quot;);</span>
+<span class="nc" id="L289">        lock.writeLock().lock();</span>
+        try {
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (configured.compareAndSet(false, true)) {</span>
+<span class="nc" id="L292">                TopicBasedRemoteLogMetadataManagerConfig rlmmConfig = new TopicBasedRemoteLogMetadataManagerConfig(configs);</span>
+                // Creates initialization thread for producer/consumer managers. It will be started when
+                // the broker is ready via onBrokerReady(). The thread retries until resources are available.
+<span class="nc" id="L295">                initializationThread = KafkaThread.nonDaemon(</span>
+<span class="nc" id="L296">                        &quot;RLMMInitializationThread&quot;, () -&gt; initializeResources(rlmmConfig));</span>
+<span class="nc" id="L297">                log.info(&quot;Successfully configured topic-based RLMM with config: {}&quot;, rlmmConfig);</span>
+<span class="nc" id="L298">            } else {</span>
+<span class="nc" id="L299">                log.info(&quot;Skipping configure as it is already configured.&quot;);</span>
+            }
+        } finally {
+<span class="nc" id="L302">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L304">    }</span>
+
+    @Override
+    public boolean isReady(TopicIdPartition topicIdPartition) {
+<span class="nc" id="L308">        return remotePartitionMetadataStore.isInitialized(topicIdPartition);</span>
+    }
+
+    private void handleRetry(long retryIntervalMs) {
+<span class="nc" id="L312">        log.info(&quot;Sleep for {} ms before retrying.&quot;, retryIntervalMs);</span>
+<span class="nc" id="L313">        Utils.sleep(retryIntervalMs);</span>
+<span class="nc" id="L314">    }</span>
+
+    private void initializeResources(TopicBasedRemoteLogMetadataManagerConfig rlmmConfig) {
+<span class="nc" id="L317">        log.info(&quot;Initializing topic-based RLMM resources&quot;);</span>
+<span class="nc" id="L318">        int metadataTopicPartitionCount = rlmmConfig.metadataTopicPartitionsCount();</span>
+<span class="nc" id="L319">        long retryIntervalMs = rlmmConfig.initializationRetryIntervalMs();</span>
+<span class="nc" id="L320">        long retryMaxTimeoutMs = rlmmConfig.initializationRetryMaxTimeoutMs();</span>
+<span class="nc" id="L321">        RemoteLogMetadataTopicPartitioner partitioner = partitionerFunction.apply(metadataTopicPartitionCount);</span>
+<span class="nc" id="L322">        NewTopic newTopic = newRemoteLogMetadataTopic(rlmmConfig);</span>
+<span class="nc" id="L323">        boolean isTopicCreated = false;</span>
+<span class="nc" id="L324">        long startTimeMs = time.milliseconds();</span>
+<span class="nc" id="L325">        boolean initializationFailed = false;</span>
+<span class="nc" id="L326">        try (Admin admin = Admin.create(rlmmConfig.adminProperties())) {</span>
+<span class="nc bnc" id="L327" title="All 6 branches missed.">            while (!(initialized.get() || closing.get() || initializationFailed)) {</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">                if (time.milliseconds() - startTimeMs &gt; retryMaxTimeoutMs) {</span>
+<span class="nc" id="L329">                    log.error(&quot;Timed out to initialize the resources within {} ms.&quot;, retryMaxTimeoutMs);</span>
+<span class="nc" id="L330">                    initializationFailed = true;</span>
+<span class="nc" id="L331">                    break;</span>
+                }
+<span class="nc bnc" id="L333" title="All 4 branches missed.">                isTopicCreated = isTopicCreated || createTopic(admin, newTopic);</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                if (!isTopicCreated) {</span>
+<span class="nc" id="L335">                    handleRetry(retryIntervalMs);</span>
+<span class="nc" id="L336">                    continue;</span>
+                }
+                try {
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                    if (!isPartitionsCountSameAsConfigured(admin, newTopic.name(), metadataTopicPartitionCount)) {</span>
+<span class="nc" id="L340">                        initializationFailed = true;</span>
+<span class="nc" id="L341">                        break;</span>
+                    }
+<span class="nc" id="L343">                } catch (Exception e) {</span>
+<span class="nc" id="L344">                    handleRetry(retryIntervalMs);</span>
+<span class="nc" id="L345">                    continue;</span>
+<span class="nc" id="L346">                }</span>
+                // Create producer and consumer managers.
+<span class="nc" id="L348">                lock.writeLock().lock();</span>
+                try {
+<span class="nc" id="L350">                    producerManager = new ProducerManager(rlmmConfig, partitioner);</span>
+<span class="nc" id="L351">                    consumerManager = new ConsumerManager(rlmmConfig, remotePartitionMetadataStore, partitioner, time);</span>
+<span class="nc" id="L352">                    consumerManager.startConsumerThread();</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">                    if (!pendingAssignPartitions.isEmpty()) {</span>
+<span class="nc" id="L354">                        assignPartitions(pendingAssignPartitions);</span>
+<span class="nc" id="L355">                        pendingAssignPartitions.clear();</span>
+                    }
+<span class="nc" id="L357">                    initialized.set(true);</span>
+<span class="nc" id="L358">                    log.info(&quot;Initialized topic-based RLMM resources successfully&quot;);</span>
+<span class="nc" id="L359">                } catch (Exception e) {</span>
+<span class="nc" id="L360">                    log.error(&quot;Encountered error while initializing producer/consumer&quot;, e);</span>
+<span class="nc" id="L361">                    initializationFailed = true;</span>
+                } finally {
+<span class="nc" id="L363">                    lock.writeLock().unlock();</span>
+<span class="nc" id="L364">                }</span>
+            }
+<span class="nc" id="L366">        } catch (KafkaException e) {</span>
+<span class="nc" id="L367">            log.error(&quot;Encountered error while initializing topic-based RLMM resources&quot;, e);</span>
+<span class="nc" id="L368">            initializationFailed = true;</span>
+        } finally {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">            if (initializationFailed) {</span>
+<span class="nc" id="L371">                log.error(&quot;Stopping the server as it failed to initialize topic-based RLMM resources&quot;);</span>
+<span class="nc" id="L372">                Exit.exit(1);</span>
+            }
+        }
+<span class="nc" id="L375">    }</span>
+
+    /**
+     * Invoked when the broker is ready to handle requests. This triggers the initialization of
+     * resources including Kafka clients that operate on the remote log metadata topic.
+     * &lt;p&gt;
+     * The target cluster for the topic is determined by configuration and can be either:
+     * &lt;ol&gt;
+     *   &lt;li&gt;The local cluster (most common) - the initialization is deferred until the broker is ready
+     *       to handle requests. Early initialization would lead to connection failures.&lt;/li&gt;
+     *   &lt;li&gt;A remote cluster - the delay is not necessary but causes no harm.&lt;/li&gt;
+     * &lt;/ol&gt;
+     * &lt;p&gt;
+     * By using the broker ready state as the initialization trigger, the implementation optimally handles
+     * the typical case while remaining correct for alternative configurations.
+     */
+    @Override
+    public void onBrokerReady() {
+<span class="nc" id="L393">        initializationThread.start();</span>
+<span class="nc" id="L394">    }</span>
+
+    boolean doesTopicExist(Admin admin, String topic) throws ExecutionException, InterruptedException {
+        try {
+<span class="nc" id="L398">            TopicDescription description = admin.describeTopics(Set.of(topic))</span>
+<span class="nc" id="L399">                    .topicNameValues()</span>
+<span class="nc" id="L400">                    .get(topic)</span>
+<span class="nc" id="L401">                    .get();</span>
+<span class="nc" id="L402">            log.info(&quot;Topic {} exists. TopicId: {}, numPartitions: {}&quot;, topic, description.topicId(),</span>
+<span class="nc" id="L403">                    description.partitions().size());</span>
+<span class="nc" id="L404">            return true;</span>
+<span class="nc" id="L405">        } catch (ExecutionException | InterruptedException ex) {</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">            if (ex.getCause() instanceof UnknownTopicOrPartitionException) {</span>
+<span class="nc" id="L407">                log.info(&quot;Topic {} does not exist&quot;, topic);</span>
+<span class="nc" id="L408">                return false;</span>
+            }
+<span class="nc" id="L410">            throw ex;</span>
+        }
+    }
+
+    private boolean isPartitionsCountSameAsConfigured(Admin admin,
+                                                      String topicName,
+                                                      int metadataTopicPartitionCount) throws InterruptedException, ExecutionException {
+<span class="nc" id="L417">        log.debug(&quot;Getting topic details to check for partition count and replication factor.&quot;);</span>
+<span class="nc" id="L418">        TopicDescription topicDescription = admin</span>
+<span class="nc" id="L419">                .describeTopics(Set.of(topicName))</span>
+<span class="nc" id="L420">                .topicNameValues()</span>
+<span class="nc" id="L421">                .get(topicName)</span>
+<span class="nc" id="L422">                .get();</span>
+<span class="nc" id="L423">        int topicPartitionsSize = topicDescription.partitions().size();</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">        if (topicPartitionsSize != metadataTopicPartitionCount) {</span>
+<span class="nc" id="L425">            log.error(&quot;Existing topic partition count {} is not same as the expected partition count {}&quot;,</span>
+<span class="nc" id="L426">                      topicPartitionsSize, metadataTopicPartitionCount);</span>
+<span class="nc" id="L427">            return false;</span>
+        }
+<span class="nc" id="L429">        return true;</span>
+    }
+
+    private NewTopic newRemoteLogMetadataTopic(TopicBasedRemoteLogMetadataManagerConfig rlmmConfig) {
+<span class="nc" id="L433">        Map&lt;String, String&gt; topicConfigs = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L434">        topicConfigs.put(TopicConfig.RETENTION_MS_CONFIG, Long.toString(rlmmConfig.metadataTopicRetentionMs()));</span>
+<span class="nc" id="L435">        topicConfigs.put(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE);</span>
+<span class="nc" id="L436">        topicConfigs.put(TopicConfig.REMOTE_LOG_STORAGE_ENABLE_CONFIG, &quot;false&quot;);</span>
+<span class="nc" id="L437">        topicConfigs.put(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, Short.toString(rlmmConfig.metadataTopicMinIsr()));</span>
+<span class="nc" id="L438">        return new NewTopic(rlmmConfig.remoteLogMetadataTopicName(),</span>
+<span class="nc" id="L439">                            rlmmConfig.metadataTopicPartitionsCount(),</span>
+<span class="nc" id="L440">                            rlmmConfig.metadataTopicReplicationFactor()).configs(topicConfigs);</span>
+    }
+
+    /**
+     * @param newTopic topic to be created.
+     * @return Returns true if the topic already exists, or it is created successfully.
+     */
+    private boolean createTopic(Admin admin, NewTopic newTopic) {
+<span class="nc" id="L448">        boolean doesTopicExist = false;</span>
+<span class="nc" id="L449">        String topic = newTopic.name();</span>
+        try {
+<span class="nc" id="L451">            doesTopicExist = doesTopicExist(admin, topic);</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">            if (!doesTopicExist) {</span>
+<span class="nc" id="L453">                CreateTopicsResult result = admin.createTopics(Set.of(newTopic));</span>
+<span class="nc" id="L454">                result.all().get();</span>
+<span class="nc" id="L455">                List&lt;String&gt; overriddenConfigs = result.config(topic).get()</span>
+<span class="nc" id="L456">                        .entries()</span>
+<span class="nc" id="L457">                        .stream()</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">                        .filter(entry -&gt; !entry.isDefault())</span>
+<span class="nc" id="L459">                        .map(entry -&gt; entry.name() + &quot;=&quot; + entry.value())</span>
+<span class="nc" id="L460">                        .toList();</span>
+<span class="nc" id="L461">                log.info(&quot;Topic {} created. TopicId: {}, numPartitions: {}, replicationFactor: {}, config: {}&quot;,</span>
+<span class="nc" id="L462">                        topic, result.topicId(topic).get(), result.numPartitions(topic).get(),</span>
+<span class="nc" id="L463">                        result.replicationFactor(topic).get(), overriddenConfigs);</span>
+<span class="nc" id="L464">                doesTopicExist = true;</span>
+            }
+<span class="nc" id="L466">        } catch (Exception e) {</span>
+            // This exception can still occur as multiple brokers may call create topics and one of them may become
+            // successful and other would throw TopicExistsException
+<span class="nc bnc" id="L469" title="All 2 branches missed.">            if (e.getCause() instanceof TopicExistsException) {</span>
+<span class="nc" id="L470">                log.info(&quot;Topic: {} already exists&quot;, topic);</span>
+<span class="nc" id="L471">                doesTopicExist = true;</span>
+            } else {
+<span class="nc" id="L473">                log.error(&quot;Encountered error while querying or creating {} topic.&quot;, topic, e);</span>
+            }
+<span class="nc" id="L475">        }</span>
+<span class="nc" id="L476">        return doesTopicExist;</span>
+    }
+
+    boolean isInitialized() {
+<span class="nc" id="L480">        return initialized.get();</span>
+    }
+
+
+    private void ensureInitializedAndNotClosed() {
+<span class="nc bnc" id="L485" title="All 4 branches missed.">        if (closing.get() || !initialized.get()) {</span>
+<span class="nc" id="L486">            throw new IllegalStateException(&quot;This instance is in invalid state, initialized: &quot; + initialized +</span>
+                                                    &quot; close: &quot; + closing);
+        }
+<span class="nc" id="L489">    }</span>
+
+    @Override
+    public void close() throws IOException {
+        // Close all the resources.
+<span class="nc" id="L494">        log.info(&quot;Closing topic-based RLMM resources&quot;);</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">        if (closing.compareAndSet(false, true)) {</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">            if (initializationThread != null) {</span>
+                try {
+<span class="nc" id="L498">                    initializationThread.join();</span>
+<span class="nc" id="L499">                } catch (InterruptedException e) {</span>
+<span class="nc" id="L500">                    log.error(&quot;Initialization thread was interrupted while waiting to join on close.&quot;, e);</span>
+<span class="nc" id="L501">                }</span>
+            }
+<span class="nc" id="L503">            Utils.closeQuietly(producerManager, &quot;ProducerTask&quot;);</span>
+<span class="nc" id="L504">            Utils.closeQuietly(consumerManager, &quot;RLMMConsumerManager&quot;);</span>
+<span class="nc" id="L505">            Utils.closeQuietly(remotePartitionMetadataStore, &quot;RemotePartitionMetadataStore&quot;);</span>
+<span class="nc" id="L506">            log.info(&quot;Closed topic-based RLMM resources&quot;);</span>
+        }
+<span class="nc" id="L508">    }</span>
+
+    private &lt;T&gt; T withReadLockAndEnsureInitialized(ThrowingSupplier&lt;T, RemoteStorageException&gt; action) throws RemoteStorageException {
+<span class="nc" id="L511">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L513">            ensureInitializedAndNotClosed();</span>
+<span class="nc" id="L514">            return action.get();</span>
+        } finally {
+<span class="nc" id="L516">            lock.readLock().unlock();</span>
+        }
+    }
+
+    @FunctionalInterface
+    public interface ThrowingSupplier&lt;T, E extends Exception&gt; {
+        /**
+         * Supplies a result, potentially throwing an exception.
+         *
+         * @return the supplied result.
+         * @throws E an exception that may be thrown during execution.
+         */
+        T get() throws E;
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

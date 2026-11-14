@@ -1,0 +1,919 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamsGroupHeartbeatRequestManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">StreamsGroupHeartbeatRequestManager.java</span></div><h1>StreamsGroupHeartbeatRequestManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.internals.events.AsyncPollEvent;
+import org.apache.kafka.clients.consumer.internals.events.BackgroundEventHandler;
+import org.apache.kafka.clients.consumer.internals.events.ErrorEvent;
+import org.apache.kafka.clients.consumer.internals.metrics.HeartbeatMetricsManager;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.GroupAuthorizationException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.message.StreamsGroupHeartbeatRequestData;
+import org.apache.kafka.common.message.StreamsGroupHeartbeatResponseData;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.StreamsGroupHeartbeatRequest;
+import org.apache.kafka.common.requests.StreamsGroupHeartbeatResponse;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP;
+import static org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.PollResult.EMPTY;
+import static org.apache.kafka.clients.consumer.internals.RequestState.RETRY_BACKOFF_JITTER;
+
+/**
+ * &lt;p&gt;Manages the request creation and response handling for the streams group heartbeat. The class creates a
+ * heartbeat request using the state stored in the membership manager. The requests can be retrieved
+ * by calling {@link StreamsGroupHeartbeatRequestManager#poll(long)}. Once the response is received, it updates the
+ * state in the membership manager and handles any errors.
+ *
+ * &lt;p&gt;The heartbeat manager generates heartbeat requests based on the member state. It's also responsible
+ * for the timing of the heartbeat requests to ensure they are sent according to the heartbeat interval
+ * (while the member state is stable) or on demand (while the member is acknowledging an assignment or
+ * leaving the group).
+ */
+public class StreamsGroupHeartbeatRequestManager implements RequestManager {
+
+    private static final String UNSUPPORTED_VERSION_ERROR_MESSAGE = &quot;The cluster does not support the STREAMS group &quot; +
+        &quot;protocol or does not support the versions of the STREAMS group protocol used by this client &quot; +
+        &quot;(used versions: &quot; + StreamsGroupHeartbeatRequestData.LOWEST_SUPPORTED_VERSION + &quot; to &quot; +
+        StreamsGroupHeartbeatRequestData.HIGHEST_SUPPORTED_VERSION + &quot;).&quot;;
+
+    static class HeartbeatState {
+
+        // Fields of StreamsGroupHeartbeatRequest sent in the most recent request
+        static class LastSentFields {
+
+<span class="nc" id="L80">            private StreamsRebalanceData.Assignment assignment = null;</span>
+<span class="nc" id="L81">            private Map&lt;StreamsRebalanceData.TaskId, Long&gt; taskOffsets = null;</span>
+<span class="nc" id="L82">            private Map&lt;StreamsRebalanceData.TaskId, Long&gt; taskEndOffsets = null;</span>
+
+<span class="nc" id="L84">            LastSentFields() {</span>
+<span class="nc" id="L85">            }</span>
+
+            void reset() {
+<span class="nc" id="L88">                assignment = null;</span>
+<span class="nc" id="L89">                taskOffsets = null;</span>
+<span class="nc" id="L90">                taskEndOffsets = null;</span>
+<span class="nc" id="L91">            }</span>
+        }
+
+        private final StreamsMembershipManager membershipManager;
+        private final int rebalanceTimeoutMs;
+        private final StreamsRebalanceData streamsRebalanceData;
+        private final Time time;
+<span class="nc" id="L98">        private final LastSentFields lastSentFields = new LastSentFields();</span>
+<span class="nc" id="L99">        private int endpointInformationEpoch = -1;</span>
+<span class="nc" id="L100">        private long lastTaskOffsetIntervalTs = -1;</span>
+
+        public HeartbeatState(final StreamsRebalanceData streamsRebalanceData,
+                              final StreamsMembershipManager membershipManager,
+                              final int rebalanceTimeoutMs,
+<span class="nc" id="L105">                              final Time time) {</span>
+<span class="nc" id="L106">            this.membershipManager = membershipManager;</span>
+<span class="nc" id="L107">            this.streamsRebalanceData = streamsRebalanceData;</span>
+<span class="nc" id="L108">            this.rebalanceTimeoutMs = rebalanceTimeoutMs;</span>
+<span class="nc" id="L109">            this.time = time;</span>
+<span class="nc" id="L110">        }</span>
+
+        public void reset() {
+<span class="nc" id="L113">            lastSentFields.reset();</span>
+<span class="nc" id="L114">            lastTaskOffsetIntervalTs = -1L;</span>
+<span class="nc" id="L115">        }</span>
+
+        public int endpointInformationEpoch() {
+<span class="nc" id="L118">            return endpointInformationEpoch;</span>
+        }
+
+        public void setEndpointInformationEpoch(int endpointInformationEpoch) {
+<span class="nc" id="L122">            this.endpointInformationEpoch = endpointInformationEpoch;</span>
+<span class="nc" id="L123">        }</span>
+
+        public StreamsGroupHeartbeatRequestData buildRequestData() {
+<span class="nc" id="L126">            StreamsGroupHeartbeatRequestData data = new StreamsGroupHeartbeatRequestData();</span>
+<span class="nc" id="L127">            data.setGroupId(membershipManager.groupId());</span>
+<span class="nc" id="L128">            data.setMemberId(membershipManager.memberId());</span>
+<span class="nc" id="L129">            data.setMemberEpoch(membershipManager.memberEpoch());</span>
+<span class="nc" id="L130">            data.setEndpointInformationEpoch(endpointInformationEpoch);</span>
+<span class="nc" id="L131">            membershipManager.groupInstanceId().ifPresent(data::setInstanceId);</span>
+
+<span class="nc bnc" id="L133" title="All 2 branches missed.">            boolean joining = membershipManager.state() == MemberState.JOINING;</span>
+
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            if (joining) {</span>
+<span class="nc" id="L136">                StreamsGroupHeartbeatRequestData.Topology topology = new StreamsGroupHeartbeatRequestData.Topology();</span>
+<span class="nc" id="L137">                topology.setSubtopologies(fromStreamsToHeartbeatRequest(streamsRebalanceData.subtopologies()));</span>
+<span class="nc" id="L138">                topology.setEpoch(streamsRebalanceData.topologyEpoch());</span>
+<span class="nc" id="L139">                data.setTopology(topology);</span>
+<span class="nc" id="L140">                data.setRebalanceTimeoutMs(rebalanceTimeoutMs);</span>
+<span class="nc" id="L141">                data.setProcessId(streamsRebalanceData.processId().toString());</span>
+<span class="nc" id="L142">                streamsRebalanceData.endpoint().ifPresent(userEndpoint -&gt; {</span>
+<span class="nc" id="L143">                    data.setUserEndpoint(new StreamsGroupHeartbeatRequestData.Endpoint()</span>
+<span class="nc" id="L144">                        .setHost(userEndpoint.host())</span>
+<span class="nc" id="L145">                        .setPort(userEndpoint.port())</span>
+                    );
+<span class="nc" id="L147">                });</span>
+<span class="nc" id="L148">                streamsRebalanceData.rackId().ifPresent(data::setRackId);</span>
+<span class="nc" id="L149">                data.setClientTags(streamsRebalanceData.clientTags().entrySet().stream()</span>
+<span class="nc" id="L150">                    .map(entry -&gt; new StreamsGroupHeartbeatRequestData.KeyValue()</span>
+<span class="nc" id="L151">                        .setKey(entry.getKey())</span>
+<span class="nc" id="L152">                        .setValue(entry.getValue())</span>
+                    )
+<span class="nc" id="L154">                    .collect(Collectors.toList()));</span>
+<span class="nc" id="L155">                data.setActiveTasks(fromStreamsToHeartbeatRequest(Set.of()));</span>
+<span class="nc" id="L156">                data.setStandbyTasks(fromStreamsToHeartbeatRequest(Set.of()));</span>
+<span class="nc" id="L157">                data.setWarmupTasks(fromStreamsToHeartbeatRequest(Set.of()));</span>
+                // call both methods only once, as they invoke an expensive `supplier`
+<span class="nc" id="L159">                final Map&lt;StreamsRebalanceData.TaskId, Long&gt; taskOffsetSum = streamsRebalanceData.taskOffsetSum();</span>
+<span class="nc" id="L160">                final Map&lt;StreamsRebalanceData.TaskId, Long&gt; taskEndOffsetSum = streamsRebalanceData.taskEndOffsetSum();</span>
+<span class="nc" id="L161">                data.setTaskOffsets(convertToList(taskOffsetSum));</span>
+<span class="nc" id="L162">                data.setTaskEndOffsets(convertToList(taskEndOffsetSum));</span>
+                // Record what we sent so the first non-joining heartbeat does not redundantly resend unchanged offsets.
+<span class="nc" id="L164">                lastSentFields.taskOffsets = taskOffsetSum;</span>
+<span class="nc" id="L165">                lastSentFields.taskEndOffsets = taskEndOffsetSum;</span>
+<span class="nc" id="L166">                lastTaskOffsetIntervalTs = time.milliseconds();</span>
+<span class="nc" id="L167">            } else {</span>
+<span class="nc" id="L168">                final StreamsRebalanceData.Assignment reconciledAssignment = streamsRebalanceData.reconciledAssignment();</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">                final boolean assignmentChanged = !reconciledAssignment.equals(lastSentFields.assignment);</span>
+
+<span class="nc bnc" id="L171" title="All 2 branches missed.">                if (assignmentChanged) {</span>
+<span class="nc" id="L172">                    data.setActiveTasks(fromStreamsToHeartbeatRequest(reconciledAssignment.activeTasks()));</span>
+<span class="nc" id="L173">                    data.setStandbyTasks(fromStreamsToHeartbeatRequest(reconciledAssignment.standbyTasks()));</span>
+<span class="nc" id="L174">                    data.setWarmupTasks(fromStreamsToHeartbeatRequest(reconciledAssignment.warmupTasks()));</span>
+<span class="nc" id="L175">                    lastSentFields.assignment = reconciledAssignment;</span>
+                }
+
+                // call both method only once, as they invoke an expensive `supplier`
+<span class="nc" id="L179">                final Map&lt;StreamsRebalanceData.TaskId, Long&gt; taskOffsetSum = streamsRebalanceData.taskOffsetSum();</span>
+<span class="nc" id="L180">                final Map&lt;StreamsRebalanceData.TaskId, Long&gt; taskEndOffsetSum = streamsRebalanceData.taskEndOffsetSum();</span>
+
+<span class="nc" id="L182">                final long now = time.milliseconds();</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">                if (assignmentChanged</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">                    || taskOffsetIntervalPassed(now)</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">                    || hasAtLeastOneHotWarmupTask(reconciledAssignment.warmupTasks(), taskOffsetSum, taskEndOffsetSum)</span>
+                ) {
+                    // Task offsets and end-offsets are reported independently. A null field means &quot;unchanged since the
+                    // last heartbeat&quot;, so we send each one only when its value actually changed and leave it null
+                    // otherwise. reset() clears the snapshot on any error/disconnect, forcing a full resend afterward.
+<span class="nc bnc" id="L190" title="All 2 branches missed.">                    if (!taskOffsetSum.equals(lastSentFields.taskOffsets)) {</span>
+<span class="nc" id="L191">                        data.setTaskOffsets(convertToList(taskOffsetSum));</span>
+<span class="nc" id="L192">                        lastSentFields.taskOffsets = taskOffsetSum;</span>
+<span class="nc" id="L193">                        lastTaskOffsetIntervalTs = now;</span>
+                    }
+<span class="nc bnc" id="L195" title="All 2 branches missed.">                    if (!taskEndOffsetSum.equals(lastSentFields.taskEndOffsets)) {</span>
+<span class="nc" id="L196">                        data.setTaskEndOffsets(convertToList(taskEndOffsetSum));</span>
+<span class="nc" id="L197">                        lastSentFields.taskEndOffsets = taskEndOffsetSum;</span>
+<span class="nc" id="L198">                        lastTaskOffsetIntervalTs = now;</span>
+                    }
+                }
+            }
+<span class="nc" id="L202">            data.setShutdownApplication(streamsRebalanceData.shutdownRequested());</span>
+<span class="nc" id="L203">            return data;</span>
+        }
+
+        private static List&lt;StreamsGroupHeartbeatRequestData.TaskOffset&gt; convertToList(Map&lt;StreamsRebalanceData.TaskId, Long&gt; offsetsMap) {
+<span class="nc" id="L207">            return offsetsMap.entrySet().stream().map(</span>
+<span class="nc" id="L208">                    entry -&gt; new StreamsGroupHeartbeatRequestData.TaskOffset()</span>
+<span class="nc" id="L209">                        .setSubtopologyId(entry.getKey().subtopologyId())</span>
+<span class="nc" id="L210">                        .setPartition(entry.getKey().partitionId())</span>
+<span class="nc" id="L211">                        .setOffset(entry.getValue()))</span>
+<span class="nc" id="L212">                .collect(Collectors.toList());</span>
+        }
+
+        private boolean taskOffsetIntervalPassed(final long now) {
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            return lastTaskOffsetIntervalTs + streamsRebalanceData.taskOffsetIntervalMs() &lt;= now;</span>
+        }
+
+        private boolean hasAtLeastOneHotWarmupTask(
+            final Set&lt;StreamsRebalanceData.TaskId&gt; warmupTasks,
+            final Map&lt;StreamsRebalanceData.TaskId, Long&gt; taskOffsetSum,
+            final Map&lt;StreamsRebalanceData.TaskId, Long&gt; taskEndOffsetSum
+        ) {
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            if (warmupTasks.isEmpty()) {</span>
+<span class="nc" id="L225">                return false;</span>
+            }
+
+<span class="nc" id="L228">            final long acceptableRecoveryLag = streamsRebalanceData.acceptableRecoveryLag();</span>
+
+<span class="nc" id="L230">            return warmupTasks.stream()</span>
+<span class="nc" id="L231">                .anyMatch(taskId -&gt; {</span>
+<span class="nc" id="L232">                    final Long offset = taskOffsetSum.get(taskId);</span>
+<span class="nc" id="L233">                    final Long endOffset = taskEndOffsetSum.get(taskId);</span>
+
+                    // offset and endOffset might not be known,
+                    // or be capped at MAX_VALUE due to overflow
+<span class="nc bnc" id="L237" title="All 6 branches missed.">                    if (offset == null || offset == Long.MAX_VALUE</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                        || endOffset == null || endOffset == Long.MAX_VALUE) {</span>
+<span class="nc" id="L239">                        return false;</span>
+                    }
+
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                    return endOffset - offset &lt;= acceptableRecoveryLag;</span>
+                });
+        }
+
+        private static List&lt;StreamsGroupHeartbeatRequestData.TaskIds&gt; fromStreamsToHeartbeatRequest(final Set&lt;StreamsRebalanceData.TaskId&gt; tasks) {
+<span class="nc" id="L247">            return tasks.stream()</span>
+<span class="nc" id="L248">                .collect(</span>
+<span class="nc" id="L249">                    Collectors.groupingBy(StreamsRebalanceData.TaskId::subtopologyId,</span>
+<span class="nc" id="L250">                        Collectors.mapping(StreamsRebalanceData.TaskId::partitionId, Collectors.toList()))</span>
+                )
+<span class="nc" id="L252">                .entrySet()</span>
+<span class="nc" id="L253">                .stream()</span>
+<span class="nc" id="L254">                .map(entry -&gt; {</span>
+<span class="nc" id="L255">                    return new StreamsGroupHeartbeatRequestData.TaskIds()</span>
+<span class="nc" id="L256">                        .setSubtopologyId(entry.getKey())</span>
+<span class="nc" id="L257">                        .setPartitions(entry.getValue());</span>
+                })
+<span class="nc" id="L259">                .collect(Collectors.toList());</span>
+        }
+
+        private static List&lt;StreamsGroupHeartbeatRequestData.Subtopology&gt; fromStreamsToHeartbeatRequest(final Map&lt;String, StreamsRebalanceData.Subtopology&gt; subtopologies) {
+<span class="nc" id="L263">            final List&lt;StreamsGroupHeartbeatRequestData.Subtopology&gt; subtopologiesForRequest = new ArrayList&lt;&gt;(subtopologies.size());</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">            for (final Map.Entry&lt;String, StreamsRebalanceData.Subtopology&gt; subtopology : subtopologies.entrySet()) {</span>
+<span class="nc" id="L265">                subtopologiesForRequest.add(fromStreamsToHeartbeatRequest(subtopology.getKey(), subtopology.getValue()));</span>
+<span class="nc" id="L266">            }</span>
+<span class="nc" id="L267">            subtopologiesForRequest.sort(Comparator.comparing(StreamsGroupHeartbeatRequestData.Subtopology::subtopologyId));</span>
+<span class="nc" id="L268">            return subtopologiesForRequest;</span>
+        }
+
+        private static StreamsGroupHeartbeatRequestData.Subtopology fromStreamsToHeartbeatRequest(final String subtopologyId,
+                                                                                                  final StreamsRebalanceData.Subtopology subtopology) {
+<span class="nc" id="L273">            final StreamsGroupHeartbeatRequestData.Subtopology subtopologyData = new StreamsGroupHeartbeatRequestData.Subtopology();</span>
+<span class="nc" id="L274">            subtopologyData.setSubtopologyId(subtopologyId);</span>
+<span class="nc" id="L275">            ArrayList&lt;String&gt; sortedSourceTopics = new ArrayList&lt;&gt;(subtopology.sourceTopics());</span>
+<span class="nc" id="L276">            Collections.sort(sortedSourceTopics);</span>
+<span class="nc" id="L277">            subtopologyData.setSourceTopics(sortedSourceTopics);</span>
+<span class="nc" id="L278">            ArrayList&lt;String&gt; sortedSinkTopics = new ArrayList&lt;&gt;(subtopology.repartitionSinkTopics());</span>
+<span class="nc" id="L279">            Collections.sort(sortedSinkTopics);</span>
+<span class="nc" id="L280">            subtopologyData.setRepartitionSinkTopics(sortedSinkTopics);</span>
+<span class="nc" id="L281">            subtopologyData.setRepartitionSourceTopics(getRepartitionTopicsInfoFromStreams(subtopology));</span>
+<span class="nc" id="L282">            subtopologyData.setStateChangelogTopics(getChangelogTopicsInfoFromStreams(subtopology));</span>
+<span class="nc" id="L283">            subtopologyData.setCopartitionGroups(</span>
+<span class="nc" id="L284">                getCopartitionGroupsFromStreams(subtopology.copartitionGroups(), subtopologyData));</span>
+<span class="nc" id="L285">            return subtopologyData;</span>
+        }
+
+        private static List&lt;StreamsGroupHeartbeatRequestData.CopartitionGroup&gt; getCopartitionGroupsFromStreams(final Collection&lt;Set&lt;String&gt;&gt; copartitionGroups,
+                                                                                                               final StreamsGroupHeartbeatRequestData.Subtopology subtopologyData) {
+<span class="nc" id="L290">            final Map&lt;String, Short&gt; sourceTopicsMap =</span>
+<span class="nc" id="L291">                IntStream.range(0, subtopologyData.sourceTopics().size())</span>
+<span class="nc" id="L292">                    .boxed()</span>
+<span class="nc" id="L293">                    .collect(Collectors.toMap(subtopologyData.sourceTopics()::get, Integer::shortValue));</span>
+
+<span class="nc" id="L295">            final Map&lt;String, Short&gt; repartitionSourceTopics =</span>
+<span class="nc" id="L296">                IntStream.range(0, subtopologyData.repartitionSourceTopics().size())</span>
+<span class="nc" id="L297">                    .boxed()</span>
+<span class="nc" id="L298">                    .collect(</span>
+<span class="nc" id="L299">                        Collectors.toMap(x -&gt; subtopologyData.repartitionSourceTopics().get(x).name(),</span>
+                            Integer::shortValue));
+
+<span class="nc" id="L302">            return copartitionGroups.stream()</span>
+<span class="nc" id="L303">                .map(x -&gt; getCopartitionGroupFromStreams(x, sourceTopicsMap, repartitionSourceTopics))</span>
+<span class="nc" id="L304">                .collect(Collectors.toList());</span>
+        }
+
+        private static StreamsGroupHeartbeatRequestData.CopartitionGroup getCopartitionGroupFromStreams(final Set&lt;String&gt; topicNames,
+                                                                                                        final Map&lt;String, Short&gt; sourceTopicsMap,
+                                                                                                        final Map&lt;String, Short&gt; repartitionSourceTopics) {
+<span class="nc" id="L310">            StreamsGroupHeartbeatRequestData.CopartitionGroup copartitionGroup = new StreamsGroupHeartbeatRequestData.CopartitionGroup();</span>
+
+<span class="nc" id="L312">            topicNames.forEach(topicName -&gt; {</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                if (sourceTopicsMap.containsKey(topicName)) {</span>
+<span class="nc" id="L314">                    copartitionGroup.sourceTopics().add(sourceTopicsMap.get(topicName));</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">                } else if (repartitionSourceTopics.containsKey(topicName)) {</span>
+<span class="nc" id="L316">                    copartitionGroup.repartitionSourceTopics()</span>
+<span class="nc" id="L317">                        .add(repartitionSourceTopics.get(topicName));</span>
+                } else {
+<span class="nc" id="L319">                    throw new IllegalStateException(</span>
+                        &quot;Source topic not found in subtopology: &quot; + topicName);
+                }
+<span class="nc" id="L322">            });</span>
+
+<span class="nc" id="L324">            return copartitionGroup;</span>
+        }
+
+        private static List&lt;StreamsGroupHeartbeatRequestData.TopicInfo&gt; getRepartitionTopicsInfoFromStreams(final StreamsRebalanceData.Subtopology subtopologyDataFromStreams) {
+<span class="nc" id="L328">            final List&lt;StreamsGroupHeartbeatRequestData.TopicInfo&gt; repartitionTopicsInfo = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">            for (final Map.Entry&lt;String, StreamsRebalanceData.TopicInfo&gt; repartitionTopic : subtopologyDataFromStreams.repartitionSourceTopics().entrySet()) {</span>
+<span class="nc" id="L330">                final StreamsGroupHeartbeatRequestData.TopicInfo repartitionTopicInfo = new StreamsGroupHeartbeatRequestData.TopicInfo();</span>
+<span class="nc" id="L331">                repartitionTopicInfo.setName(repartitionTopic.getKey());</span>
+<span class="nc" id="L332">                repartitionTopic.getValue().numPartitions().ifPresent(repartitionTopicInfo::setPartitions);</span>
+<span class="nc" id="L333">                repartitionTopic.getValue().replicationFactor().ifPresent(repartitionTopicInfo::setReplicationFactor);</span>
+<span class="nc" id="L334">                repartitionTopic.getValue().topicConfigs().forEach((k, v) -&gt;</span>
+<span class="nc" id="L335">                    repartitionTopicInfo.topicConfigs().add(new StreamsGroupHeartbeatRequestData.KeyValue().setKey(k).setValue(v))</span>
+                );
+<span class="nc" id="L337">                repartitionTopicsInfo.add(repartitionTopicInfo);</span>
+<span class="nc" id="L338">                repartitionTopicInfo.topicConfigs().sort(Comparator.comparing(StreamsGroupHeartbeatRequestData.KeyValue::key));</span>
+<span class="nc" id="L339">            }</span>
+<span class="nc" id="L340">            repartitionTopicsInfo.sort(Comparator.comparing(StreamsGroupHeartbeatRequestData.TopicInfo::name));</span>
+<span class="nc" id="L341">            return repartitionTopicsInfo;</span>
+        }
+
+        private static List&lt;StreamsGroupHeartbeatRequestData.TopicInfo&gt; getChangelogTopicsInfoFromStreams(final StreamsRebalanceData.Subtopology subtopologyDataFromStreams) {
+<span class="nc" id="L345">            final List&lt;StreamsGroupHeartbeatRequestData.TopicInfo&gt; changelogTopicsInfo = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">            for (final Map.Entry&lt;String, StreamsRebalanceData.TopicInfo&gt; changelogTopic : subtopologyDataFromStreams.stateChangelogTopics().entrySet()) {</span>
+<span class="nc" id="L347">                final StreamsGroupHeartbeatRequestData.TopicInfo changelogTopicInfo = new StreamsGroupHeartbeatRequestData.TopicInfo();</span>
+<span class="nc" id="L348">                changelogTopicInfo.setName(changelogTopic.getKey());</span>
+<span class="nc" id="L349">                changelogTopic.getValue().replicationFactor().ifPresent(changelogTopicInfo::setReplicationFactor);</span>
+<span class="nc" id="L350">                changelogTopic.getValue().topicConfigs().forEach((k, v) -&gt;</span>
+<span class="nc" id="L351">                    changelogTopicInfo.topicConfigs().add(new StreamsGroupHeartbeatRequestData.KeyValue().setKey(k).setValue(v))</span>
+                );
+<span class="nc" id="L353">                changelogTopicInfo.topicConfigs().sort(Comparator.comparing(StreamsGroupHeartbeatRequestData.KeyValue::key));</span>
+<span class="nc" id="L354">                changelogTopicsInfo.add(changelogTopicInfo);</span>
+<span class="nc" id="L355">            }</span>
+<span class="nc" id="L356">            changelogTopicsInfo.sort(Comparator.comparing(StreamsGroupHeartbeatRequestData.TopicInfo::name));</span>
+<span class="nc" id="L357">            return changelogTopicsInfo;</span>
+        }
+    }
+
+    private final Logger logger;
+
+    private final int maxPollIntervalMs;
+
+    private final CoordinatorRequestManager coordinatorRequestManager;
+
+    private final HeartbeatRequestState heartbeatRequestState;
+
+    private final HeartbeatState heartbeatState;
+
+    private final StreamsMembershipManager membershipManager;
+
+    private final BackgroundEventHandler backgroundEventHandler;
+
+    private final HeartbeatMetricsManager metricsManager;
+
+    private final StreamsRebalanceData streamsRebalanceData;
+
+<span class="nc" id="L379">    private String lastMissingClientTagsDetail = null;</span>
+
+    /**
+     * Timer for tracking the time since the last consumer poll.  If the timer expires, the consumer will stop
+     * sending heartbeat until the next poll.
+     */
+    private final Timer pollTimer;
+
+    public StreamsGroupHeartbeatRequestManager(final LogContext logContext,
+                                               final Time time,
+                                               final ConsumerConfig config,
+                                               final CoordinatorRequestManager coordinatorRequestManager,
+                                               final StreamsMembershipManager membershipManager,
+                                               final BackgroundEventHandler backgroundEventHandler,
+                                               final Metrics metrics,
+<span class="nc" id="L394">                                               final StreamsRebalanceData streamsRebalanceData) {</span>
+<span class="nc" id="L395">        this.logger = logContext.logger(getClass());</span>
+<span class="nc" id="L396">        this.coordinatorRequestManager = Objects.requireNonNull(</span>
+            coordinatorRequestManager,
+            &quot;Coordinator request manager cannot be null&quot;
+        );
+<span class="nc" id="L400">        this.membershipManager = Objects.requireNonNull(</span>
+            membershipManager,
+            &quot;Streams membership manager cannot be null&quot;
+        );
+<span class="nc" id="L404">        this.backgroundEventHandler = Objects.requireNonNull(</span>
+            backgroundEventHandler,
+            &quot;Background event handler cannot be null&quot;
+        );
+<span class="nc" id="L408">        this.metricsManager = new HeartbeatMetricsManager(</span>
+<span class="nc" id="L409">            Objects.requireNonNull(metrics, &quot;Metrics cannot be null&quot;)</span>
+        );
+<span class="nc" id="L411">        this.streamsRebalanceData = Objects.requireNonNull(streamsRebalanceData, &quot;Streams rebalance data cannot be null&quot;);</span>
+<span class="nc" id="L412">        this.maxPollIntervalMs = config.getInt(CommonClientConfigs.MAX_POLL_INTERVAL_MS_CONFIG);</span>
+<span class="nc" id="L413">        long retryBackoffMs = config.getLong(ConsumerConfig.RETRY_BACKOFF_MS_CONFIG);</span>
+<span class="nc" id="L414">        long retryBackoffMaxMs = config.getLong(ConsumerConfig.RETRY_BACKOFF_MAX_MS_CONFIG);</span>
+<span class="nc" id="L415">        this.heartbeatState = new HeartbeatState(streamsRebalanceData, membershipManager, maxPollIntervalMs, time);</span>
+<span class="nc" id="L416">        this.heartbeatRequestState = new HeartbeatRequestState(</span>
+            logContext,
+            time,
+            0,
+            retryBackoffMs,
+            retryBackoffMaxMs,
+            RETRY_BACKOFF_JITTER
+        );
+<span class="nc" id="L424">        this.pollTimer = time.timer(maxPollIntervalMs);</span>
+<span class="nc" id="L425">    }</span>
+
+    /**
+     * This will build a heartbeat request if one must be sent, determined based on the member
+     * state. A heartbeat is sent when all of the following applies:
+     * &lt;ol&gt;
+     *     &lt;li&gt;Member is part of the consumer group or wants to join it.&lt;/li&gt;
+     *     &lt;li&gt;The heartbeat interval has expired, or the member is in a state that indicates
+     *     that it should heartbeat without waiting for the interval.&lt;/li&gt;
+     * &lt;/ol&gt;
+     * This will also determine the maximum wait time until the next poll based on the member's
+     * state.
+     * &lt;ol&gt;
+     *     &lt;li&gt;If the member is without a coordinator or is in a failed state, the timer is set
+     *     to Long.MAX_VALUE, as there's no need to send a heartbeat.&lt;/li&gt;
+     *     &lt;li&gt;If the member cannot send a heartbeat due to either exponential backoff, it will
+     *     return the remaining time left on the backoff timer.&lt;/li&gt;
+     *     &lt;li&gt;If the member's heartbeat timer has not expired, It will return the remaining time
+     *     left on the heartbeat timer.&lt;/li&gt;
+     *     &lt;li&gt;If the member can send a heartbeat, the timer is set to the current heartbeat interval.&lt;/li&gt;
+     * &lt;/ol&gt;
+     *
+     * @return {@link org.apache.kafka.clients.consumer.internals.NetworkClientDelegate.PollResult} that includes a
+     *         heartbeat request if one must be sent, and the time to wait until the next poll.
+     */
+    @Override
+    public NetworkClientDelegate.PollResult poll(long currentTimeMs) {
+<span class="nc bnc" id="L452" title="All 4 branches missed.">        if (coordinatorRequestManager.coordinator().isEmpty() || membershipManager.shouldSkipHeartbeat()) {</span>
+<span class="nc" id="L453">            membershipManager.onHeartbeatRequestSkipped();</span>
+<span class="nc" id="L454">            maybePropagateCoordinatorFatalErrorEvent();</span>
+<span class="nc" id="L455">            return NetworkClientDelegate.PollResult.EMPTY;</span>
+        }
+<span class="nc" id="L457">        pollTimer.update(currentTimeMs);</span>
+<span class="nc bnc" id="L458" title="All 4 branches missed.">        if (pollTimer.isExpired() &amp;&amp; !membershipManager.isLeavingGroup()) {</span>
+<span class="nc" id="L459">            logger.warn(&quot;Consumer poll timeout has expired. This means the time between &quot; +</span>
+                &quot;subsequent calls to poll() was longer than the configured max.poll.interval.ms, &quot; +
+                &quot;which typically implies that the poll loop is spending too much time processing &quot; +
+                &quot;messages. You can address this either by increasing max.poll.interval.ms or by &quot; +
+                &quot;reducing the maximum size of batches returned in poll() with max.poll.records.&quot;);
+
+<span class="nc" id="L465">            membershipManager.onPollTimerExpired();</span>
+<span class="nc" id="L466">            NetworkClientDelegate.UnsentRequest leaveHeartbeat = makeHeartbeatRequestAndLogResponse(currentTimeMs);</span>
+
+            // We can ignore the leave response because we can join before or after receiving the response.
+<span class="nc" id="L469">            heartbeatRequestState.reset();</span>
+<span class="nc" id="L470">            heartbeatState.reset();</span>
+<span class="nc" id="L471">            return new NetworkClientDelegate.PollResult(heartbeatRequestState.heartbeatIntervalMs(), Collections.singletonList(leaveHeartbeat));</span>
+        }
+<span class="nc bnc" id="L473" title="All 4 branches missed.">        if (membershipManager.state() == MemberState.LEAVING &amp;&amp; shouldSkipLeaveHeartbeat()) {</span>
+<span class="nc" id="L474">            logger.info(&quot;Dynamic member {} skipping leave heartbeat (operation=REMAIN_IN_GROUP). &quot; +</span>
+                &quot;The broker will remove the member from the group via session timeout.&quot;,
+<span class="nc" id="L476">                membershipManager.memberId());</span>
+<span class="nc" id="L477">            membershipManager.onHeartbeatRequestSkipped();</span>
+<span class="nc" id="L478">            return EMPTY;</span>
+        }
+<span class="nc bnc" id="L480" title="All 4 branches missed.">        if (shouldHeartbeatBeforeIntervalExpires() || heartbeatRequestState.canSendRequest(currentTimeMs)) {</span>
+<span class="nc" id="L481">            NetworkClientDelegate.UnsentRequest request = makeHeartbeatRequestAndHandleResponse(currentTimeMs);</span>
+<span class="nc" id="L482">            return new NetworkClientDelegate.PollResult(heartbeatRequestState.heartbeatIntervalMs(), Collections.singletonList(request));</span>
+        } else {
+<span class="nc" id="L484">            return new NetworkClientDelegate.PollResult(heartbeatRequestState.timeToNextHeartbeatMs(currentTimeMs));</span>
+        }
+    }
+
+    /**
+     * Generate a heartbeat request to leave the group if the state is still LEAVING when this is
+     * called to close the consumer.
+     * &lt;p/&gt;
+     * Note that when closing the consumer, even though an event to Unsubscribe is generated
+     * (triggers callbacks and sends leave group), it could be the case that the Unsubscribe event
+     * processing does not complete in time and moves on to close the managers (ex. calls to
+     * close with zero timeout). So we could end up on this pollOnClose with the member in
+     * {@link MemberState#PREPARE_LEAVING} (ex. app thread did not have the time to process the
+     * event to execute callbacks), or {@link MemberState#LEAVING} (ex. the leave request could
+     * not be sent due to coordinator not available at that time). In all cases, the pollOnClose
+     * will be triggered right before sending the final requests, so we ensure that we generate
+     * the request to leave if needed.
+     *
+     * @param currentTimeMs The current system time in milliseconds at which the method was called
+     * @return PollResult containing the request to send
+     */
+    @Override
+    public NetworkClientDelegate.PollResult pollOnClose(long currentTimeMs) {
+<span class="nc bnc" id="L507" title="All 4 branches missed.">        if (membershipManager.isLeavingGroup() &amp;&amp; !shouldSkipLeaveHeartbeat()) {</span>
+<span class="nc" id="L508">            NetworkClientDelegate.UnsentRequest request = makeHeartbeatRequestAndLogResponse(currentTimeMs);</span>
+<span class="nc" id="L509">            return new NetworkClientDelegate.PollResult(heartbeatRequestState.heartbeatIntervalMs(), List.of(request));</span>
+        }
+<span class="nc" id="L511">        return EMPTY;</span>
+    }
+
+    public StreamsMembershipManager membershipManager() {
+<span class="nc" id="L515">        return membershipManager;</span>
+    }
+
+    /**
+     * Returns the delay for which the application thread can safely wait before it should be responsive
+     * to results from the request managers. For example, the subscription state can change when heartbeats
+     * are sent, so blocking for longer than the heartbeat interval might mean the application thread is not
+     * responsive to changes.
+     *
+     * &lt;p&gt;Similarly, we may have to unblock the application thread to send a {@link AsyncPollEvent} to make sure
+     * our poll timer will not expire while we are polling.
+     *
+     * &lt;p&gt;In the event that heartbeats are currently being skipped, this still returns the next heartbeat
+     * delay rather than {@code Long.MAX_VALUE} so that the application thread remains responsive.
+     */
+    @Override
+    public long maximumTimeToWait(long currentTimeMs) {
+<span class="nc" id="L532">        pollTimer.update(currentTimeMs);</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">        if (pollTimer.isExpired()) {</span>
+<span class="nc" id="L534">            return 0L;</span>
+        }
+        // A heartbeat is only sent when the coordinator is known; poll() returns EMPTY otherwise
+        // (see the guard at the top of poll()). If the coordinator is unavailable (for example,
+        // while bootstrap DNS resolution is still in progress), the
+        // shouldNotWaitForHeartbeatInterval() check would return 0 whenever the member wants to
+        // (re)join. Because no heartbeat can be sent until the coordinator is discovered, the
+        // condition remains true and both the application and network threads end up busy-spinning.
+        // Wait a retry backoff rather than the heartbeat interval, because the interval is zero
+        // until the first heartbeat response is received, which would also busy-spin.
+<span class="nc bnc" id="L544" title="All 4 branches missed.">        if (coordinatorRequestManager.coordinator().isEmpty() || membershipManager.shouldSkipHeartbeat()) {</span>
+<span class="nc" id="L545">            return heartbeatRequestState.retryBackoffMs();</span>
+        }
+<span class="nc bnc" id="L547" title="All 4 branches missed.">        if (membershipManager.shouldNotWaitForHeartbeatInterval() &amp;&amp; !heartbeatRequestState.requestInFlight()) {</span>
+<span class="nc" id="L548">            return 0L;</span>
+        }
+<span class="nc" id="L550">        return Math.min(pollTimer.remainingMs() / 2, heartbeatRequestState.timeToNextHeartbeatMs(currentTimeMs));</span>
+    }
+
+    public void resetPollTimer(final long pollMs) {
+<span class="nc" id="L554">        pollTimer.update(pollMs);</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">        if (pollTimer.isExpired()) {</span>
+<span class="nc" id="L556">            logger.warn(&quot;Time between subsequent calls to poll() was longer than the configured &quot; +</span>
+                    &quot;max.poll.interval.ms, exceeded approximately by {} ms. Member {} will rejoin the group now.&quot;,
+<span class="nc" id="L558">                pollTimer.isExpiredBy(), membershipManager.memberId());</span>
+<span class="nc" id="L559">            membershipManager.maybeRejoinStaleMember();</span>
+        }
+<span class="nc" id="L561">        pollTimer.reset(maxPollIntervalMs);</span>
+<span class="nc" id="L562">    }</span>
+
+    /**
+     * A heartbeat should be sent without waiting for the heartbeat interval to expire if:
+     * - the member should send a leave heartbeat (see {@link #shouldSendLeaveHeartbeat()})
+     * or
+     * - the member is joining the group or acknowledging the assignment and for both cases there is no heartbeat request
+     *   in flight.
+     *
+     * @return true if a heartbeat should be sent before the interval expires, false otherwise
+     */
+    private boolean shouldHeartbeatBeforeIntervalExpires() {
+<span class="nc bnc" id="L574" title="All 2 branches missed.">        return shouldSendLeaveHeartbeat()</span>
+<span class="nc bnc" id="L575" title="All 4 branches missed.">            || (membershipManager.state() == MemberState.JOINING || membershipManager.state() == MemberState.ACKNOWLEDGING)</span>
+<span class="nc bnc" id="L576" title="All 2 branches missed.">                &amp;&amp; !heartbeatRequestState.requestInFlight();</span>
+    }
+
+    /**
+     * Returns whether a leave group heartbeat should be sent. The leave heartbeat is skipped only
+     * when the member is dynamic (no group instance ID) and the operation is
+     * {@link org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation#REMAIN_IN_GROUP}.
+     * Static members always send the leave heartbeat (with epoch -2) so the broker holds the
+     * assignment until the session timeout.
+     *
+     * @return true if a leave heartbeat should be sent, false otherwise
+     */
+    private boolean shouldSendLeaveHeartbeat() {
+<span class="nc bnc" id="L589" title="All 2 branches missed.">        if (shouldSkipLeaveHeartbeat()) {</span>
+<span class="nc" id="L590">            logger.debug(&quot;Member {} skipping leave heartbeat (operation={}, static={}).&quot;,</span>
+<span class="nc" id="L591">                membershipManager.memberId(),</span>
+<span class="nc" id="L592">                membershipManager.leaveGroupOperation(),</span>
+<span class="nc" id="L593">                membershipManager.groupInstanceId().isPresent());</span>
+<span class="nc" id="L594">            return false;</span>
+        }
+<span class="nc bnc" id="L596" title="All 2 branches missed.">        return membershipManager.state() == MemberState.LEAVING;</span>
+    }
+
+    /**
+     * Returns true if the leave heartbeat should be skipped: only when the member is dynamic
+     * (no group instance ID) and the operation is REMAIN_IN_GROUP. Static members always send
+     * a leave heartbeat (with epoch -2) so the broker can hold the assignment.
+     */
+    private boolean shouldSkipLeaveHeartbeat() {
+<span class="nc bnc" id="L605" title="All 2 branches missed.">        return REMAIN_IN_GROUP == membershipManager.leaveGroupOperation()</span>
+<span class="nc bnc" id="L606" title="All 2 branches missed.">            &amp;&amp; membershipManager.groupInstanceId().isEmpty();</span>
+    }
+
+    private void maybePropagateCoordinatorFatalErrorEvent() {
+<span class="nc" id="L610">        coordinatorRequestManager.getAndClearFatalError()</span>
+<span class="nc" id="L611">            .ifPresent(fatalError -&gt; backgroundEventHandler.add(new ErrorEvent(fatalError)));</span>
+<span class="nc" id="L612">    }</span>
+
+    private NetworkClientDelegate.UnsentRequest makeHeartbeatRequestAndLogResponse(final long currentTimeMs) {
+<span class="nc" id="L615">        return makeHeartbeatRequest(currentTimeMs).whenComplete((response, exception) -&gt; {</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">            if (response != null) {</span>
+<span class="nc" id="L617">                metricsManager.recordRequestLatency(response.requestLatencyMs());</span>
+<span class="nc" id="L618">                Errors error = Errors.forCode(((StreamsGroupHeartbeatResponse) response.responseBody()).data().errorCode());</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">                if (error == Errors.NONE)</span>
+<span class="nc" id="L620">                    logger.debug(&quot;StreamsGroupHeartbeatRequest responded successfully: {}&quot;, response);</span>
+                else
+<span class="nc" id="L622">                    logger.error(&quot;StreamsGroupHeartbeatRequest failed because of {}: {}&quot;, error, response);</span>
+<span class="nc" id="L623">            } else {</span>
+<span class="nc" id="L624">                logger.error(&quot;StreamsGroupHeartbeatRequest failed because of unexpected exception.&quot;, exception);</span>
+            }
+<span class="nc" id="L626">        });</span>
+    }
+
+    private NetworkClientDelegate.UnsentRequest makeHeartbeatRequestAndHandleResponse(final long currentTimeMs) {
+<span class="nc" id="L630">        NetworkClientDelegate.UnsentRequest request = makeHeartbeatRequest(currentTimeMs);</span>
+<span class="nc" id="L631">        return request.whenComplete((response, exception) -&gt; {</span>
+<span class="nc" id="L632">            long completionTimeMs = request.handler().completionTimeMs();</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">            if (response != null) {</span>
+<span class="nc" id="L634">                metricsManager.recordRequestLatency(response.requestLatencyMs());</span>
+<span class="nc" id="L635">                onResponse((StreamsGroupHeartbeatResponse) response.responseBody(), completionTimeMs);</span>
+            } else {
+<span class="nc" id="L637">                onFailure(exception, completionTimeMs);</span>
+            }
+<span class="nc" id="L639">        });</span>
+    }
+
+    private NetworkClientDelegate.UnsentRequest makeHeartbeatRequest(final long currentTimeMs) {
+<span class="nc" id="L643">        NetworkClientDelegate.UnsentRequest request = new NetworkClientDelegate.UnsentRequest(</span>
+<span class="nc" id="L644">            new StreamsGroupHeartbeatRequest.Builder(this.heartbeatState.buildRequestData()),</span>
+<span class="nc" id="L645">            coordinatorRequestManager.coordinator()</span>
+        );
+<span class="nc" id="L647">        heartbeatRequestState.onSendAttempt(currentTimeMs);</span>
+<span class="nc" id="L648">        membershipManager.onHeartbeatRequestGenerated();</span>
+<span class="nc" id="L649">        metricsManager.recordHeartbeatSentMs(currentTimeMs);</span>
+<span class="nc" id="L650">        heartbeatRequestState.resetTimer();</span>
+<span class="nc" id="L651">        return request;</span>
+    }
+
+    private void onResponse(final StreamsGroupHeartbeatResponse response, long currentTimeMs) {
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        if (Errors.forCode(response.data().errorCode()) == Errors.NONE) {</span>
+<span class="nc" id="L656">            onSuccessResponse(response, currentTimeMs);</span>
+        } else {
+<span class="nc" id="L658">            onErrorResponse(response, currentTimeMs);</span>
+        }
+<span class="nc" id="L660">    }</span>
+
+    private void onSuccessResponse(final StreamsGroupHeartbeatResponse response, final long currentTimeMs) {
+<span class="nc" id="L663">        final StreamsGroupHeartbeatResponseData data = response.data();</span>
+<span class="nc" id="L664">        heartbeatRequestState.updateHeartbeatIntervalMs(data.heartbeatIntervalMs());</span>
+<span class="nc" id="L665">        heartbeatRequestState.onSuccessfulAttempt(currentTimeMs);</span>
+<span class="nc" id="L666">        heartbeatState.setEndpointInformationEpoch(data.endpointInformationEpoch());</span>
+        // A leaving member's response carries no group configuration (the fields hold protocol defaults), so do not
+        // log or store it while shutting down. Normal responses have memberEpoch &gt;= 0; leave responses use the
+        // negative leave sentinels (fenced members take the error path instead). Log only when a value changes, to
+        // avoid repeating it on every heartbeat: this fires on first receipt (values start unset) and on any later change.
+<span class="nc bnc" id="L671" title="All 2 branches missed.">        if (data.memberEpoch() &gt;= 0) {</span>
+<span class="nc bnc" id="L672" title="All 2 branches missed.">            if (data.heartbeatIntervalMs() != streamsRebalanceData.heartbeatIntervalMs()</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">                    || data.taskOffsetIntervalMs() != streamsRebalanceData.taskOffsetIntervalMs()</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">                    || data.acceptableRecoveryLag() != streamsRebalanceData.acceptableRecoveryLag()) {</span>
+<span class="nc" id="L675">                logger.info(&quot;Received Streams group configuration from the group coordinator: &quot;</span>
+                        + &quot;heartbeatIntervalMs={}, taskOffsetIntervalMs={}, acceptableRecoveryLag={}&quot;,
+<span class="nc" id="L677">                    describeConfig(data.heartbeatIntervalMs(), 1),</span>
+<span class="nc" id="L678">                    describeConfig(data.taskOffsetIntervalMs(), 1),</span>
+<span class="nc" id="L679">                    describeConfig(data.acceptableRecoveryLag(), 0));</span>
+            }
+<span class="nc" id="L681">            streamsRebalanceData.setHeartbeatIntervalMs(data.heartbeatIntervalMs());</span>
+<span class="nc" id="L682">            streamsRebalanceData.setTaskOffsetIntervalMs(data.taskOffsetIntervalMs());</span>
+<span class="nc" id="L683">            streamsRebalanceData.setAcceptableRecoveryLag(data.acceptableRecoveryLag());</span>
+        }
+
+<span class="nc bnc" id="L686" title="All 4 branches missed.">        if (data.topologyDescriptionRequired() &amp;&amp; streamsRebalanceData.wireTopologyDescription() != null) {</span>
+<span class="nc" id="L687">            logger.info(&quot;Broker requested topology description push&quot;);</span>
+<span class="nc" id="L688">            streamsRebalanceData.setTopologyPushRequired(true);</span>
+        }
+
+<span class="nc bnc" id="L691" title="All 2 branches missed.">        if (data.partitionsByUserEndpoint() != null) {</span>
+<span class="nc" id="L692">            streamsRebalanceData.setPartitionsByHost(convertHostInfoMap(data));</span>
+        }
+
+<span class="nc" id="L695">        maybeLogStatuses(data.status());</span>
+
+<span class="nc" id="L697">        membershipManager.onHeartbeatSuccess(response);</span>
+<span class="nc" id="L698">    }</span>
+
+    private void maybeLogStatuses(final List&lt;StreamsGroupHeartbeatResponseData.Status&gt; statuses) {
+<span class="nc bnc" id="L701" title="All 2 branches missed.">        if (statuses == null) {</span>
+<span class="nc" id="L702">            return;</span>
+        }
+<span class="nc" id="L704">        streamsRebalanceData.setStatuses(statuses);</span>
+        // The broker recomputes and returns the full set of statuses on every heartbeat, so a response without a
+        // MISSING_CLIENT_TAGS status means the condition no longer holds.
+<span class="nc" id="L707">        boolean hasMissingClientTagsStatus = false;</span>
+<span class="nc" id="L708">        List&lt;String&gt; statusesToLog = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">        for (StreamsGroupHeartbeatResponseData.Status status : statuses) {</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">            if (status.statusCode() == StreamsGroupHeartbeatResponse.Status.MISSING_CLIENT_TAGS.code()) {</span>
+<span class="nc" id="L711">                hasMissingClientTagsStatus = true;</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">                if (!status.statusDetail().equals(lastMissingClientTagsDetail)) {</span>
+<span class="nc" id="L713">                    lastMissingClientTagsDetail = status.statusDetail();</span>
+<span class="nc" id="L714">                    statusesToLog.add(&quot;(&quot; + status.statusCode() + &quot;) &quot; + status.statusDetail());</span>
+                }
+            } else {
+<span class="nc" id="L717">                statusesToLog.add(&quot;(&quot; + status.statusCode() + &quot;) &quot; + status.statusDetail());</span>
+            }
+<span class="nc" id="L719">        }</span>
+        // Reset the de-duplication marker once the MISSING_CLIENT_TAGS status clears, so that a later recurrence
+        // (even with the same detail) is logged again rather than silently suppressed.
+<span class="nc bnc" id="L722" title="All 2 branches missed.">        if (!hasMissingClientTagsStatus) {</span>
+<span class="nc" id="L723">            lastMissingClientTagsDetail = null;</span>
+        }
+<span class="nc bnc" id="L725" title="All 2 branches missed.">        if (!statusesToLog.isEmpty()) {</span>
+<span class="nc" id="L726">            logger.warn(&quot;Membership is in the following statuses: {}&quot;, String.join(&quot;, &quot;, statusesToLog));</span>
+        }
+<span class="nc" id="L728">    }</span>
+
+    // Renders a coordinator-provided config value for logging, or a note when the broker did not provide it. An older
+    // broker leaves these at their protocol defaults (intervals 0, acceptableRecoveryLag -1); a value below minValid
+    // means &quot;not provided&quot;.
+    private static String describeConfig(final long value, final long minValid) {
+<span class="nc bnc" id="L734" title="All 2 branches missed.">        return value &lt; minValid ? &quot;not provided (older broker)&quot; : Long.toString(value);</span>
+    }
+
+    private void onErrorResponse(final StreamsGroupHeartbeatResponse response, final long currentTimeMs) {
+<span class="nc" id="L738">        final Errors error = Errors.forCode(response.data().errorCode());</span>
+<span class="nc" id="L739">        final String errorMessage = response.data().errorMessage();</span>
+
+<span class="nc" id="L741">        heartbeatState.reset();</span>
+<span class="nc" id="L742">        this.heartbeatRequestState.onFailedAttempt(currentTimeMs);</span>
+
+<span class="nc bnc" id="L744" title="All 11 branches missed.">        switch (error) {</span>
+            case NOT_COORDINATOR:
+<span class="nc" id="L746">                logInfo(</span>
+<span class="nc" id="L747">                    String.format(&quot;StreamsGroupHeartbeatRequest failed because the group coordinator %s is incorrect. &quot; +</span>
+<span class="nc" id="L748">                        &quot;Will attempt to find the coordinator again and retry&quot;, coordinatorRequestManager.coordinator()),</span>
+                    response,
+                    currentTimeMs
+                );
+<span class="nc" id="L752">                coordinatorRequestManager.markCoordinatorUnknown(errorMessage, currentTimeMs);</span>
+                // Skip backoff so that the next HB is sent as soon as the new coordinator is discovered
+<span class="nc" id="L754">                heartbeatRequestState.reset();</span>
+<span class="nc" id="L755">                break;</span>
+
+            case COORDINATOR_NOT_AVAILABLE:
+<span class="nc" id="L758">                logInfo(</span>
+<span class="nc" id="L759">                    String.format(&quot;StreamsGroupHeartbeatRequest failed because the group coordinator %s is not available. &quot; +</span>
+<span class="nc" id="L760">                        &quot;Will attempt to find the coordinator again and retry&quot;, coordinatorRequestManager.coordinator()),</span>
+                    response,
+                    currentTimeMs
+                );
+<span class="nc" id="L764">                coordinatorRequestManager.markCoordinatorUnknown(errorMessage, currentTimeMs);</span>
+                // Skip backoff so that the next HB is sent as soon as the new coordinator is discovered
+<span class="nc" id="L766">                heartbeatRequestState.reset();</span>
+<span class="nc" id="L767">                break;</span>
+
+            case COORDINATOR_LOAD_IN_PROGRESS:
+<span class="nc" id="L770">                logInfo(</span>
+<span class="nc" id="L771">                    String.format(&quot;StreamsGroupHeartbeatRequest failed because the group coordinator %s is still loading. &quot; +</span>
+<span class="nc" id="L772">                    &quot;Will retry&quot;, coordinatorRequestManager.coordinator()),</span>
+                    response,
+                    currentTimeMs
+                );
+<span class="nc" id="L776">                break;</span>
+
+            case GROUP_AUTHORIZATION_FAILED:
+<span class="nc" id="L779">                GroupAuthorizationException exception =</span>
+<span class="nc" id="L780">                    GroupAuthorizationException.forGroupId(membershipManager.groupId());</span>
+<span class="nc" id="L781">                logger.error(&quot;StreamsGroupHeartbeatRequest failed due to group authorization failure: {}&quot;,</span>
+<span class="nc" id="L782">                    exception.getMessage());</span>
+<span class="nc" id="L783">                handleFatalFailure(error.exception(exception.getMessage()));</span>
+<span class="nc" id="L784">                break;</span>
+
+            case TOPIC_AUTHORIZATION_FAILED:
+<span class="nc" id="L787">                logger.error(&quot;StreamsGroupHeartbeatRequest failed for member {} with state {} due to {}: {}&quot;,</span>
+<span class="nc" id="L788">                    membershipManager.memberId(), membershipManager.state(), error, errorMessage);</span>
+                // Propagate auth error received in HB so that it's returned on poll.
+                // Member should stay in its current state so it can recover if ever the missing ACLs are added.
+<span class="nc" id="L791">                backgroundEventHandler.add(new ErrorEvent(error.exception()));</span>
+<span class="nc" id="L792">                break;</span>
+
+            case INVALID_REQUEST:
+            case GROUP_MAX_SIZE_REACHED:
+            case STREAMS_INVALID_TOPOLOGY:
+            case STREAMS_INVALID_TOPOLOGY_EPOCH:
+            case STREAMS_TOPOLOGY_FENCED:
+            case UNRELEASED_INSTANCE_ID:
+<span class="nc" id="L800">                logger.error(&quot;StreamsGroupHeartbeatRequest failed due to {}: {}&quot;, error, errorMessage);</span>
+<span class="nc" id="L801">                handleFatalFailure(error.exception(errorMessage));</span>
+<span class="nc" id="L802">                break;</span>
+
+            case FENCED_INSTANCE_ID:
+<span class="nc" id="L805">                logger.error(&quot;StreamsGroupHeartbeatRequest failed because instance id {} is fenced: {}. &quot; +</span>
+                        &quot;Check for another Streams instance using the same group instance id.&quot;,
+<span class="nc" id="L807">                    membershipManager.groupInstanceId().get(), errorMessage);</span>
+<span class="nc" id="L808">                handleFatalFailure(error.exception(errorMessage));</span>
+<span class="nc" id="L809">                break;</span>
+
+            case FENCED_MEMBER_EPOCH:
+<span class="nc" id="L812">                logInfo(</span>
+<span class="nc" id="L813">                    String.format(&quot;StreamsGroupHeartbeatRequest failed for member %s because epoch %s is fenced.&quot;,</span>
+<span class="nc" id="L814">                        membershipManager.memberId(), membershipManager.memberEpoch()),</span>
+                    response,
+                    currentTimeMs
+                );
+<span class="nc" id="L818">                membershipManager.onFenced();</span>
+                // Skip backoff so that a next HB to rejoin is sent as soon as the fenced member releases its assignment
+<span class="nc" id="L820">                heartbeatRequestState.reset();</span>
+<span class="nc" id="L821">                streamsRebalanceData.setTopologyPushRequired(false);</span>
+<span class="nc" id="L822">                break;</span>
+
+            case UNKNOWN_MEMBER_ID:
+<span class="nc" id="L825">                logInfo(</span>
+<span class="nc" id="L826">                    String.format(&quot;StreamsGroupHeartbeatRequest failed because member %s is unknown.&quot;,</span>
+<span class="nc" id="L827">                        membershipManager.memberId()),</span>
+                    response,
+                    currentTimeMs
+                );
+<span class="nc" id="L831">                membershipManager.onFenced();</span>
+                // Skip backoff so that a next HB to rejoin is sent as soon as the fenced member releases its assignment
+<span class="nc" id="L833">                heartbeatRequestState.reset();</span>
+<span class="nc" id="L834">                streamsRebalanceData.setTopologyPushRequired(false);</span>
+<span class="nc" id="L835">                break;</span>
+
+            case UNSUPPORTED_VERSION:
+<span class="nc" id="L838">                logger.error(&quot;StreamsGroupHeartbeatRequest failed due to {}: {}&quot;, error, UNSUPPORTED_VERSION_ERROR_MESSAGE);</span>
+<span class="nc" id="L839">                handleFatalFailure(error.exception(UNSUPPORTED_VERSION_ERROR_MESSAGE));</span>
+<span class="nc" id="L840">                break;</span>
+
+            default:
+<span class="nc" id="L843">                logger.error(&quot;StreamsGroupHeartbeatRequest failed due to unexpected error {}: {}&quot;, error, errorMessage);</span>
+<span class="nc" id="L844">                handleFatalFailure(error.exception(errorMessage));</span>
+        }
+<span class="nc" id="L846">        membershipManager.onFatalHeartbeatFailure();</span>
+<span class="nc" id="L847">    }</span>
+
+    private void logInfo(final String message,
+                         final StreamsGroupHeartbeatResponse response,
+                         final long currentTimeMs) {
+<span class="nc" id="L852">        logger.info(&quot;{} in {}ms: {}&quot;,</span>
+            message,
+<span class="nc" id="L854">            heartbeatRequestState.remainingBackoffMs(currentTimeMs),</span>
+<span class="nc" id="L855">            response.data().errorMessage());</span>
+<span class="nc" id="L856">    }</span>
+
+    private void onFailure(final Throwable exception, final long responseTimeMs) {
+<span class="nc" id="L859">        heartbeatRequestState.onFailedAttempt(responseTimeMs);</span>
+<span class="nc" id="L860">        heartbeatState.reset();</span>
+<span class="nc bnc" id="L861" title="All 2 branches missed.">        if (exception instanceof RetriableException) {</span>
+<span class="nc" id="L862">            coordinatorRequestManager.handleCoordinatorDisconnect(exception, responseTimeMs);</span>
+<span class="nc" id="L863">            String message = String.format(&quot;StreamsGroupHeartbeatRequest failed because of a retriable exception. Will retry in %s ms: %s&quot;,</span>
+<span class="nc" id="L864">                heartbeatRequestState.remainingBackoffMs(responseTimeMs),</span>
+<span class="nc" id="L865">                exception.getMessage());</span>
+<span class="nc" id="L866">            logger.debug(message);</span>
+<span class="nc" id="L867">            membershipManager.onRetriableHeartbeatFailure();</span>
+<span class="nc" id="L868">        } else {</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">            if (exception instanceof UnsupportedVersionException) {</span>
+<span class="nc" id="L870">                logger.error(&quot;StreamsGroupHeartbeatRequest failed because of an unsupported version exception: {}&quot;,</span>
+<span class="nc" id="L871">                    exception.getMessage());</span>
+<span class="nc" id="L872">                handleFatalFailure(new UnsupportedVersionException(UNSUPPORTED_VERSION_ERROR_MESSAGE));</span>
+            } else {
+<span class="nc" id="L874">                logger.error(&quot;StreamsGroupHeartbeatRequest failed because of a fatal exception while sending request: {}&quot;,</span>
+<span class="nc" id="L875">                    exception.getMessage());</span>
+<span class="nc" id="L876">                handleFatalFailure(exception);</span>
+            }
+<span class="nc" id="L878">            membershipManager.onFatalHeartbeatFailure();</span>
+        }
+<span class="nc" id="L880">    }</span>
+
+    private void handleFatalFailure(Throwable error) {
+<span class="nc" id="L883">        backgroundEventHandler.add(new ErrorEvent(error));</span>
+<span class="nc" id="L884">        membershipManager.transitionToFatal();</span>
+<span class="nc" id="L885">    }</span>
+
+    private static Map&lt;StreamsRebalanceData.HostInfo, StreamsRebalanceData.EndpointPartitions&gt; convertHostInfoMap(
+            final StreamsGroupHeartbeatResponseData data) {
+<span class="nc" id="L889">        Map&lt;StreamsRebalanceData.HostInfo, StreamsRebalanceData.EndpointPartitions&gt; partitionsByHost = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L890">        data.partitionsByUserEndpoint().forEach(endpoint -&gt; {</span>
+<span class="nc" id="L891">            List&lt;TopicPartition&gt; activeTopicPartitions = getTopicPartitionList(endpoint.activePartitions());</span>
+<span class="nc" id="L892">            List&lt;TopicPartition&gt; standbyTopicPartitions = getTopicPartitionList(endpoint.standbyPartitions());</span>
+<span class="nc" id="L893">            StreamsGroupHeartbeatResponseData.Endpoint userEndpoint = endpoint.userEndpoint();</span>
+<span class="nc" id="L894">            StreamsRebalanceData.HostInfo hostInfo = new StreamsRebalanceData.HostInfo(userEndpoint.host(), userEndpoint.port());</span>
+<span class="nc" id="L895">            partitionsByHost.merge(</span>
+                hostInfo,
+                new StreamsRebalanceData.EndpointPartitions(activeTopicPartitions, standbyTopicPartitions),
+                (existing, newPartitions) -&gt; {
+<span class="nc" id="L899">                    List&lt;TopicPartition&gt; mergedActive = new ArrayList&lt;&gt;(existing.activePartitions());</span>
+<span class="nc" id="L900">                    mergedActive.addAll(newPartitions.activePartitions());</span>
+<span class="nc" id="L901">                    List&lt;TopicPartition&gt; mergedStandby = new ArrayList&lt;&gt;(existing.standbyPartitions());</span>
+<span class="nc" id="L902">                    mergedStandby.addAll(newPartitions.standbyPartitions());</span>
+<span class="nc" id="L903">                    return new StreamsRebalanceData.EndpointPartitions(mergedActive, mergedStandby);</span>
+                }
+            );
+<span class="nc" id="L906">        });</span>
+<span class="nc" id="L907">        return partitionsByHost;</span>
+    }
+
+    static List&lt;TopicPartition&gt; getTopicPartitionList(List&lt;StreamsGroupHeartbeatResponseData.TopicPartition&gt; topicPartitions) {
+<span class="nc" id="L911">        return topicPartitions.stream()</span>
+<span class="nc" id="L912">                .flatMap(partition -&gt;</span>
+<span class="nc" id="L913">                        partition.partitions().stream().map(partitionId -&gt; new TopicPartition(partition.topic(), partitionId)))</span>
+                // toUnmodifiableList rather than toList, so that List.copyOf in EndpointPartitions is a no-op
+<span class="nc" id="L915">                .collect(Collectors.toUnmodifiableList());</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

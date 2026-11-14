@@ -1,0 +1,41 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "test-lib.h"
+#include "ldap-utils.h"
+
+static void test_ldap_escape(void)
+{
+	struct {
+		const char *input;
+		const char *output;
+	} tests[] = {
+		{ "", "" },
+		{ " ", "\\20" },
+		{ "  ", "\\20\\20" },
+		{ "foo ", "foo\\20" },
+		{ ",", "\\2c" },
+		{ "s p a c e", "s p a c e" },
+		{ "# start-end#", "\\23 start-end#" },
+		{ "  start-end2  ", "\\20 start-end2 \\20" },
+		{ "middle:,+\"\\<>;=", "middle:\\2c\\2b\\22\\5c\\3c\\3e\\3b\\3d" },
+		{ "filter:*()", "filter:\\2a\\28\\29" },
+		{ "valid-utf8:\xc3\xb1", "valid-utf8:\xc3\xb1" },
+		{ "Bad \xFF Characters", "Bad \xEF\xBF\xBD Characters" },
+	};
+	test_begin("ldap_escape()");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		const char *output, *error;
+		test_assert(ldap_escape(tests[i].input, &output, NULL, &error) == 0);
+		test_assert_strcmp_idx(output, tests[i].output, i);
+	}
+	test_end();
+}
+
+int main(void)
+{
+	static void (*const test_functions[])(void) = {
+		test_ldap_escape,
+		NULL
+	};
+	return test_run(test_functions);
+}

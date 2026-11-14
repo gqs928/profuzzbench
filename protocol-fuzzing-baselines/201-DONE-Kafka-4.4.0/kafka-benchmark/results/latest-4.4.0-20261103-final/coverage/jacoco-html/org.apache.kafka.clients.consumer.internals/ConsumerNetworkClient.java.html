@@ -1,0 +1,755 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConsumerNetworkClient.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">ConsumerNetworkClient.java</span></div><h1>ConsumerNetworkClient.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.ClientRequest;
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.KafkaClient;
+import org.apache.kafka.clients.Metadata;
+import org.apache.kafka.clients.NetworkClientUtils;
+import org.apache.kafka.clients.RequestCompletionHandler;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.errors.AuthenticationException;
+import org.apache.kafka.common.errors.DisconnectException;
+import org.apache.kafka.common.errors.InterruptException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.internals.LogContext;
+
+import org.slf4j.Logger;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Higher level consumer access to the network layer with basic support for request futures. This class
+ * is thread-safe, but provides no synchronization for response callbacks. This guarantees that no locks
+ * are held when they are invoked.
+ */
+public class ConsumerNetworkClient implements Closeable {
+    private static final int MAX_POLL_TIMEOUT_MS = 5000;
+
+    // the mutable state of this class is protected by the object's monitor (excluding the wakeup
+    // flag and the request completion queue below).
+    private final Logger log;
+    private final KafkaClient client;
+<span class="nc" id="L63">    private final UnsentRequests unsent = new UnsentRequests();</span>
+    private final Metadata metadata;
+    private final Time time;
+    private final long retryBackoffMs;
+    private final int maxPollTimeoutMs;
+    private final int requestTimeoutMs;
+<span class="nc" id="L69">    private final AtomicBoolean wakeupDisabled = new AtomicBoolean();</span>
+
+    // We do not need high throughput, so use a fair lock to try to avoid starvation
+<span class="nc" id="L72">    private final ReentrantLock lock = new ReentrantLock(true);</span>
+
+    // when requests complete, they are transferred to this queue prior to invocation. The purpose
+    // is to avoid invoking them while holding this object's monitor which can open the door for deadlocks.
+<span class="nc" id="L76">    private final ConcurrentLinkedQueue&lt;RequestFutureCompletionHandler&gt; pendingCompletion = new ConcurrentLinkedQueue&lt;&gt;();</span>
+
+<span class="nc" id="L78">    private final ConcurrentLinkedQueue&lt;Node&gt; pendingDisconnects = new ConcurrentLinkedQueue&lt;&gt;();</span>
+
+    // this flag allows the client to be safely woken up without waiting on the lock above. It is
+    // atomic to avoid the need to acquire the lock above in order to enable it concurrently.
+<span class="nc" id="L82">    private final AtomicBoolean wakeup = new AtomicBoolean(false);</span>
+
+    public ConsumerNetworkClient(LogContext logContext,
+                                 KafkaClient client,
+                                 Metadata metadata,
+                                 Time time,
+                                 long retryBackoffMs,
+                                 int requestTimeoutMs,
+<span class="nc" id="L90">                                 int maxPollTimeoutMs) {</span>
+<span class="nc" id="L91">        this.log = logContext.logger(ConsumerNetworkClient.class);</span>
+<span class="nc" id="L92">        this.client = client;</span>
+<span class="nc" id="L93">        this.metadata = metadata;</span>
+<span class="nc" id="L94">        this.time = time;</span>
+<span class="nc" id="L95">        this.retryBackoffMs = retryBackoffMs;</span>
+<span class="nc" id="L96">        this.maxPollTimeoutMs = Math.min(maxPollTimeoutMs, MAX_POLL_TIMEOUT_MS);</span>
+<span class="nc" id="L97">        this.requestTimeoutMs = requestTimeoutMs;</span>
+<span class="nc" id="L98">    }</span>
+
+    public int defaultRequestTimeoutMs() {
+<span class="nc" id="L101">        return requestTimeoutMs;</span>
+    }
+
+    /**
+     * Send a request with the default timeout. See {@link #send(Node, AbstractRequest.Builder, int)}.
+     */
+    public RequestFuture&lt;ClientResponse&gt; send(Node node, AbstractRequest.Builder&lt;?&gt; requestBuilder) {
+<span class="nc" id="L108">        return send(node, requestBuilder, requestTimeoutMs);</span>
+    }
+
+    /**
+     * Send a new request. Note that the request is not actually transmitted on the
+     * network until one of the {@link #poll(Timer)} variants is invoked. At this
+     * point the request will either be transmitted successfully or will fail.
+     * Use the returned future to obtain the result of the send. Note that there is no
+     * need to check for disconnects explicitly on the {@link ClientResponse} object;
+     * instead, the future will be failed with a {@link DisconnectException}.
+     *
+     * @param node The destination of the request
+     * @param requestBuilder A builder for the request payload
+     * @param requestTimeoutMs Maximum time in milliseconds to await a response before disconnecting the socket and
+     *                         cancelling the request. The request may be cancelled sooner if the socket disconnects
+     *                         for any reason.
+     * @return A future which indicates the result of the send.
+     */
+    public RequestFuture&lt;ClientResponse&gt; send(Node node,
+                                              AbstractRequest.Builder&lt;?&gt; requestBuilder,
+                                              int requestTimeoutMs) {
+<span class="nc" id="L129">        long now = time.milliseconds();</span>
+<span class="nc" id="L130">        RequestFutureCompletionHandler completionHandler = new RequestFutureCompletionHandler();</span>
+<span class="nc" id="L131">        ClientRequest clientRequest = client.newClientRequest(node.idString(), requestBuilder, now, true,</span>
+            requestTimeoutMs, completionHandler);
+<span class="nc" id="L133">        unsent.put(node, clientRequest);</span>
+
+        // wakeup the client in case it is blocking in poll so that we can send the queued request
+<span class="nc" id="L136">        client.wakeup();</span>
+<span class="nc" id="L137">        return completionHandler.future;</span>
+    }
+
+    public Node leastLoadedNode() {
+<span class="nc" id="L141">        lock.lock();</span>
+        try {
+<span class="nc" id="L143">            return client.leastLoadedNode(time.milliseconds()).node();</span>
+        } finally {
+<span class="nc" id="L145">            lock.unlock();</span>
+        }
+    }
+
+    public boolean hasReadyNodes(long now) {
+<span class="nc" id="L150">        lock.lock();</span>
+        try {
+<span class="nc" id="L152">            return client.hasReadyNodes(now);</span>
+        } finally {
+<span class="nc" id="L154">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Block waiting on the metadata refresh with a timeout.
+     *
+     * @param timer Timer bounding how long this method can block
+     * @return true if update succeeded, false otherwise.
+     * @throws WakeupException if {@link #wakeup()} is called from another thread
+     */
+    public boolean awaitMetadataUpdate(Timer timer) {
+<span class="nc" id="L166">        return awaitMetadataUpdate(timer, false);</span>
+    }
+
+    /**
+     * Block waiting on the metadata refresh with a timeout.
+     *
+     * @param timer Timer bounding how long this method can block
+     * @param disableWakeup true if we should not check for wakeups, false otherwise
+     * @return true if update succeeded, false otherwise.
+     * @throws WakeupException if {@link #wakeup()} is called from another thread and `disableWakeup` is false
+     */
+    public boolean awaitMetadataUpdate(Timer timer, boolean disableWakeup) {
+<span class="nc" id="L178">        int version = this.metadata.requestUpdate(false);</span>
+        do {
+<span class="nc" id="L180">            poll(timer, null, disableWakeup);</span>
+<span class="nc bnc" id="L181" title="All 4 branches missed.">        } while (this.metadata.updateVersion() == version &amp;&amp; timer.notExpired());</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        return this.metadata.updateVersion() &gt; version;</span>
+    }
+
+    /**
+     * Ensure our metadata is fresh (if an update is expected, this will block
+     * until it has completed).
+     *
+     * @throws WakeupException if {@link #wakeup()} is called from another thread
+     */
+    boolean ensureFreshMetadata(Timer timer) {
+<span class="nc bnc" id="L192" title="All 4 branches missed.">        if (this.metadata.updateRequested() || this.metadata.timeToNextUpdate(timer.currentTimeMs()) == 0) {</span>
+<span class="nc" id="L193">            return awaitMetadataUpdate(timer);</span>
+        } else {
+            // the metadata is already fresh
+<span class="nc" id="L196">            return true;</span>
+        }
+    }
+
+    /**
+     * Wakeup an active poll. This will cause the polling thread to throw an exception either
+     * on the current poll if one is active, or the next poll.
+     */
+    public void wakeup() {
+        // wakeup should be safe without holding the client lock since it simply delegates to
+        // Selector's wakeup, which is thread-safe
+<span class="nc" id="L207">        log.debug(&quot;Received user wakeup&quot;);</span>
+<span class="nc" id="L208">        this.wakeup.set(true);</span>
+<span class="nc" id="L209">        this.client.wakeup();</span>
+<span class="nc" id="L210">    }</span>
+
+    /**
+     * Block indefinitely until the given request future has finished.
+     * @param future The request future to await.
+     * @throws WakeupException if {@link #wakeup()} is called from another thread
+     * @throws InterruptException if the calling thread is interrupted
+     */
+    public void poll(RequestFuture&lt;?&gt; future) {
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        while (!future.isDone())</span>
+<span class="nc" id="L220">            poll(time.timer(Long.MAX_VALUE), future);</span>
+<span class="nc" id="L221">    }</span>
+
+    /**
+     * Block until the provided request future request has finished or the timeout has expired.
+     * @param future The request future to wait for
+     * @param timer Timer bounding how long this method can block
+     * @return true if the future is done, false otherwise
+     * @throws WakeupException if {@link #wakeup()} is called from another thread
+     * @throws InterruptException if the calling thread is interrupted
+     */
+    public boolean poll(RequestFuture&lt;?&gt; future, Timer timer) {
+<span class="nc" id="L232">        return poll(future, timer, false);</span>
+    }
+
+    /**
+     * Block until the provided request future request has finished or the timeout has expired.
+     *
+     * @param future The request future to wait for
+     * @param timer Timer bounding how long this method can block
+     * @param disableWakeup true if we should not check for wakeups, false otherwise
+     *
+     * @return true if the future is done, false otherwise
+     * @throws WakeupException if {@link #wakeup()} is called from another thread and `disableWakeup` is false
+     * @throws InterruptException if the calling thread is interrupted
+     */
+    public boolean poll(RequestFuture&lt;?&gt; future, Timer timer, boolean disableWakeup) {
+        do {
+<span class="nc" id="L248">            poll(timer, future, disableWakeup);</span>
+<span class="nc bnc" id="L249" title="All 4 branches missed.">        } while (!future.isDone() &amp;&amp; timer.notExpired());</span>
+<span class="nc" id="L250">        return future.isDone();</span>
+    }
+
+    /**
+     * Poll for any network IO.
+     * @param timer Timer bounding how long this method can block
+     * @throws WakeupException if {@link #wakeup()} is called from another thread
+     * @throws InterruptException if the calling thread is interrupted
+     */
+    public void poll(Timer timer) {
+<span class="nc" id="L260">        poll(timer, null);</span>
+<span class="nc" id="L261">    }</span>
+
+    /**
+     * Poll for any network IO.
+     * @param timer Timer bounding how long this method can block
+     * @param pollCondition Nullable blocking condition
+     * @throws WakeupException if {@link #wakeup()} is called from another thread
+     */
+    public void poll(Timer timer, PollCondition pollCondition) {
+<span class="nc" id="L270">        poll(timer, pollCondition, false);</span>
+<span class="nc" id="L271">    }</span>
+
+    /**
+     * Poll for any network IO.
+     * @param timer Timer bounding how long this method can block
+     * @param pollCondition Nullable blocking condition
+     * @param disableWakeup If TRUE disable triggering wake-ups
+     * @throws WakeupException if {@link #wakeup()} is called from another thread and `disableWakeup` is false
+     */
+    public void poll(Timer timer, PollCondition pollCondition, boolean disableWakeup) {
+        // there may be handlers which need to be invoked if we woke up the previous call to poll
+<span class="nc" id="L282">        firePendingCompletedRequests();</span>
+
+<span class="nc" id="L284">        lock.lock();</span>
+        try {
+            // Handle async disconnects prior to attempting any sends
+<span class="nc" id="L287">            handlePendingDisconnects();</span>
+
+            // send all the requests we can send now
+<span class="nc" id="L290">            long pollDelayMs = trySend(timer.currentTimeMs());</span>
+
+            // check whether the poll is still needed by the caller. Note that if the expected completion
+            // condition becomes satisfied after the call to shouldBlock() (because of a fired completion
+            // handler), the client will be woken up.
+<span class="nc bnc" id="L295" title="All 6 branches missed.">            if (pendingCompletion.isEmpty() &amp;&amp; (pollCondition == null || pollCondition.shouldBlock())) {</span>
+                // if there are no requests in flight, do not block longer than the retry backoff
+<span class="nc" id="L297">                long pollTimeout = Math.min(timer.remainingMs(), pollDelayMs);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">                if (client.inFlightRequestCount() == 0)</span>
+<span class="nc" id="L299">                    pollTimeout = Math.min(pollTimeout, retryBackoffMs);</span>
+<span class="nc" id="L300">                client.poll(pollTimeout, timer.currentTimeMs());</span>
+<span class="nc" id="L301">            } else {</span>
+<span class="nc" id="L302">                client.poll(0, timer.currentTimeMs());</span>
+            }
+<span class="nc" id="L304">            timer.update();</span>
+
+            // handle any disconnects by failing the active requests. note that disconnects must
+            // be checked immediately following poll since any subsequent call to client.ready()
+            // will reset the disconnect status
+<span class="nc" id="L309">            checkDisconnects(timer.currentTimeMs());</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">            if (!disableWakeup) {</span>
+                // trigger wakeups after checking for disconnects so that the callbacks will be ready
+                // to be fired on the next call to poll()
+<span class="nc" id="L313">                maybeTriggerWakeup();</span>
+            }
+            // throw InterruptException if this thread is interrupted
+<span class="nc" id="L316">            maybeThrowInterruptException();</span>
+
+            // try again to send requests since buffer space may have been
+            // cleared or a connect finished in the poll
+<span class="nc" id="L320">            trySend(timer.currentTimeMs());</span>
+
+            // fail requests that couldn't be sent if they have expired
+<span class="nc" id="L323">            failExpiredRequests(timer.currentTimeMs());</span>
+
+            // clean unsent requests collection to keep the map from growing indefinitely
+<span class="nc" id="L326">            unsent.clean();</span>
+        } finally {
+<span class="nc" id="L328">            lock.unlock();</span>
+        }
+
+        // called without the lock to avoid deadlock potential if handlers need to acquire locks
+<span class="nc" id="L332">        firePendingCompletedRequests();</span>
+
+<span class="nc" id="L334">        metadata.maybeThrowAnyException();</span>
+<span class="nc" id="L335">    }</span>
+
+    /**
+     * Poll for network IO and return immediately. This will not trigger wakeups.
+     */
+    public void pollNoWakeup() {
+<span class="nc" id="L341">        poll(time.timer(0), null, true);</span>
+<span class="nc" id="L342">    }</span>
+
+    /**
+     * Poll for network IO in best-effort only trying to transmit the ready-to-send request
+     * Do not check any pending requests or metadata errors so that no exception should ever
+     * be thrown, also no wakeups be triggered and no interrupted exception either.
+     */
+    public void transmitSends() {
+<span class="nc" id="L350">        Timer timer = time.timer(0);</span>
+
+        // do not try to handle any disconnects, prev request failures, metadata exception etc;
+        // just try once and return immediately
+<span class="nc" id="L354">        lock.lock();</span>
+        try {
+            // send all the requests we can send now
+<span class="nc" id="L357">            trySend(timer.currentTimeMs());</span>
+
+<span class="nc" id="L359">            client.poll(0, timer.currentTimeMs());</span>
+        } finally {
+<span class="nc" id="L361">            lock.unlock();</span>
+        }
+<span class="nc" id="L363">    }</span>
+
+    /**
+     * Block until all pending requests from the given node have finished.
+     * @param node The node to await requests from
+     * @param timer Timer bounding how long this method can block
+     * @return true If all requests finished, false if the timeout expired first
+     * @throws WakeupException if {@link #wakeup()} is called from another thread
+     */
+    public boolean awaitPendingRequests(Node node, Timer timer) {
+<span class="nc bnc" id="L373" title="All 4 branches missed.">        while (hasPendingRequests(node) &amp;&amp; timer.notExpired()) {</span>
+<span class="nc" id="L374">            poll(timer);</span>
+        }
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        return !hasPendingRequests(node);</span>
+    }
+
+    /**
+     * Get the count of pending requests to the given node. This includes both request that
+     * have been transmitted (i.e. in-flight requests) and those which are awaiting transmission.
+     * @param node The node in question
+     * @return The number of pending requests
+     */
+    public int pendingRequestCount(Node node) {
+<span class="nc" id="L386">        lock.lock();</span>
+        try {
+<span class="nc" id="L388">            return unsent.requestCount(node) + client.inFlightRequestCount(node.idString());</span>
+        } finally {
+<span class="nc" id="L390">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Check whether there is pending request to the given node. This includes both request that
+     * have been transmitted (i.e. in-flight requests) and those which are awaiting transmission.
+     * @param node The node in question
+     * @return A boolean indicating whether there is pending request
+     */
+    public boolean hasPendingRequests(Node node) {
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        if (unsent.hasRequests(node))</span>
+<span class="nc" id="L402">            return true;</span>
+<span class="nc" id="L403">        lock.lock();</span>
+        try {
+<span class="nc" id="L405">            return client.hasInFlightRequests(node.idString());</span>
+        } finally {
+<span class="nc" id="L407">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Get the total count of pending requests from all nodes. This includes both requests that
+     * have been transmitted (i.e. in-flight requests) and those which are awaiting transmission.
+     * @return The total count of pending requests
+     */
+    public int pendingRequestCount() {
+<span class="nc" id="L417">        lock.lock();</span>
+        try {
+<span class="nc" id="L419">            return unsent.requestCount() + client.inFlightRequestCount();</span>
+        } finally {
+<span class="nc" id="L421">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Check whether there is pending request. This includes both requests that
+     * have been transmitted (i.e. in-flight requests) and those which are awaiting transmission.
+     * @return A boolean indicating whether there is pending request
+     */
+    public boolean hasPendingRequests() {
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        if (unsent.hasRequests())</span>
+<span class="nc" id="L432">            return true;</span>
+<span class="nc" id="L433">        lock.lock();</span>
+        try {
+<span class="nc" id="L435">            return client.hasInFlightRequests();</span>
+        } finally {
+<span class="nc" id="L437">            lock.unlock();</span>
+        }
+    }
+
+    private void firePendingCompletedRequests() {
+<span class="nc" id="L442">        boolean completedRequestsFired = false;</span>
+        for (;;) {
+<span class="nc" id="L444">            RequestFutureCompletionHandler completionHandler = pendingCompletion.poll();</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">            if (completionHandler == null)</span>
+<span class="nc" id="L446">                break;</span>
+
+<span class="nc" id="L448">            completionHandler.fireCompletion();</span>
+<span class="nc" id="L449">            completedRequestsFired = true;</span>
+<span class="nc" id="L450">        }</span>
+
+        // wakeup the client in case it is blocking in poll for this future's completion
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if (completedRequestsFired)</span>
+<span class="nc" id="L454">            client.wakeup();</span>
+<span class="nc" id="L455">    }</span>
+
+    private void checkDisconnects(long now) {
+        // any disconnects affecting requests that have already been transmitted will be handled
+        // by NetworkClient, so we just need to check whether connections for any of the unsent
+        // requests have been disconnected; if they have, then we complete the corresponding future
+        // and set the disconnect flag in the ClientResponse
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        for (Node node : unsent.nodes()) {</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">            if (client.connectionFailed(node)) {</span>
+                // Remove entry before invoking request callback to avoid callbacks handling
+                // coordinator failures traversing the unsent list again.
+<span class="nc" id="L466">                Collection&lt;ClientRequest&gt; requests = unsent.remove(node);</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                for (ClientRequest request : requests) {</span>
+<span class="nc" id="L468">                    RequestFutureCompletionHandler handler = (RequestFutureCompletionHandler) request.callback();</span>
+<span class="nc" id="L469">                    AuthenticationException authenticationException = client.authenticationException(node);</span>
+<span class="nc" id="L470">                    handler.onComplete(new ClientResponse(request.makeHeader(request.requestBuilder().latestAllowedVersion()),</span>
+<span class="nc" id="L471">                            request.callback(), request.destination(), request.createdTimeMs(), now, true,</span>
+                            null, authenticationException, null));
+<span class="nc" id="L473">                }</span>
+            }
+<span class="nc" id="L475">        }</span>
+<span class="nc" id="L476">    }</span>
+
+    private void handlePendingDisconnects() {
+<span class="nc" id="L479">        lock.lock();</span>
+        try {
+            while (true) {
+<span class="nc" id="L482">                Node node = pendingDisconnects.poll();</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">                if (node == null)</span>
+<span class="nc" id="L484">                    break;</span>
+
+<span class="nc" id="L486">                failUnsentRequests(node, DisconnectException.INSTANCE);</span>
+<span class="nc" id="L487">                client.disconnect(node.idString());</span>
+<span class="nc" id="L488">            }</span>
+        } finally {
+<span class="nc" id="L490">            lock.unlock();</span>
+        }
+<span class="nc" id="L492">    }</span>
+
+    public void disconnectAsync(Node node) {
+<span class="nc" id="L495">        pendingDisconnects.offer(node);</span>
+<span class="nc" id="L496">        client.wakeup();</span>
+<span class="nc" id="L497">    }</span>
+
+    private void failExpiredRequests(long now) {
+        // clear all expired unsent requests and fail their corresponding futures
+<span class="nc" id="L501">        Collection&lt;ClientRequest&gt; expiredRequests = unsent.removeExpiredRequests(now);</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">        for (ClientRequest request : expiredRequests) {</span>
+<span class="nc" id="L503">            RequestFutureCompletionHandler handler = (RequestFutureCompletionHandler) request.callback();</span>
+<span class="nc" id="L504">            handler.onFailure(new TimeoutException(&quot;Failed to send request after &quot; + request.requestTimeoutMs() + &quot; ms.&quot;));</span>
+<span class="nc" id="L505">        }</span>
+<span class="nc" id="L506">    }</span>
+
+    private void failUnsentRequests(Node node, RuntimeException e) {
+        // clear unsent requests to node and fail their corresponding futures
+<span class="nc" id="L510">        lock.lock();</span>
+        try {
+<span class="nc" id="L512">            Collection&lt;ClientRequest&gt; unsentRequests = unsent.remove(node);</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">            for (ClientRequest unsentRequest : unsentRequests) {</span>
+<span class="nc" id="L514">                RequestFutureCompletionHandler handler = (RequestFutureCompletionHandler) unsentRequest.callback();</span>
+<span class="nc" id="L515">                handler.onFailure(e);</span>
+<span class="nc" id="L516">            }</span>
+        } finally {
+<span class="nc" id="L518">            lock.unlock();</span>
+        }
+<span class="nc" id="L520">    }</span>
+
+    // Visible for testing
+    long trySend(long now) {
+<span class="nc" id="L524">        long pollDelayMs = maxPollTimeoutMs;</span>
+
+        // send any requests that can be sent now
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        for (Node node : unsent.nodes()) {</span>
+<span class="nc" id="L528">            Iterator&lt;ClientRequest&gt; iterator = unsent.requestIterator(node);</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">            if (iterator.hasNext())</span>
+<span class="nc" id="L530">                pollDelayMs = Math.min(pollDelayMs, client.pollDelayMs(node, now));</span>
+
+<span class="nc bnc" id="L532" title="All 2 branches missed.">            while (iterator.hasNext()) {</span>
+<span class="nc" id="L533">                ClientRequest request = iterator.next();</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">                if (client.ready(node, now)) {</span>
+<span class="nc" id="L535">                    client.send(request, now);</span>
+<span class="nc" id="L536">                    iterator.remove();</span>
+                } else {
+                    // try next node when current node is not ready
+                    break;
+                }
+<span class="nc" id="L541">            }</span>
+<span class="nc" id="L542">        }</span>
+<span class="nc" id="L543">        return pollDelayMs;</span>
+    }
+
+    public void maybeTriggerWakeup() {
+<span class="nc bnc" id="L547" title="All 4 branches missed.">        if (!wakeupDisabled.get() &amp;&amp; wakeup.get()) {</span>
+<span class="nc" id="L548">            log.debug(&quot;Raising WakeupException in response to user wakeup&quot;);</span>
+<span class="nc" id="L549">            wakeup.set(false);</span>
+<span class="nc" id="L550">            throw new WakeupException();</span>
+        }
+<span class="nc" id="L552">    }</span>
+
+    private void maybeThrowInterruptException() {
+<span class="nc bnc" id="L555" title="All 2 branches missed.">        if (Thread.interrupted()) {</span>
+<span class="nc" id="L556">            throw new InterruptException(new InterruptedException());</span>
+        }
+<span class="nc" id="L558">    }</span>
+
+    public void disableWakeups() {
+<span class="nc" id="L561">        wakeupDisabled.set(true);</span>
+<span class="nc" id="L562">    }</span>
+
+    @Override
+    public void close() throws IOException {
+<span class="nc" id="L566">        lock.lock();</span>
+        try {
+<span class="nc" id="L568">            client.close();</span>
+        } finally {
+<span class="nc" id="L570">            lock.unlock();</span>
+        }
+<span class="nc" id="L572">    }</span>
+
+
+    /**
+     * Check if the code is disconnected and unavailable for immediate reconnection (i.e. if it is in
+     * reconnect backoff window following the disconnect).
+     */
+    public boolean isUnavailable(Node node) {
+<span class="nc" id="L580">        lock.lock();</span>
+        try {
+<span class="nc" id="L582">            return NetworkClientUtils.isUnavailable(client, node, time);</span>
+        } finally {
+<span class="nc" id="L584">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Check for an authentication error on a given node and raise the exception if there is one.
+     */
+    public void maybeThrowAuthFailure(Node node) {
+<span class="nc" id="L592">        lock.lock();</span>
+        try {
+<span class="nc" id="L594">            NetworkClientUtils.maybeThrowAuthFailure(client, node);</span>
+        } finally {
+<span class="nc" id="L596">            lock.unlock();</span>
+        }
+<span class="nc" id="L598">    }</span>
+
+    /**
+     * Initiate a connection if currently possible. This is only really useful for resetting the failed
+     * status of a socket. If there is an actual request to send, then {@link #send(Node, AbstractRequest.Builder)}
+     * should be used.
+     * @param node The node to connect to
+     */
+    public void tryConnect(Node node) {
+<span class="nc" id="L607">        lock.lock();</span>
+        try {
+<span class="nc" id="L609">            NetworkClientUtils.tryConnect(client, node, time);</span>
+        } finally {
+<span class="nc" id="L611">            lock.unlock();</span>
+        }
+<span class="nc" id="L613">    }</span>
+
+    private class RequestFutureCompletionHandler implements RequestCompletionHandler {
+        private final RequestFuture&lt;ClientResponse&gt; future;
+        private ClientResponse response;
+        private RuntimeException e;
+
+<span class="nc" id="L620">        private RequestFutureCompletionHandler() {</span>
+<span class="nc" id="L621">            this.future = new RequestFuture&lt;&gt;();</span>
+<span class="nc" id="L622">        }</span>
+
+        public void fireCompletion() {
+<span class="nc bnc" id="L625" title="All 2 branches missed.">            if (e != null) {</span>
+<span class="nc" id="L626">                future.raise(e);</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            } else if (response.authenticationException() != null) {</span>
+<span class="nc" id="L628">                future.raise(response.authenticationException());</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">            } else if (response.wasDisconnected()) {</span>
+<span class="nc" id="L630">                log.debug(&quot;Cancelled request with header {} due to node {} being disconnected&quot;,</span>
+<span class="nc" id="L631">                        response.requestHeader(), response.destination());</span>
+<span class="nc" id="L632">                future.raise(DisconnectException.INSTANCE);</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">            } else if (response.versionMismatch() != null) {</span>
+<span class="nc" id="L634">                future.raise(response.versionMismatch());</span>
+            } else {
+<span class="nc" id="L636">                future.complete(response);</span>
+            }
+<span class="nc" id="L638">        }</span>
+
+        public void onFailure(RuntimeException e) {
+<span class="nc" id="L641">            this.e = e;</span>
+<span class="nc" id="L642">            pendingCompletion.add(this);</span>
+<span class="nc" id="L643">        }</span>
+
+        @Override
+        public void onComplete(ClientResponse response) {
+<span class="nc" id="L647">            this.response = response;</span>
+<span class="nc" id="L648">            pendingCompletion.add(this);</span>
+<span class="nc" id="L649">        }</span>
+    }
+
+    /**
+     * When invoking poll from a multi-threaded environment, it is possible that the condition that
+     * the caller is awaiting has already been satisfied prior to the invocation of poll. We therefore
+     * introduce this interface to push the condition checking as close as possible to the invocation
+     * of poll. In particular, the check will be done while holding the lock used to protect concurrent
+     * access to {@link org.apache.kafka.clients.NetworkClient}, which means implementations must be
+     * very careful about locking order if the callback must acquire additional locks.
+     */
+    public interface PollCondition {
+        /**
+         * Return whether the caller is still awaiting an IO event.
+         * @return true if so, false otherwise.
+         */
+        boolean shouldBlock();
+    }
+
+    /*
+     * A thread-safe helper class to hold requests per node that have not been sent yet
+     */
+    private static final class UnsentRequests {
+        private final ConcurrentMap&lt;Node, ConcurrentLinkedQueue&lt;ClientRequest&gt;&gt; unsent;
+
+<span class="nc" id="L674">        private UnsentRequests() {</span>
+<span class="nc" id="L675">            unsent = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L676">        }</span>
+
+        public void put(Node node, ClientRequest request) {
+            // the lock protects the put from a concurrent removal of the queue for the node
+<span class="nc" id="L680">            synchronized (unsent) {</span>
+<span class="nc" id="L681">                ConcurrentLinkedQueue&lt;ClientRequest&gt; requests = unsent.computeIfAbsent(node, key -&gt; new ConcurrentLinkedQueue&lt;&gt;());</span>
+<span class="nc" id="L682">                requests.add(request);</span>
+<span class="nc" id="L683">            }</span>
+<span class="nc" id="L684">        }</span>
+
+        public int requestCount(Node node) {
+<span class="nc" id="L687">            ConcurrentLinkedQueue&lt;ClientRequest&gt; requests = unsent.get(node);</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">            return requests == null ? 0 : requests.size();</span>
+        }
+
+        public int requestCount() {
+<span class="nc" id="L692">            int total = 0;</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">            for (ConcurrentLinkedQueue&lt;ClientRequest&gt; requests : unsent.values())</span>
+<span class="nc" id="L694">                total += requests.size();</span>
+<span class="nc" id="L695">            return total;</span>
+        }
+
+        public boolean hasRequests(Node node) {
+<span class="nc" id="L699">            ConcurrentLinkedQueue&lt;ClientRequest&gt; requests = unsent.get(node);</span>
+<span class="nc bnc" id="L700" title="All 4 branches missed.">            return requests != null &amp;&amp; !requests.isEmpty();</span>
+        }
+
+        public boolean hasRequests() {
+<span class="nc bnc" id="L704" title="All 2 branches missed.">            for (ConcurrentLinkedQueue&lt;ClientRequest&gt; requests : unsent.values())</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">                if (!requests.isEmpty())</span>
+<span class="nc" id="L706">                    return true;</span>
+<span class="nc" id="L707">            return false;</span>
+        }
+
+        private Collection&lt;ClientRequest&gt; removeExpiredRequests(long now) {
+<span class="nc" id="L711">            List&lt;ClientRequest&gt; expiredRequests = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">            for (ConcurrentLinkedQueue&lt;ClientRequest&gt; requests : unsent.values()) {</span>
+<span class="nc" id="L713">                Iterator&lt;ClientRequest&gt; requestIterator = requests.iterator();</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">                while (requestIterator.hasNext()) {</span>
+<span class="nc" id="L715">                    ClientRequest request = requestIterator.next();</span>
+<span class="nc" id="L716">                    long elapsedMs = Math.max(0, now - request.createdTimeMs());</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">                    if (elapsedMs &gt; request.requestTimeoutMs()) {</span>
+<span class="nc" id="L718">                        expiredRequests.add(request);</span>
+<span class="nc" id="L719">                        requestIterator.remove();</span>
+                    } else
+                        break;
+<span class="nc" id="L722">                }</span>
+<span class="nc" id="L723">            }</span>
+<span class="nc" id="L724">            return expiredRequests;</span>
+        }
+
+        public void clean() {
+            // the lock protects removal from a concurrent put which could otherwise mutate the
+            // queue after it has been removed from the map
+<span class="nc" id="L730">            synchronized (unsent) {</span>
+<span class="nc" id="L731">                unsent.values().removeIf(ConcurrentLinkedQueue::isEmpty);</span>
+<span class="nc" id="L732">            }</span>
+<span class="nc" id="L733">        }</span>
+
+        public Collection&lt;ClientRequest&gt; remove(Node node) {
+            // the lock protects removal from a concurrent put which could otherwise mutate the
+            // queue after it has been removed from the map
+<span class="nc" id="L738">            synchronized (unsent) {</span>
+<span class="nc" id="L739">                ConcurrentLinkedQueue&lt;ClientRequest&gt; requests = unsent.remove(node);</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">                return requests == null ? Collections.emptyList() : requests;</span>
+            }
+        }
+
+        public Iterator&lt;ClientRequest&gt; requestIterator(Node node) {
+<span class="nc" id="L745">            ConcurrentLinkedQueue&lt;ClientRequest&gt; requests = unsent.get(node);</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">            return requests == null ? Collections.emptyIterator() : requests.iterator();</span>
+        }
+
+        public Collection&lt;Node&gt; nodes() {
+<span class="nc" id="L750">            return unsent.keySet();</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>

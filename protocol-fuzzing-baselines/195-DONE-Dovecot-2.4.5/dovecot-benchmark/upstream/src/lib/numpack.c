@@ -1,0 +1,59 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "buffer.h"
+#include "numpack.h"
+
+void numpack_encode(buffer_t *buf, uint64_t num)
+{
+	/* number continues as long as the highest bit is set */
+	while (num >= 0x80) {
+		buffer_append_c(buf, (num & 0x7f) | 0x80);
+		num >>= 7;
+	}
+
+	buffer_append_c(buf, num);
+}
+
+int numpack_decode(const uint8_t **p, const uint8_t *end, uint64_t *num_r)
+	ATTR_UNSIGNED_WRAPS
+{
+	const uint8_t *c = *p;
+	uint64_t value = 0;
+	unsigned int bits = 0;
+
+	while (bits < 64) {
+		if (c == end)
+			return -1;
+
+		value |= (uint64_t)(*c & 0x7f) << bits;
+		if (*c < 0x80)
+			break;
+
+		bits += 7;
+		c++;
+	}
+
+	if (c == end)
+		return -1;
+	bits += bits_required8(*c);
+	if (bits > 64) /* overflow */
+		return -1;
+
+	*p = c + 1;
+	*num_r = value;
+	return 0;
+}
+
+int numpack_decode32(const uint8_t **p, const uint8_t *end, uint32_t *num_r)
+{
+	uint64_t num;
+
+	if (numpack_decode(p, end, &num) < 0)
+		return -1;
+	if (num > 4294967295U)
+		return -1;
+
+	*num_r = (uint32_t)num;
+	return 0;
+}

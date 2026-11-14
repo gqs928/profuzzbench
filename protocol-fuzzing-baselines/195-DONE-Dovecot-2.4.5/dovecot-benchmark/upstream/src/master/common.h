@@ -1,0 +1,38 @@
+#ifndef COMMON_H
+#define COMMON_H
+
+#include "lib.h"
+#include "master-interface.h"
+#include "master-settings.h"
+
+#define LINUX_PROC_FS_SUID_DUMPABLE "/proc/sys/fs/suid_dumpable"
+#define LINUX_PROC_SYS_KERNEL_CORE_PATTERN "/proc/sys/kernel/core_pattern"
+
+extern uid_t master_uid;
+extern gid_t master_gid;
+extern bool core_dumps_disabled;
+extern bool have_proc_fs_suid_dumpable;
+extern bool have_proc_sys_kernel_core_pattern;
+extern const char *ssl_manual_key_password;
+/* Pipe that stays open for as long as the master process is alive. */
+extern int master_alive_pipe_fd[2];
+extern struct log_error_buffer *log_error_buffer;
+extern int global_config_fd;
+extern struct service_list *services;
+extern bool startup_finished;
+
+/* Reload the configuration. If replace_timeout is TRUE, kick_timeout_secs
+   overrides the services' shutdown_clients_timeout setting for how long the
+   old generation's client-facing processes may keep their clients.
+   Returns 0 on success, -1 on error. */
+int master_settings_reload(bool replace_timeout,
+			   unsigned int kick_timeout_secs,
+			   const char **error_r);
+
+void process_exec(const char *cmd) ATTR_NORETURN;
+
+int get_uidgid(const char *user, uid_t *uid_r, gid_t *gid_r,
+	       const char **error_r);
+int get_gid(const char *group, gid_t *gid_r, const char **error_r);
+
+#endif

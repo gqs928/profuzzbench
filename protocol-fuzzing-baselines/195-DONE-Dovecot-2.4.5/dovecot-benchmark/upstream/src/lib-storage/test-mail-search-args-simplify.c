@@ -1,0 +1,497 @@
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
+
+#include "lib.h"
+#include "str.h"
+#include "test-common.h"
+#include "mail-storage-private.h"
+#include "mail-search-build.h"
+#include "mail-search-parser.h"
+#include "mail-search.h"
+
+static const struct {
+	const char *input;
+	const char *output;
+} tests[] = {
+	{ "ALL", "ALL" },
+	{ "NOT ALL", "NOT ALL" },
+	{ "ALL NOT ALL", "NOT ALL" },
+	{ "ALL NOT ALL TEXT foo", "NOT ALL" },
+	{ "OR ALL NOT ALL", "ALL" },
+	{ "OR ALL OR NOT ALL TEXT foo", "ALL" },
+	/* the dropped args must be deinitialized (checked by valgrind) */
+	{ "OR ALL KEYWORD k1", "ALL" },
+	{ "NOT ALL KEYWORD k1", "NOT ALL" },
+	{ "OR ALL OR TEXT foo TEXT bar", "ALL" },
+	{ "OR TEXT FOO ( ALL NOT ALL )", "TEXT FOO" },
+	{ "TEXT FOO OR ALL NOT ALL", "TEXT FOO" },
+
+	{ "TEXT foo", "TEXT foo" },
+	{ "( TEXT foo )", "TEXT foo" },
+	{ "( ( TEXT foo ) )", "TEXT foo" },
+	{ "( ( TEXT foo ) ( TEXT bar ) )", "TEXT foo TEXT bar" },
+
+	{ "OR ( TEXT foo ) ( TEXT bar )", "OR TEXT foo TEXT bar" },
+	{ "OR ( TEXT foo ) OR ( TEXT bar ) ( TEXT baz )",
+	  "OR TEXT foo OR TEXT bar TEXT baz" },
+	{ "OR ( ( TEXT foo TEXT foo2 ) ) ( ( TEXT bar ( TEXT baz ) ) )",
+	  "OR (TEXT foo TEXT foo2) (TEXT bar TEXT baz)" },
+
+	{ "NOT ( TEXT foo )", "NOT TEXT foo" },
+	{ "NOT ( NOT ( TEXT foo ) )", "TEXT foo" },
+	{ "NOT OR ( TEXT foo ) ( TEXT bar )", "NOT TEXT foo NOT TEXT bar" },
+	{ "NOT ( OR ( TEXT foo ) ( TEXT bar ) )", "NOT TEXT foo NOT TEXT bar" },
+	{ "NOT ( TEXT foo TEXT bar )", "OR NOT TEXT foo NOT TEXT bar" },
+
+	{ "ANSWERED FLAGGED SEEN", "(ANSWERED FLAGGED SEEN)" },
+	{ "OR ( ANSWERED FLAGGED SEEN ) DRAFT", "OR (ANSWERED FLAGGED SEEN) DRAFT" },
+	{ "ANSWERED TEXT foo FLAGGED SEEN", "(ANSWERED FLAGGED SEEN) TEXT foo" },
+	{ "NOT ( ANSWERED FLAGGED SEEN )", "NOT (ANSWERED FLAGGED SEEN)" },
+	{ "OR NOT ANSWERED OR NOT FLAGGED NOT SEEN", "NOT (ANSWERED FLAGGED SEEN)" },
+	{ "OR NOT ANSWERED OR NOT FLAGGED SEEN", "OR NOT (ANSWERED FLAGGED) SEEN" },
+	{ "OR NOT ANSWERED OR FLAGGED NOT SEEN", "OR NOT (ANSWERED SEEN) FLAGGED" },
+	{ "NOT ANSWERED OR FLAGGED NOT SEEN", "NOT ANSWERED OR FLAGGED NOT SEEN" },
+	{ "NOT ANSWERED OR NOT FLAGGED NOT SEEN", "NOT ANSWERED NOT (FLAGGED SEEN)" },
+	{ "ANSWERED NOT FLAGGED SEEN NOT DRAFT", "(ANSWERED SEEN) NOT FLAGGED NOT DRAFT" },
+	{ "OR NOT ANSWERED NOT SEEN", "NOT (ANSWERED SEEN)" },
+	{ "OR NOT ANSWERED OR NOT SEEN TEXT foo", "OR NOT (ANSWERED SEEN) TEXT foo" },
+
+	{ "ANSWERED ANSWERED", "ANSWERED" },
+	{ "ANSWERED NOT ANSWERED", "NOT ALL" },
+	{ "ANSWERED ANSWERED NOT ANSWERED", "NOT ALL" },
+	{ "ANSWERED NOT ANSWERED ANSWERED NOT ANSWERED", "NOT ALL" },
+	{ "NOT ANSWERED NOT ANSWERED", "NOT ANSWERED" },
+	{ "NOT SEEN NOT ANSWERED NOT ANSWERED", "NOT SEEN NOT ANSWERED" },
+	{ "OR NOT SEEN OR NOT ANSWERED NOT ANSWERED", "NOT (ANSWERED SEEN)" },
+
+	{ "KEYWORD foo", "KEYWORD foo" },
+	{ "KEYWORD foo KEYWORD bar", "KEYWORD foo KEYWORD bar" },
+	{ "NOT KEYWORD foo", "NOT KEYWORD foo" },
+	{ "NOT KEYWORD foo NOT KEYWORD bar", "NOT KEYWORD foo NOT KEYWORD bar" },
+	{ "OR KEYWORD foo KEYWORD bar", "OR KEYWORD foo KEYWORD bar" },
+	{ "OR NOT KEYWORD foo NOT KEYWORD bar", "OR NOT KEYWORD foo NOT KEYWORD bar" },
+
+	{ "KEYWORD foo KEYWORD foo", "KEYWORD foo" },
+	{ "KEYWORD foo NOT KEYWORD foo", "NOT ALL" },
+	{ "OR KEYWORD foo NOT KEYWORD foo", "ALL" },
+	{ "OR KEYWORD foo KEYWORD foo", "KEYWORD foo" },
+	{ "NOT KEYWORD foo NOT KEYWORD foo", "NOT KEYWORD foo" },
+
+	/* keywords are case-insensitive */
+	{ "KEYWORD a OR KEYWORD A KEYWORD z", "KEYWORD a" },
+	{ "OR $ OR KEYWORD oR $ OR KEYWORD k22aaaaaaaaaaaaaaaaR!$ OR KEYWORD OR $ OR KEYWORD ka2 1",
+	  "KEYWORD oR OR KEYWORD ka2 1" },
+
+	{ "1:* 1:*", "ALL" },
+	{ "OR 1:5 6:*", "ALL" },
+
+	{ "UID 1:* UID 1:*", "ALL" },
+	{ "OR UID 1:5 UID 6:*", "ALL" },
+
+	{ "2:* 2:*", "2:4294967295" },
+	{ "OR 2:* 2:*", "2:4294967295" },
+
+	{ "UID 2:* UID 2:*", "UID 2:4294967295" },
+	{ "OR UID 2:* UID 2:*", "UID 2:4294967295" },
+
+	{ "1:5 6:7", "NOT ALL" },
+	{ "1:5 3:7", "3:5" },
+	{ "1:5 3:7 4:9", "4:5" },
+	{ "1:5 OR 3:4 4:6", "3:5" },
+	{ "OR 1 2", "1:2" },
+	{ "NOT 1,3:5", "2,6:4294967294" },
+	{ "NOT 1:100 NOT 50:200", "201:4294967294" },
+	{ "OR NOT 1:100 NOT 50:200", "1:49,101:4294967294" },
+
+	{ "UID 1:5 UID 6:7", "NOT ALL" },
+	{ "UID 1:5 UID 3:7", "UID 3:5" },
+	{ "OR UID 1 UID 2", "UID 1:2" },
+	{ "NOT UID 1,3:5", "UID 2,6:4294967294" },
+
+	{ "1:5 UID 10:20", "1:5 UID 10:20" },
+	{ "1:5 NOT UID 10:20", "1:5 UID 1:9,21:4294967294" },
+
+	{ "ALL NOT UID 3:*", "NOT UID 3:4294967295" },
+	{ "NOT 1:10 NOT *", "11:4294967294 NOT 4294967295" },
+
+	{ "BEFORE 03-Aug-2014 BEFORE 01-Aug-2014 BEFORE 02-Aug-2014", "BEFORE \"01-Aug-2014\"" },
+	{ "OR BEFORE 01-Aug-2014 BEFORE 02-Aug-2014", "BEFORE \"02-Aug-2014\"" },
+	{ "OR BEFORE 01-Aug-2014 OR BEFORE 03-Aug-2014 BEFORE 02-Aug-2014", "BEFORE \"03-Aug-2014\"" },
+	{ "BEFORE 03-Aug-2014 NOT BEFORE 01-Aug-2014 BEFORE 02-Aug-2014", "BEFORE \"02-Aug-2014\" NOT BEFORE \"01-Aug-2014\"" },
+	{ "SENTBEFORE 03-Aug-2014 SENTBEFORE 01-Aug-2014 SENTBEFORE 02-Aug-2014", "SENTBEFORE \"01-Aug-2014\"" },
+	{ "SENTBEFORE 03-Aug-2014 BEFORE 01-Aug-2014 SENTBEFORE 02-Aug-2014", "SENTBEFORE \"02-Aug-2014\" BEFORE \"01-Aug-2014\"" },
+
+	{ "ON 03-Aug-2014 ON 03-Aug-2014", "ON \"03-Aug-2014\"" },
+	{ "ON 03-Aug-2014 ON 04-Aug-2014", "ON \"03-Aug-2014\" ON \"04-Aug-2014\"" }, /* this could be replaced with e.g. NOT ALL */
+	{ "OR ON 03-Aug-2014 ON 04-Aug-2014", "OR ON \"03-Aug-2014\" ON \"04-Aug-2014\"" },
+
+	{ "SINCE 03-Aug-2014 SINCE 01-Aug-2014 SINCE 02-Aug-2014", "SINCE \"03-Aug-2014\"" },
+	{ "OR SINCE 01-Aug-2014 SINCE 02-Aug-2014", "SINCE \"01-Aug-2014\"" },
+	{ "OR SINCE 01-Aug-2014 OR SINCE 03-Aug-2014 SINCE 02-Aug-2014", "SINCE \"01-Aug-2014\"" },
+	{ "SINCE 03-Aug-2014 NOT SINCE 01-Aug-2014 SINCE 02-Aug-2014", "SINCE \"03-Aug-2014\" NOT SINCE \"01-Aug-2014\"" },
+	{ "NOT BEFORE 01-Aug-2014 NOT BEFORE 02-Aug-2014", "NOT BEFORE \"02-Aug-2014\"" },
+	{ "OR NOT BEFORE 01-Aug-2014 NOT BEFORE 02-Aug-2014", "NOT BEFORE \"01-Aug-2014\"" },
+	{ "NOT ( BEFORE 01-Aug-2014 BEFORE 02-Aug-2014 )", "NOT BEFORE \"01-Aug-2014\"" },
+	{ "NOT SINCE 01-Aug-2014 NOT SINCE 02-Aug-2014", "NOT SINCE \"01-Aug-2014\"" },
+	{ "OR NOT SINCE 01-Aug-2014 NOT SINCE 02-Aug-2014", "NOT SINCE \"02-Aug-2014\"" },
+	{ "NOT ( SINCE 01-Aug-2014 SINCE 02-Aug-2014 )", "NOT SINCE \"02-Aug-2014\"" },
+	{ "OR ( SINCE 01-Aug-2014 SINCE 02-Aug-2014 ) NOT ( SINCE 01-Aug-2014 SINCE 02-Aug-2014 )", "OR SINCE \"02-Aug-2014\" NOT SINCE \"02-Aug-2014\"" },
+	{ "SENTSINCE 03-Aug-2014 SENTSINCE 01-Aug-2014 SENTSINCE 02-Aug-2014", "SENTSINCE \"03-Aug-2014\"" },
+	{ "SENTSINCE 03-Aug-2014 SINCE 01-Aug-2014 SENTSINCE 02-Aug-2014", "SENTSINCE \"03-Aug-2014\" SINCE \"01-Aug-2014\"" },
+
+	{ "SMALLER 1 SMALLER 2", "SMALLER 1" },
+	{ "OR SMALLER 1 SMALLER 2", "SMALLER 2" },
+	{ "OR SMALLER 1 OR SMALLER 3 SMALLER 2", "SMALLER 3" },
+	{ "SMALLER 3 NOT SMALLER 1 SMALLER 2", "SMALLER 2 NOT SMALLER 1" },
+	{ "SMALLER 3 LARGER 5", "SMALLER 3 LARGER 5" }, /* this could be replaced with e.g. NOT ALL */
+	{ "OR SMALLER 3 LARGER 5", "OR SMALLER 3 LARGER 5" },
+
+	{ "LARGER 3 LARGER 1 LARGER 2", "LARGER 3" },
+	{ "OR LARGER 1 LARGER 2", "LARGER 1" },
+	{ "OR LARGER 1 OR LARGER 3 LARGER 2", "LARGER 1" },
+	{ "LARGER 3 NOT LARGER 1 LARGER 2", "LARGER 3 NOT LARGER 1" },
+	{ "NOT SMALLER 1 NOT SMALLER 2", "NOT SMALLER 2" },
+	{ "OR NOT SMALLER 1 NOT SMALLER 2", "NOT SMALLER 1" },
+	{ "NOT ( SMALLER 1 SMALLER 2 )", "NOT SMALLER 1" },
+	{ "NOT LARGER 1 NOT LARGER 2", "NOT LARGER 1" },
+	{ "OR NOT LARGER 1 NOT LARGER 2", "NOT LARGER 2" },
+	{ "NOT ( LARGER 1 LARGER 2 )", "NOT LARGER 2" },
+	{ "OR ( LARGER 1 LARGER 2 ) NOT ( LARGER 1 LARGER 2 )", "OR LARGER 2 NOT LARGER 2" },
+
+	{ "SUBJECT foo SUBJECT foo", "SUBJECT foo" },
+	{ "SUBJECT foo NOT SUBJECT foo", "NOT ALL" },
+	{ "OR SUBJECT foo NOT SUBJECT foo", "ALL" },
+	{ "SUBJECT foo SUBJECT foob", "SUBJECT foo SUBJECT foob" },
+	{ "OR SUBJECT foo SUBJECT foo", "SUBJECT foo" },
+	{ "FROM foo FROM foo", "FROM foo" },
+	{ "FROM foo NOT FROM foo", "NOT ALL" },
+	{ "OR FROM foo NOT FROM foo", "ALL" },
+	{ "FROM foo FROM bar", "FROM foo FROM bar" },
+	{ "FROM foo TO foo", "FROM foo TO foo" },
+
+	{ "TEXT foo TEXT foo", "TEXT foo" },
+	{ "TEXT foo TEXT foob", "TEXT foo TEXT foob" },
+	{ "OR TEXT foo TEXT foo", "TEXT foo" },
+	{ "OR NOT TEXT foo TEXT foo", "ALL" },
+	{ "OR TEXT foo NOT TEXT foo", "ALL" },
+	{ "TEXT foo NOT TEXT foo", "NOT ALL" },
+	{ "NOT TEXT foo TEXT foo", "NOT ALL" },
+	{ "BODY foo BODY foo", "BODY foo" },
+	{ "BODY foo NOT BODY foo", "NOT ALL" },
+	{ "OR BODY foo NOT BODY foo", "ALL" },
+	{ "OR BODY foo BODY foo", "BODY foo" },
+	{ "TEXT foo BODY foo", "TEXT foo BODY foo" },
+	{ "OR ( TEXT foo OR TEXT foo TEXT foo ) ( TEXT foo ( TEXT foo ) )", "TEXT foo" },
+
+	/* value="" tests */
+	{ "HEADER foo ", "HEADER FOO \"\"" },
+	{ "SUBJECT ", "SUBJECT \"\"" },
+	{ "BODY ", "ALL" },
+	{ "TEXT ", "ALL" },
+	{ "HEADER foo .", "HEADER FOO ." },
+	{ "SUBJECT .", "SUBJECT ." },
+	{ "BODY .", "BODY ." },
+	{ "TEXT .", "TEXT ." },
+
+	/* OR: drop redundant args */
+	{ "OR ( TEXT common1 TEXT unique1 ) TEXT common1", "TEXT common1" },
+	{ "OR ( TEXT unique1 TEXT common1 ) TEXT common1", "TEXT common1" },
+	{ "OR TEXT common1 ( TEXT common1 TEXT unique1 )", "TEXT common1" },
+	{ "OR TEXT common1 ( TEXT unique1 TEXT common1 )", "TEXT common1" },
+	{ "OR ( TEXT common1 TEXT common2 ) ( TEXT common1 TEXT common2 TEXT unique1 )", "TEXT common1 TEXT common2" },
+	{ "OR TEXT common1 OR ( TEXT unique1 TEXT common1 ) ( TEXT unique3 TEXT common1 )", "TEXT common1" },
+
+	/* OR: extract common AND */
+	{ "OR ( TEXT common1 TEXT unique1 ) ( TEXT common1 TEXT unique2 )", "OR TEXT unique1 TEXT unique2 TEXT common1" },
+	{ "OR ( TEXT unique1 TEXT common1 ) ( TEXT unique2 TEXT common1 )", "OR TEXT unique1 TEXT unique2 TEXT common1" },
+	{ "OR ( TEXT common1 TEXT unique1 ) ( TEXT unique2 TEXT common1 )", "OR TEXT unique1 TEXT unique2 TEXT common1" },
+	{ "OR ( TEXT unique1 TEXT common1 ) ( TEXT common1 TEXT unique2 )", "OR TEXT unique1 TEXT unique2 TEXT common1" },
+
+	{ "OR ( TEXT unique1 TEXT common1 ) ( TEXT common1 TEXT unique2 TEXT unique3 )", "OR TEXT unique1 (TEXT unique2 TEXT unique3) TEXT common1" },
+	{ "OR ( TEXT common1 TEXT common2 TEXT unique1 ) ( TEXT common1 TEXT common2 TEXT unique2 )", "OR TEXT unique1 TEXT unique2 TEXT common2 TEXT common1" },
+	{ "OR ( TEXT common1 TEXT common2 TEXT unique1 TEXT unique2 ) ( TEXT common1 TEXT common2 TEXT unique3 TEXT unique4 )", "OR (TEXT unique1 TEXT unique2) (TEXT unique3 TEXT unique4) TEXT common2 TEXT common1" },
+
+	/* NOT (SUB) must be converted with De Morgan before dropping redundant
+	   args or extracting common args */
+	{ "OR ( TEXT foo TEXT bar ) NOT ( TEXT foo TEXT bar )", "OR (TEXT foo TEXT bar) OR NOT TEXT foo NOT TEXT bar" },
+	{ "OR TEXT foo NOT ( TEXT foo TEXT baz )", "ALL" },
+	{ "OR ( TEXT foo TEXT bar ) NOT ( TEXT foo TEXT baz )", "OR (TEXT foo TEXT bar) OR NOT TEXT foo NOT TEXT baz" },
+	{ "OR NOT ( TEXT foo TEXT bar ) ( TEXT foo TEXT bar TEXT baz )", "OR NOT TEXT foo OR NOT TEXT bar (TEXT foo TEXT bar TEXT baz)" },
+	{ "OR NOT ( TEXT foo TEXT bar ) NOT ( TEXT foo TEXT bar TEXT baz )", "OR NOT TEXT foo OR NOT TEXT bar NOT TEXT baz" },
+	{ "OR TEXT x ( ( OR TEXT foo TEXT bar ) NOT ( OR TEXT foo TEXT baz ) )", "OR TEXT x (OR TEXT foo TEXT bar NOT TEXT foo NOT TEXT baz)" },
+	{ "( OR TEXT x ( OR TEXT foo TEXT bar ) ) ( OR TEXT x NOT ( OR TEXT foo TEXT baz ) )", "OR (OR TEXT foo TEXT bar NOT TEXT foo NOT TEXT baz) TEXT x" },
+
+	/* non-matching cases */
+	{ "OR ( TEXT unique1 TEXT unique2 ) TEXT unique3", "OR (TEXT unique1 TEXT unique2) TEXT unique3" },
+	{ "OR ( TEXT unique1 TEXT unique2 ) ( TEXT unique3 TEXT unique4 )", "OR (TEXT unique1 TEXT unique2) (TEXT unique3 TEXT unique4)" },
+	{ "OR ( TEXT common1 TEXT unique1 ) OR ( TEXT common1 TEXT unique2 ) TEXT unique3", "OR (TEXT common1 TEXT unique1) OR (TEXT common1 TEXT unique2) TEXT unique3" },
+	{ "OR ( TEXT common1 TEXT unique1 ) OR ( TEXT common1 TEXT common2 ) ( TEXT common2 TEXT unique2 )", "OR (TEXT common1 TEXT unique1) OR (TEXT common1 TEXT common2) (TEXT common2 TEXT unique2)" },
+
+	/* SUB: drop redundant args */
+	{ "( OR TEXT common1 TEXT unique1 ) TEXT common1", "TEXT common1" },
+	{ "( OR TEXT unique1 TEXT common1 ) TEXT common1", "TEXT common1" },
+	{ "TEXT common1 ( OR TEXT common1 TEXT unique1 )", "TEXT common1" },
+	{ "TEXT common1 ( OR TEXT unique1 TEXT common1 )", "TEXT common1" },
+	{ "( OR TEXT common1 TEXT common2 ) ( OR TEXT common1 OR TEXT common2 TEXT unique1 )", "OR TEXT common1 TEXT common2" },
+	{ "TEXT common1 ( OR TEXT unique1 TEXT common1 ) ( OR TEXT unique3 TEXT common1 )", "TEXT common1" },
+	{ "OR ( TEXT common1 ( OR TEXT unique1 TEXT common1 ) ) TEXT unique1", "OR TEXT common1 TEXT unique1" },
+
+	/* args that are redundant with each other: only one is dropped */
+	{ "( OR BODY x BODY y ) ( OR BODY y BODY x )", "OR BODY x BODY y" },
+	{ "OR ( BODY x BODY y ) ( BODY y BODY x )", "BODY x BODY y" },
+	{ "TEXT z ( OR BODY x BODY y ) ( OR BODY y BODY x )", "TEXT z OR BODY x BODY y" },
+	{ "( OR BODY x BODY y ) ( OR BODY y BODY x ) BODY x", "BODY x" },
+	{ "( OR BODY a OR BODY b BODY c ) ( OR BODY c OR BODY b BODY a )", "OR BODY a OR BODY b BODY c" },
+
+	/* extracted common args must stay initialized */
+	{ "( OR KEYWORD k1 BODY x ) ( OR KEYWORD k1 BODY y )", "OR (BODY x BODY y) KEYWORD k1" },
+	{ "OR ( KEYWORD k1 BODY x ) ( KEYWORD k1 BODY y )", "OR BODY x BODY y KEYWORD k1" },
+	{ "OR ( KEYWORD k1 ( TEXT d TEXT e ) ) ( KEYWORD k1 TEXT d TEXT e )", "TEXT d TEXT e KEYWORD k1" },
+
+	/* one of the args is entirely the common arg */
+	{ "OR UID 2:5 ( OR OR BODY a BODY b ( BODY s1 BODY s2 ) OR BODY a BODY b )", "OR UID 2:5 OR BODY a BODY b" },
+	{ "OR BODY q ( ( OR BODY a BODY b ) OR BODY b BODY a )", "OR BODY q OR BODY a BODY b" },
+	/* .. and the already extracted common args are kept */
+	{ "OR ( TEXT c ( TEXT d TEXT e ) ) ( TEXT c TEXT d TEXT e )", "TEXT d TEXT e TEXT c" },
+
+	/* SUB: extract common OR */
+	{ "( OR TEXT common1 TEXT unique1 ) ( OR TEXT common1 TEXT unique2 )", "OR (TEXT unique1 TEXT unique2) TEXT common1" },
+	{ "( OR TEXT unique1 TEXT common1 ) ( OR TEXT unique2 TEXT common1 )", "OR (TEXT unique1 TEXT unique2) TEXT common1" },
+	{ "( OR TEXT common1 TEXT unique1 ) ( OR TEXT unique2 TEXT common1 )", "OR (TEXT unique1 TEXT unique2) TEXT common1" },
+	{ "( OR TEXT unique1 TEXT common1 ) ( OR TEXT common1 TEXT unique2 )", "OR (TEXT unique1 TEXT unique2) TEXT common1" },
+
+	{ "( OR TEXT unique1 TEXT common1 ) ( OR TEXT common1 OR TEXT unique2 TEXT unique3 )", "OR (TEXT unique1 OR TEXT unique2 TEXT unique3) TEXT common1" },
+	{ "( OR TEXT common1 OR TEXT common2 TEXT unique1 ) ( OR TEXT common1 OR TEXT common2 TEXT unique2 )", "OR (TEXT unique1 TEXT unique2) OR TEXT common2 TEXT common1" },
+	{ "( OR TEXT common1 OR TEXT common2 OR TEXT unique1 TEXT unique2 ) ( OR TEXT common1 OR TEXT common2 OR TEXT unique3 TEXT unique4 )", "OR (OR TEXT unique1 TEXT unique2 OR TEXT unique3 TEXT unique4) OR TEXT common2 TEXT common1" },
+
+	/* non-matching cases */
+	{ "( OR TEXT unique1 TEXT unique2 ) TEXT unique3", "OR TEXT unique1 TEXT unique2 TEXT unique3" },
+	{ "( OR TEXT unique1 TEXT unique2 ) ( OR TEXT unique3 TEXT unique4 )", "OR TEXT unique1 TEXT unique2 OR TEXT unique3 TEXT unique4" },
+	{ "( OR TEXT common1 TEXT unique1 ) ( OR TEXT common1 TEXT unique2 ) TEXT unique3", "OR TEXT common1 TEXT unique1 OR TEXT common1 TEXT unique2 TEXT unique3" },
+	{ "( OR TEXT common1 TEXT unique1 ) ( OR TEXT common1 TEXT common2 ) ( OR TEXT common2 TEXT unique2 )", "OR TEXT common1 TEXT unique1 OR TEXT common1 TEXT common2 OR TEXT common2 TEXT unique2" },
+
+	/* extra for simplifications on 2nd and later terms */
+	{ "( OR BODY z BODY x ) BODY x BODY y",  "BODY x BODY y" },
+	{ "( OR BODY x BODY y ) ( OR BODY x BODY z )",  "OR (BODY y BODY z) BODY x" },
+	{ "( OR BODY z BODY x ) BODY x BODY y",  "BODY x BODY y" },
+	{ "( OR BODY z NOT BODY x ) BODY x BODY y",  "OR BODY z NOT BODY x BODY x BODY y" },
+
+	{ "( OR BODY z BODY y ) BODY x BODY y",  "BODY x BODY y" },
+	{ "( OR BODY z BODY y ) ( OR BODY z BODY w ) BODY x BODY y BODY w",  "BODY x BODY y BODY w" },
+
+	{ "subject y", "SUBJECT y"},
+
+	/* negated INTHREAD */
+	{ "NOT INTHREAD REFS BODY x", "NOT INTHREAD REFS (BODY x)" },
+	{ "TEXT a NOT INTHREAD REFS BODY x", "TEXT a NOT INTHREAD REFS (BODY x)" },
+	{ "NOT INTHREAD REFS ( BODY x OR BODY y BODY z )", "NOT INTHREAD REFS (BODY x OR BODY y BODY z)" },
+
+	/* INTHREAD's search key is kept as it is */
+	{ "INTHREAD REFS ( TEXT w OR BODY a BODY b )", "INTHREAD REFS (TEXT w OR BODY a BODY b)" },
+	{ "INTHREAD REFS ( OR BODY a BODY b TEXT w )", "INTHREAD REFS (OR BODY a BODY b TEXT w)" },
+	{ "INTHREAD REFS ( TEXT w OR BODY a BODY b TEXT x )", "INTHREAD REFS (TEXT w OR BODY a BODY b TEXT x)" },
+
+	/* nested INTHREADs are kept nested */
+	{ "INTHREAD REFS INTHREAD REFS BODY a", "INTHREAD REFS (INTHREAD REFS (BODY a))" },
+	{ "INTHREAD REFS NOT INTHREAD REFS BODY a", "INTHREAD REFS (NOT INTHREAD REFS (BODY a))" },
+	{ "INTHREAD REFS ( TEXT w INTHREAD REFS BODY a )", "INTHREAD REFS (TEXT w INTHREAD REFS (BODY a))" },
+	{ "INTHREAD REFS ( INTHREAD REFS BODY a INTHREAD REFS BODY b )", "INTHREAD REFS (INTHREAD REFS (BODY a) INTHREAD REFS (BODY b))" },
+	{ "INTHREAD REFS ( TEXT w INTHREAD REFS ( BODY a INTHREAD REFS BODY b ) )", "INTHREAD REFS (TEXT w INTHREAD REFS (BODY a INTHREAD REFS (BODY b)))" },
+	{ "INTHREAD REFS OR TEXT w INTHREAD REFS BODY a", "INTHREAD REFS (OR TEXT w INTHREAD REFS (BODY a))" },
+	{ "INTHREAD REFS ( TEXT w OR BODY a INTHREAD REFS BODY b )", "INTHREAD REFS (TEXT w OR BODY a INTHREAD REFS (BODY b))" },
+	{ "NOT INTHREAD REFS ( TEXT w INTHREAD REFS BODY a )", "NOT INTHREAD REFS (TEXT w INTHREAD REFS (BODY a))" },
+	{ "INTHREAD REFS ( KEYWORD k1 INTHREAD REFS KEYWORD k2 )", "INTHREAD REFS (KEYWORD k1 INTHREAD REFS (KEYWORD k2))" },
+	{ "INTHREAD REFS ( TEXT w INTHREAD REFS ( BODY a BODY a ) )", "INTHREAD REFS (TEXT w INTHREAD REFS (BODY a))" },
+	/* unnesting these used to grow the args exponentially */
+	{ "INTHREAD REFS ( OR 1 7 OR CC x INTHREAD REFS ( OR 2 8 OR CC x INTHREAD REFS ( OR 3 9 OR CC x INTHREAD REFS ( OR 4 10 OR CC x INTHREAD REFS ( 5 CC x ) ) ) ) )",
+	  "INTHREAD REFS (1,7 OR CC x INTHREAD REFS (2,8 OR CC x INTHREAD REFS (3,9 OR CC x INTHREAD REFS (4,10 OR CC x INTHREAD REFS (5 CC x)))))" },
+};
+
+static struct mail_search_args *
+test_build_search_args(const char *args)
+{
+	struct mail_search_parser *parser;
+	struct mail_search_args *sargs;
+	const char *error, *charset = "UTF-8";
+
+	parser = mail_search_parser_init_cmdline(t_strsplit(args, " "));
+	if (mail_search_build(mail_search_register_get_imap4rev1(),
+			      parser, &charset, &sargs, &error) < 0)
+		i_panic("%s", error);
+	mail_search_parser_deinit(&parser);
+	return sargs;
+}
+
+static bool test_search_args_are_initialized(struct mail_search_arg *arg)
+{
+	for (; arg != NULL; arg = arg->next) {
+		switch (arg->type) {
+		case SEARCH_MODSEQ:
+			if (arg->value.str != NULL &&
+			    arg->initialized.keywords == NULL)
+				return FALSE;
+			break;
+		case SEARCH_KEYWORDS:
+			if (arg->initialized.keywords == NULL)
+				return FALSE;
+			break;
+		case SEARCH_MAILBOX_GLOB:
+			if (arg->initialized.mailbox_glob == NULL)
+				return FALSE;
+			break;
+		case SEARCH_INTHREAD:
+			if (arg->initialized.search_args == NULL)
+				return FALSE;
+			/* fall through */
+		case SEARCH_SUB:
+		case SEARCH_OR:
+			if (!test_search_args_are_initialized(arg->value.subargs))
+				return FALSE;
+			break;
+		default:
+			break;
+		}
+	}
+	return TRUE;
+}
+
+static void test_mail_search_args_simplify(void)
+{
+	struct mail_search_args *args;
+	struct mail_storage_settings set = { .mail_max_keyword_length = 100 };
+	struct mail_storage storage = { .set = &set };
+	struct mailbox box = { .opened = TRUE, .storage = &storage };
+	string_t *str = t_str_new(256);
+	const char *error;
+	unsigned int i;
+
+	test_begin("mail search args simplify");
+	box.index = mail_index_alloc(NULL, NULL, "dovecot.index.");
+	for (i = 0; i < N_ELEMENTS(tests); i++) {
+		args = test_build_search_args(tests[i].input);
+		/* delay simplification until after init. that way we can test
+		   that the simplification works correctly when working on
+		   already-initialized args. */
+		args->simplified = TRUE;
+		mail_search_args_init(args, &box, FALSE, NULL);
+		mail_search_args_simplify(args);
+
+		str_truncate(str, 0);
+		test_assert(mail_search_args_to_imap(str, args->args, FALSE,
+						     &error));
+		test_assert_idx(strcmp(str_c(str), tests[i].output) == 0, i);
+
+		test_assert_idx(test_search_args_are_initialized(args->args), i);
+		mail_search_args_unref(&args);
+	}
+	mail_index_free(&box.index);
+	test_end();
+}
+
+static const struct {
+	const char *input;
+	const char *output;
+} uninit_tests[] = {
+	/* mail_search_args_init() simplifies the args before it initializes
+	   them, but with init_refcount already set. Dropping an uninitialized
+	   INTHREAD arg must not crash. */
+	{ "OR ( INTHREAD REFS BODY x BODY y ) ( INTHREAD REFS BODY x BODY y BODY z )", "INTHREAD REFS (BODY x) BODY y" },
+	{ "OR ( INTHREAD REFS BODY x BODY y ) ( INTHREAD REFS BODY x BODY z )", "OR BODY y BODY z INTHREAD REFS (BODY x)" },
+	{ "( OR INTHREAD REFS BODY x BODY y ) ( OR BODY y INTHREAD REFS BODY x )", "OR INTHREAD REFS (BODY x) BODY y" },
+	/* dropped by ALL */
+	{ "OR ALL INTHREAD REFS BODY x", "ALL" },
+	{ "NOT ALL INTHREAD REFS BODY x", "NOT ALL" },
+	/* negated INTHREAD */
+	{ "NOT INTHREAD REFS BODY x", "NOT INTHREAD REFS (BODY x)" },
+	/* nested INTHREADs */
+	{ "INTHREAD REFS ( TEXT w INTHREAD REFS BODY a )", "INTHREAD REFS (TEXT w INTHREAD REFS (BODY a))" },
+	{ "NOT INTHREAD REFS ( KEYWORD k1 INTHREAD REFS KEYWORD k2 )", "NOT INTHREAD REFS (KEYWORD k1 INTHREAD REFS (KEYWORD k2))" },
+};
+
+static void test_mail_search_args_simplify_uninitialized(void)
+{
+	struct mail_search_args *args;
+	struct mail_storage_settings set = { .mail_max_keyword_length = 100 };
+	struct mail_storage storage = { .set = &set };
+	struct mailbox box = { .opened = TRUE, .storage = &storage };
+	string_t *str = t_str_new(256);
+	const char *error;
+	unsigned int i;
+
+	test_begin("mail search args simplify uninitialized");
+	box.index = mail_index_alloc(NULL, NULL, "dovecot.index.");
+	for (i = 0; i < N_ELEMENTS(uninit_tests); i++) {
+		args = test_build_search_args(uninit_tests[i].input);
+		mail_search_args_init(args, &box, FALSE, NULL);
+
+		str_truncate(str, 0);
+		test_assert(mail_search_args_to_imap(str, args->args, FALSE,
+						     &error));
+		test_assert_idx(strcmp(str_c(str), uninit_tests[i].output) == 0, i);
+
+		test_assert_idx(test_search_args_are_initialized(args->args), i);
+		mail_search_args_deinit(args);
+		mail_search_args_unref(&args);
+	}
+	mail_index_free(&box.index);
+	test_end();
+}
+
+static bool
+test_search_args_build_fails(const char *args, const char *error_prefix)
+{
+	struct mail_search_parser *parser;
+	struct mail_search_args *sargs;
+	const char *error, *charset = "UTF-8";
+	int ret;
+
+	parser = mail_search_parser_init_cmdline(t_strsplit(args, " "));
+	ret = mail_search_build(mail_search_register_get_imap4rev1(),
+				parser, &charset, &sargs, &error);
+	mail_search_parser_deinit(&parser);
+	if (ret == 0) {
+		mail_search_args_unref(&sargs);
+		return FALSE;
+	}
+	return str_begins_with(error, error_prefix);
+}
+
+static void test_mail_search_args_inthread_algorithm(void)
+{
+	test_begin("mail search args inthread algorithm");
+	test_assert(!test_search_args_build_fails("INTHREAD REFS BODY a", ""));
+	test_assert(!test_search_args_build_fails("INTHREAD REFERENCES BODY a", ""));
+	/* mail_thread_finish() can't do ORDEREDSUBJECT */
+	test_assert(test_search_args_build_fails("INTHREAD ORDEREDSUBJECT BODY a",
+						 "INTHREAD doesn't support ORDEREDSUBJECT"));
+	test_assert(test_search_args_build_fails("INTHREAD BOGUS BODY a",
+						 "Unknown thread algorithm"));
+	test_end();
+}
+
+static void test_mail_search_args_simplify_empty_lists(void)
+{
+	struct mail_search_args *args;
+
+	test_begin("mail search args simplify empty args");
+
+	args = mail_search_build_init();
+	mail_search_args_simplify(args);
+	mail_search_args_unref(&args);
+
+	test_end();
+}
+
+int main(void)
+{
+	static void (*const test_functions[])(void) = {
+		mail_storage_init,
+		test_mail_search_args_simplify,
+		test_mail_search_args_simplify_uninitialized,
+		test_mail_search_args_inthread_algorithm,
+		test_mail_search_args_simplify_empty_lists,
+		mail_storage_deinit,
+		NULL
+	};
+
+	return test_run(test_functions);
+}

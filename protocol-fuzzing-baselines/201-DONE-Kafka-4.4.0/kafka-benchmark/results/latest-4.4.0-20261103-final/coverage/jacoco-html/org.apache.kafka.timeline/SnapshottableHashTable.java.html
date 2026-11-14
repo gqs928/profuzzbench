@@ -1,0 +1,444 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SnapshottableHashTable.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.timeline</a> &gt; <span class="el_source">SnapshottableHashTable.java</span></div><h1>SnapshottableHashTable.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.timeline;
+
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.NoSuchElementException;
+
+
+/**
+ * SnapshottableHashTable implements a hash table that supports creating point-in-time
+ * snapshots.  Each snapshot is immutable once it is created; the past cannot be changed.
+ * We handle divergences between the current state and historical state by copying a
+ * reference to elements that have been deleted or overwritten into the most recent
+ * snapshot tier.
+ * &lt;p&gt;
+ * Note that there are no keys in SnapshottableHashTable, only values.  So it more similar
+ * to a hash set than a hash map.  The subclasses implement full-featured maps and sets
+ * using this class as a building block.
+ * &lt;p&gt;
+ * Each snapshot tier contains a size and a hash table.  The size reflects the size at
+ * the time the snapshot was taken.  Note that, as an optimization, snapshot tiers will
+ * be null if they don't contain anything.  So for example, if snapshot 20 of Object O
+ * contains the same entries as snapshot 10 of that object, the snapshot 20 tier for
+ * object O will be null.
+ * &lt;p&gt;
+ * The current tier's data is stored in the fields inherited from BaseHashTable.  It
+ * would be conceptually simpler to have a separate BaseHashTable object, but since Java
+ * doesn't have value types, subclassing is the only way to avoid another pointer
+ * indirection and the associated extra memory cost.
+ * &lt;p&gt;
+ * Note that each element in the hash table contains a start epoch, and a value.  The
+ * start epoch is there to identify when the object was first inserted.  This in turn
+ * determines which snapshots it is a member of.
+ * &lt;p&gt;
+ * In order to retrieve an object from snapshot E, we start by checking to see if the
+ * object exists in the &quot;current&quot; hash tier.  If it does, and its startEpoch extends back
+ * to E, we return that object.  Otherwise, we check all the snapshot tiers, starting
+ * with E, and ending with the most recent snapshot, to see if the object is there.
+ * As an optimization, if we encounter the object in a snapshot tier but its epoch is too
+ * new, we know that its value at epoch E must be null, so we can return that immediately.
+ * &lt;p&gt;
+ * The class hierarchy looks like this:
+ * &lt;pre&gt;
+ *        Revertable       BaseHashTable
+ *              ↑              ↑
+ *           SnapshottableHashTable → SnapshotRegistry → Snapshot
+ *               ↑             ↑
+ *   TimelineHashSet       TimelineHashMap
+ * &lt;/pre&gt;
+ * BaseHashTable is a simple hash table that uses separate chaining.  The interface is
+ * pretty bare-bones since this class is not intended to be used directly by end-users.
+ * &lt;p&gt;
+ * This class, SnapshottableHashTable, has the logic for snapshotting and iterating over
+ * snapshots.  This is the core of the snapshotted hash table code and handles the
+ * tiering.
+ * &lt;p&gt;
+ * TimelineHashSet and TimelineHashMap are mostly wrappers around this
+ * SnapshottableHashTable class.  They implement standard Java APIs for Set and Map,
+ * respectively.  There's a fair amount of boilerplate for this, but it's necessary so
+ * that timeline data structures can be used while writing idiomatic Java code.
+ * The accessor APIs have two versions -- one that looks at the current state, and one
+ * that looks at a historical snapshotted state.  Mutation APIs only ever mutate the
+ * current state.
+ * &lt;p&gt;
+ * One very important feature of SnapshottableHashTable is that we support iterating
+ * over a snapshot even while changes are being made to the current state.  See the
+ * Javadoc for the iterator for more information about how this is accomplished.
+ * &lt;p&gt;
+ * All of these classes require external synchronization, and don't support null keys or
+ * values.
+ */
+class SnapshottableHashTable&lt;T extends SnapshottableHashTable.ElementWithStartEpoch&gt;
+        extends BaseHashTable&lt;T&gt; implements Revertable {
+
+    /**
+     * A special epoch value that represents the latest data.
+     */
+    static final long LATEST_EPOCH = Long.MAX_VALUE;
+
+    interface ElementWithStartEpoch {
+        void setStartEpoch(long startEpoch);
+        long startEpoch();
+    }
+
+    static class HashTier&lt;T extends SnapshottableHashTable.ElementWithStartEpoch&gt; implements Delta {
+        private final int size;
+        private BaseHashTable&lt;T&gt; deltaTable;
+
+<span class="nc" id="L106">        HashTier(int size) {</span>
+<span class="nc" id="L107">            this.size = size;</span>
+<span class="nc" id="L108">        }</span>
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        @Override
+        public void mergeFrom(long epoch, Delta source) {
+<span class="nc" id="L113">            HashTier&lt;T&gt; other = (HashTier&lt;T&gt;) source;</span>
+            // As an optimization, the deltaTable might not exist for a new key
+            // as there is no previous value
+<span class="nc bnc" id="L116" title="All 2 branches missed.">            if (other.deltaTable != null) {</span>
+<span class="nc" id="L117">                List&lt;T&gt; list = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L118">                Object[] otherElements = other.deltaTable.baseElements();</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">                for (int slot = 0; slot &lt; otherElements.length; slot++) {</span>
+<span class="nc" id="L120">                    BaseHashTable.unpackSlot(list, otherElements, slot);</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">                    for (T element : list) {</span>
+                        // When merging in a later hash tier, we want to keep only the elements
+                        // that were present at our epoch.
+<span class="nc bnc" id="L124" title="All 2 branches missed.">                        if (element.startEpoch() &lt;= epoch) {</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">                            if (deltaTable == null) {</span>
+<span class="nc" id="L126">                                deltaTable = new BaseHashTable&lt;&gt;(1);</span>
+                            }
+<span class="nc" id="L128">                            deltaTable.baseAddOrReplace(element);</span>
+                        }
+<span class="nc" id="L130">                    }</span>
+                }
+            }
+<span class="nc" id="L133">        }</span>
+    }
+
+    /**
+     * Iterate over the values that currently exist in the hash table.
+     * &lt;p&gt;
+     * You can use this iterator even if you are making changes to the map.
+     * The changes may or may not be visible while you are iterating.
+     */
+    class CurrentIterator implements Iterator&lt;T&gt; {
+        private final Object[] topTier;
+        private final List&lt;T&gt; ready;
+        private int slot;
+        private T lastReturned;
+
+<span class="nc" id="L148">        CurrentIterator(Object[] topTier) {</span>
+<span class="nc" id="L149">            this.topTier = topTier;</span>
+<span class="nc" id="L150">            this.ready = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L151">            this.slot = 0;</span>
+<span class="nc" id="L152">            this.lastReturned = null;</span>
+<span class="nc" id="L153">        }</span>
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L157" title="All 2 branches missed.">            while (ready.isEmpty()) {</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                if (slot == topTier.length) {</span>
+<span class="nc" id="L159">                    return false;</span>
+                }
+<span class="nc" id="L161">                BaseHashTable.unpackSlot(ready, topTier, slot);</span>
+<span class="nc" id="L162">                slot++;</span>
+            }
+<span class="nc" id="L164">            return true;</span>
+        }
+
+        @Override
+        public T next() {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L170">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L172">            lastReturned = ready.remove(ready.size() - 1);</span>
+<span class="nc" id="L173">            return lastReturned;</span>
+        }
+
+        @Override
+        public void remove() {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            if (lastReturned == null) {</span>
+<span class="nc" id="L179">                throw new UnsupportedOperationException(&quot;remove&quot;);</span>
+            }
+<span class="nc" id="L181">            snapshottableRemove(lastReturned);</span>
+<span class="nc" id="L182">            lastReturned = null;</span>
+<span class="nc" id="L183">        }</span>
+    }
+
+    /**
+     * Iterate over the values that existed in the hash table during a specific snapshot.
+     * &lt;p&gt;
+     * You can use this iterator even if you are making changes to the map.
+     * The snapshot is immutable and will always show up the same.
+     */
+    class HistoricalIterator implements Iterator&lt;T&gt; {
+        private final Object[] topTier;
+        private final Snapshot snapshot;
+        private final List&lt;T&gt; temp;
+        private final List&lt;T&gt; ready;
+        private int slot;
+
+<span class="nc" id="L199">        HistoricalIterator(Object[] topTier, Snapshot snapshot) {</span>
+<span class="nc" id="L200">            this.topTier = topTier;</span>
+<span class="nc" id="L201">            this.snapshot = snapshot;</span>
+<span class="nc" id="L202">            this.temp = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L203">            this.ready = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L204">            this.slot = 0;</span>
+<span class="nc" id="L205">        }</span>
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">            while (ready.isEmpty()) {</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                if (slot == topTier.length) {</span>
+<span class="nc" id="L211">                    return false;</span>
+                }
+<span class="nc" id="L213">                BaseHashTable.unpackSlot(temp, topTier, slot);</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                for (T object : temp) {</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">                    if (object.startEpoch() &lt;= snapshot.epoch()) {</span>
+<span class="nc" id="L216">                        ready.add(object);</span>
+                    }
+<span class="nc" id="L218">                }</span>
+<span class="nc" id="L219">                temp.clear();</span>
+
+                /*
+                 * As we iterate over the SnapshottableHashTable, elements may move from
+                 * the top tier into the snapshot tiers.  This would happen if something
+                 * were deleted in the top tier, for example, but still retained in the
+                 * snapshot.
+                 *
+                 * We don't want to return any elements twice, though.  Therefore, we
+                 * iterate over the top tier and the snapshot tier at the
+                 * same time.  The key to understanding how this works is realizing that
+                 * both hash tables use the same hash function, but simply choose a
+                 * different number of significant bits based on their size.
+                 * So if the top tier has size 4 and the snapshot tier has size 2, we have
+                 * the following mapping:
+                 *
+                 * Elements that would be in slot 0 or 1 in the top tier can only be in
+                 * slot 0 in the snapshot tier.
+                 * Elements that would be in slot 2 or 3 in the top tier can only be in
+                 * slot 1 in the snapshot tier.
+                 *
+                 * Therefore, we can do something like this:
+                 * 1. check slot 0 in the top tier and slot 0 in the snapshot tier.
+                 * 2. check slot 1 in the top tier and slot 0 in the snapshot tier.
+                 * 3. check slot 2 in the top tier and slot 1 in the snapshot tier.
+                 * 4. check slot 3 in the top tier and slot 1 in the snapshot tier.
+                 *
+                 * If elements move from the top tier to the snapshot tier, then
+                 * we'll still find them and report them exactly once.
+                 *
+                 * Note that while I used 4 and 2 as example sizes here, the same pattern
+                 * holds for different powers of two.  The &quot;snapshot slot&quot; of an element
+                 * will be the top few bits of the top tier slot of that element.
+                 */
+<span class="nc" id="L253">                Iterator&lt;Snapshot&gt; iterator = snapshotRegistry.iterator(snapshot);</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">                while (iterator.hasNext()) {</span>
+<span class="nc" id="L255">                    Snapshot curSnapshot = iterator.next();</span>
+<span class="nc" id="L256">                    HashTier&lt;T&gt; tier = curSnapshot.getDelta(SnapshottableHashTable.this);</span>
+<span class="nc bnc" id="L257" title="All 4 branches missed.">                    if (tier != null &amp;&amp; tier.deltaTable != null) {</span>
+<span class="nc" id="L258">                        BaseHashTable&lt;T&gt; deltaTable = tier.deltaTable;</span>
+<span class="nc" id="L259">                        int shift = Integer.numberOfLeadingZeros(deltaTable.baseElements().length) -</span>
+<span class="nc" id="L260">                            Integer.numberOfLeadingZeros(topTier.length);</span>
+<span class="nc" id="L261">                        int tierSlot = slot &gt;&gt;&gt; shift;</span>
+<span class="nc" id="L262">                        BaseHashTable.unpackSlot(temp, deltaTable.baseElements(), tierSlot);</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">                        for (T object : temp) {</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">                            if (object.startEpoch() &lt;= snapshot.epoch()) {</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">                                if (BaseHashTable.findSlot(object, topTier.length) == slot) {</span>
+<span class="nc" id="L266">                                    ready.add(object);</span>
+                                }
+                            }
+<span class="nc" id="L269">                        }</span>
+<span class="nc" id="L270">                        temp.clear();</span>
+                    }
+<span class="nc" id="L272">                }</span>
+<span class="nc" id="L273">                slot++;</span>
+<span class="nc" id="L274">            }</span>
+<span class="nc" id="L275">            return true;</span>
+        }
+
+        @Override
+        public T next() {
+<span class="nc bnc" id="L280" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L281">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L283">            return ready.remove(ready.size() - 1);</span>
+        }
+    }
+
+    private final SnapshotRegistry snapshotRegistry;
+
+    SnapshottableHashTable(SnapshotRegistry snapshotRegistry, int expectedSize) {
+<span class="nc" id="L290">        super(expectedSize);</span>
+<span class="nc" id="L291">        this.snapshotRegistry = snapshotRegistry;</span>
+<span class="nc" id="L292">        snapshotRegistry.register(this);</span>
+<span class="nc" id="L293">    }</span>
+
+    int snapshottableSize(long epoch) {
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if (epoch == LATEST_EPOCH) {</span>
+<span class="nc" id="L297">            return baseSize();</span>
+        } else {
+<span class="nc" id="L299">            Iterator&lt;Snapshot&gt; iterator = snapshotRegistry.iterator(epoch);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            while (iterator.hasNext()) {</span>
+<span class="nc" id="L301">                Snapshot snapshot = iterator.next();</span>
+<span class="nc" id="L302">                HashTier&lt;T&gt; tier = snapshot.getDelta(SnapshottableHashTable.this);</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                if (tier != null) {</span>
+<span class="nc" id="L304">                    return tier.size;</span>
+                }
+<span class="nc" id="L306">            }</span>
+<span class="nc" id="L307">            return baseSize();</span>
+        }
+    }
+
+    T snapshottableGet(Object key, long epoch) {
+<span class="nc" id="L312">        T result = baseGet(key);</span>
+<span class="nc bnc" id="L313" title="All 4 branches missed.">        if (result != null &amp;&amp; result.startEpoch() &lt;= epoch) {</span>
+<span class="nc" id="L314">            return result;</span>
+        }
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        if (epoch == LATEST_EPOCH) {</span>
+<span class="nc" id="L317">            return null;</span>
+        }
+<span class="nc" id="L319">        Iterator&lt;Snapshot&gt; iterator = snapshotRegistry.iterator(epoch);</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        while (iterator.hasNext()) {</span>
+<span class="nc" id="L321">            Snapshot snapshot = iterator.next();</span>
+<span class="nc" id="L322">            HashTier&lt;T&gt; tier = snapshot.getDelta(SnapshottableHashTable.this);</span>
+<span class="nc bnc" id="L323" title="All 4 branches missed.">            if (tier != null &amp;&amp; tier.deltaTable != null) {</span>
+<span class="nc" id="L324">                result = tier.deltaTable.baseGet(key);</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                if (result != null) {</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                    if (result.startEpoch() &lt;= epoch) {</span>
+<span class="nc" id="L327">                        return result;</span>
+                    } else {
+<span class="nc" id="L329">                        return null;</span>
+                    }
+                }
+            }
+<span class="nc" id="L333">        }</span>
+<span class="nc" id="L334">        return null;</span>
+    }
+
+    boolean snapshottableAddUnlessPresent(T object) {
+<span class="nc" id="L338">        T prev = baseGet(object);</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (prev != null) {</span>
+<span class="nc" id="L340">            return false;</span>
+        }
+<span class="nc" id="L342">        object.setStartEpoch(snapshotRegistry.latestEpoch() + 1);</span>
+<span class="nc" id="L343">        int prevSize = baseSize();</span>
+<span class="nc" id="L344">        baseAddOrReplace(object);</span>
+<span class="nc" id="L345">        updateTierData(prevSize);</span>
+<span class="nc" id="L346">        return true;</span>
+    }
+
+    T snapshottableAddOrReplace(T object) {
+<span class="nc" id="L350">        object.setStartEpoch(snapshotRegistry.latestEpoch() + 1);</span>
+<span class="nc" id="L351">        int prevSize = baseSize();</span>
+<span class="nc" id="L352">        T prev = baseAddOrReplace(object);</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">        if (prev == null) {</span>
+<span class="nc" id="L354">            updateTierData(prevSize);</span>
+        } else {
+<span class="nc" id="L356">            updateTierData(prev, prevSize);</span>
+        }
+<span class="nc" id="L358">        return prev;</span>
+    }
+
+    T snapshottableRemove(Object object) {
+<span class="nc" id="L362">        T prev = baseRemove(object);</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        if (prev == null) {</span>
+<span class="nc" id="L364">            return null;</span>
+        } else {
+<span class="nc" id="L366">            updateTierData(prev, baseSize() + 1);</span>
+<span class="nc" id="L367">            return prev;</span>
+        }
+    }
+
+    private void updateTierData(int prevSize) {
+<span class="nc" id="L372">        Iterator&lt;Snapshot&gt; iterator = snapshotRegistry.reverseIterator();</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        if (iterator.hasNext()) {</span>
+<span class="nc" id="L374">            Snapshot snapshot = iterator.next();</span>
+<span class="nc" id="L375">            HashTier&lt;T&gt; tier = snapshot.getDelta(SnapshottableHashTable.this);</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">            if (tier == null) {</span>
+<span class="nc" id="L377">                tier = new HashTier&lt;&gt;(prevSize);</span>
+<span class="nc" id="L378">                snapshot.setDelta(SnapshottableHashTable.this, tier);</span>
+            }
+        }
+<span class="nc" id="L381">    }</span>
+
+    private void updateTierData(T prev, int prevSize) {
+<span class="nc" id="L384">        Iterator&lt;Snapshot&gt; iterator = snapshotRegistry.reverseIterator();</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (iterator.hasNext()) {</span>
+<span class="nc" id="L386">            Snapshot snapshot = iterator.next();</span>
+            // If the previous element was present in the most recent snapshot, add it to
+            // that snapshot's hash tier.
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (prev.startEpoch() &lt;= snapshot.epoch()) {</span>
+<span class="nc" id="L390">                HashTier&lt;T&gt; tier = snapshot.getDelta(SnapshottableHashTable.this);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                if (tier == null) {</span>
+<span class="nc" id="L392">                    tier = new HashTier&lt;&gt;(prevSize);</span>
+<span class="nc" id="L393">                    snapshot.setDelta(SnapshottableHashTable.this, tier);</span>
+                }
+<span class="nc bnc" id="L395" title="All 2 branches missed.">                if (tier.deltaTable == null) {</span>
+<span class="nc" id="L396">                    tier.deltaTable = new BaseHashTable&lt;&gt;(1);</span>
+                }
+<span class="nc" id="L398">                tier.deltaTable.baseAddOrReplace(prev);</span>
+            }
+        }
+<span class="nc" id="L401">    }</span>
+
+    Iterator&lt;T&gt; snapshottableIterator(long epoch) {
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        if (epoch == LATEST_EPOCH) {</span>
+<span class="nc" id="L405">            return new CurrentIterator(baseElements());</span>
+        } else {
+<span class="nc" id="L407">            return new HistoricalIterator(baseElements(), snapshotRegistry.getSnapshot(epoch));</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public void executeRevert(long targetEpoch, Delta delta) {
+<span class="nc" id="L414">        HashTier&lt;T&gt; tier = (HashTier&lt;T&gt;) delta;</span>
+<span class="nc" id="L415">        Iterator&lt;T&gt; iter = snapshottableIterator(LATEST_EPOCH);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">        while (iter.hasNext()) {</span>
+<span class="nc" id="L417">            T element = iter.next();</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            if (element.startEpoch() &gt; targetEpoch) {</span>
+<span class="nc" id="L419">                iter.remove();</span>
+            }
+<span class="nc" id="L421">        }</span>
+<span class="nc" id="L422">        BaseHashTable&lt;T&gt; deltaTable = tier.deltaTable;</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">        if (deltaTable != null) {</span>
+<span class="nc" id="L424">            List&lt;T&gt; out = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">            for (int i = 0; i &lt; deltaTable.baseElements().length; i++) {</span>
+<span class="nc" id="L426">                BaseHashTable.unpackSlot(out, deltaTable.baseElements(), i);</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                for (T value : out) {</span>
+<span class="nc" id="L428">                    baseAddOrReplace(value);</span>
+<span class="nc" id="L429">                }</span>
+<span class="nc" id="L430">                out.clear();</span>
+            }
+        }
+<span class="nc" id="L433">    }</span>
+
+    @Override
+    public void reset() {
+<span class="nc" id="L437">        Iterator&lt;T&gt; iter = snapshottableIterator(SnapshottableHashTable.LATEST_EPOCH);</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        while (iter.hasNext()) {</span>
+<span class="nc" id="L439">            iter.next();</span>
+<span class="nc" id="L440">            iter.remove();</span>
+        }
+<span class="nc" id="L442">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.13.202504020838</span></div></body></html>
